@@ -28,10 +28,14 @@
 
 #include "mle/defaults.h"
 #include "mle/launcher.h"
+#include "mle/worker.h"
 
 namespace mle_component {
 
 namespace {
+
+/** The one worker class of Phase 4 (defaults.h). */
+constexpr char kWorkerClass[] = "jvm";
 
 std::mutex g_mutex;
 std::unique_ptr<mle::Launcher> g_launcher;  // guarded by g_mutex
@@ -132,6 +136,7 @@ bool engine_start(const Settings &s, std::string *error, std::string *info) {
   }
 
   mle::JvmClassOptions options;
+  options.name = kWorkerClass;
   options.memory_max = s.memory_max;
   options.heap = std::to_string(s.heap_max >> 20) + "m";
   options.pool_size = s.pool_size;
@@ -197,5 +202,57 @@ EngineState engine_state(bool with_stats) {
 }
 
 long engine_workers_in_use() { return g_workers_in_use.load(); }
+
+namespace {
+/** How long a session waits for its worker to be READY (a pool hit is
+    ready at once; a cold start takes seconds). */
+constexpr int kReadyTimeoutMs = 120000;
+}  // namespace
+
+std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us,
+                                               int interrupt_grace_ms,
+                                               AcquireError *why,
+                                               std::string *error) {
+  if (++g_workers_in_use > static_cast<long>(max_workers)) {
+    --g_workers_in_use;
+    *why = AcquireError::kLimit;
+    return nullptr;
+  }
+  std::unique_ptr<mle::WorkerProcess> process;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_launcher) {
+      --g_workers_in_use;
+      *why = AcquireError::kInactive;
+      *error = g_error.empty() ? "the MLE engine is stopped" : g_error;
+      return nullptr;
+    }
+    process = g_launcher->acquire(kWorkerClass, error);
+  }
+  if (!process) {
+    --g_workers_in_use;
+    *why = AcquireError::kFailed;
+    return nullptr;
+  }
+  mle::WorkerOptions options;
+  options.spin_us = spin_us;
+  options.interrupt_grace_ms = interrupt_grace_ms;
+  auto worker = std::make_unique<mle::Worker>(std::move(process), options);
+  mle::ReadyMsg ready;
+  if (worker->wait_ready(kReadyTimeoutMs, &ready, error) != mle::Status::kOk) {
+    worker.reset();
+    --g_workers_in_use;
+    *why = AcquireError::kFailed;
+    return nullptr;
+  }
+  *why = AcquireError::kNone;
+  return worker;
+}
+
+void engine_release_worker(std::unique_ptr<mle::Worker> worker) {
+  if (!worker) return;
+  worker.reset();
+  --g_workers_in_use;
+}
 
 }  // namespace mle_component

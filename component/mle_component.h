@@ -89,6 +89,10 @@ void unregister_settings();
 Settings current_settings();
 /** Bits of mle.languages. */
 unsigned enabled_languages();
+/** mle.max_workers, mle.spin_us, mle.interrupt_grace_ms. */
+uint32_t max_workers();
+int spin_us();
+int interrupt_grace_ms();
 
 /* status.cc: the mle_* status variables. */
 bool register_status();

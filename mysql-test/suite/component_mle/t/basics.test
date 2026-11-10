@@ -30,34 +30,28 @@ SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
   ORDER BY VARIABLE_NAME;
 
 --echo #
---echo # The three languages are routed to MLE; running them comes in P4-W4.
+--echo # The three languages run in MLE (a session that used MLE blocks
+--echo # UNINSTALL until it disconnects, so the work is done in con1).
 --echo #
+--error ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE
+CREATE FUNCTION c_f() RETURNS INT LANGUAGE COBOL AS $$ $$;
+--connect (con1, localhost, root,,test)
 CREATE FUNCTION js_f(a INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return a + 1 $$;
 CREATE PROCEDURE js_p() LANGUAGE javascript AS $$ console.log("hi") $$;
 CREATE FUNCTION py_f(a INT) RETURNS INT LANGUAGE PYTHON AS $$ return a + 1 $$;
 CREATE FUNCTION java_f(a INT) RETURNS INT LANGUAGE JAVA AS $$ return a + 1; $$;
 SELECT ROUTINE_NAME, ROUTINE_TYPE, EXTERNAL_LANGUAGE FROM information_schema.routines
   WHERE ROUTINE_SCHEMA = 'test' ORDER BY ROUTINE_NAME;
---error ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE
-CREATE FUNCTION c_f() RETURNS INT LANGUAGE COBOL AS $$ $$;
-
---connect (con1, localhost, root,,test)
---error ER_LANGUAGE_COMPONENT
-SELECT js_f(1);
---error ER_LANGUAGE_COMPONENT
+SELECT js_f(1), py_f(2), java_f(3);
 CALL js_p();
---error ER_LANGUAGE_COMPONENT
-SELECT py_f(1);
---error ER_LANGUAGE_COMPONENT
-SELECT java_f(1);
 --echo # The session caches the routines: 3 functions, 1 procedure.
 SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
   WHERE VARIABLE_NAME IN ('mle_stored_functions', 'mle_stored_procedures',
-    'mle_stored_programs')
+    'mle_stored_programs', 'mle_sessions', 'mle_workers')
   ORDER BY VARIABLE_NAME;
 
 --connection default
---echo # UNINSTALL is refused while a session caches MLE routines.
+--echo # UNINSTALL is refused while a session that used MLE is connected.
 --error ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL
 UNINSTALL COMPONENT "file://component_mle";
 SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status

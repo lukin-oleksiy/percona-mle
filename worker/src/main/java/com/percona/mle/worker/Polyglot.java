@@ -261,8 +261,10 @@ final class Polyglot {
             # The body becomes the function body; ast keeps its line numbers. With OUT
             # parameters it runs in an inner function (it may return early) that declares all
             # parameters nonlocal, and the function returns (result, *parameters).
-            import ast
-            tree = ast.parse(src, filename=name)
+            # Bodies are usually indented inside $$ ... $$ (or start after
+            # "$$ "): remove the common indentation (lines stay where they are).
+            import ast, textwrap
+            tree = ast.parse(textwrap.dedent(src), filename=name)
             def fn(fname, args, body):
                 kw = dict(name=fname, args=ast.arguments(posonlyargs=[], args=[ast.arg(arg=a) for a in args],
                           vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),

@@ -1,7 +1,7 @@
 #
 # component_mle next to Percona's V8 component_js_lang behind
 # component_lang_router: LANGUAGE JS runs in V8, LANGUAGE JAVASCRIPT,
-# PYTHON and JAVA reach MLE.
+# PYTHON and JAVA run in MLE.
 #
 INSTALL COMPONENT "file://component_js_lang";
 INSTALL COMPONENT "file://component_mle";
@@ -15,16 +15,15 @@ backends
 CREATE FUNCTION v8_f(a INT) RETURNS INT LANGUAGE JS AS $$ return a * 2 $$;
 CREATE FUNCTION mle_js(a INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return a * 2 $$;
 CREATE FUNCTION mle_py(a INT) RETURNS INT LANGUAGE PYTHON AS $$ return a * 2 $$;
-CREATE PROCEDURE mle_java() LANGUAGE JAVA AS $$ $$;
-SELECT v8_f(21) AS v8;
-v8
-42
-SELECT mle_js(21);
-ERROR HY000: MLE> test.mle_js: running MLE routines is not implemented yet.
-SELECT mle_py(21);
-ERROR HY000: MLE> test.mle_py: running MLE routines is not implemented yet.
-CALL mle_java();
-ERROR HY000: MLE> test.mle_java: running MLE routines is not implemented yet.
+CREATE PROCEDURE mle_java(OUT r VARCHAR(20)) LANGUAGE JAVA AS $$ r[0] = "from Java"; $$;
+# One statement: V8, then GraalJS, GraalPy and Java in the MLE worker.
+SELECT v8_f(21) AS v8, mle_js(21) AS mle_js, mle_py(21) AS mle_py;
+v8	mle_js	mle_py
+42	42	42
+CALL mle_java(@r);
+SELECT @r;
+@r
+from Java
 SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
 WHERE VARIABLE_NAME IN ('mle_stored_programs', 'Lang_router_live_handles')
 ORDER BY VARIABLE_NAME;
@@ -35,11 +34,9 @@ mle_stored_programs	3
 # keeps routing both languages.
 UNINSTALL COMPONENT "file://component_mle";
 ERROR HY000: Language component: Cannot uninstall due to connected sessions. Please disconnect all sessions and try again.
-SELECT v8_f(5) AS v8;
-v8
-10
-SELECT mle_js(5);
-ERROR HY000: MLE> test.mle_js: running MLE routines is not implemented yet.
+SELECT v8_f(5) AS v8, mle_js(5) AS mle_js;
+v8	mle_js
+10	10
 DROP FUNCTION v8_f;
 DROP FUNCTION mle_js;
 DROP FUNCTION mle_py;

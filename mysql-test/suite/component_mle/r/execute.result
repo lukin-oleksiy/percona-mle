@@ -1,0 +1,284 @@
+#
+# component_mle (P4-W4): routines run in MLE workers: arguments and
+# results of all supported SQL types, OUT/INOUT, errors, a worker per
+# session and principal.
+#
+INSTALL COMPONENT "file://component_mle";
+CREATE USER u1@localhost;
+GRANT ALL ON test.* TO u1@localhost;
+# MLE sessions block UNINSTALL until they disconnect: work in con1.
+SET time_zone = '+00:00';
+#
+# JavaScript (Oracle's form)
+#
+CREATE FUNCTION js_add(a INT, b INT) RETURNS INT LANGUAGE JAVASCRIPT
+AS $$ return a === null ? -1 : a + b $$;
+SELECT js_add(2, 40), js_add(NULL, 1);
+js_add(2, 40)	js_add(NULL, 1)
+42	-1
+SELECT js_add(n, n) FROM (SELECT 1 AS n UNION SELECT 2 UNION SELECT 3) t ORDER BY 1;
+js_add(n, n)
+2
+4
+6
+# Arguments of every supported type: what JavaScript sees.
+CREATE FUNCTION js_types(i INT, bi BIGINT, ub BIGINT UNSIGNED, f FLOAT,
+d DOUBLE, de DECIMAL(10,2), s VARCHAR(20), b VARBINARY(10), j JSON,
+dt DATE, tm TIME, ts DATETIME(3), y YEAR, bt BIT(8), e ENUM('a','b'),
+st SET('x','y','z'), v VECTOR(3), tx TEXT)
+RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+const show = (x) => x instanceof Date ? 'Date ' + x.toISOString()
+: x instanceof Set ? 'Set ' + [...x].join('|')
+: ArrayBuffer.isView(x) ? x.constructor.name + ' ' + Array.from(x).join('|')
+: typeof x === 'object' && x !== null ? 'object ' + JSON.stringify(x)
+: typeof x + ' ' + String(x);
+return [i, bi, ub, f, d, de, s, b, j, dt, tm, ts, y, bt, e, st, v, tx]
+.map(show).join('\n');
+$$;
+SELECT js_types(-7, 9007199254740993, 18446744073709551615, 1.5, 2.25,
+12.34, 'héllo', x'0102ff', '{"a": [1, true]}', '2024-01-02',
+'-12:34:56', '2024-01-02 03:04:05.678', 2024, b'101', 'b', 'x,z',
+STRING_TO_VECTOR('[1,2.5,3]'), 'text') AS seen;
+seen
+number -7
+string 9007199254740993
+string 18446744073709551615
+number 1.5
+number 2.25
+string 12.34
+string héllo
+Uint8Array 1|2|255
+object {"a":[1,true]}
+Date 2024-01-02T00:00:00.000Z
+string -12:34:56
+Date 2024-01-02T03:04:05.678Z
+number 2024
+number 5
+string b
+Set x|z
+Float32Array 1|2.5|3
+string text
+# Results of every supported type.
+CREATE FUNCTION r_int() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 41.6 $$;
+CREATE FUNCTION r_big() RETURNS BIGINT UNSIGNED LANGUAGE JAVASCRIPT AS $$ return 18446744073709551615n $$;
+CREATE FUNCTION r_dbl() RETURNS DOUBLE LANGUAGE JAVASCRIPT AS $$ return 0.1 + 0.2 $$;
+CREATE FUNCTION r_dec() RETURNS DECIMAL(10,3) LANGUAGE JAVASCRIPT AS $$ return '12.345' $$;
+CREATE FUNCTION r_str() RETURNS VARCHAR(20) LANGUAGE JAVASCRIPT AS $$ return 'é' + 1 $$;
+CREATE FUNCTION r_bin() RETURNS VARBINARY(10) LANGUAGE JAVASCRIPT AS $$ return new Uint8Array([65, 66, 255]) $$;
+CREATE FUNCTION r_json() RETURNS JSON LANGUAGE JAVASCRIPT AS $$ return {a: 1, b: [null, 'x']} $$;
+CREATE FUNCTION r_date() RETURNS DATE LANGUAGE JAVASCRIPT AS $$ return new Date(Date.UTC(2024, 1, 29)) $$;
+CREATE FUNCTION r_dt() RETURNS DATETIME(3) LANGUAGE JAVASCRIPT AS $$ return new Date(Date.UTC(2024, 1, 29, 23, 59, 58, 123)) $$;
+CREATE FUNCTION r_time() RETURNS TIME LANGUAGE JAVASCRIPT AS $$ return '-12:34:56' $$;
+CREATE FUNCTION r_year() RETURNS YEAR LANGUAGE JAVASCRIPT AS $$ return 2024 $$;
+CREATE FUNCTION r_bit() RETURNS BIT(8) LANGUAGE JAVASCRIPT AS $$ return 5 $$;
+CREATE FUNCTION r_enum() RETURNS ENUM('a','b') LANGUAGE JAVASCRIPT AS $$ return 'b' $$;
+CREATE FUNCTION r_set() RETURNS SET('x','y','z') LANGUAGE JAVASCRIPT AS $$ return new Set(['z', 'x']) $$;
+CREATE FUNCTION r_vec() RETURNS VECTOR(3) LANGUAGE JAVASCRIPT AS $$ return new Float32Array([1, 2.5, -3]) $$;
+CREATE FUNCTION r_null() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return undefined $$;
+SELECT r_int(), r_big(), r_dbl(), r_dec(), r_str(), HEX(r_bin()), r_json(),
+r_date(), r_dt(), r_time(), r_year(), r_bit() + 0, r_enum(), r_set(),
+VECTOR_TO_STRING(r_vec()), r_null();
+r_int()	r_big()	r_dbl()	r_dec()	r_str()	HEX(r_bin())	r_json()	r_date()	r_dt()	r_time()	r_year()	r_bit() + 0	r_enum()	r_set()	VECTOR_TO_STRING(r_vec())	r_null()
+42	18446744073709551615	0.30000000000000004	12.345	é1	4142FF	{"a": 1, "b": [null, "x"]}	2024-02-29	2024-02-29 23:59:58.123	-12:34:56	2024	5	b	x,z	[1.00000e+00,2.50000e+00,-3.00000e+00]	NULL
+# Session time zone: bound at the session's first MLE use (Oracle).
+CREATE FUNCTION js_iso(t DATETIME) RETURNS VARCHAR(30) LANGUAGE JAVASCRIPT
+AS $$ return t.toISOString() $$;
+SELECT js_iso('2024-01-02 03:04:05');
+js_iso('2024-01-02 03:04:05')
+2024-01-02T03:04:05.000Z
+SET time_zone = '+05:00';
+SELECT js_iso('2024-01-02 03:04:05') AS still_bound_to_utc;
+still_bound_to_utc
+2024-01-02T03:04:05.000Z
+SET time_zone = '+00:00';
+# OUT and INOUT parameters.
+CREATE PROCEDURE js_proc(IN a INT, OUT b INT, INOUT c VARCHAR(20))
+LANGUAGE JAVASCRIPT AS $$
+if (b !== null) throw new Error('OUT starts as null');
+b = a * 2;
+c = c + '!';
+if (a > 0) return;
+c = 'not reached';
+$$;
+SET @b = 99, @c = 'hi';
+CALL js_proc(21, @b, @c);
+SELECT @b, @c;
+@b	@c
+42	hi!
+# Oracle's d1 example: an OUT value too long for its type.
+CREATE PROCEDURE d1(OUT res VARCHAR(5)) LANGUAGE JAVASCRIPT AS $$ res = 'abcdefgh' $$;
+CALL d1(@r);
+ERROR 22001: Data too long for column 'res' at row 1
+#
+# Python and Java bodies
+#
+CREATE FUNCTION py_add(a INT, b INT) RETURNS INT LANGUAGE PYTHON AS $$ return a + b $$;
+CREATE PROCEDURE py_proc(IN a INT, OUT b INT, INOUT c VARCHAR(20)) LANGUAGE PYTHON AS $$
+b = a * 2
+c = c + '!'
+$$;
+CREATE FUNCTION py_types(de DECIMAL(10,2), dt DATETIME, v VECTOR(3), j JSON)
+RETURNS TEXT LANGUAGE PYTHON
+AS $$ return ' '.join(type(x).__name__ for x in (de, dt, v, j)) $$;
+CREATE FUNCTION java_add(a INT, b BIGINT) RETURNS BIGINT LANGUAGE JAVA AS $$ return a + b; $$;
+CREATE PROCEDURE java_proc(IN a INT, OUT b INT, INOUT c VARCHAR(20)) LANGUAGE JAVA AS $$
+b[0] = a * 2;
+c[0] = c[0] + "!";
+$$;
+CREATE FUNCTION java_types(de DECIMAL(10,2), dt DATETIME, v VECTOR(3), j JSON)
+RETURNS TEXT LANGUAGE JAVA AS $$
+return de.getClass().getSimpleName() + " " + dt.getClass().getSimpleName()
++ " " + v.getClass().getSimpleName() + " " + j.getClass().getSimpleName();
+$$;
+SELECT py_add(2, 40), java_add(2, 40);
+py_add(2, 40)	java_add(2, 40)
+42	42
+SELECT py_types(1.5, '2024-01-02 03:04:05', STRING_TO_VECTOR('[1,2,3]'), '[1]') AS py,
+java_types(1.5, '2024-01-02 03:04:05', STRING_TO_VECTOR('[1,2,3]'), '[1]') AS java;
+py	java
+Decimal datetime ndarray list	BigDecimal LocalDateTime float[] String
+SET @b = NULL, @c = 'py';
+CALL py_proc(5, @b, @c);
+SELECT @b, @c;
+@b	@c
+10	py!
+SET @b = NULL, @c = 'java';
+CALL java_proc(7, @b, @c);
+SELECT @b, @c;
+@b	@c
+14	java!
+#
+# Errors
+#
+CREATE FUNCTION js_throw() RETURNS INT LANGUAGE JAVASCRIPT AS $$ throw new Error('boom') $$;
+SELECT js_throw();
+ERROR HY000: JavaScript> Error: boom
+CREATE FUNCTION py_throw() RETURNS INT LANGUAGE PYTHON AS $$ return 1 / 0 $$;
+SELECT py_throw();
+ERROR HY000: Python> ZeroDivisionError: division by zero
+CREATE FUNCTION java_throw() RETURNS INT LANGUAGE JAVA AS $$ throw new IllegalStateException("no"); $$;
+SELECT java_throw();
+ERROR HY000: Java> java.lang.IllegalStateException: no
+# Syntax errors fail CREATE.
+CREATE FUNCTION js_bad() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 +; $$;
+ERROR HY000: JavaScript> SyntaxError: js_bad:1:11 Expected an operand but found ;
+ return 1 +; 
+           ^
+
+CREATE FUNCTION py_bad() RETURNS INT LANGUAGE PYTHON AS $$ return ( $$;
+ERROR HY000: Python> SyntaxError: '(' was never closed (py_bad, line 1)
+CREATE FUNCTION java_bad() RETURNS INT LANGUAGE JAVA AS $$ return 1 + ; $$;
+ERROR HY000: Java> java_bad:1:13: illegal start of expression
+SELECT COUNT(*) AS created FROM information_schema.routines
+WHERE ROUTINE_NAME IN ('js_bad', 'py_bad', 'java_bad');
+created
+0
+# Conversion errors: 6000 MLE-Type (Oracle's myfunc example).
+CREATE FUNCTION myfunc(x INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return x * NaN $$;
+SELECT myfunc(10);
+ERROR HY000: MLE-Type> Cannot convert value 'NaN' to INT from MLE in 'myfunc(10)'
+CREATE FUNCTION r_tiny() RETURNS TINYINT LANGUAGE JAVASCRIPT AS $$ return 300 $$;
+SELECT r_tiny();
+ERROR HY000: MLE-Type> Cannot convert value '300' to TINYINT from MLE in 'r_tiny()'
+# Recursion beyond 1000 frames (Oracle).
+CREATE FUNCTION recursive_sum(n INT) RETURNS BIGINT LANGUAGE JAVASCRIPT AS $$
+function sum(k) { return k <= 0 ? 0 : k + sum(k - 1); }
+return sum(n);
+$$;
+SELECT recursive_sum(998);
+recursive_sum(998)
+498501
+SELECT recursive_sum(999);
+ERROR HY000: JavaScript> Maximum frame limit of 1000 exceeded. Frames on stack: 1001.
+# Reserved parameter names (6115) and unsupported types (6117).
+CREATE FUNCTION js_kw(console INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+ERROR HY000: JavaScript> The identifier 'console' is not valid.
+CREATE FUNCTION py_kw(lambda INT) RETURNS INT LANGUAGE PYTHON AS $$ return 1 $$;
+ERROR HY000: Python> The identifier 'lambda' is not valid.
+CREATE FUNCTION js_geo(g GEOMETRY) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+ERROR HY000: MLE-Type> The type GEOMETRY is not supported (parameter 'g')
+CREATE FUNCTION js_latin(s VARCHAR(10) CHARSET latin1) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+ERROR HY000: MLE-Type> The character set latin1 is not supported; use utf8mb4 or binary (parameter 's')
+# The session works on after the errors.
+SELECT js_add(1, 1), py_add(1, 1), java_add(1, 1);
+js_add(1, 1)	py_add(1, 1)	java_add(1, 1)
+2	2	2
+#
+# A worker per session and principal (D-8): SQL SECURITY DEFINER runs
+# as the definer, INVOKER as the current user.
+#
+CREATE DEFINER = root@localhost FUNCTION who_definer() RETURNS INT
+SQL SECURITY DEFINER LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+CREATE DEFINER = root@localhost FUNCTION who_invoker() RETURNS INT
+SQL SECURITY INVOKER LANGUAGE JAVASCRIPT AS $$ return 2 $$;
+GRANT EXECUTE ON FUNCTION test.who_definer TO u1@localhost;
+GRANT EXECUTE ON FUNCTION test.who_invoker TO u1@localhost;
+SELECT VARIABLE_VALUE INTO @w0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_workers';
+SELECT who_definer(), who_invoker();
+who_definer()	who_invoker()
+1	2
+# u1's session has two workers: root@localhost (DEFINER) and u1@localhost.
+SELECT VARIABLE_VALUE - @w0 AS new_workers FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_workers';
+new_workers
+2
+# They end with the session.
+# Status after the work.
+SELECT VARIABLE_NAME, VARIABLE_VALUE > 0 AS positive FROM performance_schema.global_status
+WHERE VARIABLE_NAME IN ('mle_sessions', 'mle_sessions_max', 'mle_threads_max',
+'mle_workers', 'mle_stored_programs')
+ORDER BY VARIABLE_NAME;
+VARIABLE_NAME	positive
+mle_sessions	1
+mle_sessions_max	1
+mle_stored_programs	1
+mle_threads_max	1
+mle_workers	1
+SELECT VARIABLE_VALUE AS threads FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_threads';
+threads
+0
+UNINSTALL COMPONENT "file://component_mle";
+ERROR HY000: Language component: Cannot uninstall due to connected sessions. Please disconnect all sessions and try again.
+DROP USER u1@localhost;
+DROP FUNCTION js_add;
+DROP FUNCTION js_types;
+DROP FUNCTION r_int;
+DROP FUNCTION r_big;
+DROP FUNCTION r_dbl;
+DROP FUNCTION r_dec;
+DROP FUNCTION r_str;
+DROP FUNCTION r_bin;
+DROP FUNCTION r_json;
+DROP FUNCTION r_date;
+DROP FUNCTION r_dt;
+DROP FUNCTION r_time;
+DROP FUNCTION r_year;
+DROP FUNCTION r_bit;
+DROP FUNCTION r_enum;
+DROP FUNCTION r_set;
+DROP FUNCTION r_vec;
+DROP FUNCTION r_null;
+DROP FUNCTION js_iso;
+DROP PROCEDURE js_proc;
+DROP PROCEDURE d1;
+DROP FUNCTION py_add;
+DROP PROCEDURE py_proc;
+DROP FUNCTION py_types;
+DROP FUNCTION java_add;
+DROP PROCEDURE java_proc;
+DROP FUNCTION java_types;
+DROP FUNCTION js_throw;
+DROP FUNCTION py_throw;
+DROP FUNCTION java_throw;
+DROP FUNCTION myfunc;
+DROP FUNCTION r_tiny;
+DROP FUNCTION recursive_sum;
+DROP FUNCTION who_definer;
+DROP FUNCTION who_invoker;
+SELECT VARIABLE_VALUE AS mle_workers FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_workers';
+mle_workers
+0
+UNINSTALL COMPONENT "file://component_mle";

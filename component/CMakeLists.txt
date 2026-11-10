@@ -18,6 +18,8 @@
 MYSQL_ADD_COMPONENT(mle
   component.cc
   engine.cc
+  routine.cc
+  session.cc
   settings.cc
   status.cc
   LINK_LIBRARIES mle_host

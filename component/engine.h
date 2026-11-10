@@ -32,7 +32,12 @@
 #include <sys/types.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
+
+namespace mle {
+class Worker;
+}
 
 namespace mle_component {
 
@@ -72,9 +77,24 @@ void engine_stop();
 /** State; with_stats asks the launcher for its pool statistics. */
 EngineState engine_state(bool with_stats);
 
-/** Workers held by sessions (Phase 4 W4); settings that shape workers can
-    change only while this is 0. */
+/** Workers held by sessions; settings that shape workers can change only
+    while this is 0. */
 long engine_workers_in_use();
+
+/** Why engine_new_worker failed. */
+enum class AcquireError { kNone, kInactive, kLimit, kFailed };
+
+/**
+  A started worker (READY) for a session, counted in engine_workers_in_use()
+  until engine_release_worker(). At most max_workers at a time.
+*/
+std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us,
+                                               int interrupt_grace_ms,
+                                               AcquireError *why,
+                                               std::string *error);
+
+/** A session gives a worker back: it is destroyed (killed), not reused. */
+void engine_release_worker(std::unique_ptr<mle::Worker> worker);
 
 /**
   mle.cgroup_base = AUTO: the parent of mysqld's cgroup, if it is delegated

@@ -466,6 +466,19 @@ TEST_F(MleBodyForms, PythonFunctionBody) {
   EXPECT_EQ(ret(id, {Value::i64(2), Value::i64(40)}), Value::i64(42));
 }
 
+TEST_F(MleBodyForms, PythonIndentedBodies) {
+  // As written in SQL: "AS $$ return a $$" or an indented block.
+  const uint64_t one = prepare("python", "p1", " return a + 1 ",
+                               {{"a", ParamMode::kIn, kInt}}, kInt);
+  ASSERT_NE(one, 0u);
+  EXPECT_EQ(ret(one, {Value::i64(1)}), Value::i64(2));
+  const uint64_t block = prepare("python", "p2",
+                                 "\n    x = a * 2\n    if x > 0:\n        return x\n    return 0\n",
+                                 {{"a", ParamMode::kIn, kInt}}, kInt);
+  ASSERT_NE(block, 0u);
+  EXPECT_EQ(ret(block, {Value::i64(21)}), Value::i64(42));
+}
+
 TEST_F(MleBodyForms, PythonOutAndInout) {
   std::string err;
   const uint64_t id = prepare("python", "pproc",

@@ -1,7 +1,7 @@
 --echo #
 --echo # component_mle next to Percona's V8 component_js_lang behind
 --echo # component_lang_router: LANGUAGE JS runs in V8, LANGUAGE JAVASCRIPT,
---echo # PYTHON and JAVA reach MLE.
+--echo # PYTHON and JAVA run in MLE.
 --echo #
 --source include/have_mle_component.inc
 --source include/have_js_lang_component.inc
@@ -19,14 +19,11 @@ SELECT VARIABLE_VALUE AS backends FROM performance_schema.global_status
 CREATE FUNCTION v8_f(a INT) RETURNS INT LANGUAGE JS AS $$ return a * 2 $$;
 CREATE FUNCTION mle_js(a INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return a * 2 $$;
 CREATE FUNCTION mle_py(a INT) RETURNS INT LANGUAGE PYTHON AS $$ return a * 2 $$;
-CREATE PROCEDURE mle_java() LANGUAGE JAVA AS $$ $$;
-SELECT v8_f(21) AS v8;
---error ER_LANGUAGE_COMPONENT
-SELECT mle_js(21);
---error ER_LANGUAGE_COMPONENT
-SELECT mle_py(21);
---error ER_LANGUAGE_COMPONENT
-CALL mle_java();
+CREATE PROCEDURE mle_java(OUT r VARCHAR(20)) LANGUAGE JAVA AS $$ r[0] = "from Java"; $$;
+--echo # One statement: V8, then GraalJS, GraalPy and Java in the MLE worker.
+SELECT v8_f(21) AS v8, mle_js(21) AS mle_js, mle_py(21) AS mle_py;
+CALL mle_java(@r);
+SELECT @r;
 SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
   WHERE VARIABLE_NAME IN ('mle_stored_programs', 'Lang_router_live_handles')
   ORDER BY VARIABLE_NAME;
@@ -37,9 +34,7 @@ SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
 --error ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL
 UNINSTALL COMPONENT "file://component_mle";
 --connection con1
-SELECT v8_f(5) AS v8;
---error ER_LANGUAGE_COMPONENT
-SELECT mle_js(5);
+SELECT v8_f(5) AS v8, mle_js(5) AS mle_js;
 
 --connection default
 --disconnect con1

@@ -336,6 +336,10 @@ Settings current_settings() {
 
 unsigned enabled_languages() { return g_language_bits.load(); }
 
+uint32_t max_workers() { return g_max_workers; }
+int spin_us() { return static_cast<int>(g_spin_us); }
+int interrupt_grace_ms() { return static_cast<int>(g_interrupt_grace_ms); }
+
 unsigned language_bit(std::string_view name) {
   auto is = [&](const char *n) {
     return name.size() == strlen(n) &&

@@ -23,11 +23,12 @@
   a launcher started by this component provides. Next to Percona's V8
   LANGUAGE JS behind component_lang_router. Design: 11-phase4-component.md.
 
-  P4-W2, this skeleton: the language services (routine handles counted, so
-  UNINSTALL is refused while sessions cache MLE routines), the engine
-  started at INSTALL (INSTALL fails clearly if it cannot start), the mle.*
-  sysvars and the mle_* status variables. Routines are accepted at CREATE;
-  running them comes with P4-W3/W4.
+  Parts: the language services (here), routines (routine.cc: metadata,
+  arguments, results), sessions (session.cc: a worker per session and
+  principal, PREPARE/CALL/DROP, errors), the engine started at INSTALL
+  (engine.cc), the mle.* sysvars (settings.cc) and the mle_* status
+  variables (status.cc). UNINSTALL is refused while sessions that used MLE
+  are connected.
 */
 
 #define LOG_COMPONENT_TAG "mle"
@@ -45,10 +46,17 @@
 #include <mysql/components/services/mysql_runtime_error_service.h>
 #include <mysql/components/services/mysql_runtime_warning.h>
 #include <mysql/components/services/mysql_stored_program.h>
+#include <mysql/components/services/mysql_current_thread_reader.h>
+#include <mysql/components/services/mysql_string.h>
 #include <mysql/components/services/mysql_system_variable.h>
+#include <mysql/components/services/mysql_thd_attributes.h>
+#include <mysql/components/services/mysql_thd_store_service.h>
+#include <mysql/components/services/security_context.h>
 #include <mysqld_error.h>
 
 #include "mle_component.h"
+#include "routine.h"
+#include "session.h"
 
 REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_error);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_warning);
@@ -57,6 +65,26 @@ REQUIRES_SERVICE_PLACEHOLDER(component_sys_variable_register);
 REQUIRES_SERVICE_PLACEHOLDER(component_sys_variable_unregister);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_system_variable_reader);
 REQUIRES_SERVICE_PLACEHOLDER(status_variable_registration);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_argument_metadata_query);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_metadata_query);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_int);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_unsigned_int);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_float);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_string);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_string_charset);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_null);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_int);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_unsigned_int);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_float);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_string);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_string_charset);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_null);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_charset);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_current_thread_reader);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_store);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_security_context);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_options);
 REQUIRES_SERVICE_PLACEHOLDER(log_builtins);
 REQUIRES_SERVICE_PLACEHOLDER(log_builtins_string);
 
@@ -85,29 +113,12 @@ void log_error(const std::string &message) {
 
 namespace {
 
-/** What the component keeps for a stored program cached in a session
-    (the SQL layer's external_program_handle). */
-struct Routine {
-  unsigned language = 0;
-  uint16_t type = 0;
-  std::string qualified_name;
-  std::string body;
-};
-
-bool is_function(const Routine &r) {
-  return r.type == MYSQL_STORED_PROGRAM_DATA_QUERY_TYPE_FUNCTION;
-}
-
 void report(const std::string &message) {
   my_error(ER_LANGUAGE_COMPONENT, MYF(0), message.c_str());
 }
 
-std::string get_string(stored_program_handle sp, const char *key) {
-  mysql_cstring_with_length value{nullptr, 0};
-  if (mysql_service_mysql_stored_program_metadata_query->get(sp, key, &value) ||
-      value.str == nullptr)
-    return "";
-  return {value.str, value.length};
+Routine *routine_of(external_program_handle h) {
+  return reinterpret_cast<Routine *>(h);
 }
 
 class Services {
@@ -125,65 +136,53 @@ class Services {
   }
 
   /* external_program_execution */
+
+  /** A routine enters a session's routine cache (or CREATE checks it):
+      metadata, parameter names and types are checked here. */
   static DEFINE_BOOL_METHOD(init, (stored_program_handle sp,
                                    stored_program_statement_handle,
                                    external_program_handle *lang_sp)) {
-    const std::string language = get_string(sp, "sp_language");
-    const unsigned bit = language_bit(language);
-    if ((bit & enabled_languages()) == 0) {
-      my_error(ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE, MYF(0),
-               language.c_str());
-      return true;
-    }
-    uint16_t type = 0;
-    if (mysql_service_mysql_stored_program_metadata_query->get(sp, "sp_type",
-                                                               &type))
-      return true;
-    if (type != MYSQL_STORED_PROGRAM_DATA_QUERY_TYPE_FUNCTION &&
-        type != MYSQL_STORED_PROGRAM_DATA_QUERY_TYPE_PROCEDURE) {
-      report("MLE> Only stored functions and procedures are supported.");
-      return true;
-    }
-    auto *routine = new Routine();
-    routine->language = bit;
-    routine->type = type;
-    routine->qualified_name = get_string(sp, "qualified_name");
-    routine->body = get_string(sp, "sp_body");
-    (is_function(*routine) ? g_counters.functions : g_counters.procedures)++;
+    Routine *routine = Routine::create(sp);
+    if (routine == nullptr) return true;
+    (routine->is_function() ? g_counters.functions : g_counters.procedures)++;
     raise_max(g_counters.program_bytes_max,
-              static_cast<long>(routine->body.size()));
+              static_cast<long>(routine->prepare.source.size()));
     *lang_sp = reinterpret_cast<external_program_handle>(routine);
     return false;
   }
 
-  static DEFINE_BOOL_METHOD(deinit, (MYSQL_THD, external_program_handle lang_sp,
+  /** The routine leaves the cache: the session's workers drop it. thd is
+      the session that cached it. */
+  static DEFINE_BOOL_METHOD(deinit, (MYSQL_THD thd, external_program_handle lang_sp,
                                      stored_program_handle)) {
     if (lang_sp == nullptr) return false;
-    auto *routine = reinterpret_cast<Routine *>(lang_sp);
-    (is_function(*routine) ? g_counters.functions : g_counters.procedures)--;
-    delete routine;
+    Routine *routine = routine_of(lang_sp);
+    if (Session *session = Session::of(thd)) session->forget(*routine);
+    (routine->is_function() ? g_counters.functions : g_counters.procedures)--;
+    Routine::destroy(routine);
     return false;
   }
 
-  /** CREATE, and when a routine enters a session's SP cache. The worker
-      checks the syntax from P4-W4 on. */
-  static DEFINE_BOOL_METHOD(parse, (external_program_handle,
+  /** CREATE, and when a routine enters the cache: the worker of the
+      current principal compiles it (syntax errors fail the CREATE). */
+  static DEFINE_BOOL_METHOD(parse, (external_program_handle lang_sp,
                                     stored_program_statement_handle)) {
-    return false;
+    Session *session = Session::current(true);
+    if (session == nullptr) {
+      my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+      return true;
+    }
+    return !session->parse(*routine_of(lang_sp));
   }
 
   static DEFINE_BOOL_METHOD(execute, (external_program_handle lang_sp,
                                       stored_program_statement_handle)) {
-    auto *routine = reinterpret_cast<Routine *>(lang_sp);
-    const EngineState st = engine_state(false);
-    if (!st.active) {
-      report("MLE> The MLE engine is not running: " +
-             (st.error.empty() ? std::string("stopped") : st.error));
+    Session *session = Session::current(true);
+    if (session == nullptr) {
+      my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
       return true;
     }
-    report("MLE> " + routine->qualified_name +
-           ": running MLE routines is not implemented yet.");
-    return true;
+    return !session->execute(*routine_of(lang_sp));
   }
 };
 
@@ -202,8 +201,10 @@ bool start_engine() {
 mysql_service_status_t init() {
   log_bi = mysql_service_log_builtins;
   log_bs = mysql_service_log_builtins_string;
-  if (register_settings() || register_status() || start_engine()) {
+  if (register_settings() || register_status() || Session::register_slot() ||
+      start_engine()) {
     engine_stop();
+    Session::unregister_slot();
     unregister_status();
     unregister_settings();
     log_bi = nullptr;
@@ -217,11 +218,15 @@ mysql_service_status_t deinit() {
   /* Routine handles live in the sessions' SP caches until the sessions end
      (or the routines are dropped or altered). No new one can appear here:
      the server does not unload a component whose services are in use. */
-  if (g_counters.functions + g_counters.procedures > 0) {
+  /* Sessions that used MLE keep their state in a thd_store slot, which
+     the server does not free once the slot is unregistered: refuse until
+     they disconnect (as js_lang). */
+  if (g_counters.functions + g_counters.procedures > 0 || Session::count() > 0) {
     my_error(ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL, MYF(0));
     return 1;
   }
   engine_stop();
+  Session::unregister_slot();
   unregister_status();
   unregister_settings();
   log_info("Engine stopped; component uninstalled.");
@@ -260,6 +265,26 @@ BEGIN_COMPONENT_REQUIRES(mle)
   REQUIRES_SERVICE(component_sys_variable_unregister),
   REQUIRES_SERVICE(mysql_system_variable_reader),
   REQUIRES_SERVICE(status_variable_registration),
+  REQUIRES_SERVICE(mysql_stored_program_argument_metadata_query),
+  REQUIRES_SERVICE(mysql_stored_program_return_metadata_query),
+  REQUIRES_SERVICE(mysql_stored_program_runtime_argument_int),
+  REQUIRES_SERVICE(mysql_stored_program_runtime_argument_unsigned_int),
+  REQUIRES_SERVICE(mysql_stored_program_runtime_argument_float),
+  REQUIRES_SERVICE(mysql_stored_program_runtime_argument_string),
+  REQUIRES_SERVICE(mysql_stored_program_runtime_argument_string_charset),
+  REQUIRES_SERVICE(mysql_stored_program_runtime_argument_null),
+  REQUIRES_SERVICE(mysql_stored_program_return_value_int),
+  REQUIRES_SERVICE(mysql_stored_program_return_value_unsigned_int),
+  REQUIRES_SERVICE(mysql_stored_program_return_value_float),
+  REQUIRES_SERVICE(mysql_stored_program_return_value_string),
+  REQUIRES_SERVICE(mysql_stored_program_return_value_string_charset),
+  REQUIRES_SERVICE(mysql_stored_program_return_value_null),
+  REQUIRES_SERVICE(mysql_charset),
+  REQUIRES_SERVICE(mysql_current_thread_reader),
+  REQUIRES_SERVICE(mysql_thd_store),
+  REQUIRES_SERVICE(mysql_thd_attributes),
+  REQUIRES_SERVICE(mysql_thd_security_context),
+  REQUIRES_SERVICE(mysql_security_context_options),
   REQUIRES_SERVICE(log_builtins),
   REQUIRES_SERVICE(log_builtins_string),
 END_COMPONENT_REQUIRES();
