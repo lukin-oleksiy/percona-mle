@@ -57,7 +57,7 @@ class MleWorkerProtocol : public ::testing::Test {
          {"good", "bad_op", "big_len", "bad_body", "wrong_depth", "wrong_seq",
           "status_without_error", "missing_return", "host_status", "chunk_lie",
           "die", "silent", "bad_stats", "tainted", "sql_in_prepare",
-          "resize_mailbox"}) {
+          "resize_mailbox", "out_for_in"}) {
       ClassConfig k;
       k.name = how;
       k.executable = MLE_TEST_WORKER_EXE;
@@ -143,6 +143,7 @@ TEST_F(MleWorkerProtocol, Violations) {
   expect_violation("missing_return", "missing return value");
   expect_violation("host_status", "bad status");
   expect_violation("chunk_lie", "after the last byte");
+  expect_violation("out_for_in", "bad OUT parameter");
 }
 
 TEST_F(MleWorkerProtocol, SqlOutsideACall) {

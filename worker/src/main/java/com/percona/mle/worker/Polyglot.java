@@ -62,10 +62,28 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
 final class Polyglot {
   static final List<String> LANGUAGES = List.of("js", "python");
 
-  record Routine(String language, Value fn, Value[] converters, Values.ParamType ret) {}
+  /**
+   * A prepared routine. Body form (entry ""): js is set for JavaScript; Python routines with OUT
+   * parameters return (result, out1, ...), outs gives the parameters' indexes.
+   */
+  record Routine(String language, Value fn, Value[] converters, Values.ParamType ret, Values.ParamType[] params,
+      int[] outs, JsOracle.Routine js) {
+    int arity() {
+      return params.length;
+    }
+  }
+
+  /** Scheme of the URIs of routine sources (stack frames are kept only for these). */
+  static final String ROUTINE_SCHEME = "mle-routine";
 
   private final Console console;
+  private final Options options;
   private final Map<Long, Routine> routines = new HashMap<>();
+  /** Source names of the Python routines (Python sources have no URI of ours). */
+  private static final java.util.Set<String> pythonSources = java.util.concurrent.ConcurrentHashMap.newKeySet();
+  /** Length of the wrapper text before the body on line 1, by JS routine source URI. */
+  static final Map<java.net.URI, Integer> prefixes = new java.util.concurrent.ConcurrentHashMap<>();
+  private Value jsOracle;
   private volatile Context context;
   private Helpers js;
   private Helpers python;
@@ -76,8 +94,17 @@ final class Polyglot {
       Value decimal, Value bigint, Value str, Value toJson, Value toBytes, Value toVector, Value toNumber,
       Value loader) {}
 
-  Polyglot(Console console) {
+  Polyglot(Console console, Options options) {
     this.console = console;
+    this.options = options;
+  }
+
+  /** OPTIONS: the JavaScript converters read the integer and decimal types from $o. */
+  void applyOptions() {
+    if (jsOracle == null) return;
+    Value o = jsOracle.getMember("$o");
+    o.putMember("int", options.integerType);
+    o.putMember("dec", options.decimalType);
   }
 
   static boolean isGuest(String language) {
@@ -118,7 +145,9 @@ final class Polyglot {
       c.getPolyglotBindings().putMember("Mle", mleApi);
       js = jsHelpers(c);
       python = pythonHelpers(c);
+      jsOracle = JsOracle.helpers(c);
       context = c;
+      applyOptions();
     }
     return context;
   }
@@ -145,6 +174,7 @@ final class Polyglot {
             .allowHostSocketAccess(false)
             .build())
         .option("engine.WarnInterpreterOnly", "false")
+        .option(FrameLimit.ID, "true")
         .option("python.PosixModuleBackend", "java")
         .option("python.DontWriteBytecodeFlag", "true")
         .option("python.NoUserSiteFlag", "true")
@@ -227,6 +257,33 @@ final class Polyglot {
             exec(compile(src, name + '.py', 'exec'), ns)
             return ns[entry]
 
+        def _load_body(src, name, params, has_outs, mle):
+            # The body becomes the function body; ast keeps its line numbers. With OUT
+            # parameters it runs in an inner function (it may return early) that declares all
+            # parameters nonlocal, and the function returns (result, *parameters).
+            import ast
+            tree = ast.parse(src, filename=name)
+            def fn(fname, args, body):
+                kw = dict(name=fname, args=ast.arguments(posonlyargs=[], args=[ast.arg(arg=a) for a in args],
+                          vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+                          body=body or [ast.Pass()], decorator_list=[], returns=None)
+                if 'type_params' in ast.FunctionDef._fields:
+                    kw['type_params'] = []
+                return ast.FunctionDef(**kw)
+            body = tree.body
+            if has_outs:
+                inner = fn('__mle_body', [], [ast.Nonlocal(names=list(params))] + body)
+                call = ast.Assign(targets=[ast.Name(id='__mle_r', ctx=ast.Store())],
+                                  value=ast.Call(func=ast.Name(id='__mle_body', ctx=ast.Load()), args=[], keywords=[]))
+                ret = ast.Return(value=ast.Tuple(elts=[ast.Name(id='__mle_r', ctx=ast.Load())]
+                                 + [ast.Name(id=p, ctx=ast.Load()) for p in params], ctx=ast.Load()))
+                body = [inner, call, ret]
+            mod = ast.Module(body=[fn('__mle_routine', list(params), body)], type_ignores=[])
+            ast.fix_missing_locations(mod)
+            ns = {'__name__': name, 'Mle': mle}
+            exec(compile(mod, name, 'exec'), ns)
+            return ns['__mle_routine']
+
         _mle_helpers = {
             'bytes': lambda b: bytes(b),
             'vector': _vector,
@@ -242,6 +299,7 @@ final class Polyglot {
             'toVector': _to_vector,
             'toNumber': lambda v: float(v),
             'loader': _load,
+            'body_loader': _load_body,
         }
         _mle_helpers
         """));
@@ -250,6 +308,10 @@ final class Polyglot {
         ns.getHashValue("decimal"), ns.getHashValue("bigint"), ns.getHashValue("str"),
         ns.getHashValue("toJson"), ns.getHashValue("toBytes"), ns.getHashValue("toVector"),
         ns.getHashValue("toNumber"), ns.getHashValue("loader"));
+  }
+
+  private Value pythonBodyLoader() {
+    return context.getBindings("python").getMember("_mle_helpers").getHashValue("body_loader");
   }
 
   private Helpers helpers(String language) {
@@ -266,28 +328,53 @@ final class Polyglot {
 
   void drop(long id) {
     routines.remove(id);
+    prefixes.remove(java.net.URI.create(ROUTINE_SCHEME + ":" + id));
   }
 
   void reset() {
     routines.clear();
+    prefixes.clear();
+    pythonSources.clear();
   }
 
-  /** Loads javac-free: evaluates the source and finds the entry function. */
-  void prepare(long id, String language, String entry, String source, List<JavaRoutines.Param> params,
-      Values.ParamType ret) throws JavaRoutines.CompileException {
-    if (!IDENTIFIER.matcher(entry).matches())
+  /**
+   * Loads a routine. With an entry, the source defines a function of that name (Phase 3 form);
+   * with an empty entry, the source is the routine body (JavaScript: Oracle's form, JsOracle).
+   */
+  void prepare(long id, String language, String routineName, String entry, String source,
+      List<JavaRoutines.Param> params, Values.ParamType ret) throws JavaRoutines.CompileException {
+    boolean bodyForm = entry.isEmpty();
+    if (!bodyForm && !IDENTIFIER.matcher(entry).matches())
       throw new JavaRoutines.CompileException("the entry must be a function name, not '" + entry + "'");
     Context c = context();
     Helpers h = helpers(language);
-    String name = "routine_" + id;
+    String name = routineName.isEmpty() ? "routine_" + id : routineName;
+    java.net.URI uri = java.net.URI.create(ROUTINE_SCHEME + ":" + id);
+    Values.ParamType[] types = new Values.ParamType[params.size()];
+    for (int i = 0; i < types.length; i++) types[i] = params.get(i).type();
+    int[] outs = java.util.stream.IntStream.range(0, params.size())
+        .filter(i -> params.get(i).mode() != Wire.MODE_IN).toArray();
     Value fn;
+    JsOracle.Routine jsRoutine = null;
     try {
-      if (language.equals("js")) {
+      if (language.equals("js") && bodyForm) {
+        for (JavaRoutines.Param p : params)
+          if (!IDENTIFIER.matcher(p.name()).matches())
+            throw new JavaRoutines.CompileException("'" + p.name() + "' is not a JavaScript identifier");
+        jsRoutine = JsOracle.prepare(c, jsOracle, name, source, params, ret, uri);
+        fn = jsRoutine.fn();
+      } else if (language.equals("js")) {
         // Same first line, so that positions in errors match the source.
         String wrapped = "(function(){" + source + "\n;return (typeof " + entry + " === 'function') ? " + entry
             + " : undefined;})()";
-        fn = c.eval(Source.newBuilder("js", wrapped, name + ".js").buildLiteral());
+        prefixes.put(uri, "(function(){".length());
+        fn = c.eval(Source.newBuilder("js", wrapped, name + ".js").uri(uri).buildLiteral());
+      } else if (bodyForm) {
+        pythonSources.add(name);
+        String[] names = params.stream().map(JavaRoutines.Param::name).toArray(String[]::new);
+        fn = pythonBodyLoader().execute(source, name, names, outs.length > 0, mleApi);
       } else {
+        pythonSources.add(name + ".py");
         fn = h.loader().execute(source, name, entry, mleApi);
       }
     } catch (PolyglotException e) {
@@ -295,13 +382,14 @@ final class Polyglot {
       if (e.isInterrupted() || e.isCancelled() || e.isResourceExhausted()
           || (e.isHostException() && e.asHostException() instanceof Error))
         throw e;
-      throw new JavaRoutines.CompileException(describe(e, true));
+      throw new JavaRoutines.CompileException(bodyForm ? bodyCompileError(e, uri) : describe(e, true));
     }
     if (fn == null || !fn.canExecute())
       throw new JavaRoutines.CompileException("the source does not define a function " + entry);
     Value[] converters = new Value[params.size()];
-    for (int i = 0; i < converters.length; i++) converters[i] = converter(h, params.get(i).type().tag(), language);
-    routines.put(id, new Routine(language, fn, converters, ret));
+    if (jsRoutine == null)
+      for (int i = 0; i < converters.length; i++) converters[i] = converter(h, types[i].tag(), language);
+    routines.put(id, new Routine(language, fn, converters, ret, types, outs, jsRoutine));
   }
 
   private static Value converter(Helpers h, int tag, String language) {
@@ -318,8 +406,12 @@ final class Polyglot {
     };
   }
 
-  /** Calls the routine; returns the result as a Java value for {@link Values#writeAs}. */
-  Object invoke(Routine r, Object[] neutral) {
+  /**
+   * Calls the routine; returns the result as a Java value for {@link Values#writeAs} and puts the
+   * OUT and INOUT values into outs (by parameter index).
+   */
+  Object invoke(Routine r, Object[] neutral, Object[] outs) {
+    if (r.js() != null) return invokeJs(r, neutral, outs);
     Object[] args = new Object[neutral.length];
     boolean js = r.language().equals("js");
     for (int i = 0; i < args.length; i++) {
@@ -327,7 +419,35 @@ final class Polyglot {
       args[i] = v == null || r.converters()[i] == null ? v : r.converters()[i].execute(v);
     }
     Value result = r.fn().execute(args);
-    return r.ret() == null ? null : toJava(result, r.ret(), helpers(r.language()));
+    Helpers h = helpers(r.language());
+    if (r.outs().length > 0) {
+      // Python body form: (result, parameter 1, ...)
+      for (int i : r.outs()) outs[i] = toJava(result.getArrayElement(i + 1), r.params()[i], h);
+      result = result.getArrayElement(0);
+    }
+    return r.ret() == null ? null : toJava(result, r.ret(), h);
+  }
+
+  private Object invokeJs(Routine r, Object[] neutral, Object[] outs) {
+    JsOracle.Routine j = r.js();
+    Object[] args = new Object[neutral.length];
+    for (int i = 0; i < args.length; i++) args[i] = JsOracle.hostForm(neutral[i], j.params()[i], options);
+    Value result = j.fn().execute(args);
+    if (j.async()) {
+      Value settled = jsOracle.getMember("settle").execute(result);
+      if (!settled.getMember("done").asBoolean())
+        throw new Values.ConversionException("the routine's promise did not settle");
+      result = settled.getMember("v");
+      if (!settled.getMember("ok").asBoolean()) jsOracle.getMember("rethrow").execute(result);
+    }
+    if (j.outs().length > 0) {
+      for (int k = 0; k < j.outs().length; k++) {
+        int i = j.outs()[k];
+        outs[i] = JsOracle.toJava(result.getArrayElement(k + 1), j.params()[i], options, jsOracle);
+      }
+      result = result.getArrayElement(0);
+    }
+    return j.ret() == null ? null : JsOracle.toJava(result, j.ret(), options, jsOracle);
   }
 
   /** The neutral value in the form the language's converter takes. */
@@ -426,17 +546,21 @@ final class Polyglot {
       case Wire.T_TIME -> {
         if (v.isDuration()) return v.asDuration();
         if (v.isTime()) return v.asTime();
-        String s = v.isString() ? v.asString() : h.str().execute(v).asString();
-        Matcher m = TIME.matcher(s);
-        if (!m.matches()) throw new Values.ConversionException("cannot convert '" + s + "' to TIME");
-        Duration d = Duration.ofHours(Long.parseLong(m.group(2))).plusMinutes(Long.parseLong(m.group(3)))
-            .plusSeconds(Long.parseLong(m.group(4)));
-        if (m.group(5) != null)
-          d = d.plusNanos(Long.parseLong((m.group(5) + "000000").substring(0, 6)) * 1000);
-        return m.group(1) != null ? d.negated() : d;
+        return parseTime(v.isString() ? v.asString() : h.str().execute(v).asString(), t);
       }
       default -> throw new Values.ConversionException("cannot convert to " + t.sqlName());
     }
+  }
+
+  /** [-]h:mm:ss[.ffffff] as a Duration. */
+  static Duration parseTime(String s, Values.ParamType t) {
+    Matcher m = TIME.matcher(s.trim());
+    if (!m.matches()) throw new Values.ConversionException("Cannot convert value '" + s + "' to TIME from MLE");
+    Duration d = Duration.ofHours(Long.parseLong(m.group(2))).plusMinutes(Long.parseLong(m.group(3)))
+        .plusSeconds(Long.parseLong(m.group(4)));
+    if (m.group(5) != null)
+      d = d.plusNanos(Long.parseLong((m.group(5) + "000000").substring(0, 6)) * 1000);
+    return m.group(1) != null ? d.negated() : d;
   }
 
   private static Object parseDecimal(String s, Values.ParamType t) {
@@ -470,21 +594,61 @@ final class Polyglot {
     String msg = e.getMessage() == null ? e.toString() : e.getMessage();
     if (withLocation && e.isSyntaxError() && e.getSourceLocation() != null) {
       var loc = e.getSourceLocation();
-      return loc.getSource().getName() + ":" + loc.getStartLine() + ":" + loc.getStartColumn() + ": " + msg;
+      var src = loc.getSource();
+      int line = loc.getStartLine();
+      return src.getName() + ":" + line + ":" + bodyColumn(src, line, loc.getStartColumn()) + ": " + msg;
     }
     return msg;
   }
 
-  /** The guest frames of e (up to the protocol's limit). */
+  private static final Pattern LOCATION_LINE_1 = Pattern.compile("^(.*?:1:)(\\d+)( .*)$");
+
+  /**
+   * A body's compile error as the language reports it: GraalJS gives Oracle's form
+   * ("SyntaxError: name:line:col message", the source line, a caret), Python names the line. On
+   * the body's first line the JavaScript wrapper text before the body is taken out of the column,
+   * the source line and the caret.
+   */
+  static String bodyCompileError(PolyglotException e, java.net.URI uri) {
+    String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+    Integer prefix = prefixes.get(uri);
+    if (prefix == null || e.getSourceLocation() == null || e.getSourceLocation().getStartLine() != 1) return msg;
+    String[] lines = msg.split("\n", -1);
+    Matcher m = LOCATION_LINE_1.matcher(lines[0]);
+    if (m.matches())
+      lines[0] = m.group(1) + Math.max(0, Integer.parseInt(m.group(2)) - prefix) + m.group(3);
+    if (lines.length >= 3 && lines[1].length() >= prefix && lines[2].length() >= prefix) {
+      lines[1] = lines[1].substring(prefix);
+      lines[2] = lines[2].substring(prefix);
+    }
+    return String.join("\n", lines);
+  }
+
+  /** Whether a source is a routine's (not the worker's own helpers). */
+  static boolean isRoutineSource(org.graalvm.polyglot.Source src) {
+    java.net.URI uri = src.getURI();
+    return (uri != null && ROUTINE_SCHEME.equals(uri.getScheme())) || pythonSources.contains(src.getName());
+  }
+
+  /** Column on the body's first line: the wrapper text before the body is not counted. */
+  static int bodyColumn(org.graalvm.polyglot.Source src, int line, int column) {
+    if (line != 1 || src.getURI() == null) return column;
+    Integer prefix = prefixes.get(src.getURI());
+    return prefix == null ? column : Math.max(1, column - prefix);
+  }
+
+  /** The guest frames of e (up to the protocol's limit), innermost first. */
   static List<Dispatcher.Frame> frames(PolyglotException e) {
     List<Dispatcher.Frame> frames = new java.util.ArrayList<>();
     for (PolyglotException.StackFrame f : e.getPolyglotStackTrace()) {
       if (!f.isGuestFrame() || f.getSourceLocation() == null) continue;
       var loc = f.getSourceLocation();
-      String name = loc.getSource().getName();
-      if (!name.startsWith("routine_")) continue;  // the worker's own helpers
-      frames.add(new Dispatcher.Frame(f.getRootName() == null ? "" : f.getRootName(), name, loc.getStartLine(),
-          loc.getStartColumn()));
+      var src = loc.getSource();
+      if (!isRoutineSource(src)) continue;
+      String root = f.getRootName() == null ? "" : f.getRootName();
+      int line = loc.getStartLine();
+      frames.add(new Dispatcher.Frame(root, src.getName(), line, bodyColumn(src, line, loc.getStartColumn()),
+          loc.getEndLine() == line ? bodyColumn(src, line, loc.getEndColumn()) : loc.getEndColumn()));
       if (frames.size() == Wire.MAX_STACK_FRAMES) break;
     }
     return frames;

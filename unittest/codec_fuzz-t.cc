@@ -69,6 +69,7 @@ void check_all(std::string_view body) {
   check_one<SqlResultMsg>(body);
   check_one<FetchMsg>(body);
   check_one<DropMsg>(body);
+  check_one<OptionsMsg>(body);
 }
 
 std::vector<std::string> seed_messages() {
@@ -113,6 +114,7 @@ std::vector<std::string> seed_messages() {
   add(rows);
   PrepareMsg prepare;
   prepare.language = "js";
+  prepare.name = "f_routine";
   prepare.entry = "f";
   prepare.source = "function f(a) { return a; }";
   prepare.params = {{"a", ParamMode::kInOut, {}}};
@@ -123,6 +125,10 @@ std::vector<std::string> seed_messages() {
   add(ready);
   add(FetchMsg{10});
   add(DropMsg{11});
+  OptionsMsg options;
+  options.integer_type = wire::IntegerType::kUnsafeBigint;
+  options.time_zone = "Europe/Kyiv";
+  add(options);
   return out;
 }
 

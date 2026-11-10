@@ -94,9 +94,13 @@ enum class Op : uint32_t {
       languages, str runtime version, str info. With a status other than OK
       the worker failed to start and info says why. */
   kReady = 1,
-  /** h->w. u64 routine id, str language, str entry, str source,
-      u32 n + n x Param, u8 has_return [, ParamType return type].
-      Answered by kResult (OK, or kGuestError with the compile error). */
+  /** h->w. u64 routine id, str language, str name (the routine's name, for
+      stack traces and messages), str entry, str source, u32 n + n x Param,
+      u8 has_return [, ParamType return type]. An empty entry means the
+      source is a routine *body* (CREATE ... AS $$ body $$): the worker
+      wraps it with the parameters as named variables (Oracle's form for
+      JavaScript). Answered by kResult (OK, or kGuestError with the compile
+      error). */
   kPrepare = 2,
   /** h->w. u64 routine id, u32 events (Event bits), u32 n + n x value. */
   kCall = 3,
@@ -123,8 +127,32 @@ enum class Op : uint32_t {
   kReset = 9,
   /** both. Empty: acknowledges a chunk that had MessageFlag::kMore. */
   kContinue = 10,
+  /** h->w. u8 IntegerType, u8 DecimalType, str time zone (IANA name or
+      +hh:mm): the session's conversion options (mle_set_session_state) and
+      time zone. Sent before the first CALL and whenever they change.
+      Answered by kResult (kGuestError with language "MLE-TimeZone" for a
+      zone the worker does not know). */
+  kOptions = 11,
 };
-constexpr uint32_t kMaxOp = 10;
+constexpr uint32_t kMaxOp = 11;
+
+/** How JavaScript gets SQL integers (Oracle's integer_type option). A safe
+    integer is within +-(2^53 - 1). */
+enum class IntegerType : uint8_t {
+  /** Number if safe, else String (Oracle's default). */
+  kUnsafeString = 0,
+  /** Number if safe, else BigInt. */
+  kUnsafeBigint = 1,
+  /** Always String. */
+  kString = 2,
+  /** Always BigInt. */
+  kBigint = 3,
+};
+constexpr uint8_t kMaxIntegerType = 3;
+
+/** How JavaScript gets DECIMAL (Oracle's decimal_type option). */
+enum class DecimalType : uint8_t { kString = 0, kNumber = 1 };
+constexpr uint8_t kMaxDecimalType = 1;
 
 /** RESULT status (MessageHeader::status). */
 enum class Status : uint32_t {
@@ -195,12 +223,16 @@ constexpr uint8_t kMaxTag = 13;
 /** Parameter mode in PREPARE. */
 enum class ParamMode : uint8_t { kIn = 0, kOut = 1, kInOut = 2 };
 
-/** ParamType = u8 tag, u8 unsigned, u32 length, u32 precision, u32 scale.
+/** ParamType = u8 tag, u8 unsigned, u32 length, u32 precision, u32 scale,
+            str SQL type name (upper case, without length: INT, VARCHAR,
+            SET, YEAR, BIT ...; empty if unknown).
     Param = str name, u8 mode, ParamType.
     Column = str name, str table, ParamType.
     Error = str language, str message, u32 n + n x (str function, str file,
-            u32 line, u32 column) stack frames, u32 sql errno (0 = not a
-            MySQL error), str sqlstate (empty or 5 characters). */
+            u32 line, u32 column, u32 end column) stack frames, u32 sql
+            errno (0 = not a MySQL error), str sqlstate (empty or 5
+            characters). The language "MLE-Type" marks a value conversion
+            error (Oracle: 6000 "MLE-Type> Cannot convert value ..."). */
 
 enum class SqlResultKind : uint8_t { kError = 0, kOk = 1, kRows = 2 };
 

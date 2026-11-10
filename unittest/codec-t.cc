@@ -341,12 +341,14 @@ TEST(MleCodec, PrepareRoundTrip) {
   PrepareMsg m;
   m.routine_id = 0xfeedfacecafebeef;
   m.language = "python";
+  m.name = "nearest_rows";
   m.entry = "nearest";
   m.source = "import numpy as np\ndef nearest(q, k):\n  return 1\n";
   ParamType dec;
   dec.tag = Tag::kDecimal;
   dec.precision = 65;
   dec.scale = 30;
+  dec.type_name = "DECIMAL";
   ParamType u;
   u.tag = Tag::kU64;
   u.is_unsigned = true;
@@ -379,7 +381,7 @@ TEST(MleCodec, ResultRoundTrip) {
   ResultMsg e;
   e.error = Error{"js",
                   "TypeError: x is not a function",
-                  {{"f", "routine.js", 3, 7}, {":program", "routine.js", 9, 1}},
+                  {{"f", "routine.js", 3, 7, 12}, {":program", "routine.js", 9, 1, 0}},
                   0,
                   ""};
   EXPECT_EQ(message_round_trip(e), e);
@@ -437,6 +439,23 @@ TEST(MleCodec, SmallMessagesRoundTrip) {
   EXPECT_EQ(message_round_trip(DropMsg{99}), DropMsg{99});
 }
 
+TEST(MleCodec, OptionsRoundTrip) {
+  OptionsMsg m;
+  EXPECT_EQ(message_round_trip(m), m);
+  m.integer_type = wire::IntegerType::kBigint;
+  m.decimal_type = wire::DecimalType::kNumber;
+  m.time_zone = "Europe/Kyiv";
+  EXPECT_EQ(message_round_trip(m), m);
+  std::string bytes, error;
+  encode(m, &bytes);
+  OptionsMsg back;
+  bytes[0] = 4;  // no such integer type
+  EXPECT_FALSE(decode(bytes, &back, &error));
+  encode(m, &bytes);
+  bytes[1] = 2;  // no such decimal type
+  EXPECT_FALSE(decode(bytes, &back, &error));
+}
+
 TEST(MleCodec, BadMessagesAreRejected) {
   std::string error;
   {  // unknown CALL events
@@ -452,7 +471,7 @@ TEST(MleCodec, BadMessagesAreRejected) {
     m.params = {{"a", ParamMode::kIn, {}}};
     std::string bytes;
     encode(m, &bytes);
-    const size_t mode_at = 8 + 3 * 4 + 4 + 4 + 1;  // id, 3 empty strs, n, "a"
+    const size_t mode_at = 8 + 4 * 4 + 4 + 4 + 1;  // id, 4 empty strs, n, "a"
     ASSERT_EQ(bytes[mode_at], 0);
     bytes[mode_at] = 3;
     PrepareMsg back;

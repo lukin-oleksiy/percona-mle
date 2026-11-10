@@ -22,6 +22,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -83,6 +84,8 @@ const char *op_name(uint32_t op) {
       return "RESET";
     case wire::Op::kContinue:
       return "CONTINUE";
+    case wire::Op::kOptions:
+      return "OPTIONS";
   }
   return "?";
 }
@@ -372,8 +375,10 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
                                  : "missing return value");
       std::set<uint32_t> seen;
       for (const auto &[index, value] : result->out_params)
-        if (op != wire::Op::kCall || routine == nullptr ||
-            index >= routine->params || !seen.insert(index).second)
+        if (op != wire::Op::kCall || routine == nullptr || !ok ||
+            std::find(routine->outs.begin(), routine->outs.end(), index) ==
+                routine->outs.end() ||
+            !seen.insert(index).second)
           return broke("bad OUT parameter");
       // A worker that ran out of heap or stack is retired once the
       // outermost call is over (an outer call may still be using it).
@@ -411,9 +416,12 @@ Status Worker::prepare(const PrepareMsg &routine, CallHooks &hooks,
   encode(routine, &body);
   const Status s =
       request(wire::Op::kPrepare, body, hooks, nullptr, result, error);
-  if (s == Status::kOk)
-    m_routines[routine.routine_id] = {routine.params.size(),
-                                      routine.returns.has_value()};
+  if (s == Status::kOk) {
+    RoutineInfo info{routine.params.size(), routine.returns.has_value(), {}};
+    for (uint32_t i = 0; i < routine.params.size(); i++)
+      if (routine.params[i].mode != wire::ParamMode::kIn) info.outs.push_back(i);
+    m_routines[routine.routine_id] = std::move(info);
+  }
   return s;
 }
 
@@ -445,6 +453,17 @@ Status Worker::drop(uint64_t routine_id, std::string *error) {
   const Status s =
       request(wire::Op::kDrop, body, hooks, nullptr, &result, error);
   if (s == Status::kOk) m_routines.erase(routine_id);
+  if (s != Status::kOk && result.error) *error = result.error->message;
+  return s;
+}
+
+Status Worker::options(const OptionsMsg &options, std::string *error) {
+  std::string body;
+  encode(options, &body);
+  NoSql hooks;
+  ResultMsg result;
+  const Status s =
+      request(wire::Op::kOptions, body, hooks, nullptr, &result, error);
   if (s != Status::kOk && result.error) *error = result.error->message;
   return s;
 }

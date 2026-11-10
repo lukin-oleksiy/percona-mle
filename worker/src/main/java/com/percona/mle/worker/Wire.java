@@ -72,6 +72,19 @@ final class Wire {
   static final int DROP = 8;
   static final int RESET = 9;
   static final int CONTINUE = 10;
+  static final int OPTIONS = 11;
+
+  // IntegerType (Oracle's integer_type) and DecimalType (decimal_type)
+  static final int INT_UNSAFE_STRING = 0;
+  static final int INT_UNSAFE_BIGINT = 1;
+  static final int INT_STRING = 2;
+  static final int INT_BIGINT = 3;
+  static final int DECIMAL_STRING = 0;
+  static final int DECIMAL_NUMBER = 1;
+
+  /** Error language of value conversion errors (Oracle: 6000 "MLE-Type> ..."). */
+  static final String LANGUAGE_TYPE = "MLE-Type";
+  static final String LANGUAGE_TIME_ZONE = "MLE-TimeZone";
 
   // Status
   static final int OK = 0;
@@ -106,6 +119,8 @@ final class Wire {
 
   // ParamMode
   static final int MODE_IN = 0;
+  static final int MODE_OUT = 1;
+  static final int MODE_INOUT = 2;
 
   // SqlResultKind
   static final int SQL_ERROR = 0;

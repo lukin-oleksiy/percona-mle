@@ -44,6 +44,13 @@
       <artifactId>polyglot</artifactId>
       <version>${graalvm.version}</version>
     </dependency>
+    <!-- The frame-limit instrument (FrameLimit.java); at run time it comes
+         with GraalJS anyway. -->
+    <dependency>
+      <groupId>org.graalvm.truffle</groupId>
+      <artifactId>truffle-api</artifactId>
+      <version>${graalvm.version}</version>
+    </dependency>
     <dependency>
       <groupId>org.graalvm.polyglot</groupId>
       <artifactId>js-community</artifactId>
@@ -69,8 +76,18 @@
         <configuration>
           <compilerArgs>
             <arg>-Xlint:all</arg>
+            <!-- The Truffle processor leaves @GeneratedBy unclaimed. -->
+            <arg>-Xlint:-processing</arg>
             <arg>-Werror</arg>
           </compilerArgs>
+          <!-- Generates the instrument's registration and options. -->
+          <annotationProcessorPaths>
+            <path>
+              <groupId>org.graalvm.truffle</groupId>
+              <artifactId>truffle-dsl-processor</artifactId>
+              <version>${graalvm.version}</version>
+            </path>
+          </annotationProcessorPaths>
         </configuration>
       </plugin>
       <plugin>

@@ -150,6 +150,7 @@ void prepare(Worker &w, uint64_t id, const std::string &lang,
   PrepareMsg p;
   p.routine_id = id;
   p.language = lang;
+  p.name = "r" + std::to_string(id);
   p.entry = entry;
   p.source = src;
   for (size_t i = 0; i < params.size(); i++)
@@ -270,6 +271,12 @@ void cmd_calls() {
   prepare(*w, 9, "java", "I.f",
           "public class I { public static long f() { return 7; } }", {},
           type(Tag::kI64));
+  // CREATE ... AS $$ body $$ (empty entry; P4-W3).
+  prepare(*w, 11, "js", "", "return p1 + p2.length + p3;", p3, type(Tag::kI64));
+  prepare(*w, 12, "python", "", "return p1 + len(p2) + int(p3)", p3,
+          type(Tag::kI64));
+  prepare(*w, 13, "java", "", "return p1 + p2.length() + p3.longValue();", p3,
+          type(Tag::kI64));
 
   const std::vector<Value> a3 = {Value::i64(1), Value::string("hello"),
                                  Value::f64(2.0)};
@@ -298,6 +305,9 @@ void cmd_calls() {
        std::vector<Case>{{"Java, 3 typed args", 1, &a3},
                          {"JS, 3 typed args", 2, &a3},
                          {"Python, 3 typed args", 3, &a3},
+                         {"JS body (Oracle form), 3 typed args", 11, &a3},
+                         {"Python body, 3 typed args", 12, &a3},
+                         {"Java body, 3 typed args", 13, &a3},
                          {"Java, VECTOR(768) as float[]", 4, &av},
                          {"JS, VECTOR(768) as Float32Array", 5, &av},
                          {"Python, VECTOR(768) as numpy array", 6, &av},

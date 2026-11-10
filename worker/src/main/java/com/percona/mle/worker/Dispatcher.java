@@ -38,23 +38,26 @@ final class Dispatcher {
   private final Polyglot polyglot;
   private final Console console;
   private final Control control;
+  private final Options options;
   private final Thread thread;
   private final int maxDepth;
   private int depth;
   private long seq;
   private boolean tainted;
 
-  record Frame(String function, String file, int line, int column) {}
+  record Frame(String function, String file, int line, int column, int endColumn) {}
 
   record ErrorInfo(String language, String message, List<Frame> frames, int sqlErrno, String sqlState) {}
 
-  Dispatcher(Mailbox mb, JavaRoutines java, Polyglot polyglot, Console console, Control control, int maxDepth) {
+  Dispatcher(Mailbox mb, JavaRoutines java, Polyglot polyglot, Console console, Control control, Options options,
+      int maxDepth) {
     this.mb = mb;
     this.w = new MessageWriter(mb.arena);
     this.java = java;
     this.polyglot = polyglot;
     this.console = console;
     this.control = control;
+    this.options = options;
     this.thread = Thread.currentThread();
     this.maxDepth = maxDepth;
   }
@@ -89,7 +92,10 @@ final class Dispatcher {
     int savedDepth = depth;
     long savedSeq = seq;
     depth = m.depth();
-    if (depth == 0) seq = m.callSeq();
+    if (depth == 0) {
+      seq = m.callSeq();
+      FrameLimit.reset();
+    }
     try {
       switch (m.op()) {
         case Wire.PREPARE -> prepare(m);
@@ -107,6 +113,7 @@ final class Dispatcher {
           polyglot.reset();
           result(Wire.OK, null, null, null);
         }
+        case Wire.OPTIONS -> options(m);
         default -> result(Wire.INTERNAL, null, null, internal("unexpected message " + m.op()));
       }
     } finally {
@@ -115,10 +122,29 @@ final class Dispatcher {
     }
   }
 
+  private void options(Mailbox.Message m) {
+    MessageReader r = new MessageReader(m.body());
+    int integerType = r.u8();
+    int decimalType = r.u8();
+    String zoneText = r.str();
+    r.finish();
+    java.time.ZoneId zone = Options.parseZone(zoneText);
+    if (zone == null) {
+      result(Wire.GUEST_ERROR, null, null, guest(Wire.LANGUAGE_TIME_ZONE, "unknown time zone '" + zoneText + "'"));
+      return;
+    }
+    options.integerType = integerType;
+    options.decimalType = decimalType;
+    options.zone = zone;
+    polyglot.applyOptions();
+    result(Wire.OK, null, null, null);
+  }
+
   private void prepare(Mailbox.Message m) {
     MessageReader r = new MessageReader(m.body());
     long id = r.u64();
     String language = r.str();
+    String name = r.str();
     String entry = r.str();
     String source = r.str();
     int n = r.count();
@@ -131,11 +157,6 @@ final class Dispatcher {
       result(Wire.GUEST_ERROR, null, null, guest(language, "the language " + language + " is not available in this worker"));
       return;
     }
-    for (JavaRoutines.Param p : params)
-      if (p.mode() != Wire.MODE_IN) {
-        result(Wire.GUEST_ERROR, null, null, guest(language, "OUT and INOUT parameters are not supported yet"));
-        return;
-      }
     mb.stats(Wire.STATE_COMPILING, tainted);
     // Loading runs routine code too (Python module level, JS top level), so PREPARE can be
     // interrupted like a call.
@@ -147,8 +168,8 @@ final class Dispatcher {
       // A routine id is prepared again after ALTER; it may change language.
       java.drop(id);
       polyglot.drop(id);
-      if (language.equals("java")) java.prepare(id, entry, source, params, ret);
-      else polyglot.prepare(id, language, entry, source, params, ret);
+      if (language.equals("java")) java.prepare(id, name, entry, source, params, ret);
+      else polyglot.prepare(id, language, name, entry, source, params, ret);
     } catch (JavaRoutines.CompileException e) {
       compileError = e.getMessage();
     } catch (Throwable t) {
@@ -171,13 +192,13 @@ final class Dispatcher {
     r.finish();
     JavaRoutines.Routine routine = java.get(id);
     Polyglot.Routine guestRoutine = routine == null ? polyglot.get(id) : null;
-    int arity = routine != null ? routine.converters().length
-        : guestRoutine != null ? guestRoutine.converters().length : -1;
+    int arity = routine != null ? routine.converters().length : guestRoutine != null ? guestRoutine.arity() : -1;
     if (arity != n) {
       result(Wire.INTERNAL, null, null, internal("routine " + id + " is not prepared with " + n + " parameters"));
       return;
     }
     Values.ParamType retType = routine != null ? routine.ret() : guestRoutine.ret();
+    int[] outIndexes = routine != null ? routine.outs() : guestRoutine.outs();
 
     boolean top = depth == 0;
     if (top) control.begin(seq, guestRoutine != null);
@@ -185,9 +206,10 @@ final class Dispatcher {
     // The call's arena owns MemorySegment arguments; closing it makes them unusable afterwards.
     try (Arena callArena = Arena.ofConfined()) {
       Object ret = null;
+      Object[] outs = new Object[n];
       Throwable failure = null;
       try {
-        ret = routine != null ? java.invoke(routine, args, callArena) : polyglot.invoke(guestRoutine, args);
+        ret = routine != null ? java.invoke(routine, args, callArena, outs) : polyglot.invoke(guestRoutine, args, outs);
       } catch (Throwable t) {
         failure = t;
       }
@@ -195,9 +217,13 @@ final class Dispatcher {
       if (top) polyglot.settleInterrupt(control.takeInterrupter());
       // A killed statement reports the KILL, even if the routine then ended normally.
       if (failure == null && interrupted) result(Wire.INTERRUPTED, null, null, guest("", "interrupted"));
-      else if (failure == null) result(Wire.OK, ret, retType, null);
+      else if (failure == null) result(Wire.OK, ret, retType, null, outIndexes, outs, paramTypes(routine, guestRoutine));
       else failed(failure, interrupted);
     }
+  }
+
+  private static Values.ParamType[] paramTypes(JavaRoutines.Routine j, Polyglot.Routine g) {
+    return j != null ? j.types() : g.params();
   }
 
   private void failed(Throwable t, boolean interrupted) {
@@ -217,9 +243,10 @@ final class Dispatcher {
     } else if (t instanceof MleSqlException e) {
       result(Wire.GUEST_ERROR, null, null,
           new ErrorInfo("java", e.getMessage(), userFrames(t), e.getErrorCode(), e.getSqlState()));
+    } else if (t instanceof Values.ConversionException) {
+      result(Wire.GUEST_ERROR, null, null, new ErrorInfo(Wire.LANGUAGE_TYPE, t.getMessage(), userFrames(t), 0, ""));
     } else {
-      String message = t instanceof Values.ConversionException ? t.getMessage() : describe(t);
-      result(Wire.GUEST_ERROR, null, null, new ErrorInfo("java", message, userFrames(t), 0, ""));
+      result(Wire.GUEST_ERROR, null, null, new ErrorInfo("java", describe(t), userFrames(t), 0, ""));
     }
   }
 
@@ -252,7 +279,7 @@ final class Dispatcher {
         return;
       }
       if (h instanceof Values.ConversionException c) {
-        result(Wire.GUEST_ERROR, null, null, new ErrorInfo(language, c.getMessage(), frames, 0, ""));
+        result(Wire.GUEST_ERROR, null, null, new ErrorInfo(Wire.LANGUAGE_TYPE, c.getMessage(), frames, 0, ""));
         return;
       }
     }
@@ -274,9 +301,17 @@ final class Dispatcher {
     List<Frame> frames = new ArrayList<>();
     for (StackTraceElement e : t.getStackTrace()) {
       String loader = e.getClassLoaderName();
-      if (loader != null && loader.startsWith(JavaRoutines.LOADER_PREFIX))
-        frames.add(new Frame(e.getClassName() + "." + e.getMethodName(),
-            e.getFileName() == null ? "" : e.getFileName(), Math.max(0, e.getLineNumber()), 0));
+      if (loader != null && loader.startsWith(JavaRoutines.LOADER_PREFIX)) {
+        JavaRoutines.Origin o = JavaRoutines.origins.get(loader);
+        String function = e.getClassName() + "." + e.getMethodName();
+        String file = e.getFileName() == null ? "" : e.getFileName();
+        if (o != null && o.bodyForm()) {
+          // The body's own frames: named like the routine (the wrapper class is ours).
+          function = e.getMethodName().equals("call") ? "" : e.getMethodName();
+          file = o.name();
+        }
+        frames.add(new Frame(function, file, Math.max(0, e.getLineNumber()), 0, 0));
+      }
       if (frames.size() == Wire.MAX_STACK_FRAMES) break;
     }
     return frames;
@@ -290,19 +325,28 @@ final class Dispatcher {
     return new ErrorInfo("", message, List.of(), 0, "");
   }
 
-  /** Posts a RESULT. A return value that cannot be converted turns into a guest error. */
   private void result(int status, Object ret, Values.ParamType retType, ErrorInfo error) {
+    result(status, ret, retType, error, null, null, null);
+  }
+
+  /**
+   * Posts a RESULT with the OUT values outs[i] for i in outIndexes. A value that cannot be
+   * converted turns into a conversion error.
+   */
+  private void result(int status, Object ret, Values.ParamType retType, ErrorInfo error, int[] outIndexes,
+      Object[] outs, Values.ParamType[] types) {
     try {
-      writeResult(ret, retType, error);
+      writeResult(ret, retType, error, outIndexes, outs, types);
     } catch (Values.ConversionException e) {
       status = Wire.GUEST_ERROR;
-      writeResult(null, null, guest("java", "return value: " + e.getMessage()));
+      writeResult(null, null, guest(Wire.LANGUAGE_TYPE, e.getMessage()), null, null, null);
     }
     mb.stats(depth == 0 ? Wire.STATE_IDLE : Wire.STATE_RUNNING, tainted);
     mb.send(Wire.RESULT, status, depth, seq, w);
   }
 
-  private void writeResult(Object ret, Values.ParamType retType, ErrorInfo error) {
+  private void writeResult(Object ret, Values.ParamType retType, ErrorInfo error, int[] outIndexes, Object[] outs,
+      Values.ParamType[] types) {
     w.reset();
     if (retType != null && error == null) {
       w.u8(1);
@@ -310,7 +354,15 @@ final class Dispatcher {
     } else {
       w.u8(0);
     }
-    w.u32(0);  // OUT parameters: Phase 8
+    if (error == null && outIndexes != null) {
+      w.u32(outIndexes.length);
+      for (int i : outIndexes) {
+        w.u32(i);
+        Values.writeAs(w, outs[i], types[i]);
+      }
+    } else {
+      w.u32(0);
+    }
     w.bytes(console.takeOut());
     w.bytes(console.takeErr());
     if (error == null) {
@@ -326,6 +378,7 @@ final class Dispatcher {
       w.str(f.file());
       w.u32(f.line());
       w.u32(f.column());
+      w.u32(f.endColumn());
     }
     w.u32(error.sqlErrno());
     w.str(error.sqlState() == null ? "" : error.sqlState());

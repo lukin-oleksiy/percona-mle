@@ -278,7 +278,9 @@ TEST_F(MleWorkerFailures, KillLongNumpyComputation) {
 TEST_F(MleWorkerFailures, GuestStackOverflowIsAGuestError) {
   ResultMsg res;
   const std::vector<std::tuple<std::string, std::string, std::string>> cases = {
-      {"js", "function f() { return f() + 1; }", "RangeError"},
+      // JS stops at Oracle's frame limit (FrameLimit) before the stack ends.
+      {"js", "function f() { return f() + 1; }",
+       "Maximum frame limit of 1000 exceeded. Frames on stack: 1001."},
       {"python", "def f():\n    return f() + 1\n", "RecursionError"}};
   uint64_t id = 100;
   for (const auto &[lang, src, error] : cases) {

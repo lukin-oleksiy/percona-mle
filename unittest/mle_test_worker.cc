@@ -225,6 +225,13 @@ void post_msg(wire::RegionHeader *h, wire::Op op, uint32_t status,
       answer(body, 0, 0, 1);
     } else if (how == "status_without_error") {
       answer(body, static_cast<uint32_t>(wire::Status::kGuestError));
+    } else if (how == "out_for_in") {
+      // An OUT value for a parameter that is not OUT or INOUT.
+      ResultMsg r = good;
+      r.out_params = {{0, Value::i64(1)}};
+      std::string b;
+      encode(r, &b);
+      answer(b);
     } else if (how == "missing_return") {
       ResultMsg r;
       std::string b;

@@ -48,10 +48,19 @@ final class Values {
     }
   }
 
-  /** ParamType from protocol.h. */
-  record ParamType(int tag, boolean unsigned, long length, long precision, long scale) {
+  /** ParamType from protocol.h; typeName is INT, VARCHAR, SET, YEAR, BIT ... or empty. */
+  record ParamType(int tag, boolean unsigned, long length, long precision, long scale, String typeName) {
+    ParamType(int tag, boolean unsigned, long length, long precision, long scale) {
+      this(tag, unsigned, length, precision, scale, "");
+    }
+
     String sqlName() {
+      if (!typeName.isEmpty()) return typeName;
       return tag <= Wire.MAX_TAG ? Wire.TAG_NAMES[tag] : "?";
+    }
+
+    boolean is(String name) {
+      return typeName.equals(name);
     }
   }
 
@@ -89,7 +98,7 @@ final class Values {
   // ------------------------------------------------------------ decoding
 
   static ParamType readParamType(MessageReader r) {
-    return new ParamType(r.u8(), r.flag(), r.u32(), r.u32(), r.u32());
+    return new ParamType(r.u8(), r.flag(), r.u32(), r.u32(), r.u32(), r.str());
   }
 
   static Object read(MessageReader r) {

@@ -130,6 +130,8 @@ struct ParamType {
   uint32_t length = 0;
   uint32_t precision = 0;
   uint32_t scale = 0;
+  /** INT, VARCHAR, SET, YEAR, BIT ... (protocol.h). */
+  std::string type_name;
   bool operator==(const ParamType &) const = default;
 };
 
@@ -152,6 +154,7 @@ struct StackFrame {
   std::string file;
   uint32_t line = 0;
   uint32_t column = 0;
+  uint32_t end_column = 0;
   bool operator==(const StackFrame &) const = default;
 };
 
@@ -184,6 +187,8 @@ struct ReadyMsg {
 struct PrepareMsg {
   uint64_t routine_id = 0;
   std::string language;
+  std::string name;
+  /** Empty: source is a routine body (protocol.h). */
   std::string entry;
   std::string source;
   std::vector<Param> params;
@@ -244,6 +249,13 @@ struct DropMsg {
   bool operator==(const DropMsg &) const = default;
 };
 
+struct OptionsMsg {
+  wire::IntegerType integer_type = wire::IntegerType::kUnsafeString;
+  wire::DecimalType decimal_type = wire::DecimalType::kString;
+  std::string time_zone = "+00:00";
+  bool operator==(const OptionsMsg &) const = default;
+};
+
 /** Each encode() replaces *out with the message body. */
 void encode(const ReadyMsg &m, std::string *out);
 void encode(const PrepareMsg &m, std::string *out);
@@ -253,6 +265,7 @@ void encode(const SqlMsg &m, std::string *out);
 void encode(const SqlResultMsg &m, std::string *out);
 void encode(const FetchMsg &m, std::string *out);
 void encode(const DropMsg &m, std::string *out);
+void encode(const OptionsMsg &m, std::string *out);
 
 bool decode(std::string_view body, ReadyMsg *m, std::string *error);
 bool decode(std::string_view body, PrepareMsg *m, std::string *error);
@@ -262,6 +275,7 @@ bool decode(std::string_view body, SqlMsg *m, std::string *error);
 bool decode(std::string_view body, SqlResultMsg *m, std::string *error);
 bool decode(std::string_view body, FetchMsg *m, std::string *error);
 bool decode(std::string_view body, DropMsg *m, std::string *error);
+bool decode(std::string_view body, OptionsMsg *m, std::string *error);
 
 // ---------------------------------------------------------------- chunks
 

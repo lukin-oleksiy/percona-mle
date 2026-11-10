@@ -30,10 +30,10 @@ namespace {
 // Smallest encodings, used to bound element counts.
 constexpr size_t kMinValue = 1;                      // tag only (NULL)
 constexpr size_t kMinStr = 4;                        // empty string
-constexpr size_t kMinParamType = 1 + 1 + 4 + 4 + 4;  // tag .. scale
+constexpr size_t kMinParamType = 1 + 1 + 4 + 4 + 4 + kMinStr;  // tag .. name
 constexpr size_t kMinParam = kMinStr + 1 + kMinParamType;
 constexpr size_t kMinColumn = 2 * kMinStr + kMinParamType;
-constexpr size_t kMinFrame = 2 * kMinStr + 4 + 4;
+constexpr size_t kMinFrame = 2 * kMinStr + 4 + 4 + 4;
 constexpr size_t kMinWarning = 4 + 4 + kMinStr;
 constexpr size_t kMinOutParam = 4 + kMinValue;
 constexpr size_t kTemporalSize = 2 + 1 + 1 + 4 + 1 + 1 + 4 + 1;
@@ -50,6 +50,7 @@ void put_param_type(Writer &w, const ParamType &t) {
   w.u32(t.length);
   w.u32(t.precision);
   w.u32(t.scale);
+  w.str(t.type_name);
 }
 
 bool get_tag(Reader &r, Tag *tag) {
@@ -63,7 +64,7 @@ bool get_tag(Reader &r, Tag *tag) {
 
 bool get_param_type(Reader &r, ParamType *t) {
   return get_tag(r, &t->tag) && r.flag(&t->is_unsigned) && r.u32(&t->length) &&
-         r.u32(&t->precision) && r.u32(&t->scale);
+         r.u32(&t->precision) && r.u32(&t->scale) && r.str(&t->type_name);
 }
 
 void put_values(Writer &w, const std::vector<Value> &values) {
@@ -117,6 +118,7 @@ void put_error(Writer &w, const Error &e) {
     w.str(f.file);
     w.u32(f.line);
     w.u32(f.column);
+    w.u32(f.end_column);
   }
   w.u32(e.sql_errno);
   w.str(e.sqlstate);
@@ -131,7 +133,7 @@ bool get_error(Reader &r, Error *e) {
   e->stack.resize(n);
   for (StackFrame &f : e->stack)
     if (!r.str(&f.function) || !r.str(&f.file) || !r.u32(&f.line) ||
-        !r.u32(&f.column))
+        !r.u32(&f.column) || !r.u32(&f.end_column))
       return false;
   if (!r.u32(&e->sql_errno) || !r.str(&e->sqlstate)) return false;
   if (!valid_sqlstate(e->sqlstate)) return r.fail("bad SQLSTATE");
@@ -516,6 +518,7 @@ void encode(const PrepareMsg &m, std::string *out) {
   Writer w(out);
   w.u64(m.routine_id);
   w.str(m.language);
+  w.str(m.name);
   w.str(m.entry);
   w.str(m.source);
   w.u32(static_cast<uint32_t>(m.params.size()));
@@ -531,7 +534,8 @@ void encode(const PrepareMsg &m, std::string *out) {
 bool decode(std::string_view body, PrepareMsg *m, std::string *error) {
   return decode_with<PrepareMsg>(body, m, error, [](Reader &r, PrepareMsg *x) {
     uint32_t n;
-    if (!r.u64(&x->routine_id) || !r.str(&x->language) || !r.str(&x->entry) ||
+    if (!r.u64(&x->routine_id) || !r.str(&x->language) || !r.str(&x->name) ||
+        !r.str(&x->entry) ||
         !r.str(&x->source) || !r.count(&n, kMinParam))
       return false;
     x->params.clear();
@@ -720,6 +724,26 @@ void encode(const DropMsg &m, std::string *out) {
 bool decode(std::string_view body, DropMsg *m, std::string *error) {
   return decode_with<DropMsg>(body, m, error, [](Reader &r, DropMsg *x) {
     return r.u64(&x->routine_id);
+  });
+}
+
+void encode(const OptionsMsg &m, std::string *out) {
+  out->clear();
+  Writer w(out);
+  w.u8(static_cast<uint8_t>(m.integer_type));
+  w.u8(static_cast<uint8_t>(m.decimal_type));
+  w.str(m.time_zone);
+}
+
+bool decode(std::string_view body, OptionsMsg *m, std::string *error) {
+  return decode_with<OptionsMsg>(body, m, error, [](Reader &r, OptionsMsg *x) {
+    uint8_t i, d;
+    if (!r.u8(&i) || !r.u8(&d) || !r.str(&x->time_zone)) return false;
+    if (i > wire::kMaxIntegerType) return r.fail("bad integer type");
+    if (d > wire::kMaxDecimalType) return r.fail("bad decimal type");
+    x->integer_type = static_cast<wire::IntegerType>(i);
+    x->decimal_type = static_cast<wire::DecimalType>(d);
+    return true;
   });
 }
 

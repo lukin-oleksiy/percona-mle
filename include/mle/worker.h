@@ -115,6 +115,9 @@ class Worker {
               ResultMsg *result, std::string *error);
 
   Status drop(uint64_t routine_id, std::string *error);
+  /** Conversion options and time zone of the session (OPTIONS). A zone
+      the worker does not know gives kGuestError, *error says why. */
+  Status options(const OptionsMsg &options, std::string *error);
   /** mle_session_reset(): the worker forgets all routines and state. */
   Status reset(std::string *error);
 
@@ -142,6 +145,8 @@ class Worker {
   struct RoutineInfo {
     size_t params;
     bool has_return;
+    /** Indexes of the OUT and INOUT parameters. */
+    std::vector<uint32_t> outs;
   };
 
   Status request(wire::Op op, const std::string &body, CallHooks &hooks,

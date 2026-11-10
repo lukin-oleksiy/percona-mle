@@ -27,6 +27,7 @@ SET(MLE_TESTS
   worker_protocol
   polyglot_worker
   worker_failures
+  body_forms
   )
 
 FOREACH(test ${MLE_TESTS})
@@ -63,7 +64,7 @@ IF(MLE_TEST_PYTHON_VENV)
 ELSE()
   SET(MLE_TESTS_VENV ${MLE_BUILT_PYTHON_VENV})
 ENDIF()
-FOREACH(test java_worker polyglot_worker worker_failures)
+FOREACH(test java_worker polyglot_worker worker_failures body_forms)
   TARGET_COMPILE_DEFINITIONS(mle_${test}-t PRIVATE
     MLE_LAUNCHER_EXE="$<TARGET_FILE:mle_launcher>"
     MLE_WORKER_EXE="$<TARGET_FILE:mle_worker>"

@@ -33,11 +33,13 @@ public final class Main {
     try {
       Mailbox mb = Mailbox.open(Integer.getInteger("mle.spin", 2000));
       console.install();
-      Polyglot polyglot = new Polyglot(console);
+      Options options = new Options();
+      Polyglot polyglot = new Polyglot(console, options);
       Control control = new Control(Thread.currentThread(), polyglot);
       control.start();
       JavaRoutines java = new JavaRoutines();
-      Dispatcher d = new Dispatcher(mb, java, polyglot, console, control, Integer.getInteger("mle.maxDepth", 32));
+      Dispatcher d = new Dispatcher(mb, java, polyglot, console, control, options,
+          Integer.getInteger("mle.maxDepth", 32));
       SqlBridge.dispatcher = d;
       int status = Wire.OK;
       String info;
