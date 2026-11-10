@@ -1,0 +1,91 @@
+/* Copyright (c) 2026 Percona LLC and/or its affiliates. All rights
+   reserved.
+
+   This program is free software; you can redistribute it and/or
+   modify it under the terms of the GNU General Public License
+   as published by the Free Software Foundation; version 2 of
+   the License.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
+
+package com.percona.mle.worker;
+
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+
+/**
+ * The control socket (fd 4): INTERRUPT(call_seq) and SHUTDOWN from the host; EOF means the host
+ * is gone, and the worker ends.
+ *
+ * <p>An INTERRUPT applies only to the top-level call with that sequence number. One that arrives
+ * before its call has started (e.g. while the worker is still starting) is remembered and applied
+ * when the call begins. Java code is interrupted cooperatively (Thread.interrupt); code that
+ * ignores it is ended by the host with SIGKILL after the grace period.
+ */
+final class Control implements Runnable {
+  private final Thread main;
+  private long running = -1;
+  private long pending = -1;
+  private long last;
+  private boolean interrupted;
+
+  Control(Thread main) {
+    this.main = main;
+  }
+
+  void start() {
+    Thread t = new Thread(this, "mle-control");
+    t.setDaemon(true);
+    t.start();
+  }
+
+  @Override
+  public void run() {
+    MemorySegment buf = Arena.global().allocate(64);
+    while (true) {
+      long n = Native.read(Wire.CONTROL_FD, buf);
+      if (n <= 0) Runtime.getRuntime().halt(0);  // the host closed the session or died
+      int kind = buf.get(ValueLayout.JAVA_BYTE, 0);
+      if (kind == Wire.CTL_SHUTDOWN) Runtime.getRuntime().halt(0);
+      if (kind == Wire.CTL_INTERRUPT && n >= 9) interrupt(buf.get(ValueLayout.JAVA_LONG_UNALIGNED, 1));
+    }
+  }
+
+  private synchronized void interrupt(long seq) {
+    if (seq == running) {
+      interrupted = true;
+      main.interrupt();
+    } else if (seq > last) {
+      pending = seq;
+    }
+  }
+
+  /** A top-level call starts (on the main thread). */
+  synchronized void begin(long seq) {
+    running = seq;
+    interrupted = false;
+    if (pending == seq) {
+      pending = -1;
+      interrupted = true;
+      main.interrupt();
+    }
+  }
+
+  /** The top-level call ended; true if it was interrupted. Clears the thread's interrupt flag. */
+  synchronized boolean end() {
+    last = Math.max(last, running);
+    running = -1;
+    boolean r = interrupted;
+    interrupted = false;
+    Thread.interrupted();
+    return r;
+  }
+}
