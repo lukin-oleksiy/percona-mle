@@ -1,0 +1,74 @@
+#
+# component_mle (Phase 6): database libraries in Python and Java (our
+# extension of Oracle's CREATE LIBRARY), and libraries used across
+# languages (14-phase6-libraries.md §2).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE LIBRARY jsmath LANGUAGE JAVASCRIPT AS $$
+export function square(n) { return n * n }
+export default { offset: 100 }
+$$;
+# Python libraries and routines (created by the mysql client: mysqltest
+# strips the indentation Python needs).
+# 1. Python routine with Python libraries (one imports the other).
+CALL py_using(@r);
+SELECT @r;
+@r
+5.0 | mean 5.00, stdev 2.00
+# 2. Python routine with a JavaScript library.
+SELECT py_uses_js(7);
+py_uses_js(7)
+149
+# 3. JavaScript routine with a Python library.
+CREATE FUNCTION js_uses_py() RETURNS TEXT LANGUAGE JAVASCRIPT USING (pystats AS stats)
+AS $$ return 'mean ' + stats.mean([1, 2, 3, 6]) + ', stdev ' + stats.stdev([1, 2, 3, 6]).toFixed(3) $$;
+SELECT js_uses_py();
+js_uses_py()
+mean 3, stdev 1.871
+# 4. Java routine with a Java library (compiled with the routine).
+CREATE LIBRARY geo LANGUAGE JAVA AS $$
+package geo;
+public final class Shapes {
+private Shapes() {}
+public static double diagonal(double w, double h) { return Math.sqrt(w * w + h * h); }
+}
+$$;
+CREATE FUNCTION java_diag(w DOUBLE, h DOUBLE) RETURNS DOUBLE LANGUAGE JAVA USING (geo)
+AS $$ return geo.Shapes.diagonal(w, h); $$;
+SELECT java_diag(5, 10);
+java_diag(5, 10)
+11.180339887498949
+# A Java routine uses Java libraries only (checked when it is compiled).
+CREATE FUNCTION java_uses_js() RETURNS INT LANGUAGE JAVA USING (jsmath) AS $$ return 1; $$;
+ERROR HY000: Java> library test.jsmath is a JavaScript library: Java routines use Java libraries (other languages through Mle.context())
+# Other languages use Java through the polyglot API, not Java libraries.
+CREATE FUNCTION js_uses_java() RETURNS INT LANGUAGE JAVASCRIPT USING (geo) AS $$ return 1 $$;
+SELECT js_uses_java();
+ERROR HY000: JavaScript> library test.geo is a Java library: Java routines use it with USING
+# 5. Syntax errors at CREATE LIBRARY, by language.
+CREATE LIBRARY bad_py LANGUAGE PYTHON AS $$ def f(:
+pass $$;
+ERROR HY000: Python> IndentationError: unexpected indent (bad_py, line 1)
+CREATE LIBRARY bad_java LANGUAGE JAVA AS $$ public class Bad { int x = ; } $$;
+ERROR HY000: Java> bad_java:1:29: illegal start of expression
+# 6. A changed library is used at the next call (here: JavaScript, from Python).
+DROP LIBRARY jsmath;
+CREATE LIBRARY jsmath LANGUAGE JAVASCRIPT AS $$
+export function square(n) { return n * n * 10 }
+export default { offset: 1 }
+$$;
+SELECT py_uses_js(7);
+py_uses_js(7)
+491
+DROP PROCEDURE py_using;
+DROP FUNCTION py_uses_js;
+DROP FUNCTION js_uses_py;
+DROP FUNCTION java_diag;
+DROP FUNCTION js_uses_java;
+DROP LIBRARY jsmath;
+DROP LIBRARY pystats;
+DROP LIBRARY pyreport;
+DROP LIBRARY geo;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

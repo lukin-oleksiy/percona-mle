@@ -67,7 +67,7 @@ final class Polyglot {
    * parameters return (result, out1, ...), outs gives the parameters' indexes.
    */
   record Routine(String language, Value fn, Value[] converters, Values.ParamType ret, Values.ParamType[] params,
-      int[] outs, JsOracle.Routine js) {
+      int[] outs, JsOracle.Routine js, List<LibraryFileSystem.Import> imports) {
     int arity() {
       return params.length;
     }
@@ -98,6 +98,8 @@ final class Polyglot {
   /** Length of the wrapper text before the body on line 1, by JS routine source URI. */
   static final Map<java.net.URI, Integer> prefixes = new java.util.concurrent.ConcurrentHashMap<>();
   private Value jsOracle;
+  private PySql pySql;
+  private Value jsImport;
   private volatile Context context;
   private Helpers js;
   private Helpers python;
@@ -159,6 +161,10 @@ final class Polyglot {
       c.getPolyglotBindings().putMember("Mle", mleApi);
       js = jsHelpers(c);
       jsOracle = JsOracle.helpers(c);
+      // USING in JavaScript routines (Phase 6): $c.lib(...) asks for non-JavaScript libraries.
+      jsOracle.putMember("libBridge",
+          (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString(), true));
+      jsImport = c.eval("js", "(p) => import(p)");
       // The SQL API (Phase 5): the globals session, mysql and SqlError. Python's are made
       // with Python's helpers, on first use (GraalPy costs ~150 MB: JS-only workers skip it).
       new JsSql(c, options);
@@ -361,13 +367,44 @@ final class Polyglot {
     return context.getBindings("python").getMember("_mle_helpers").getHashValue("body_loader");
   }
 
+  /**
+   * A database library's module for a routine of another language (Phase 6): a Python library as a
+   * Python module (evaluated once per version); a JavaScript library as its module namespace, or
+   * null for JavaScript routines (they import it themselves). Java libraries are for Java routines.
+   */
+  Object libraryModule(String schema, String name, boolean forJs) {
+    LibraryFileSystem.Library l;
+    try {
+      l = LibraryFileSystem.library(schema, name);
+    } catch (java.io.IOException e) {
+      throw new IllegalArgumentException(e.getMessage() == null ? e.toString() : e.getMessage());
+    }
+    switch (l.language()) {
+      case "js" -> {
+        if (forJs) return null;
+        Value settled = jsOracle.getMember("settle").execute(jsImport.execute("/" + schema + "/" + name));
+        if (!settled.getMember("done").asBoolean())
+          throw new IllegalStateException("library " + schema + "." + name + " did not load");
+        if (!settled.getMember("ok").asBoolean()) jsOracle.getMember("rethrow").execute(settled.getMember("v"));
+        return settled.getMember("v");
+      }
+      case "python" -> {
+        pythonReady();
+        return pySql.loadLibrary.execute(schema + "." + name, l.hash(),
+            new String(l.body(), java.nio.charset.StandardCharsets.UTF_8));
+      }
+      default -> throw new IllegalArgumentException("library " + schema + "." + name
+          + " is a Java library: Java routines use it with USING");
+    }
+  }
+
   /** Python's helpers and SQL API, made when the first Python routine is loaded. */
   private void pythonReady() {
     if (python != null) return;
     Context c = context();
     // All or nothing: an interrupt (KILL) in between leaves Python to be set up again.
     Helpers h = pythonHelpers(c);
-    new PySql(c, options);
+    pySql = new PySql(c, options, a -> libraryModule(a[0].asString(), a[1].asString(), false));
     python = h;
   }
 
@@ -449,7 +486,7 @@ final class Polyglot {
     Value[] converters = new Value[params.size()];
     if (jsRoutine == null)
       for (int i = 0; i < converters.length; i++) converters[i] = converter(h, types[i].tag(), language);
-    routines.put(id, new Routine(language, fn, converters, ret, types, outs, jsRoutine));
+    routines.put(id, new Routine(language, fn, converters, ret, types, outs, jsRoutine, imports));
   }
 
   private static Value converter(Helpers h, int tag, String language) {
@@ -478,6 +515,10 @@ final class Polyglot {
       Object v = hostForm(neutral[i], js);
       args[i] = v == null || r.converters()[i] == null ? v : r.converters()[i].execute(v);
     }
+    // USING (Phase 6): the libraries' current modules, bound before each call.
+    if (r.language().equals("python"))
+      for (LibraryFileSystem.Import i : r.imports())
+        pySql.bind.execute(r.fn(), i.binding(), libraryModule(i.schema(), i.name(), false));
     Value result = r.fn().execute(args);
     Helpers h = helpers(r.language());
     if (r.outs().length > 0) {

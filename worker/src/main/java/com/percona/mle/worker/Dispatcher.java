@@ -152,7 +152,7 @@ final class Dispatcher {
     r.finish();
     String error;
     try {
-      error = polyglot.parseLibrary(language, name, body);
+      error = language.equals("java") ? java.checkLibrary(name, body) : polyglot.parseLibrary(language, name, body);
     } catch (Throwable t) {
       failed(t, false);
       return;
@@ -214,7 +214,7 @@ final class Dispatcher {
       // A routine id is prepared again after ALTER; it may change language.
       java.drop(id);
       polyglot.drop(id);
-      if (language.equals("java")) java.prepare(id, name, entry, source, params, ret);
+      if (language.equals("java")) java.prepare(id, name, entry, source, params, ret, imports);
       else polyglot.prepare(id, language, name, entry, source, params, ret, imports);
     } catch (JavaRoutines.CompileException e) {
       compileError = e.getMessage();

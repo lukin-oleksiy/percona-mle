@@ -1,0 +1,107 @@
+--echo #
+--echo # component_mle (Phase 6): database libraries in Python and Java (our
+--echo # extension of Oracle's CREATE LIBRARY), and libraries used across
+--echo # languages (14-phase6-libraries.md §2).
+--echo #
+--source include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+
+CREATE LIBRARY jsmath LANGUAGE JAVASCRIPT AS $$
+  export function square(n) { return n * n }
+  export default { offset: 100 }
+$$;
+
+--echo # Python libraries and routines (created by the mysql client: mysqltest
+--echo # strips the indentation Python needs).
+--write_file $MYSQLTEST_VARDIR/tmp/libs.sql
+CREATE LIBRARY pystats LANGUAGE PYTHON AS $$
+import math
+
+def mean(xs):
+    xs = list(xs)
+    return sum(xs) / len(xs)
+
+def stdev(xs):
+    m = mean(xs)
+    xs = list(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
+$$;
+CREATE LIBRARY pyreport LANGUAGE PYTHON AS $$
+stats = import_library('/test/pystats')
+
+def describe(xs):
+    return 'mean %.2f, stdev %.2f' % (stats.mean(xs), stats.stdev(xs))
+$$;
+CREATE PROCEDURE py_using(OUT r TEXT) LANGUAGE PYTHON USING (pystats, pyreport AS report) AS $$
+    xs = [2, 4, 4, 4, 5, 5, 7, 9]
+    r = '%s | %s' % (pystats.mean(xs), report.describe(xs))
+$$;
+CREATE FUNCTION py_uses_js(n INT) RETURNS INT LANGUAGE PYTHON USING (jsmath) AS $$
+    return jsmath.square(n) + jsmath.default.offset
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/libs.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/libs.sql
+
+--echo # 1. Python routine with Python libraries (one imports the other).
+CALL py_using(@r);
+SELECT @r;
+--echo # 2. Python routine with a JavaScript library.
+SELECT py_uses_js(7);
+--echo # 3. JavaScript routine with a Python library.
+CREATE FUNCTION js_uses_py() RETURNS TEXT LANGUAGE JAVASCRIPT USING (pystats AS stats)
+  AS $$ return 'mean ' + stats.mean([1, 2, 3, 6]) + ', stdev ' + stats.stdev([1, 2, 3, 6]).toFixed(3) $$;
+SELECT js_uses_py();
+
+--echo # 4. Java routine with a Java library (compiled with the routine).
+CREATE LIBRARY geo LANGUAGE JAVA AS $$
+package geo;
+public final class Shapes {
+  private Shapes() {}
+  public static double diagonal(double w, double h) { return Math.sqrt(w * w + h * h); }
+}
+$$;
+CREATE FUNCTION java_diag(w DOUBLE, h DOUBLE) RETURNS DOUBLE LANGUAGE JAVA USING (geo)
+  AS $$ return geo.Shapes.diagonal(w, h); $$;
+SELECT java_diag(5, 10);
+--echo # A Java routine uses Java libraries only (checked when it is compiled).
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CREATE FUNCTION java_uses_js() RETURNS INT LANGUAGE JAVA USING (jsmath) AS $$ return 1; $$;
+--echo # Other languages use Java through the polyglot API, not Java libraries.
+CREATE FUNCTION js_uses_java() RETURNS INT LANGUAGE JAVASCRIPT USING (geo) AS $$ return 1 $$;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_uses_java();
+
+--echo # 5. Syntax errors at CREATE LIBRARY, by language.
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CREATE LIBRARY bad_py LANGUAGE PYTHON AS $$ def f(:
+  pass $$;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CREATE LIBRARY bad_java LANGUAGE JAVA AS $$ public class Bad { int x = ; } $$;
+
+--echo # 6. A changed library is used at the next call (here: JavaScript, from Python).
+DROP LIBRARY jsmath;
+CREATE LIBRARY jsmath LANGUAGE JAVASCRIPT AS $$
+  export function square(n) { return n * n * 10 }
+  export default { offset: 1 }
+$$;
+SELECT py_uses_js(7);
+
+--disconnect con1
+--connection default
+DROP PROCEDURE py_using;
+DROP FUNCTION py_uses_js;
+DROP FUNCTION js_uses_py;
+DROP FUNCTION java_diag;
+DROP FUNCTION js_uses_java;
+DROP LIBRARY jsmath;
+DROP LIBRARY pystats;
+DROP LIBRARY pyreport;
+DROP LIBRARY geo;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

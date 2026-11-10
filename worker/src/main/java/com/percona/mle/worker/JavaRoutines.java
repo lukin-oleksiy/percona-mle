@@ -175,7 +175,7 @@ final class JavaRoutines {
 
   /** Loads javac and compiles a trivial class, so that the first PREPARE is fast. */
   void prewarm() throws CompileException {
-    compile("package mle.warm; public class Warm { public static int f(int x) { return x + 1; } }", 0, null);
+    compile("package mle.warm; public class Warm { public static int f(int x) { return x + 1; } }", 0, null, List.of());
   }
 
   Routine get(long id) {
@@ -233,6 +233,44 @@ final class JavaRoutines {
 
   void prepare(long id, String routineName, String entry, String source, List<Param> params, Values.ParamType ret)
       throws CompileException {
+    prepare(id, routineName, entry, source, params, ret, List.of());
+  }
+
+  /**
+   * With database libraries (USING, Phase 6): Java libraries are compiled with the routine (their
+   * classes are the routine's); a changed library applies when the routine is loaded again.
+   */
+  void prepare(long id, String routineName, String entry, String source, List<Param> params, Values.ParamType ret,
+      List<LibraryFileSystem.Import> imports) throws CompileException {
+    List<String[]> libraries = new ArrayList<>();
+    for (LibraryFileSystem.Import i : imports) {
+      LibraryFileSystem.Library l;
+      try {
+        l = LibraryFileSystem.library(i.schema(), i.name());
+      } catch (IOException e) {
+        throw new CompileException(e.getMessage() == null ? e.toString() : e.getMessage());
+      }
+      if (!l.language().equals("java"))
+        throw new CompileException("library " + i.schema() + "." + i.name() + " is a "
+            + (l.language().equals("js") ? "JavaScript" : "Python")
+            + " library: Java routines use Java libraries (other languages through Mle.context())");
+      libraries.add(new String[] {i.schema() + "." + i.name(), new String(l.body(), StandardCharsets.UTF_8)});
+    }
+    prepareWith(id, routineName, entry, source, params, ret, libraries);
+  }
+
+  /** CREATE LIBRARY ... LANGUAGE JAVA: compiles the library alone; the error or null. */
+  String checkLibrary(String name, String source) {
+    try {
+      compile(source, 0, name, List.of());
+      return null;
+    } catch (CompileException e) {
+      return e.getMessage();
+    }
+  }
+
+  private void prepareWith(long id, String routineName, String entry, String source, List<Param> params,
+      Values.ParamType ret, List<String[]> libraries) throws CompileException {
     int n = params.size();
     String name = routineName.isEmpty() ? "routine_" + id : routineName;
     boolean bodyForm = entry.isEmpty() && !PUBLIC_TYPE.matcher(source).find();
@@ -243,7 +281,7 @@ final class JavaRoutines {
       prefix = wrap[0].length();
       unit = wrap[0] + source + wrap[1];
     }
-    Map<String, byte[]> classes = compile(unit, prefix, bodyForm ? name : null);
+    Map<String, byte[]> classes = compile(unit, prefix, bodyForm ? name : null, libraries);
     RoutineLoader loader = new RoutineLoader(id, apiLoader, classes);
     origins.put(LOADER_PREFIX + id, new Origin(name, bodyForm));
 
@@ -366,11 +404,27 @@ final class JavaRoutines {
     }
   }
 
+  /** A compilation unit for javac: the path of its public type. */
+  private static JavaFileObject unit(String source, String fallbackType) {
+    Matcher t = PUBLIC_TYPE.matcher(source);
+    String typeName = t.find() ? t.group(1) : fallbackType;
+    String pkg = packageOf(source);
+    String path = (pkg.isEmpty() ? "" : pkg.replace('.', '/') + "/") + typeName;
+    return new SimpleJavaFileObject(URI.create("string:///" + path + ".java"), JavaFileObject.Kind.SOURCE) {
+      @Override
+      public CharSequence getCharContent(boolean ignoreEncodingErrors) {
+        return source;
+      }
+    };
+  }
+
   /**
-   * Compiles a unit; prefix: wrapper text before the routine body on line 1 (body form), display:
-   * the file name in error messages (null: the class's).
+   * Compiles a unit with the routine's Java libraries ({name, source}); prefix: wrapper text before
+   * the routine body on line 1 (body form), display: the file name in error messages (null: the
+   * class's).
    */
-  private Map<String, byte[]> compile(String source, int prefix, String display) throws CompileException {
+  private Map<String, byte[]> compile(String source, int prefix, String display, List<String[]> libraries)
+      throws CompileException {
     if (javac == null) {
       javac = ToolProvider.getSystemJavaCompiler();
       if (javac == null) throw new CompileException("no Java compiler in this JDK (module jdk.compiler)");
@@ -403,14 +457,25 @@ final class JavaRoutines {
       }
     };
     DiagnosticCollector<JavaFileObject> diags = new DiagnosticCollector<>();
-    boolean ok = javac.getTask(null, fm, diags, options, null, List.of(unit)).call();
+    List<JavaFileObject> units = new ArrayList<>();
+    units.add(unit);
+    Map<JavaFileObject, String> libraryNames = new HashMap<>();
+    for (String[] lib : libraries) {
+      JavaFileObject u = unit(lib[1], "Library");
+      units.add(u);
+      libraryNames.put(u, lib[0]);
+    }
+    boolean ok = javac.getTask(null, fm, diags, options, null, units).call();
     if (!ok) {
       StringBuilder msg = new StringBuilder();
       for (Diagnostic<? extends JavaFileObject> d : diags.getDiagnostics()) {
         if (d.getKind() != Diagnostic.Kind.ERROR) continue;
         if (!msg.isEmpty()) msg.append('\n');
-        long column = d.getLineNumber() == 1 ? Math.max(1, d.getColumnNumber() - prefix) : d.getColumnNumber();
-        msg.append(display != null ? display : typeName + ".java").append(':').append(d.getLineNumber()).append(':').append(column)
+        String library = d.getSource() == null ? null : libraryNames.get(d.getSource());
+        long column = library == null && d.getLineNumber() == 1 ? Math.max(1, d.getColumnNumber() - prefix)
+            : d.getColumnNumber();
+        msg.append(library != null ? "library " + library : display != null ? display : typeName + ".java")
+            .append(':').append(d.getLineNumber()).append(':').append(column)
             .append(": ").append(d.getMessage(Locale.ROOT));
       }
       throw new CompileException(msg.isEmpty() ? "compilation failed" : msg.toString());

@@ -67,7 +67,11 @@ final class PySql implements GuestSql.Lang {
   private final Value throwSql;
   private final Value throwError;
 
-  PySql(Context c, Options options) {
+  /** Python libraries (Phase 6): a module from a body, cached per worker; a global binding. */
+  final Value loadLibrary;
+  final Value bind;
+
+  PySql(Context c, Options options, ProxyExecutable library) {
     this.options = options;
     GuestSql.GSession session = new GuestSql.GSession(this);
     Map<String, Object> bridge = Map.of(
@@ -76,7 +80,8 @@ final class PySql implements GuestSql.Lang {
         "sleep", (ProxyExecutable) a -> Functions.sleep(a[0].asDouble()),
         "uuid", (ProxyExecutable) a -> Functions.uuid(),
         "isUUID", (ProxyExecutable) a -> Functions.isUUID(a[0].isNull() ? null : a[0].asString()),
-        "arg", (ProxyExecutable) a -> new GuestSql.GArgument(this, a.length == 0 ? null : a[0]));
+        "arg", (ProxyExecutable) a -> new GuestSql.GArgument(this, a.length == 0 ? null : a[0]),
+        "library", library);
     Value h = c.eval(Source.create("python", PRELUDE)).execute(ProxyObject.fromMap(bridge));
     list = h.getHashValue("list");
     bigint = h.getHashValue("bigint");
@@ -90,6 +95,8 @@ final class PySql implements GuestSql.Lang {
     kind = h.getHashValue("kind");
     throwSql = h.getHashValue("throw_sql");
     throwError = h.getHashValue("throw_error");
+    loadLibrary = h.getHashValue("load_library");
+    bind = h.getHashValue("bind");
   }
 
   private static final String PRELUDE = """
@@ -133,7 +140,31 @@ final class PySql implements GuestSql.Lang {
               DecimalType=ns(STRING='STRING', NUMBER='NUMBER'),
               Type=ns(**{t: t for t in types}),
               SQLError=SqlError, SqlError=SqlError)
-          _mle_globals.update(session=B.session, mysql=mysql, SqlError=SqlError)
+          # Database libraries (Phase 6): import_library('/db/lib') or ('db.lib') gives the
+          # library's module (a Python module, or a JavaScript library's namespace).
+          def import_library(path):
+              p = str(path).strip('/').replace('/', '.')
+              schema, _, name = p.partition('.')
+              if not name:
+                  raise ValueError("a library is '/schema/name' or 'schema.name', not %r" % path)
+              return B.library(schema, name)
+
+          _mle_globals.update(session=B.session, mysql=mysql, SqlError=SqlError, import_library=import_library)
+
+          cache = {}
+
+          def load_library(key, h, src):
+              hit = cache.get(key)
+              if hit is not None and hit[0] == h:
+                  return hit[1]
+              m = _mle_types.ModuleType(key)
+              m.__dict__.update(_mle_globals)
+              exec(compile(src, key, 'exec'), m.__dict__)
+              cache[key] = (h, m)
+              return m
+
+          def bind(fn, name, value):
+              fn.__globals__[name] = value
 
           def throw_sql(code, state, message):
               raise SqlError(state, message, code)
@@ -194,6 +225,7 @@ final class PySql implements GuestSql.Lang {
               'bytes': lambda s: s.encode('latin-1'), 'vector': vector, 'json': _mle_json.loads,
               'date': _mle_dt.date.fromisoformat, 'datetime': _mle_dt.datetime.fromisoformat,
               'timedelta': timedelta, 'kind': kind, 'throw_sql': throw_sql, 'throw_error': throw_error,
+              'load_library': load_library, 'bind': bind,
           }
 
       _mle_sql_api

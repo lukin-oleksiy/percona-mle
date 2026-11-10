@@ -75,19 +75,19 @@ final class LibraryFileSystem implements FileSystem {
       Pattern.quote(ROOT) + "/([^/]+)/([^/.]+)(?:\\.([0-9a-f]+))?\\.mjs");
 
   private final FileSystem delegate;
-  /** By "schema/name": the newest body seen. */
-  private final Map<String, Library> libraries = new HashMap<>();
+  /** By "schema/name": the newest body seen (one Context per worker). */
+  private static final Map<String, Library> libraries = new HashMap<>();
 
   LibraryFileSystem(FileSystem delegate) {
     this.delegate = delegate;
   }
 
-  /** Python and Java libraries need the body itself (see Polyglot). */
-  Library library(String schema, String name) throws IOException {
+  /** A library's current body (Python and Java libraries, cross-language USING). */
+  static Library library(String schema, String name) throws IOException {
     return fetch(schema, name);
   }
 
-  private Library fetch(String schema, String name) throws IOException {
+  private static Library fetch(String schema, String name) throws IOException {
     Dispatcher d = SqlBridge.dispatcher;
     String key = schema + "/" + name;
     Library known = libraries.get(key);

@@ -95,6 +95,9 @@ final class JsOracle {
               return s;
             },
             rethrow: (e) => { throw e; },
+            // USING (Phase 6): a JavaScript library is imported; others come from the host
+            // (libBridge: a Python library's module).
+            lib: function (s, n, p) { const m = this.libBridge(s, n); return m === null ? import(p) : m; },
             str: (v) => String(v),
             json_text: (v) => {
               if (typeof v === 'string') return JSON.stringify(JSON.parse(v));
@@ -161,7 +164,8 @@ final class JsOracle {
     // The body runs in an arrow function: it may return early, and its own
     // declarations (Oracle's myfunc: "var x") shadow the parameters.
     for (LibraryFileSystem.Import i : imports)
-      pre.append("const ").append(i.binding()).append("=await import(").append(jsString(i.path())).append(");");
+      pre.append("const ").append(i.binding()).append("=await $c.lib(").append(jsString(i.schema())).append(',')
+          .append(jsString(i.name())).append(',').append(jsString(i.path())).append(");");
     pre.append("const $r=").append(async ? "await(async()=>{" : "(()=>{");
     StringBuilder post = new StringBuilder("\n");
     if (outCount == 0) {
