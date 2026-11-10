@@ -32,7 +32,7 @@ constexpr size_t kMinValue = 1;                      // tag only (NULL)
 constexpr size_t kMinStr = 4;                        // empty string
 constexpr size_t kMinParamType = 1 + 1 + 4 + 4 + 4 + kMinStr;  // tag .. name
 constexpr size_t kMinParam = kMinStr + 1 + kMinParamType;
-constexpr size_t kMinColumn = 2 * kMinStr + kMinParamType;
+constexpr size_t kMinColumn = 7 * kMinStr + kMinParamType + 4;
 constexpr size_t kMinFrame = 2 * kMinStr + 4 + 4 + 4;
 constexpr size_t kMinWarning = 4 + 4 + kMinStr;
 constexpr size_t kMinOutParam = 4 + kMinValue;
@@ -620,15 +620,25 @@ bool decode(std::string_view body, ResultMsg *m, std::string *error) {
 void encode(const SqlMsg &m, std::string *out) {
   out->clear();
   Writer w(out);
+  w.u8(static_cast<uint8_t>(m.action));
+  w.u64(m.stmt_id);
   w.str(m.statement);
   put_values(w, m.params);
+  w.u8(m.flags);
   w.u32(m.max_rows);
 }
 
 bool decode(std::string_view body, SqlMsg *m, std::string *error) {
   return decode_with<SqlMsg>(body, m, error, [](Reader &r, SqlMsg *x) {
-    return r.str(&x->statement) && get_values(r, &x->params) &&
-           r.u32(&x->max_rows);
+    uint8_t action;
+    if (!r.u8(&action)) return false;
+    if (action > wire::kMaxSqlAction) return r.fail("bad SQL action");
+    x->action = static_cast<wire::SqlAction>(action);
+    if (!r.u64(&x->stmt_id) || !r.str(&x->statement) ||
+        !get_values(r, &x->params) || !r.u8(&x->flags) || !r.u32(&x->max_rows))
+      return false;
+    if ((x->flags & ~wire::kKnownSqlFlags) != 0) return r.fail("unknown SQL flags");
+    return true;
   });
 }
 
@@ -646,6 +656,9 @@ void encode(const SqlResultMsg &m, std::string *out) {
       w.u64(m.affected_rows);
       w.u64(m.insert_id);
       put_warnings(w, m.warnings);
+      w.u8(m.more_results ? 1 : 0);
+      w.u32(m.param_count);
+      w.u64(m.exec_us);
       return;
     case SqlResultKind::kRows: {
       w.u32(static_cast<uint32_t>(m.columns.size()));
@@ -653,12 +666,20 @@ void encode(const SqlResultMsg &m, std::string *out) {
         w.str(c.name);
         w.str(c.table);
         put_param_type(w, c.type);
+        w.str(c.org_name);
+        w.str(c.schema);
+        w.str(c.org_table);
+        w.str(c.charset);
+        w.str(c.collation);
+        w.u32(c.flags);
       }
       const size_t ncols = m.columns.size();
       w.u32(static_cast<uint32_t>(ncols == 0 ? 0 : m.rows.size() / ncols));
       for (const Value &v : m.rows) w.value(v);
       w.u8(m.more ? 1 : 0);
+      w.u8(m.more_results ? 1 : 0);
       put_warnings(w, m.warnings);
+      w.u64(m.exec_us);
       return;
     }
   }
@@ -679,7 +700,8 @@ bool decode(std::string_view body, SqlResultMsg *m, std::string *error) {
           case static_cast<uint8_t>(SqlResultKind::kOk):
             x->kind = SqlResultKind::kOk;
             return r.u64(&x->affected_rows) && r.u64(&x->insert_id) &&
-                   get_warnings(r, &x->warnings);
+                   get_warnings(r, &x->warnings) && r.flag(&x->more_results) &&
+                   r.u32(&x->param_count) && r.u64(&x->exec_us);
           case static_cast<uint8_t>(SqlResultKind::kRows): {
             x->kind = SqlResultKind::kRows;
             uint32_t ncols, nrows;
@@ -688,7 +710,10 @@ bool decode(std::string_view body, SqlResultMsg *m, std::string *error) {
             x->columns.resize(ncols);
             for (Column &c : x->columns)
               if (!r.str(&c.name) || !r.str(&c.table) ||
-                  !get_param_type(r, &c.type))
+                  !get_param_type(r, &c.type) || !r.str(&c.org_name) ||
+                  !r.str(&c.schema) || !r.str(&c.org_table) ||
+                  !r.str(&c.charset) || !r.str(&c.collation) ||
+                  !r.u32(&c.flags))
                 return false;
             if (!r.u32(&nrows)) return false;
             const uint64_t nvalues = uint64_t{nrows} * ncols;
@@ -699,23 +724,13 @@ bool decode(std::string_view body, SqlResultMsg *m, std::string *error) {
             x->rows.resize(nvalues);
             for (Value &v : x->rows)
               if (!r.value(&v)) return false;
-            return r.flag(&x->more) && get_warnings(r, &x->warnings);
+            return r.flag(&x->more) && r.flag(&x->more_results) &&
+                   get_warnings(r, &x->warnings) && r.u64(&x->exec_us);
           }
           default:
             return r.fail("bad SQL result kind");
         }
       });
-}
-
-void encode(const FetchMsg &m, std::string *out) {
-  out->clear();
-  Writer(out).u32(m.max_rows);
-}
-
-bool decode(std::string_view body, FetchMsg *m, std::string *error) {
-  return decode_with<FetchMsg>(body, m, error, [](Reader &r, FetchMsg *x) {
-    return r.u32(&x->max_rows);
-  });
 }
 
 void encode(const DropMsg &m, std::string *out) {

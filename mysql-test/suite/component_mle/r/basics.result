@@ -25,6 +25,10 @@ mle.max_workers	64
 mle.memory_max	2147483648
 mle.pool_size	1
 mle.spin_us	50
+mle.sql_chunk_rows	1000
+mle.sql_result_max	67108864
+mle.sql_row_max	16777216
+mle.sql_statements_max	1024
 SELECT @@mle.dir = CONCAT(TRIM(TRAILING '/' FROM @@plugin_dir), '/mle') AS default_dir;
 default_dir
 1

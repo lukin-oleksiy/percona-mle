@@ -143,9 +143,20 @@ struct Param {
 };
 
 struct Column {
+  Column() = default;
+  Column(std::string name_, std::string table_, ParamType type_)
+      : name(std::move(name_)), table(std::move(table_)), type(std::move(type_)) {}
+
+  /** The label (alias) and the table's alias. */
   std::string name;
   std::string table;
   ParamType type;
+  std::string org_name;
+  std::string schema;
+  std::string org_table;
+  std::string charset;
+  std::string collation;
+  uint32_t flags = 0;
   bool operator==(const Column &) const = default;
 };
 
@@ -216,8 +227,11 @@ struct ResultMsg {
 };
 
 struct SqlMsg {
+  wire::SqlAction action = wire::SqlAction::kExecute;
+  uint64_t stmt_id = 0;
   std::string statement;
   std::vector<Value> params;
+  uint8_t flags = 0;
   uint32_t max_rows = 0;
   bool operator==(const SqlMsg &) const = default;
 };
@@ -237,13 +251,12 @@ struct SqlResultMsg {
   std::vector<Value> rows;
   bool more = false;
   // kOk and kRows
+  bool more_results = false;
   std::vector<Warning> warnings;
+  uint64_t exec_us = 0;
+  // kOk after kPrepare
+  uint32_t param_count = 0;
   bool operator==(const SqlResultMsg &) const = default;
-};
-
-struct FetchMsg {
-  uint32_t max_rows = 0;
-  bool operator==(const FetchMsg &) const = default;
 };
 
 struct DropMsg {
@@ -265,7 +278,6 @@ void encode(const CallMsg &m, std::string *out);
 void encode(const ResultMsg &m, std::string *out);
 void encode(const SqlMsg &m, std::string *out);
 void encode(const SqlResultMsg &m, std::string *out);
-void encode(const FetchMsg &m, std::string *out);
 void encode(const DropMsg &m, std::string *out);
 void encode(const OptionsMsg &m, std::string *out);
 
@@ -275,7 +287,6 @@ bool decode(std::string_view body, CallMsg *m, std::string *error);
 bool decode(std::string_view body, ResultMsg *m, std::string *error);
 bool decode(std::string_view body, SqlMsg *m, std::string *error);
 bool decode(std::string_view body, SqlResultMsg *m, std::string *error);
-bool decode(std::string_view body, FetchMsg *m, std::string *error);
 bool decode(std::string_view body, DropMsg *m, std::string *error);
 bool decode(std::string_view body, OptionsMsg *m, std::string *error);
 

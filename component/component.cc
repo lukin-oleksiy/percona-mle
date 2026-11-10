@@ -47,6 +47,7 @@
 #include <mysql/components/services/mysql_runtime_warning.h>
 #include <mysql/components/services/mysql_stored_program.h>
 #include <mysql/components/services/mysql_current_thread_reader.h>
+#include <mysql/components/services/mysql_statement_service.h>
 #include <mysql/components/services/mysql_string.h>
 #include <mysql/components/services/mysql_system_variable.h>
 #include <mysql/components/services/dynamic_privilege.h>
@@ -94,6 +95,20 @@ REQUIRES_SERVICE_PLACEHOLDER(dynamic_privilege_register);
 REQUIRES_SERVICE_PLACEHOLDER(global_grants_check);
 REQUIRES_SERVICE_PLACEHOLDER(udf_registration);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_udf_metadata);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_factory);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_execute);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_execute_direct);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_bind);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_result);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_resultset_metadata);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_metadata);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_diagnostics);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_attributes);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_get_string);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_get_integer);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_get_double);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_get_unsigned_integer);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_get_time);
 REQUIRES_SERVICE_PLACEHOLDER(log_builtins);
 REQUIRES_SERVICE_PLACEHOLDER(log_builtins_string);
 
@@ -309,6 +324,20 @@ BEGIN_COMPONENT_REQUIRES(mle)
   REQUIRES_SERVICE(global_grants_check),
   REQUIRES_SERVICE(udf_registration),
   REQUIRES_SERVICE(mysql_udf_metadata),
+  REQUIRES_SERVICE(mysql_stmt_factory),
+  REQUIRES_SERVICE(mysql_stmt_execute),
+  REQUIRES_SERVICE(mysql_stmt_execute_direct),
+  REQUIRES_SERVICE(mysql_stmt_bind),
+  REQUIRES_SERVICE(mysql_stmt_result),
+  REQUIRES_SERVICE(mysql_stmt_resultset_metadata),
+  REQUIRES_SERVICE(mysql_stmt_metadata),
+  REQUIRES_SERVICE(mysql_stmt_diagnostics),
+  REQUIRES_SERVICE(mysql_stmt_attributes),
+  REQUIRES_SERVICE(mysql_stmt_get_string),
+  REQUIRES_SERVICE(mysql_stmt_get_integer),
+  REQUIRES_SERVICE(mysql_stmt_get_double),
+  REQUIRES_SERVICE(mysql_stmt_get_unsigned_integer),
+  REQUIRES_SERVICE(mysql_stmt_get_time),
   REQUIRES_SERVICE(log_builtins),
   REQUIRES_SERVICE(log_builtins_string),
 END_COMPONENT_REQUIRES();

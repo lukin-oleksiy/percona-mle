@@ -151,6 +151,8 @@ struct TypeQuery {
   }
 };
 
+}  // namespace
+
 const char *sql_type_name(uint64_t t) {
   switch (t) {
     case MYSQL_SP_ARG_TYPE_TINY:
@@ -205,6 +207,8 @@ const char *sql_type_name(uint64_t t) {
       return "";
   }
 }
+
+namespace {
 
 /** Fills info from the metadata; false after reporting an unsupported
     type. what: "parameter 'a'" or "return value". */

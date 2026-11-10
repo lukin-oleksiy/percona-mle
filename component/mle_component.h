@@ -93,6 +93,12 @@ unsigned enabled_languages();
 uint32_t max_workers();
 int spin_us();
 int interrupt_grace_ms();
+/** SQL from routines (sql.cc): mle.sql_result_max, mle.sql_row_max,
+    mle.sql_statements_max, mle.sql_chunk_rows. */
+size_t sql_result_max();
+size_t sql_row_max();
+size_t sql_statements_max();
+uint32_t sql_chunk_rows();
 
 /* status.cc: the mle_* status variables. */
 bool register_status();

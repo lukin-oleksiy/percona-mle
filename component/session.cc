@@ -66,15 +66,14 @@ constexpr size_t kConsoleKeep = 64 * 1024;
 /** The SQL layer's side of a call: SQL from routines (Phase 5) and KILL. */
 class Hooks : public mle::CallHooks {
  public:
-  explicit Hooks(MYSQL_THD thd) : m_thd(thd) {}
+  explicit Hooks(MYSQL_THD thd, SqlRunner *sql = nullptr)
+      : m_thd(thd), m_sql(sql) {}
 
-  void sql(const mle::SqlMsg &, mle::SqlResultMsg *r) override {
-    r->kind = mle::SqlResultKind::kError;
-    r->sql_errno = ER_NOT_SUPPORTED_YET;
-    r->sqlstate = "42000";
-    r->message =
-        "This version of MySQL doesn't yet support 'SQL statements in MLE "
-        "routines'";
+  /** SQL from the routine (Phase 5): the call's statements (sql.cc). */
+  void sql(const mle::SqlMsg &m, mle::SqlResultMsg *r) override {
+    if (m_sql != nullptr) return m_sql->handle(m, r);
+    sql_error(r, ER_LANGUAGE_COMPONENT_INTERNAL,
+              "SQL is only possible while a routine runs");
   }
 
   /** KILL QUERY / KILL CONNECTION / max_execution_time. */
@@ -86,6 +85,7 @@ class Hooks : public mle::CallHooks {
 
  private:
   MYSQL_THD m_thd;
+  SqlRunner *m_sql;
 };
 
 std::string session_time_zone(MYSQL_THD thd) {
@@ -112,22 +112,45 @@ void append_capped(std::string *buffer, const std::string &more) {
     at once (the worker's killed() polling is the backstop). */
 class Session::KillGuard {
  public:
-  KillGuard(MYSQL_THD thd, mle::Worker *worker) : m_thd(thd) {
-    (void)mysql_service_mysql_thd_kill_handler->set(
-        thd,
-        [](MYSQL_THD, uint16_t, void *data) {
-          static_cast<mle::Worker *>(data)->interrupt();
-        },
-        worker);
+  KillGuard(Session *s, mle::Worker *worker) : m_session(s) {
+    const size_t n = s->m_running_n.load();
+    m_pushed = n < kMaxNesting;
+    if (m_pushed) {
+      s->m_running[n].store(worker);
+      s->m_running_n.store(n + 1);
+    }
+    if (n == 0) {
+      // Fails if another component's handler is installed (e.g. a V8
+      // routine called us): the workers' KILL polling still works.
+      s->m_kill_installed = !mysql_service_mysql_thd_kill_handler->set(
+          s->m_thd,
+          [](MYSQL_THD, uint16_t, void *data) {
+            auto *session = static_cast<Session *>(data);
+            const size_t count = session->m_running_n.load();
+            for (size_t i = 0; i < count && i < kMaxNesting; i++)
+              if (mle::Worker *w = session->m_running[i].load()) w->interrupt();
+          },
+          s);
+    }
   }
   ~KillGuard() {
-    (void)mysql_service_mysql_thd_kill_handler->set(m_thd, nullptr, nullptr);
+    if (m_pushed) {
+      const size_t n = m_session->m_running_n.load() - 1;
+      m_session->m_running[n].store(nullptr);
+      m_session->m_running_n.store(n);
+    }
+    if (m_session->m_running_n.load() == 0 && m_session->m_kill_installed) {
+      (void)mysql_service_mysql_thd_kill_handler->set(m_session->m_thd,
+                                                      nullptr, nullptr);
+      m_session->m_kill_installed = false;
+    }
   }
   KillGuard(const KillGuard &) = delete;
   KillGuard &operator=(const KillGuard &) = delete;
 
  private:
-  MYSQL_THD m_thd;
+  Session *m_session;
+  bool m_pushed = false;
 };
 
 // ------------------------------------------------------------- lifetime
@@ -278,7 +301,7 @@ bool Session::prepare_in(const std::string &principal, Slot &slot,
   std::string error;
   Status s;
   {
-    const KillGuard kill(m_thd, slot.worker.get());
+    const KillGuard kill(this, slot.worker.get());
     s = slot.worker->prepare(routine.prepare, hooks, &result, &error);
   }
   keep_console(result);
@@ -308,19 +331,21 @@ bool Session::execute(Routine &routine) {
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr || !prepare_in(who, *slot, routine)) return false;
 
-  Hooks hooks(m_thd);
+  SqlRunner sql(m_thd);  // the call's statements; closed when it returns
+  Hooks hooks(m_thd, &sql);
   ResultMsg result;
   std::string error;
   raise_max(g_counters.threads_max, ++g_counters.threads);
   Status s;
   {
-    const KillGuard kill(m_thd, slot->worker.get());
+    const KillGuard kill(this, slot->worker.get());
     s = slot->worker->call(routine.id, 0, args, hooks, &result, &error);
   }
   --g_counters.threads;
   keep_console(result);
   const bool ok = s == Status::kOk;
-  if (!ok) report(who, s, result, error, routine, &args);
+  if (ok) sql.call_succeeded();
+  else report(who, s, result, error, routine, &args, &sql);
   args.clear();
   m_args = std::move(args);
   return ok && routine.store_results(result);
@@ -347,18 +372,22 @@ void Session::keep_console(const ResultMsg &result) {
 
 void Session::report(const std::string &principal, Status status,
                      const ResultMsg &result, const std::string &error,
-                     const Routine &routine, const std::vector<Value> *args) {
+                     const Routine &routine, const std::vector<Value> *args,
+                     SqlRunner *sql) {
   const mle::Error *e = result.error ? &*result.error : nullptr;
+  // A MySQL error from the routine (S-3, S-11): an inner statement's error
+  // still in the diagnostics area reaches the client unchanged; an
+  // SqlError the routine threw is raised like SIGNAL.
+  if (status == Status::kGuestError && e != nullptr && e->sql_errno != 0 &&
+      sql != nullptr) {
+    if (sql->propagates(*e) || sql->raise(*e)) return;
+  }
+  if (sql != nullptr) sql->clear();
   switch (status) {
     case Status::kGuestError:
     case Status::kExhausted: {
       if (status == Status::kExhausted) ++g_counters.oom_errors;
       if (e == nullptr) break;
-      if (e->sql_errno != 0) {
-        // A MySQL error that crossed the routine (Phase 5 SQL API).
-        my_error(ER_LANGUAGE_COMPONENT, MYF(0), e->message.c_str());
-        return;
-      }
       if (e->language == "MLE-Type") {
         std::string message = "MLE-Type> " + e->message;
         if (args != nullptr)

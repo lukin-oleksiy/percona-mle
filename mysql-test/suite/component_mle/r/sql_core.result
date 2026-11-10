@@ -1,0 +1,323 @@
+#
+# component_mle (P5-W2): SQL from routines through mysqld's statement
+# manager, driven from Java routines with the low-level client
+# com.percona.mle.api.MleSql (the languages' APIs come with P5-W3/W4).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t1 (id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(20), n INT);
+INSERT INTO t1 (v, n) VALUES ('one', 1), ('two', 2), ('three', 3);
+CREATE USER u1@localhost;
+GRANT SELECT ON test.t1 TO u1@localhost;
+GRANT EXECUTE ON test.* TO u1@localhost;
+CREATE TABLE secret (s VARCHAR(10));
+INSERT INTO secret VALUES ('hidden');
+SET SESSION cte_max_recursion_depth = 100000;
+#
+# 1. A query, its rows and metadata.
+#
+CREATE PROCEDURE q1(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.Reply x = MleSql.execute(MleSql.newStatementId(),
+"SELECT a.id AS ident, a.v, a.n FROM t1 a ORDER BY id", null, false, 0);
+StringBuilder s = new StringBuilder();
+for (MleSql.Column c : x.columns())
+s.append(c.name()).append('/').append(c.originalName()).append('/').append(c.table())
+.append('/').append(c.originalTable()).append('/').append(c.schema()).append('/')
+.append(c.type()).append(' ');
+for (Object[] row : x.rows()) s.append("\n").append(java.util.Arrays.toString(row));
+r[0] = s.toString();
+$$;
+CALL q1(@r);
+SELECT @r;
+@r
+ident/id/a/t1/test/INT v/v/a/t1/test/VARCHAR n/n/a/t1/test/INT 
+[1, one, 1]
+[2, two, 2]
+[3, three, 3]
+# Values of all types. (A negative TIME loses its sign in results:
+# mysql_stmt_get_time drops mle_time::neg, a server bug noted for later.)
+CREATE PROCEDURE q2(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.Reply x = MleSql.execute(MleSql.newStatementId(),
+"SELECT -5, CAST(18446744073709551615 AS UNSIGNED), 2.5e0, CAST(1.25 AS DECIMAL(6,3)), " +
+"'héllo', x'00ff', CAST('{\"a\": 1}' AS JSON), DATE'2024-01-02', TIME'12:34:56', " +
+"TIMESTAMP'2024-01-02 03:04:05.678', STRING_TO_VECTOR('[1,2.5]'), b'101', NULL", null, false, 0);
+StringBuilder s = new StringBuilder();
+for (Object v : x.rows().get(0)) {
+String shown = v instanceof byte[] b ? java.util.HexFormat.of().formatHex(b)
+: v instanceof float[] f ? java.util.Arrays.toString(f) : String.valueOf(v);
+s.append(v == null ? "null" : v.getClass().getSimpleName()).append(':').append(shown).append('\n');
+}
+r[0] = s.toString();
+$$;
+CALL q2(@r);
+SELECT @r;
+@r
+Long:-5
+BigInteger:18446744073709551615
+Double:2.5
+BigDecimal:1.250
+String:héllo
+byte[]:00ff
+MleJson:{"a": 1}
+LocalDate:2024-01-02
+Duration:PT12H34M56S
+LocalDateTime:2024-01-02T03:04:05.678
+float[]:[1.0, 2.5]
+byte[]:05
+null:null
+
+#
+# 2. DML runs in the caller's transaction.
+#
+CREATE PROCEDURE ins(IN v VARCHAR(20), OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.Reply x = MleSql.execute(MleSql.newStatementId(),
+"INSERT INTO t1 (v, n) VALUES (?, 10)", new Object[] {v}, false, 0);
+r[0] = "affected=" + x.affectedRows() + " id=" + x.insertId();
+$$;
+START TRANSACTION;
+CALL ins('rolled back', @r);
+SELECT @r;
+@r
+affected=1 id=4
+ROLLBACK;
+CALL ins('kept', @r);
+# A negative TIME parameter (bound as text: the same server bug).
+CREATE PROCEDURE neg_time(OUT r TEXT) LANGUAGE JAVA AS $$
+r[0] = String.valueOf(MleSql.execute(MleSql.newStatementId(), "SELECT CAST(? AS CHAR)",
+new Object[] {java.time.Duration.ofHours(-12).minusMinutes(34)}, false, 0).rows().get(0)[0]);
+$$;
+CALL neg_time(@r);
+SELECT @r;
+@r
+-12:34:00.000000
+SELECT id, v FROM t1 WHERE n = 10;
+id	v
+5	kept
+#
+# 3. Prepared statements: partial re-binding, streaming in chunks.
+#
+CREATE PROCEDURE prep(OUT r TEXT) LANGUAGE JAVA AS $$
+long id = MleSql.newStatementId();
+MleSql.Reply p = MleSql.prepare(id, "SELECT ? * 100 + ?", false);
+String a = String.valueOf(MleSql.executePrepared(id, new Object[] {1, 2}, 0).rows().get(0)[0]);
+String b = String.valueOf(MleSql.executePrepared(id, new Object[] {10}, 0).rows().get(0)[0]);
+MleSql.close(id);
+r[0] = "params=" + p.parameterCount() + " first=" + a + " second=" + b;
+$$;
+CALL prep(@r);
+SELECT @r;
+@r
+params=2 first=102 second=1002
+CREATE PROCEDURE stream(OUT r TEXT) LANGUAGE JAVA AS $$
+long id = MleSql.newStatementId();
+MleSql.prepare(id, "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < ?) " +
+"SELECT n, REPEAT('x', 100) FROM c", false);
+MleSql.Reply x = MleSql.executePrepared(id, new Object[] {5000}, 300);
+long rows = x.rows().size(), chunks = 1, sum = 0;
+for (Object[] row : x.rows()) sum += (Long) row[0];
+while (x.moreRows()) {
+x = MleSql.fetch(id, 300);
+rows += x.rows().size();
+chunks++;
+for (Object[] row : x.rows()) sum += (Long) row[0];
+}
+r[0] = "rows=" + rows + " chunks=" + chunks + " sum=" + sum;
+$$;
+CALL stream(@r);
+SELECT @r;
+@r
+rows=5000 chunks=17 sum=12502500
+#
+# 4. Several result sets.
+#
+CREATE PROCEDURE two_sets() BEGIN SELECT 1 AS a; SELECT 'x' AS b, 'y' AS c; END|
+CREATE PROCEDURE multi(OUT r TEXT) LANGUAGE JAVA AS $$
+long id = MleSql.newStatementId();
+MleSql.Reply x = MleSql.execute(id, "CALL two_sets()", null, false, 0);
+StringBuilder s = new StringBuilder();
+while (true) {
+s.append(x.hasRows() ? "rows " + x.columns().size() + "x" + x.rows().size() : "ok").append("; ");
+if (!x.moreResults()) break;
+x = MleSql.nextResult(id);
+}
+r[0] = s.toString();
+$$;
+CALL multi(@r);
+SELECT @r;
+@r
+rows 1x1; rows 2x1; ok; 
+#
+# 5. passResultToClient: the result sets go to the client.
+#
+CREATE PROCEDURE to_client() LANGUAGE JAVA AS $$
+MleSql.execute(MleSql.newStatementId(), "SELECT v AS to_the_client FROM t1 WHERE id < 3 ORDER BY id", null, true, 0);
+MleSql.execute(MleSql.newStatementId(), "CALL two_sets()", null, true, 0);
+$$;
+CALL to_client();
+to_the_client
+one
+two
+a
+1
+b	c
+x	y
+#
+# 6. Errors: unchanged, caught, thrown (SIGNAL), and SQL in functions.
+#
+CREATE PROCEDURE e_uncaught() LANGUAGE JAVA AS $$
+MleSql.execute(MleSql.newStatementId(), "SELECT * FROM no_such_table", null, false, 0);
+$$;
+CALL e_uncaught();
+ERROR 42S02: Table 'test.no_such_table' doesn't exist
+SHOW WARNINGS;
+Level	Code	Message
+Error	1146	Table 'test.no_such_table' doesn't exist
+CREATE PROCEDURE e_caught(OUT r TEXT) LANGUAGE JAVA AS $$
+try {
+MleSql.execute(MleSql.newStatementId(), "SELECT * FROM no_such_table", null, false, 0);
+} catch (MleSqlException e) {
+r[0] = "caught " + e.getErrorCode() + " " + e.getSqlState() + "; ";
+}
+r[0] += MleSql.execute(MleSql.newStatementId(), "SELECT 'went on'", null, false, 0).rows().get(0)[0];
+$$;
+CALL e_caught(@r);
+SELECT @r;
+@r
+caught 1146 42S02; went on
+SHOW WARNINGS;
+Level	Code	Message
+CREATE PROCEDURE e_throw() LANGUAGE JAVA AS $$
+throw new MleSqlException(1000, "45000", "Some error");
+$$;
+CALL e_throw();
+ERROR 45000: Some error
+SHOW WARNINGS;
+Level	Code	Message
+Error	1000	Some error
+CREATE PROCEDURE e_bad_state() LANGUAGE JAVA AS $$
+throw new MleSqlException(1000, "00000", "not an error state");
+$$;
+CALL e_bad_state();
+ERROR HY000: Java> not an error state
+CREATE FUNCTION f_sql() RETURNS INT LANGUAGE JAVA AS $$
+return ((Long) MleSql.execute(MleSql.newStatementId(), "SELECT 1", null, false, 0).rows().get(0)[0]).intValue();
+$$;
+SELECT f_sql();
+ERROR HY000: Executing SQL statement using Regular Statement Handle Interface is not allowed within stored function, trigger or loadable function (UDF).
+# a function throwing an SqlError: SIGNAL is not possible there
+CREATE FUNCTION f_throw() RETURNS INT LANGUAGE JAVA AS $$
+throw new MleSqlException(1000, "45000", "from a function");
+$$;
+SELECT f_throw();
+ERROR HY000: Java> from a function
+SELECT 'session fine' AS after_errors;
+after_errors
+session fine
+#
+# 7. Limits.
+#
+CREATE PROCEDURE big(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.Reply x = MleSql.execute(MleSql.newStatementId(),
+"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 50000) " +
+"SELECT n, REPEAT('x', 100) FROM c", null, false, 0);
+r[0] = "rows=" + x.rows().size() + " more=" + x.moreRows();
+$$;
+CALL big(@r);
+SELECT @r;
+@r
+rows=50000 more=false
+SET GLOBAL mle.sql_result_max = 100000;
+CALL big(@r);
+ERROR HY000: Result size limit exceeded.
+SET GLOBAL mle.sql_result_max = DEFAULT;
+SET GLOBAL mle.sql_statements_max = 2;
+CREATE PROCEDURE many(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.prepare(MleSql.newStatementId(), "SELECT 1", false);
+MleSql.prepare(MleSql.newStatementId(), "SELECT 2", false);
+MleSql.prepare(MleSql.newStatementId(), "SELECT 3", false);
+$$;
+CALL many(@r);
+ERROR HY000: too many open statements (mle.sql_statements_max)
+SET GLOBAL mle.sql_statements_max = DEFAULT;
+# statements do not outlive their call
+CREATE PROCEDURE keep(INOUT id BIGINT) LANGUAGE JAVA AS $$
+if (id[0] == null) { id[0] = 1000000L; MleSql.prepare(id[0], "SELECT 1", false); }
+else MleSql.executePrepared(id[0], null, 0);
+$$;
+SET @id = NULL;
+CALL keep(@id);
+CALL keep(@id);
+ERROR HY000: no prepared statement with this id
+#
+# 8. Privileges: inner SQL runs as the routine's security context.
+#
+CREATE DEFINER = root@localhost PROCEDURE read_secret(OUT r TEXT)
+SQL SECURITY DEFINER LANGUAGE JAVA AS $$
+r[0] = (String) MleSql.execute(MleSql.newStatementId(), "SELECT s FROM test.secret", null, false, 0).rows().get(0)[0];
+$$;
+CREATE DEFINER = root@localhost PROCEDURE read_secret_invoker(OUT r TEXT)
+SQL SECURITY INVOKER LANGUAGE JAVA AS $$
+r[0] = (String) MleSql.execute(MleSql.newStatementId(), "SELECT s FROM test.secret", null, false, 0).rows().get(0)[0];
+$$;
+CALL read_secret(@r);
+SELECT @r;
+@r
+hidden
+CALL read_secret_invoker(@r);
+ERROR 42000: SELECT command denied to user 'u1'@'localhost' for table 'secret'
+#
+# 9. Nesting: SQL from a routine calls MLE routines (same worker, deeper).
+#
+CREATE FUNCTION js_twice(x INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 2 * x $$;
+CREATE PROCEDURE inner_p(OUT r TEXT) LANGUAGE JAVA AS $$
+r[0] = "inner:" + MleSql.execute(MleSql.newStatementId(), "SELECT js_twice(21)", null, false, 0).rows().get(0)[0];
+$$;
+CREATE PROCEDURE outer_p(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.execute(MleSql.newStatementId(), "CALL inner_p(@inner)", null, false, 0);
+r[0] = "outer got " + MleSql.execute(MleSql.newStatementId(), "SELECT @inner", null, false, 0).rows().get(0)[0];
+$$;
+CALL outer_p(@r);
+SELECT @r;
+@r
+outer got inner:42
+#
+# 10. KILL QUERY during an inner statement.
+#
+CREATE PROCEDURE sleeper(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.execute(MleSql.newStatementId(), "SELECT SLEEP(30)", null, false, 0);
+r[0] = "not reached";
+$$;
+CALL sleeper(@r);
+KILL QUERY CON1;
+ERROR 70100: Query execution was interrupted
+SELECT 'session fine' AS after_kill;
+after_kill
+session fine
+DROP TABLE t1, secret;
+DROP USER u1@localhost;
+DROP PROCEDURE q1;
+DROP PROCEDURE q2;
+DROP PROCEDURE ins;
+DROP PROCEDURE neg_time;
+DROP PROCEDURE prep;
+DROP PROCEDURE stream;
+DROP PROCEDURE two_sets;
+DROP PROCEDURE multi;
+DROP PROCEDURE to_client;
+DROP PROCEDURE e_uncaught;
+DROP PROCEDURE e_caught;
+DROP PROCEDURE e_throw;
+DROP PROCEDURE e_bad_state;
+DROP FUNCTION f_sql;
+DROP FUNCTION f_throw;
+DROP PROCEDURE big;
+DROP PROCEDURE many;
+DROP PROCEDURE keep;
+DROP PROCEDURE read_secret;
+DROP PROCEDURE read_secret_invoker;
+DROP FUNCTION js_twice;
+DROP PROCEDURE inner_p;
+DROP PROCEDURE outer_p;
+DROP PROCEDURE sleeper;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

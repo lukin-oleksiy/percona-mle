@@ -1,0 +1,299 @@
+--echo #
+--echo # component_mle (P5-W2): SQL from routines through mysqld's statement
+--echo # manager, driven from Java routines with the low-level client
+--echo # com.percona.mle.api.MleSql (the languages' APIs come with P5-W3/W4).
+--echo #
+--source include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t1 (id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(20), n INT);
+INSERT INTO t1 (v, n) VALUES ('one', 1), ('two', 2), ('three', 3);
+CREATE USER u1@localhost;
+GRANT SELECT ON test.t1 TO u1@localhost;
+GRANT EXECUTE ON test.* TO u1@localhost;
+CREATE TABLE secret (s VARCHAR(10));
+INSERT INTO secret VALUES ('hidden');
+
+--connect (con1, localhost, root,,test)
+SET SESSION cte_max_recursion_depth = 100000;
+
+--echo #
+--echo # 1. A query, its rows and metadata.
+--echo #
+CREATE PROCEDURE q1(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.Reply x = MleSql.execute(MleSql.newStatementId(),
+    "SELECT a.id AS ident, a.v, a.n FROM t1 a ORDER BY id", null, false, 0);
+StringBuilder s = new StringBuilder();
+for (MleSql.Column c : x.columns())
+  s.append(c.name()).append('/').append(c.originalName()).append('/').append(c.table())
+   .append('/').append(c.originalTable()).append('/').append(c.schema()).append('/')
+   .append(c.type()).append(' ');
+for (Object[] row : x.rows()) s.append("\n").append(java.util.Arrays.toString(row));
+r[0] = s.toString();
+$$;
+CALL q1(@r);
+SELECT @r;
+
+--echo # Values of all types. (A negative TIME loses its sign in results:
+--echo # mysql_stmt_get_time drops mle_time::neg, a server bug noted for later.)
+CREATE PROCEDURE q2(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.Reply x = MleSql.execute(MleSql.newStatementId(),
+    "SELECT -5, CAST(18446744073709551615 AS UNSIGNED), 2.5e0, CAST(1.25 AS DECIMAL(6,3)), " +
+    "'héllo', x'00ff', CAST('{\"a\": 1}' AS JSON), DATE'2024-01-02', TIME'12:34:56', " +
+    "TIMESTAMP'2024-01-02 03:04:05.678', STRING_TO_VECTOR('[1,2.5]'), b'101', NULL", null, false, 0);
+StringBuilder s = new StringBuilder();
+for (Object v : x.rows().get(0)) {
+  String shown = v instanceof byte[] b ? java.util.HexFormat.of().formatHex(b)
+      : v instanceof float[] f ? java.util.Arrays.toString(f) : String.valueOf(v);
+  s.append(v == null ? "null" : v.getClass().getSimpleName()).append(':').append(shown).append('\n');
+}
+r[0] = s.toString();
+$$;
+CALL q2(@r);
+SELECT @r;
+
+--echo #
+--echo # 2. DML runs in the caller's transaction.
+--echo #
+CREATE PROCEDURE ins(IN v VARCHAR(20), OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.Reply x = MleSql.execute(MleSql.newStatementId(),
+    "INSERT INTO t1 (v, n) VALUES (?, 10)", new Object[] {v}, false, 0);
+r[0] = "affected=" + x.affectedRows() + " id=" + x.insertId();
+$$;
+START TRANSACTION;
+CALL ins('rolled back', @r);
+SELECT @r;
+ROLLBACK;
+CALL ins('kept', @r);
+--echo # A negative TIME parameter (bound as text: the same server bug).
+CREATE PROCEDURE neg_time(OUT r TEXT) LANGUAGE JAVA AS $$
+r[0] = String.valueOf(MleSql.execute(MleSql.newStatementId(), "SELECT CAST(? AS CHAR)",
+    new Object[] {java.time.Duration.ofHours(-12).minusMinutes(34)}, false, 0).rows().get(0)[0]);
+$$;
+CALL neg_time(@r);
+SELECT @r;
+SELECT id, v FROM t1 WHERE n = 10;
+
+--echo #
+--echo # 3. Prepared statements: partial re-binding, streaming in chunks.
+--echo #
+CREATE PROCEDURE prep(OUT r TEXT) LANGUAGE JAVA AS $$
+long id = MleSql.newStatementId();
+MleSql.Reply p = MleSql.prepare(id, "SELECT ? * 100 + ?", false);
+String a = String.valueOf(MleSql.executePrepared(id, new Object[] {1, 2}, 0).rows().get(0)[0]);
+String b = String.valueOf(MleSql.executePrepared(id, new Object[] {10}, 0).rows().get(0)[0]);
+MleSql.close(id);
+r[0] = "params=" + p.parameterCount() + " first=" + a + " second=" + b;
+$$;
+CALL prep(@r);
+SELECT @r;
+CREATE PROCEDURE stream(OUT r TEXT) LANGUAGE JAVA AS $$
+long id = MleSql.newStatementId();
+MleSql.prepare(id, "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < ?) " +
+    "SELECT n, REPEAT('x', 100) FROM c", false);
+MleSql.Reply x = MleSql.executePrepared(id, new Object[] {5000}, 300);
+long rows = x.rows().size(), chunks = 1, sum = 0;
+for (Object[] row : x.rows()) sum += (Long) row[0];
+while (x.moreRows()) {
+  x = MleSql.fetch(id, 300);
+  rows += x.rows().size();
+  chunks++;
+  for (Object[] row : x.rows()) sum += (Long) row[0];
+}
+r[0] = "rows=" + rows + " chunks=" + chunks + " sum=" + sum;
+$$;
+CALL stream(@r);
+SELECT @r;
+
+--echo #
+--echo # 4. Several result sets.
+--echo #
+DELIMITER |;
+CREATE PROCEDURE two_sets() BEGIN SELECT 1 AS a; SELECT 'x' AS b, 'y' AS c; END|
+DELIMITER ;|
+CREATE PROCEDURE multi(OUT r TEXT) LANGUAGE JAVA AS $$
+long id = MleSql.newStatementId();
+MleSql.Reply x = MleSql.execute(id, "CALL two_sets()", null, false, 0);
+StringBuilder s = new StringBuilder();
+while (true) {
+  s.append(x.hasRows() ? "rows " + x.columns().size() + "x" + x.rows().size() : "ok").append("; ");
+  if (!x.moreResults()) break;
+  x = MleSql.nextResult(id);
+}
+r[0] = s.toString();
+$$;
+CALL multi(@r);
+SELECT @r;
+
+--echo #
+--echo # 5. passResultToClient: the result sets go to the client.
+--echo #
+CREATE PROCEDURE to_client() LANGUAGE JAVA AS $$
+MleSql.execute(MleSql.newStatementId(), "SELECT v AS to_the_client FROM t1 WHERE id < 3 ORDER BY id", null, true, 0);
+MleSql.execute(MleSql.newStatementId(), "CALL two_sets()", null, true, 0);
+$$;
+CALL to_client();
+
+--echo #
+--echo # 6. Errors: unchanged, caught, thrown (SIGNAL), and SQL in functions.
+--echo #
+CREATE PROCEDURE e_uncaught() LANGUAGE JAVA AS $$
+MleSql.execute(MleSql.newStatementId(), "SELECT * FROM no_such_table", null, false, 0);
+$$;
+--error ER_NO_SUCH_TABLE
+CALL e_uncaught();
+SHOW WARNINGS;
+CREATE PROCEDURE e_caught(OUT r TEXT) LANGUAGE JAVA AS $$
+try {
+  MleSql.execute(MleSql.newStatementId(), "SELECT * FROM no_such_table", null, false, 0);
+} catch (MleSqlException e) {
+  r[0] = "caught " + e.getErrorCode() + " " + e.getSqlState() + "; ";
+}
+r[0] += MleSql.execute(MleSql.newStatementId(), "SELECT 'went on'", null, false, 0).rows().get(0)[0];
+$$;
+CALL e_caught(@r);
+SELECT @r;
+SHOW WARNINGS;
+CREATE PROCEDURE e_throw() LANGUAGE JAVA AS $$
+throw new MleSqlException(1000, "45000", "Some error");
+$$;
+--error 1000
+CALL e_throw();
+SHOW WARNINGS;
+CREATE PROCEDURE e_bad_state() LANGUAGE JAVA AS $$
+throw new MleSqlException(1000, "00000", "not an error state");
+$$;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CALL e_bad_state();
+CREATE FUNCTION f_sql() RETURNS INT LANGUAGE JAVA AS $$
+return ((Long) MleSql.execute(MleSql.newStatementId(), "SELECT 1", null, false, 0).rows().get(0)[0]).intValue();
+$$;
+--error ER_STMT_EXECUTION_NOT_ALLOWED_WITHIN_SP_OR_TRG_OR_UDF
+SELECT f_sql();
+--echo # a function throwing an SqlError: SIGNAL is not possible there
+CREATE FUNCTION f_throw() RETURNS INT LANGUAGE JAVA AS $$
+throw new MleSqlException(1000, "45000", "from a function");
+$$;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT f_throw();
+SELECT 'session fine' AS after_errors;
+
+--echo #
+--echo # 7. Limits.
+--echo #
+CREATE PROCEDURE big(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.Reply x = MleSql.execute(MleSql.newStatementId(),
+    "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 50000) " +
+    "SELECT n, REPEAT('x', 100) FROM c", null, false, 0);
+r[0] = "rows=" + x.rows().size() + " more=" + x.moreRows();
+$$;
+CALL big(@r);
+SELECT @r;
+SET GLOBAL mle.sql_result_max = 100000;
+--error ER_RESULT_SIZE_LIMIT_EXCEEDED
+CALL big(@r);
+SET GLOBAL mle.sql_result_max = DEFAULT;
+SET GLOBAL mle.sql_statements_max = 2;
+CREATE PROCEDURE many(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.prepare(MleSql.newStatementId(), "SELECT 1", false);
+MleSql.prepare(MleSql.newStatementId(), "SELECT 2", false);
+MleSql.prepare(MleSql.newStatementId(), "SELECT 3", false);
+$$;
+--error ER_LANGUAGE_COMPONENT_INTERNAL
+CALL many(@r);
+SET GLOBAL mle.sql_statements_max = DEFAULT;
+--echo # statements do not outlive their call
+CREATE PROCEDURE keep(INOUT id BIGINT) LANGUAGE JAVA AS $$
+if (id[0] == null) { id[0] = 1000000L; MleSql.prepare(id[0], "SELECT 1", false); }
+else MleSql.executePrepared(id[0], null, 0);
+$$;
+SET @id = NULL;
+CALL keep(@id);
+--error ER_LANGUAGE_COMPONENT_INTERNAL
+CALL keep(@id);
+
+--echo #
+--echo # 8. Privileges: inner SQL runs as the routine's security context.
+--echo #
+CREATE DEFINER = root@localhost PROCEDURE read_secret(OUT r TEXT)
+  SQL SECURITY DEFINER LANGUAGE JAVA AS $$
+r[0] = (String) MleSql.execute(MleSql.newStatementId(), "SELECT s FROM test.secret", null, false, 0).rows().get(0)[0];
+$$;
+CREATE DEFINER = root@localhost PROCEDURE read_secret_invoker(OUT r TEXT)
+  SQL SECURITY INVOKER LANGUAGE JAVA AS $$
+r[0] = (String) MleSql.execute(MleSql.newStatementId(), "SELECT s FROM test.secret", null, false, 0).rows().get(0)[0];
+$$;
+--connect (con_u1, localhost, u1,,test)
+CALL read_secret(@r);
+SELECT @r;
+--error ER_TABLEACCESS_DENIED_ERROR
+CALL read_secret_invoker(@r);
+--disconnect con_u1
+--connection con1
+
+--echo #
+--echo # 9. Nesting: SQL from a routine calls MLE routines (same worker, deeper).
+--echo #
+CREATE FUNCTION js_twice(x INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 2 * x $$;
+CREATE PROCEDURE inner_p(OUT r TEXT) LANGUAGE JAVA AS $$
+r[0] = "inner:" + MleSql.execute(MleSql.newStatementId(), "SELECT js_twice(21)", null, false, 0).rows().get(0)[0];
+$$;
+CREATE PROCEDURE outer_p(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.execute(MleSql.newStatementId(), "CALL inner_p(@inner)", null, false, 0);
+r[0] = "outer got " + MleSql.execute(MleSql.newStatementId(), "SELECT @inner", null, false, 0).rows().get(0)[0];
+$$;
+CALL outer_p(@r);
+SELECT @r;
+
+--echo #
+--echo # 10. KILL QUERY during an inner statement.
+--echo #
+CREATE PROCEDURE sleeper(OUT r TEXT) LANGUAGE JAVA AS $$
+MleSql.execute(MleSql.newStatementId(), "SELECT SLEEP(30)", null, false, 0);
+r[0] = "not reached";
+$$;
+--let $con1_id = `SELECT CONNECTION_ID()`
+--send CALL sleeper(@r)
+--connection default
+--let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE id = $con1_id AND state = 'User sleep'
+--source include/wait_condition.inc
+--replace_result $con1_id CON1
+--eval KILL QUERY $con1_id
+--connection con1
+--error ER_QUERY_INTERRUPTED
+--reap
+SELECT 'session fine' AS after_kill;
+
+--connection default
+--disconnect con1
+--source include/wait_until_count_sessions.inc
+DROP TABLE t1, secret;
+DROP USER u1@localhost;
+DROP PROCEDURE q1;
+DROP PROCEDURE q2;
+DROP PROCEDURE ins;
+DROP PROCEDURE neg_time;
+DROP PROCEDURE prep;
+DROP PROCEDURE stream;
+DROP PROCEDURE two_sets;
+DROP PROCEDURE multi;
+DROP PROCEDURE to_client;
+DROP PROCEDURE e_uncaught;
+DROP PROCEDURE e_caught;
+DROP PROCEDURE e_throw;
+DROP PROCEDURE e_bad_state;
+DROP FUNCTION f_sql;
+DROP FUNCTION f_throw;
+DROP PROCEDURE big;
+DROP PROCEDURE many;
+DROP PROCEDURE keep;
+DROP PROCEDURE read_secret;
+DROP PROCEDURE read_secret_invoker;
+DROP FUNCTION js_twice;
+DROP PROCEDURE inner_p;
+DROP PROCEDURE outer_p;
+DROP PROCEDURE sleeper;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

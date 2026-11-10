@@ -21,6 +21,7 @@ MYSQL_ADD_COMPONENT(mle
   routine.cc
   session.cc
   settings.cc
+  sql.cc
   status.cc
   udfs.cc
   LINK_LIBRARIES mle_host

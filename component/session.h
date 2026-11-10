@@ -33,6 +33,8 @@
   objects of an unregistered thd_store slot.
 */
 
+#include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -45,6 +47,7 @@
 #include "mle/codec.h"
 #include "mle/worker.h"
 #include "routine.h"
+#include "sql.h"
 
 namespace mle_component {
 
@@ -107,12 +110,20 @@ class Session {
   /** Reports a failed request; drops the worker if it is gone. */
   void report(const std::string &principal, mle::Status status,
               const mle::ResultMsg &result, const std::string &error,
-              const Routine &routine, const std::vector<mle::Value> *args);
+              const Routine &routine, const std::vector<mle::Value> *args,
+              SqlRunner *sql = nullptr);
   void keep_console(const mle::ResultMsg &result);
   void keep_stack_trace(const mle::Error &error, const Routine &routine);
   void drop_worker(const std::string &principal);
-  /** KILL handler on the session for the duration of a request. */
+  /** KILL handler on the session while requests run. The server keeps one
+      handler per session and refuses to replace it, so it is installed by
+      the outermost request and interrupts every worker on the stack
+      (nested calls: routine -> SQL -> routine). */
   class KillGuard;
+  static constexpr size_t kMaxNesting = 64;
+  std::array<std::atomic<mle::Worker *>, kMaxNesting> m_running{};
+  std::atomic<size_t> m_running_n{0};
+  bool m_kill_installed = false;
 
   MYSQL_THD m_thd;
   std::map<std::string, Slot> m_workers;

@@ -67,7 +67,6 @@ void check_all(std::string_view body) {
   check_one<ResultMsg>(body);
   check_one<SqlMsg>(body);
   check_one<SqlResultMsg>(body);
-  check_one<FetchMsg>(body);
   check_one<DropMsg>(body);
   check_one<OptionsMsg>(body);
 }
@@ -102,6 +101,8 @@ std::vector<std::string> seed_messages() {
   result.error = Error{"python", "boom", {{"f", "r.py", 1, 2}}, 1146, "42S02"};
   add(result);
   SqlMsg sql;
+  sql.action = wire::SqlAction::kExecutePrepared;
+  sql.stmt_id = 5;
   sql.statement = "SELECT ?";
   sql.params = std::vector<Value>{Value::vector({0.5f})};
   add(sql);
@@ -123,7 +124,10 @@ std::vector<std::string> seed_messages() {
   ReadyMsg ready;
   ready.languages = {"java", "js"};
   add(ready);
-  add(FetchMsg{10});
+  SqlMsg next;
+  next.action = wire::SqlAction::kNextResult;
+  next.stmt_id = 3;
+  add(next);
   add(DropMsg{11});
   OptionsMsg options;
   options.integer_type = wire::IntegerType::kUnsafeBigint;

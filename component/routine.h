@@ -116,6 +116,9 @@ struct Routine {
 /** Display name of a worker error language ("js" -> "JavaScript"). */
 const char *display_language(const std::string &worker_language);
 
+/** INT, VARCHAR, ... for a MYSQL_SP_ARG_TYPE_* value ("" if unknown). */
+const char *sql_type_name(uint64_t sql_type);
+
 /** Live routine handles. */
 long routines_alive();
 

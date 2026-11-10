@@ -393,10 +393,25 @@ TEST(MleCodec, ResultRoundTrip) {
 
 TEST(MleCodec, SqlRoundTrip) {
   SqlMsg m;
+  m.action = wire::SqlAction::kExecute;
+  m.stmt_id = 77;
   m.statement = "SELECT id, DISTANCE(v, ?, 'COSINE') FROM t ORDER BY 2 LIMIT ?";
   m.params = std::vector<Value>{Value::vector({1, 2, 3}), Value::i64(10)};
+  m.flags = wire::kPassResultToClient;
   m.max_rows = 1000;
   EXPECT_EQ(message_round_trip(m), m);
+  SqlMsg fetch;
+  fetch.action = wire::SqlAction::kFetch;
+  fetch.stmt_id = 77;
+  EXPECT_EQ(message_round_trip(fetch), fetch);
+  std::string bytes, error;
+  encode(fetch, &bytes);
+  bytes[0] = 6;  // no such action
+  SqlMsg back;
+  EXPECT_FALSE(decode(bytes, &back, &error));
+  encode(fetch, &bytes);
+  bytes[bytes.size() - 5] = 2;  // unknown flag
+  EXPECT_FALSE(decode(bytes, &back, &error));
 }
 
 TEST(MleCodec, SqlResultRoundTrip) {
@@ -412,6 +427,9 @@ TEST(MleCodec, SqlResultRoundTrip) {
   ok.affected_rows = 3;
   ok.insert_id = 42;
   ok.warnings = {{1, 1265, "Data truncated for column 'c' at row 1"}};
+  ok.more_results = true;
+  ok.param_count = 2;
+  ok.exec_us = 1234;
   EXPECT_EQ(message_round_trip(ok), ok);
 
   SqlResultMsg rows;
@@ -421,12 +439,21 @@ TEST(MleCodec, SqlResultRoundTrip) {
   id.is_unsigned = true;
   ParamType d;
   d.tag = Tag::kF64;
-  rows.columns = {{"id", "t", id}, {"dist", "", d}};
+  Column full("id", "t", id);
+  full.org_name = "id";
+  full.schema = "test";
+  full.org_table = "points";
+  full.charset = "binary";
+  full.collation = "binary";
+  full.flags = 32;
+  rows.columns = {full, {"dist", "", d}};
   for (uint64_t i = 0; i < 100; i++) {
     rows.rows.push_back(Value::u64(i));
     rows.rows.push_back(i % 7 == 0 ? Value::null() : Value::f64(1.0 / (i + 1)));
   }
   rows.more = true;
+  rows.more_results = true;
+  rows.exec_us = 99;
   EXPECT_EQ(message_round_trip(rows), rows);
 
   SqlResultMsg empty;
@@ -436,7 +463,6 @@ TEST(MleCodec, SqlResultRoundTrip) {
 }
 
 TEST(MleCodec, SmallMessagesRoundTrip) {
-  EXPECT_EQ(message_round_trip(FetchMsg{500}), FetchMsg{500});
   EXPECT_EQ(message_round_trip(DropMsg{99}), DropMsg{99});
 }
 
@@ -499,6 +525,8 @@ TEST(MleCodec, BadMessagesAreRejected) {
   {  // a count that the bytes cannot hold must fail before allocating
     std::string bytes;
     Writer w(&bytes);
+    w.u8(0);  // EXECUTE
+    w.u64(1);
     w.str("SELECT 1");
     w.u32(0xFFFFFFFF);  // parameters
     SqlMsg back;
@@ -517,6 +545,8 @@ TEST(MleCodec, BadMessagesAreRejected) {
     w.u32(0);
     w.u32(0);
     w.u32(0);
+    for (int i = 0; i < 6; i++) w.str("");  // type name .. collation
+    w.u32(0);                               // flags
     w.u32(0xFFFFFFFF);  // rows
     SqlResultMsg back;
     EXPECT_FALSE(decode(bytes, &back, &error));

@@ -34,6 +34,20 @@ public final class SqlBridge {
     return d.sql(statement, params == null ? new Object[0] : params);
   }
 
+  /** MleSql: one Phase 5 SQL request (see Dispatcher#sqlRequest). */
+  public static com.percona.mle.api.MleSql.Reply request(int action, long id, String text, Object[] params,
+      int flags, int maxRows) {
+    Dispatcher d = dispatcher;
+    if (d == null) throw new IllegalStateException("MLE worker not running");
+    return d.sqlRequest(action, id, text, params, flags, maxRows);
+  }
+
+  public static long newStatementId() {
+    Dispatcher d = dispatcher;
+    if (d == null) throw new IllegalStateException("MLE worker not running");
+    return d.newStatementId();
+  }
+
   public static org.graalvm.polyglot.Context context() {
     Dispatcher d = dispatcher;
     if (d == null) throw new IllegalStateException("MLE worker not running");

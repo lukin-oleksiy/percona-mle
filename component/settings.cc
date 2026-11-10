@@ -65,6 +65,10 @@ uint g_pool_size = 0;
 uint g_max_workers = 0;
 uint g_spin_us = 0;
 uint g_interrupt_grace_ms = 0;
+ulonglong g_sql_result_max = 0;
+ulonglong g_sql_row_max = 0;
+uint g_sql_statements_max = 0;
+uint g_sql_chunk_rows = 0;
 char *g_languages = nullptr;
 char *g_cgroup_base = nullptr;
 char *g_dir = nullptr;
@@ -161,7 +165,8 @@ Registered g_registered[] = {
     {"memory_max", false}, {"heap_max", false},    {"pool_size", false},
     {"max_workers", false}, {"spin_us", false},    {"interrupt_grace_ms", false},
     {"languages", false},  {"cgroup_base", false}, {"dir", false},
-    {"java_home", false}};
+    {"java_home", false},  {"sql_result_max", false}, {"sql_row_max", false},
+    {"sql_statements_max", false}, {"sql_chunk_rows", false}};
 
 void mark(const char *name) {
   for (auto &r : g_registered)
@@ -268,6 +273,48 @@ bool register_settings() {
           nullptr, nullptr, &grace, &g_interrupt_grace_ms))
     return true;
 
+  // SQL from routines (12-phase5-sql-api.md §4, §11). Larger than Oracle's
+  // 1 MB limits by default: rows with vectors are large already.
+  ulonglong_check_arg_s result_max;
+  result_max.def_val = 64 * kMiB;
+  result_max.min_val = 1024;
+  result_max.max_val = 1ULL << 40;
+  result_max.blk_sz = 0;
+  if (reg("sql_result_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
+          "Largest result in bytes of a statement a routine runs without "
+          "parameters (the server buffers it whole). Oracle: 1 MB.",
+          nullptr, nullptr, &result_max, &g_sql_result_max))
+    return true;
+  ulonglong_check_arg_s row_max;
+  row_max.def_val = 16 * kMiB;
+  row_max.min_val = 1024;
+  row_max.max_val = 1ULL << 40;
+  row_max.blk_sz = 0;
+  if (reg("sql_row_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
+          "Largest row in bytes of a prepared statement a routine runs (rows "
+          "are fetched one by one from a cursor). Oracle: 1 MB.",
+          nullptr, nullptr, &row_max, &g_sql_row_max))
+    return true;
+  uint_check_arg_s statements_max;
+  statements_max.def_val = 1024;
+  statements_max.min_val = 1;
+  statements_max.max_val = 1000000;
+  statements_max.blk_sz = 0;
+  if (reg("sql_statements_max", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Most statements a routine call keeps open (as Oracle: 1024).",
+          nullptr, nullptr, &statements_max, &g_sql_statements_max))
+    return true;
+  uint_check_arg_s chunk_rows;
+  chunk_rows.def_val = 1000;
+  chunk_rows.min_val = 1;
+  chunk_rows.max_val = 1000000;
+  chunk_rows.blk_sz = 0;
+  if (reg("sql_chunk_rows", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Rows of a prepared statement's result sent to the worker at a "
+          "time.",
+          nullptr, nullptr, &chunk_rows, &g_sql_chunk_rows))
+    return true;
+
   STR_CHECK_ARG(languages) languages;
   languages.def_val = const_cast<char *>(kAllLanguageNames);
   if (reg("languages", PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC,
@@ -337,6 +384,10 @@ Settings current_settings() {
 unsigned enabled_languages() { return g_language_bits.load(); }
 
 uint32_t max_workers() { return g_max_workers; }
+size_t sql_result_max() { return static_cast<size_t>(g_sql_result_max); }
+size_t sql_row_max() { return static_cast<size_t>(g_sql_row_max); }
+size_t sql_statements_max() { return g_sql_statements_max; }
+uint32_t sql_chunk_rows() { return g_sql_chunk_rows; }
 int spin_us() { return static_cast<int>(g_spin_us); }
 int interrupt_grace_ms() { return static_cast<int>(g_interrupt_grace_ms); }
 

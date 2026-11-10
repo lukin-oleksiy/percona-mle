@@ -17,6 +17,7 @@
 
 package com.percona.mle.worker;
 
+import com.percona.mle.api.MleSql;
 import com.percona.mle.api.MleSqlException;
 import com.percona.mle.api.SqlResult;
 import java.lang.foreign.Arena;
@@ -387,18 +388,32 @@ final class Dispatcher {
 
   // ------------------------------------------------------------ SQL
 
-  SqlResult sql(String statement, Object[] params) {
+  private long nextStatementId;
+
+  /** A new statement id for this worker (unique within any call). */
+  long newStatementId() {
+    return ++nextStatementId;
+  }
+
+  /**
+   * One SQL request to the host (Phase 5 protocol: action, statement id, text, parameters,
+   * flags); throws MleSqlException for an SQL error.
+   */
+  MleSql.Reply sqlRequest(int action, long id, String text, Object[] params, int flags, int maxRows) {
     if (Thread.currentThread() != thread)
-      throw new IllegalStateException("Mle.sql must be called on the routine's thread");
+      throw new IllegalStateException("SQL must be run on the routine's thread");
     w.reset();
-    w.str(statement);
-    w.u32(params.length);
-    for (Object p : params) Values.writeParam(w, p);
-    w.u32(0);
+    w.u8(action);
+    w.u64(id);
+    w.str(text == null ? "" : text);
+    w.u32(params == null ? 0 : params.length);
+    if (params != null) for (Object p : params) Values.writeParam(w, p);
+    w.u8(flags);
+    w.u32(maxRows);
     mb.send(Wire.SQL, Wire.OK, depth, seq, w);
     while (true) {
       Mailbox.Message m = mb.receive();
-      if (m.op() == Wire.SQL_RESULT && m.depth() == depth) return sqlResult(new MessageReader(m.body()));
+      if (m.op() == Wire.SQL_RESULT && m.depth() == depth) return sqlReply(id, new MessageReader(m.body()));
       boolean nested = m.op() == Wire.CALL || m.op() == Wire.PREPARE || m.op() == Wire.DROP;
       if (nested && m.depth() == depth + 1 && m.depth() <= maxDepth) {
         handle(m);
@@ -408,7 +423,28 @@ final class Dispatcher {
     }
   }
 
-  private static SqlResult sqlResult(MessageReader r) {
+  /** Phase 3 API (Mle.sql): runs a statement and returns its first result set whole. */
+  SqlResult sql(String statement, Object[] params) {
+    long id = newStatementId();
+    MleSql.Reply r = sqlRequest(Wire.SQL_EXECUTE, id, statement, params, 0, 0);
+    if (!r.hasRows())
+      return new SqlResult(List.of(), List.of(), r.affectedRows(), r.insertId(), warningText(r));
+    List<Object[]> rows = new ArrayList<>(r.rows());
+    MleSql.Reply last = r;
+    while (last.moreRows()) {
+      last = sqlRequest(Wire.SQL_FETCH, id, null, null, 0, 0);
+      rows.addAll(last.rows());
+    }
+    if (last.moreResults()) sqlRequest(Wire.SQL_CLOSE, id, null, null, 0, 0);
+    List<String> names = r.columns().stream().map(MleSql.Column::name).toList();
+    return new SqlResult(names, rows, 0, 0, warningText(r));
+  }
+
+  private static List<String> warningText(MleSql.Reply r) {
+    return r.warnings().stream().map(x -> x.level() + " " + x.code() + " " + x.message()).toList();
+  }
+
+  private static MleSql.Reply sqlReply(long id, MessageReader r) {
     int kind = r.u8();
     switch (kind) {
       case Wire.SQL_ERROR -> {
@@ -420,38 +456,48 @@ final class Dispatcher {
       case Wire.SQL_OK -> {
         long affected = r.u64();
         long insertId = r.u64();
-        List<String> warnings = warnings(r);
+        List<MleSql.Warning> warnings = warnings(r);
+        boolean moreResults = r.flag();
+        int paramCount = (int) r.u32();
+        long execUs = r.u64();
         r.finish();
-        return new SqlResult(List.of(), List.of(), affected, insertId, warnings);
+        return new MleSql.Reply(id, false, List.of(), List.of(), false, moreResults, affected, insertId, warnings,
+            paramCount, execUs);
       }
       case Wire.SQL_ROWS -> {
         int ncols = r.count();
-        List<String> columns = new ArrayList<>(ncols);
+        List<MleSql.Column> columns = new ArrayList<>(ncols);
         for (int i = 0; i < ncols; i++) {
-          columns.add(r.str());
-          r.str();  // table
-          Values.readParamType(r);
+          String name = r.str();
+          String table = r.str();
+          Values.ParamType t = Values.readParamType(r);
+          columns.add(new MleSql.Column(name, table, t.sqlName(), t.unsigned(), t.length(), (int) t.scale(),
+              r.str(), r.str(), r.str(), r.str(), r.str(), (int) r.u32()));
         }
         long nrows = r.u32();
-        List<Object[]> rows = new ArrayList<>();
+        List<Object[]> rows = new ArrayList<>((int) Math.min(nrows, 1 << 16));
         for (long i = 0; i < nrows; i++) {
           Object[] row = new Object[ncols];
           for (int c = 0; c < ncols; c++) row[c] = Values.toJava(Values.read(r));
           rows.add(row);
         }
-        r.flag();  // more rows: fetching comes with the Phase 5 SQL API
-        List<String> warnings = warnings(r);
+        boolean more = r.flag();
+        boolean moreResults = r.flag();
+        List<MleSql.Warning> warnings = warnings(r);
+        long execUs = r.u64();
         r.finish();
-        return new SqlResult(List.copyOf(columns), rows, 0, 0, warnings);
+        return new MleSql.Reply(id, true, List.copyOf(columns), rows, more, moreResults, 0, 0, warnings, 0,
+            execUs);
       }
       default -> throw new IllegalStateException("bad SQL result kind " + kind);
     }
   }
 
-  private static List<String> warnings(MessageReader r) {
+  private static List<MleSql.Warning> warnings(MessageReader r) {
     int n = r.count();
-    List<String> list = new ArrayList<>(n);
-    for (int i = 0; i < n; i++) list.add(r.u32() + " " + r.u32() + " " + r.str());
+    List<MleSql.Warning> list = new ArrayList<>(n);
+    for (int i = 0; i < n; i++) list.add(new MleSql.Warning((int) r.u32(), (int) r.u32(), r.str()));
     return list;
   }
+
 }

@@ -127,6 +127,15 @@ final class Wire {
   static final int SQL_OK = 1;
   static final int SQL_ROWS = 2;
 
+  // SqlAction, SqlFlag
+  static final int SQL_EXECUTE = 0;
+  static final int SQL_PREPARE = 1;
+  static final int SQL_EXECUTE_PREPARED = 2;
+  static final int SQL_FETCH = 3;
+  static final int SQL_NEXT_RESULT = 4;
+  static final int SQL_CLOSE = 5;
+  static final int SQL_FLAG_TO_CLIENT = 1;
+
   // Control socket
   static final int CTL_INTERRUPT = 1;
   static final int CTL_SHUTDOWN = 2;
