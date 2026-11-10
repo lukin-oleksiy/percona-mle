@@ -1,0 +1,55 @@
+#
+# component_mle: INSTALL fails clearly when the engine cannot start
+# (no half-working component), and a server whose installed component
+# cannot start comes up without it.
+#
+call mtr.add_suppression("Component mle reported: 'Cannot install: ");
+call mtr.add_suppression("MY-006000 - MLE: cannot install the component");
+call mtr.add_suppression("MY-003536 - Initialization method provided by component 'mle' failed");
+call mtr.add_suppression("Failed to load components from mysql.component");
+# 1. The MLE files are not in mle.dir.
+# restart: --loose-mle.dir=MYSQL_TMP_DIR/no-mle
+INSTALL COMPONENT "file://component_mle";
+ERROR HY000: MLE: cannot install the component: the MLE files are not installed in mle.dir 'MYSQL_TMP_DIR/no-mle': mle_launcher (MYSQL_TMP_DIR/no-mle/mle_launcher) is missing or not accessible
+SELECT COUNT(*) AS installed FROM mysql.component
+WHERE component_urn = 'file://component_mle';
+installed
+0
+SELECT COUNT(*) AS mle_variables FROM performance_schema.global_variables
+WHERE VARIABLE_NAME LIKE 'mle.%';
+mle_variables
+0
+# Without a language component the server stores the routine with a
+# warning.
+CREATE FUNCTION f() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+Warnings:
+Warning	6001	Language component: Not available.
+DROP FUNCTION f;
+# 2. mle.java_home is not a GraalVM JDK.
+# restart: --loose-mle.java_home=MYSQL_TMP_DIR/no-jdk
+INSTALL COMPONENT "file://component_mle";
+ERROR HY000: MLE: cannot install the component: mle.java_home 'MYSQL_TMP_DIR/no-jdk' is not a GraalVM JDK 25: MYSQL_TMP_DIR/no-jdk/lib/server/libjvm.so is missing
+# 3. Installed (persisted in mysql.component), then the server restarts
+#    without the files: it starts, logs why MLE is not there.
+# restart:
+INSTALL COMPONENT "file://component_mle";
+# restart: --loose-mle.dir=MYSQL_TMP_DIR/no-mle
+SELECT COUNT(*) AS mle_status_vars FROM performance_schema.global_status
+WHERE VARIABLE_NAME LIKE 'mle%';
+mle_status_vars
+0
+# Without a language component the server stores the routine with a
+# warning.
+CREATE FUNCTION f() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+Warnings:
+Warning	6001	Language component: Not available.
+DROP FUNCTION f;
+include/assert_grep.inc [The error log says why MLE did not start]
+include/assert_grep.inc [and that the JDK is missing]
+# With the files back, the persisted component is loaded at startup.
+# restart:
+SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_status';
+mle_status
+Active
+UNINSTALL COMPONENT "file://component_mle";

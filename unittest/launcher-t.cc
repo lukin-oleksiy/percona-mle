@@ -551,7 +551,7 @@ int count_leaves(const std::string &base) {
   int n = 0;
   if (DIR *d = opendir(base.c_str())) {
     while (dirent *e = readdir(d))
-      if (strncmp(e->d_name, "mle-w", 5) == 0) n++;
+      if (strncmp(e->d_name, "mle-", 4) == 0) n++;
     closedir(d);
   }
   return n;
@@ -568,7 +568,8 @@ TEST(MleLauncherCgroup, WorkersRunInTheirOwnLeaf) {
   ReadyMsg ready;
   ASSERT_TRUE(wait_ready(*w, &ready, &error)) << error;
   auto r = parse_report(ready.info);
-  EXPECT_NE(r["cgroup"].find("/mle-w" + std::to_string(w->id())),
+  EXPECT_NE(r["cgroup"].find("/mle-" + std::to_string(l->info().pid) + "-w" +
+                            std::to_string(w->id())),
             std::string::npos)
       << r["cgroup"];
   EXPECT_EQ(count_leaves(base), 1);
@@ -577,6 +578,39 @@ TEST(MleLauncherCgroup, WorkersRunInTheirOwnLeaf) {
   while (count_leaves(base) != 0 && Clock::now() < deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   EXPECT_EQ(count_leaves(base), 0) << "leaf not removed";
+}
+
+TEST(MleLauncherCgroup, LaunchersShareABase) {
+  // Several mysqld whose cgroups have one parent use one base. A leaf of a
+  // launcher that is gone is removed at start; the others' are not touched.
+  NEED_CGROUP(base);
+  const std::string stale = base + "/mle-999999999-w1";  // > pid_max
+  ASSERT_EQ(mkdir(stale.c_str(), 0755), 0) << strerror(errno);
+  auto l1 = start(config({test_class("t")}, base));
+  auto l2 = start(config({test_class("t")}, base));
+  ASSERT_NE(l1, nullptr);
+  ASSERT_NE(l2, nullptr);
+  ASSERT_TRUE(l2->info().cgroup_enabled) << l2->info().cgroup_info;
+  EXPECT_NE(access(stale.c_str(), F_OK), 0) << "stale leaf not removed";
+  std::string error;
+  auto w1 = l1->acquire("t", &error);
+  ASSERT_NE(w1, nullptr) << error;
+  auto w2 = l2->acquire("t", &error);
+  ASSERT_NE(w2, nullptr) << error;
+  ReadyMsg ready;
+  ASSERT_TRUE(wait_ready(*w1, &ready, &error)) << error;
+  const std::string cgroup1 = parse_report(ready.info)["cgroup"];
+  ASSERT_TRUE(wait_ready(*w2, &ready, &error)) << error;
+  const std::string cgroup2 = parse_report(ready.info)["cgroup"];
+  EXPECT_EQ(w1->id(), w2->id());  // the same worker id in each launcher
+  EXPECT_NE(cgroup1, cgroup2);
+  EXPECT_EQ(count_leaves(base), 2);
+  w1.reset();
+  w2.reset();
+  const auto deadline = Clock::now() + std::chrono::seconds(3);
+  while (count_leaves(base) != 0 && Clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(count_leaves(base), 0);
 }
 
 TEST(MleLauncherCgroup, MemoryLimitEndsOnlyTheWorker) {

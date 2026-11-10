@@ -54,7 +54,8 @@ struct Layout {
   std::string java_home;
 
   /** The installed layout below dir; optional parts that do not exist are
-      left empty. */
+      left empty. Symlinks are resolved (the build tree has a layout of
+      symlinks for MTR: <build>/plugin_output_directory/mle). */
   static Layout installed(const std::string &dir, const std::string &java_home);
 };
 

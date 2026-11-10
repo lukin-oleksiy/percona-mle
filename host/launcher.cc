@@ -182,8 +182,13 @@ bool LauncherChannel::start(const LauncherConfig &config, std::string *error) {
   sigfillset(&all);
   posix_spawnattr_setsigmask(&attr, &none);
   posix_spawnattr_setsigdefault(&attr, &all);
-  posix_spawnattr_setflags(&attr,
-                           POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+  // Its own session: signals for the host's process group or terminal
+  // (Ctrl-C, a test framework killing the group) do not reach the launcher
+  // and its workers; it ends when the host closes the socket, and cleans
+  // up (kills the workers, removes their cgroups).
+  posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK |
+                                      POSIX_SPAWN_SETSIGDEF |
+                                      POSIX_SPAWN_SETSID);
   std::string exe = config.launcher_exe;
   char *argv[] = {exe.data(), nullptr};
   char *envp[] = {nullptr};

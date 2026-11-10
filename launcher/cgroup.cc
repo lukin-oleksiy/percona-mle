@@ -19,11 +19,13 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -35,7 +37,19 @@ namespace mle::launcher {
 namespace {
 
 constexpr long kCgroup2SuperMagic = 0x63677270;
-constexpr const char *kLeafPrefix = "mle-w";
+/* Leaves are "mle-<launcher pid>-w<worker id>": several launchers (e.g.
+   several mysqld on one host whose cgroups share a parent) can use one
+   base without touching each other's leaves. */
+constexpr const char *kLeafPrefix = "mle-";
+
+/** Pid of the launcher that made a leaf, or 0 if the name is not a leaf. */
+pid_t leaf_owner(const char *name) {
+  if (strncmp(name, kLeafPrefix, strlen(kLeafPrefix)) != 0) return 0;
+  char *end = nullptr;
+  const long pid = strtol(name + strlen(kLeafPrefix), &end, 10);
+  if (pid <= 0 || end == nullptr || strncmp(end, "-w", 2) != 0) return 0;
+  return static_cast<pid_t>(pid);
+}
 
 bool write_file(const std::string &path, const std::string &value,
                 std::string *error) {
@@ -86,11 +100,15 @@ std::string cgroup_prepare(const std::string &base) {
   std::string error;
   if (!write_file(base + "/cgroup.subtree_control", "+memory +pids", &error))
     return error;
-  // Leaves of a previous launcher (its workers died with it).
+  // Leaves of launchers that are gone (their workers died with them; a
+  // leaf that still has processes is not removed).
   if (DIR *d = opendir(base.c_str())) {
-    while (dirent *e = readdir(d))
-      if (strncmp(e->d_name, kLeafPrefix, strlen(kLeafPrefix)) == 0)
+    while (dirent *e = readdir(d)) {
+      const pid_t owner = leaf_owner(e->d_name);
+      if (owner != 0 && owner != getpid() && kill(owner, 0) != 0 &&
+          errno == ESRCH)
         rmdir((base + "/" + e->d_name).c_str());
+    }
     closedir(d);
   }
   return "";
@@ -98,7 +116,8 @@ std::string cgroup_prepare(const std::string &base) {
 
 std::string cgroup_create_leaf(const std::string &base, uint64_t id,
                                const ClassConfig &c, std::string *error) {
-  const std::string leaf = base + "/" + kLeafPrefix + std::to_string(id);
+  const std::string leaf = base + "/" + kLeafPrefix +
+                           std::to_string(getpid()) + "-w" + std::to_string(id);
   if (mkdir(leaf.c_str(), 0755) != 0 && errno != EEXIST) {
     *error = "mkdir " + leaf + ": " + strerror(errno);
     return "";

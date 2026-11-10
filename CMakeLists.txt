@@ -29,3 +29,33 @@ ADD_SUBDIRECTORY(host)
 ADD_SUBDIRECTORY(launcher)
 ADD_SUBDIRECTORY(worker)
 ADD_SUBDIRECTORY(harness)
+
+# The build tree gets the installed layout (include/mle/defaults.h) as
+# symlinks in <build>/plugin_output_directory/mle, so component_mle finds
+# its files there with the default mle.dir (<plugin dir>/mle), e.g. in MTR.
+GET_PROPERTY(MLE_WORKER_JAR GLOBAL PROPERTY MLE_WORKER_JAR)
+GET_PROPERTY(MLE_RESOURCE_CACHE GLOBAL PROPERTY MLE_RESOURCE_CACHE)
+GET_PROPERTY(MLE_PYTHON_VENV GLOBAL PROPERTY MLE_PYTHON_VENV)
+GET_PROPERTY(MLE_AOT_CACHE GLOBAL PROPERTY MLE_AOT_CACHE)
+GET_FILENAME_COMPONENT(MLE_PYTHON_VENV_PARENT ${MLE_PYTHON_VENV} DIRECTORY)
+SET(MLE_BUILD_LAYOUT ${CMAKE_BINARY_DIR}/plugin_output_directory/mle)
+ADD_CUSTOM_TARGET(mle_build_layout ALL
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${MLE_BUILD_LAYOUT}
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    $<TARGET_FILE:mle_launcher> ${MLE_BUILD_LAYOUT}/mle_launcher
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    $<TARGET_FILE:mle_worker> ${MLE_BUILD_LAYOUT}/mle_worker
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    ${MLE_WORKER_JAR} ${MLE_BUILD_LAYOUT}/mle-worker.jar
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    ${MLE_RESOURCE_CACHE} ${MLE_BUILD_LAYOUT}/resources
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    ${MLE_PYTHON_VENV_PARENT} ${MLE_BUILD_LAYOUT}/python-venv
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    ${MLE_AOT_CACHE} ${MLE_BUILD_LAYOUT}/mle.aot
+  COMMENT "Linking the MLE layout into plugin_output_directory/mle"
+  VERBATIM
+  )
+ADD_DEPENDENCIES(mle_build_layout mle_launcher mle_worker mle_worker_jar)
+
+ADD_SUBDIRECTORY(component)

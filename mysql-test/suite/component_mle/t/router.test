@@ -1,0 +1,57 @@
+--echo #
+--echo # component_mle next to Percona's V8 component_js_lang behind
+--echo # component_lang_router: LANGUAGE JS runs in V8, LANGUAGE JAVASCRIPT,
+--echo # PYTHON and JAVA reach MLE.
+--echo #
+--source include/have_mle_component.inc
+--source include/have_js_lang_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_js_lang";
+INSTALL COMPONENT "file://component_mle";
+INSTALL COMPONENT "file://component_lang_router";
+SELECT VARIABLE_VALUE AS backends FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'Lang_router_backends';
+
+--echo # In con1: js_lang refuses UNINSTALL while a session that used V8
+--echo # (also to compile at CREATE) is connected.
+--connect (con1, localhost, root,,test)
+CREATE FUNCTION v8_f(a INT) RETURNS INT LANGUAGE JS AS $$ return a * 2 $$;
+CREATE FUNCTION mle_js(a INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return a * 2 $$;
+CREATE FUNCTION mle_py(a INT) RETURNS INT LANGUAGE PYTHON AS $$ return a * 2 $$;
+CREATE PROCEDURE mle_java() LANGUAGE JAVA AS $$ $$;
+SELECT v8_f(21) AS v8;
+--error ER_LANGUAGE_COMPONENT
+SELECT mle_js(21);
+--error ER_LANGUAGE_COMPONENT
+SELECT mle_py(21);
+--error ER_LANGUAGE_COMPONENT
+CALL mle_java();
+SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
+  WHERE VARIABLE_NAME IN ('mle_stored_programs', 'Lang_router_live_handles')
+  ORDER BY VARIABLE_NAME;
+
+--connection default
+--echo # MLE refuses UNINSTALL while con1 caches its routines; the router
+--echo # keeps routing both languages.
+--error ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL
+UNINSTALL COMPONENT "file://component_mle";
+--connection con1
+SELECT v8_f(5) AS v8;
+--error ER_LANGUAGE_COMPONENT
+SELECT mle_js(5);
+
+--connection default
+--disconnect con1
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION v8_f;
+DROP FUNCTION mle_js;
+DROP FUNCTION mle_py;
+DROP PROCEDURE mle_java;
+UNINSTALL COMPONENT "file://component_lang_router";
+UNINSTALL COMPONENT "file://component_mle";
+UNINSTALL COMPONENT "file://component_js_lang";
+
+--echo # js_lang cannot be installed again (V8) and leaves a read-only system
+--echo # variable registered until a restart (as in its own tests).
+--source include/restart_mysqld.inc

@@ -1,0 +1,380 @@
+/* Copyright (c) 2026 Percona LLC and/or its affiliates. All rights
+   reserved.
+
+   This program is free software; you can redistribute it and/or
+   modify it under the terms of the GNU General Public License
+   as published by the Free Software Foundation; version 2 of
+   the License.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
+
+/**
+  @file components/mle/component/settings.cc
+
+  The mle.* system variables (11-phase4-component.md §6).
+
+  - Settings that shape workers (memory_max, heap_max, pool_size) can be
+    changed while no session holds a worker, else 6116 (as Oracle's
+    mle.memory_max "while the component is active"). A change restarts the
+    engine, so INSTALL COMPONENT ... SET GLOBAL mle.memory_max = ... works
+    (the server applies those values after the component started).
+  - dir, java_home and cgroup_base say what mysqld executes and where:
+    read-only, like plugin_dir (command line, my.cnf, SET PERSIST_ONLY).
+  - languages, max_workers, spin_us, interrupt_grace_ms: dynamic.
+*/
+
+#include <strings.h>
+
+#include <atomic>
+#include <cstring>
+#include <string>
+
+#include <my_inttypes.h>
+#include <mysql/components/component_implementation.h>
+#include <mysql/components/services/component_sys_var_service.h>
+#include <mysql/components/services/mysql_runtime_error_service.h>
+#include <mysql/components/services/mysql_runtime_warning.h>
+#include <mysql/components/services/mysql_system_variable.h>
+#include <mysqld_error.h>
+
+#include "mle_component.h"
+
+extern REQUIRES_SERVICE_PLACEHOLDER(component_sys_variable_register);
+extern REQUIRES_SERVICE_PLACEHOLDER(component_sys_variable_unregister);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_system_variable_reader);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_error);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_warning);
+
+namespace mle_component {
+
+namespace {
+
+constexpr const char kAllLanguageNames[] = "JAVASCRIPT,PYTHON,JAVA";
+
+/* Variable values (written by the server). */
+ulonglong g_memory_max = 0;
+ulonglong g_heap_max = 0;
+uint g_pool_size = 0;
+uint g_max_workers = 0;
+uint g_spin_us = 0;
+uint g_interrupt_grace_ms = 0;
+char *g_languages = nullptr;
+char *g_cgroup_base = nullptr;
+char *g_dir = nullptr;
+char *g_java_home = nullptr;
+
+std::atomic<unsigned> g_language_bits{kAllLanguages};
+
+/** Default of mle.dir; must outlive the registration. */
+std::string g_default_dir;
+
+std::string text(const char *s) { return s == nullptr ? "" : s; }
+
+/** Engine restart after a setting changed; a failure leaves the engine
+    inactive (mle_status) and is reported as a warning and in the log. */
+void restart_engine(MYSQL_THD thd, const char *variable) {
+  std::string error, info;
+  if (engine_start(current_settings(), &error, &info)) {
+    log_info(std::string("mle.") + variable + " changed. " + info);
+    return;
+  }
+  const std::string message = std::string("MLE: mle.") + variable +
+                              " changed, but the engine cannot start: " +
+                              error;
+  log_error(message);
+  mysql_service_mysql_runtime_warning->emit(thd, ER_LANGUAGE_COMPONENT,
+                                            message.c_str());
+}
+
+/** Check of an integer setting that shapes workers: refused while a
+    session holds a worker; range checked here (a custom check replaces the
+    server's range check; the server rejects non-integers before). */
+template <typename T, const char *Name, ulonglong Min, ulonglong Max>
+int check_shaping(MYSQL_THD, SYS_VAR *, void *save,
+                  struct st_mysql_value *value) {
+  if (engine_workers_in_use() > 0) {
+    my_error(ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE, MYF(0),
+             (std::string("mle.") + Name).c_str());
+    return 1;
+  }
+  long long v = 0;
+  if (value->val_int(value, &v) != 0) return 1;
+  if (v < 0 && !value->is_unsigned(value)) return 1;
+  const auto u = static_cast<ulonglong>(v);
+  if (u < Min || u > Max) return 1;  // ER_WRONG_VALUE_FOR_VAR
+  *static_cast<T *>(save) = static_cast<T>(u);
+  return 0;
+}
+
+template <typename T, const char *Name>
+void update_shaping(MYSQL_THD thd, SYS_VAR *, void *val_ptr,
+                    const void *save) {
+  *static_cast<T *>(val_ptr) = *static_cast<const T *>(save);
+  restart_engine(thd, Name);
+}
+
+constexpr const char kMemoryMax[] = "memory_max";
+constexpr const char kHeapMax[] = "heap_max";
+constexpr const char kPoolSize[] = "pool_size";
+
+constexpr ulonglong kMiB = 1ULL << 20;
+constexpr ulonglong kMemoryMaxMin = 256 * kMiB;
+constexpr ulonglong kMemoryMaxMax = 1ULL << 40;
+constexpr ulonglong kHeapMaxMin = 64 * kMiB;
+constexpr ulonglong kHeapMaxMax = 64ULL << 30;
+constexpr ulonglong kPoolSizeMax = 64;
+
+int check_languages(MYSQL_THD, SYS_VAR *, void *save,
+                    struct st_mysql_value *value) {
+  int length = 0;
+  /* Without a buffer the value is copied to the THD's memory and lives
+     until the end of the statement. */
+  const char *s = value->val_str(value, nullptr, &length);
+  unsigned bits = 0;
+  if (s == nullptr ||
+      !parse_languages({s, static_cast<size_t>(length)}, &bits))
+    return 1;
+  *static_cast<const char **>(save) = s;
+  return 0;
+}
+
+void update_languages(MYSQL_THD, SYS_VAR *, void *val_ptr, const void *save) {
+  char *s = *static_cast<char *const *>(save);
+  *static_cast<char **>(val_ptr) = s;
+  unsigned bits = 0;
+  if (parse_languages(text(s), &bits)) g_language_bits = bits;
+}
+
+/** A registered variable, to unregister. */
+struct Registered {
+  const char *name;
+  bool done;
+};
+Registered g_registered[] = {
+    {"memory_max", false}, {"heap_max", false},    {"pool_size", false},
+    {"max_workers", false}, {"spin_us", false},    {"interrupt_grace_ms", false},
+    {"languages", false},  {"cgroup_base", false}, {"dir", false},
+    {"java_home", false}};
+
+void mark(const char *name) {
+  for (auto &r : g_registered)
+    if (strcmp(r.name, name) == 0) r.done = true;
+}
+
+template <typename Arg>
+bool reg(const char *name, int flags, const char *comment,
+         mysql_sys_var_check_func check, mysql_sys_var_update_func update,
+         Arg *arg, void *variable) {
+  if (mysql_service_component_sys_variable_register->register_variable(
+          kName, name, flags, comment, check, update, arg, variable)) {
+    log_error(std::string("Cannot register the system variable mle.") + name);
+    return true;
+  }
+  mark(name);
+  return false;
+}
+
+/** <plugin dir>/mle */
+std::string default_dir() {
+  char buffer[4096];
+  void *value = buffer;
+  size_t length = sizeof(buffer) - 1;
+  if (mysql_service_mysql_system_variable_reader->get(
+          nullptr, "GLOBAL", "mysql_server", "plugin_dir", &value, &length))
+    return "mle";
+  std::string dir(static_cast<const char *>(value), length);
+  while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+  return dir + "/mle";
+}
+
+}  // namespace
+
+bool register_settings() {
+  INTEGRAL_CHECK_ARG(ulonglong) memory_max;
+  memory_max.def_val = 2ULL << 30;
+  memory_max.min_val = kMemoryMaxMin;
+  memory_max.max_val = kMemoryMaxMax;
+  memory_max.blk_sz = kMiB;
+  if (reg("memory_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
+          "Memory limit of each MLE worker process in bytes (cgroup "
+          "memory.max: JVM, GraalJS, GraalPy, numpy). Can be changed while no "
+          "session holds a worker; restarts the engine.",
+          check_shaping<ulonglong, kMemoryMax, kMemoryMaxMin, kMemoryMaxMax>,
+          update_shaping<ulonglong, kMemoryMax>, &memory_max, &g_memory_max))
+    return true;
+
+  ulonglong_check_arg_s heap_max;
+  heap_max.def_val = 512 * kMiB;
+  heap_max.min_val = kHeapMaxMin;
+  heap_max.max_val = kHeapMaxMax;
+  heap_max.blk_sz = kMiB;
+  if (reg("heap_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
+          "Java heap of each MLE worker in bytes (-Xmx). Can be changed while "
+          "no session holds a worker; restarts the engine.",
+          check_shaping<ulonglong, kHeapMax, kHeapMaxMin, kHeapMaxMax>,
+          update_shaping<ulonglong, kHeapMax>, &heap_max, &g_heap_max))
+    return true;
+
+  INTEGRAL_CHECK_ARG(uint) pool_size;
+  pool_size.def_val = 1;
+  pool_size.min_val = 0;
+  pool_size.max_val = kPoolSizeMax;
+  pool_size.blk_sz = 0;
+  if (reg("pool_size", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Started MLE workers kept ready for sessions (JVM with Java, "
+          "JavaScript and Python loaded). Can be changed while no session "
+          "holds a worker; restarts the engine.",
+          check_shaping<uint, kPoolSize, 0, kPoolSizeMax>,
+          update_shaping<uint, kPoolSize>, &pool_size, &g_pool_size))
+    return true;
+
+  uint_check_arg_s max_workers;
+  max_workers.def_val = 64;
+  max_workers.min_val = 1;
+  max_workers.max_val = 100000;
+  max_workers.blk_sz = 0;
+  if (reg("max_workers", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Most MLE workers held by sessions at a time (one per session and "
+          "principal); beyond it calls fail with a concurrency limit error.",
+          nullptr, nullptr, &max_workers, &g_max_workers))
+    return true;
+
+  uint_check_arg_s spin_us;
+  spin_us.def_val = 50;
+  spin_us.min_val = 0;
+  spin_us.max_val = 10000;
+  spin_us.blk_sz = 0;
+  if (reg("spin_us", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Microseconds a session spins waiting for its worker before it "
+          "sleeps.",
+          nullptr, nullptr, &spin_us, &g_spin_us))
+    return true;
+
+  uint_check_arg_s grace;
+  grace.def_val = 1000;
+  grace.min_val = 0;
+  grace.max_val = 600000;
+  grace.blk_sz = 0;
+  if (reg("interrupt_grace_ms", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Milliseconds a worker has to stop a killed statement's routine "
+          "before the worker is killed.",
+          nullptr, nullptr, &grace, &g_interrupt_grace_ms))
+    return true;
+
+  STR_CHECK_ARG(languages) languages;
+  languages.def_val = const_cast<char *>(kAllLanguageNames);
+  if (reg("languages", PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC,
+          "Languages MLE runs: a list of JAVASCRIPT, PYTHON, JAVA.",
+          check_languages, update_languages, &languages, &g_languages))
+    return true;
+  /* A value from the command line or my.cnf is not checked by the server. */
+  unsigned bits = 0;
+  if (parse_languages(text(g_languages), &bits)) {
+    g_language_bits = bits;
+  } else {
+    log_warning("mle.languages '" + text(g_languages) +
+                "' is invalid; all languages are enabled.");
+    g_language_bits = kAllLanguages;
+  }
+
+  STR_CHECK_ARG(cgroup_base) cgroup_base;
+  cgroup_base.def_val = const_cast<char *>("AUTO");
+  if (reg("cgroup_base",
+          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY,
+          "cgroup v2 directory for the worker cgroups (memory and process "
+          "limits): AUTO (the parent of mysqld's cgroup, if delegated), NONE "
+          "or a path.",
+          nullptr, nullptr, &cgroup_base, &g_cgroup_base))
+    return true;
+
+  g_default_dir = default_dir();
+  STR_CHECK_ARG(dir) dir;
+  dir.def_val = const_cast<char *>(g_default_dir.c_str());
+  if (reg("dir", PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY,
+          "Directory of the MLE files (mle_launcher, mle_worker, jars, Python "
+          "venv); default <plugin_dir>/mle.",
+          nullptr, nullptr, &dir, &g_dir))
+    return true;
+
+  STR_CHECK_ARG(java_home) java_home;
+  java_home.def_val = const_cast<char *>(MLE_DEFAULT_JAVA_HOME);
+  if (reg("java_home",
+          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY,
+          "GraalVM JDK 25 that runs the MLE workers.", nullptr, nullptr,
+          &java_home, &g_java_home))
+    return true;
+  return false;
+}
+
+void unregister_settings() {
+  for (auto &r : g_registered) {
+    if (!r.done) continue;
+    if (!mysql_service_component_sys_variable_unregister->unregister_variable(
+            kName, r.name))
+      r.done = false;
+  }
+  g_languages = g_cgroup_base = g_dir = g_java_home = nullptr;
+}
+
+Settings current_settings() {
+  Settings s;
+  s.memory_max = g_memory_max;
+  s.heap_max = g_heap_max;
+  s.pool_size = g_pool_size;
+  s.cgroup_base = text(g_cgroup_base);
+  s.dir = text(g_dir);
+  s.java_home = text(g_java_home);
+  return s;
+}
+
+unsigned enabled_languages() { return g_language_bits.load(); }
+
+unsigned language_bit(std::string_view name) {
+  auto is = [&](const char *n) {
+    return name.size() == strlen(n) &&
+           strncasecmp(name.data(), n, name.size()) == 0;
+  };
+  if (is("JAVASCRIPT")) return kJavaScript;
+  if (is("PYTHON")) return kPython;
+  if (is("JAVA")) return kJava;
+  return 0;
+}
+
+bool parse_languages(std::string_view text, unsigned *bits) {
+  *bits = 0;
+  if (text.empty()) return true;  // no language
+  while (true) {
+    const size_t comma = text.find(',');
+    std::string_view item = text.substr(0, comma);
+    while (!item.empty() && item.front() == ' ') item.remove_prefix(1);
+    while (!item.empty() && item.back() == ' ') item.remove_suffix(1);
+    const unsigned bit = language_bit(item);
+    if (bit == 0) return false;
+    *bits |= bit;
+    if (comma == std::string_view::npos) break;
+    text.remove_prefix(comma + 1);
+  }
+  return true;
+}
+
+std::string language_names(unsigned bits) {
+  std::string names;
+  auto add = [&](unsigned bit, const char *name) {
+    if ((bits & bit) == 0) return;
+    if (!names.empty()) names += ",";
+    names += name;
+  };
+  add(kJavaScript, "JavaScript");
+  add(kPython, "Python");
+  add(kJava, "Java");
+  return names;
+}
+
+}  // namespace mle_component

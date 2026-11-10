@@ -20,6 +20,8 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <climits>
+#include <cstdlib>
 
 namespace mle {
 
@@ -28,6 +30,14 @@ namespace {
 bool exists(const std::string &path) {
   struct stat st;
   return stat(path.c_str(), &st) == 0;
+}
+
+/** The path with symlinks resolved, or the path itself if it does not exist.
+    Landlock rules apply to the files symlinks point to, and the AOT cache
+    checks the class path it was created with, so workers get real paths. */
+std::string resolve(const std::string &path) {
+  char buf[PATH_MAX];
+  return realpath(path.c_str(), buf) != nullptr ? std::string(buf) : path;
 }
 
 std::string dir_of(const std::string &path) {
@@ -39,14 +49,14 @@ std::string dir_of(const std::string &path) {
 
 Layout Layout::installed(const std::string &dir, const std::string &java_home) {
   Layout l;
-  l.launcher_exe = dir + "/mle_launcher";
-  l.worker_exe = dir + "/mle_worker";
-  l.worker_jar = dir + "/mle-worker.jar";
-  l.resource_cache = dir + "/resources";
+  l.launcher_exe = resolve(dir + "/mle_launcher");
+  l.worker_exe = resolve(dir + "/mle_worker");
+  l.worker_jar = resolve(dir + "/mle-worker.jar");
+  l.resource_cache = resolve(dir + "/resources");
   if (exists(dir + "/python-venv/venv/bin/python"))
-    l.python_venv = dir + "/python-venv/venv";
-  if (exists(dir + "/mle.aot")) l.aot_cache = dir + "/mle.aot";
-  l.java_home = java_home;
+    l.python_venv = resolve(dir + "/python-venv/venv");
+  if (exists(dir + "/mle.aot")) l.aot_cache = resolve(dir + "/mle.aot");
+  l.java_home = resolve(java_home);
   return l;
 }
 
