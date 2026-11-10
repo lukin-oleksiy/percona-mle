@@ -17,7 +17,6 @@
 
 package com.percona.mle.worker;
 
-import com.percona.mle.api.SqlResult;
 
 /**
  * Entry from {@link com.percona.mle.api.Mle} into the worker. Public only so that the API package
@@ -28,10 +27,13 @@ public final class SqlBridge {
 
   static volatile Dispatcher dispatcher;
 
-  public static SqlResult sql(String statement, Object[] params) {
-    Dispatcher d = dispatcher;
-    if (d == null) throw new IllegalStateException("MLE worker not running");
-    return d.sql(statement, params == null ? new Object[0] : params);
+  private static com.percona.mle.sql.Session javaSession;
+
+  /** Mle.session(): the Java routines' session (Java values). */
+  public static synchronized com.percona.mle.sql.Session javaSession() {
+    dispatcher();
+    if (javaSession == null) javaSession = new com.percona.mle.sql.Session(new JavaSql());
+    return javaSession;
   }
 
   /** MleSql: one Phase 5 SQL request (see Dispatcher#sqlRequest). */

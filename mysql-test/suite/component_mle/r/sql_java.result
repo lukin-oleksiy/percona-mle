@@ -1,0 +1,139 @@
+#
+# component_mle (P5-W4): the SQL API in Java: Oracle's object model
+# (com.percona.mle.sql) used directly through Mle.session(), with Java
+# values; errors are MleSqlExceptions.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t1 (c1 INT PRIMARY KEY, c2 INT, c3 VARCHAR(20));
+INSERT INTO t1 VALUES (1, 64, 'banana'), (2, 139, 'apple'), (3, 37, 'peach'),
+(4, 221, 'watermelon'), (5, 83, 'pear');
+CREATE TABLE tx (k INT) ENGINE=InnoDB;
+CREATE FUNCTION getArea(w INT, h INT) RETURNS INT DETERMINISTIC RETURN w * h;
+CREATE PROCEDURE my_proc(IN x INT, OUT y VARCHAR(20), INOUT z TEXT)
+LANGUAGE JAVASCRIPT AS $$
+y = "Hello world " + x
+z += "Hello again JS"
+$$;
+#
+# 1. Statements, rows, prepared statements, stored routines (OUT/INOUT
+#    of Oracle's JavaScript my_proc), user variables.
+#
+CREATE PROCEDURE j_api(OUT r TEXT) LANGUAGE JAVA AS $$
+Session s = Mle.session();
+StringBuilder b = new StringBuilder();
+SqlResult res = s.runSql("SELECT c1, c3 AS name FROM t1 WHERE c1 < ? ORDER BY c1", 4);
+b.append(res.getColumnNames());
+for (Row row : res)
+b.append('\n').append(row.get(0)).append(' ').append(row.getField("name")).append(' ')
+.append(row.get(0).getClass().getSimpleName());
+PreparedStatement p = s.prepare("SELECT ? + ? AS x");
+b.append('\n').append(p.bind(1, 2).execute().fetchOne().get(0));
+b.append(' ').append(p.bind(10).execute().fetchOne().get(0));
+p.deallocate();
+Schema schema = s.getDefaultSchema();
+Routine area = schema.getFunction("getArea");
+b.append('\n').append(area.call(5, 10));
+Routine proc = schema.getProcedure("my_proc");
+Argument y = new Argument(), z = new Argument("World ");
+proc.call(42, y, z);
+b.append('\n').append(y.getVal()).append(" | ").append(z.getVal());
+s.setVariable("jvar", 7L);
+b.append('\n').append(s.getVariable("jvar")).append(' ').append(s.getVariable("nothing"));
+SqlResult ins = s.sql("INSERT INTO tx VALUES (1), (2)").execute();
+b.append('\n').append(ins.hasData()).append(' ').append(ins.getAffectedItemsCount());
+b.append('\n').append(schema.getTable("t1").count()).append(' ').append(Session.quoteName("x`y"));
+r[0] = b.toString();
+$$;
+CALL j_api(@r);
+SELECT @r;
+@r
+[c1, name]
+1 banana Long
+2 apple Long
+3 peach Long
+3.0 12.0
+50
+Hello world 42 | World Hello again JS
+7 null
+false 2
+5 `x``y`
+#
+# 2. Values as Java types.
+#
+CREATE PROCEDURE j_types(OUT r TEXT) LANGUAGE JAVA AS $$
+SqlResult res = Mle.session().runSql("SELECT -5 AS i, CAST(18446744073709551615 AS UNSIGNED) AS ubig, " +
+"2.5e0 AS d, CAST(1.25 AS DECIMAL(6,3)) AS decm, 'héllo' AS s, x'00ff' AS b, " +
+"CAST('{\"a\": 1}' AS JSON) AS j, DATE'2024-01-02' AS dt, TIME'12:34:56.5' AS tm, " +
+"TIMESTAMP'2024-01-02 03:04:05.678' AS ts, STRING_TO_VECTOR('[1,2.5]') AS vec, NULL AS nul");
+Row row = res.fetchOne();
+StringBuilder b = new StringBuilder();
+for (int i = 0; i < row.getLength(); i++) {
+Object v = row.get(i);
+String shown = v instanceof byte[] x ? java.util.HexFormat.of().formatHex(x)
+: v instanceof float[] f ? Arrays.toString(f) : String.valueOf(v);
+b.append(res.getColumns().get(i).getColumnLabel()).append(": ").append(res.getColumns().get(i).getType())
+.append(": ").append(v == null ? "null" : v.getClass().getSimpleName()).append(' ').append(shown).append('\n');
+}
+r[0] = b.toString();
+$$;
+CALL j_types(@r);
+SELECT @r;
+@r
+i: BIGINT: Long -5
+ubig: BIGINT: BigInteger 18446744073709551615
+d: DOUBLE: Double 2.5
+decm: DECIMAL: BigDecimal 1.250
+s: STRING: String héllo
+b: BYTES: byte[] 00ff
+j: JSON: MleJson {"a": 1}
+dt: DATE: LocalDate 2024-01-02
+tm: TIME: Duration PT12H34M56.5S
+ts: DATETIME: LocalDateTime 2024-01-02T03:04:05.678
+vec: VECTOR: float[] [1.0, 2.5]
+nul: BYTES: null null
+
+#
+# 3. Errors: caught; uncaught reaches the client unchanged; a thrown
+#    MleSqlException is raised like SIGNAL. Transactions.
+#
+CREATE PROCEDURE j_errors(OUT r TEXT) LANGUAGE JAVA AS $$
+Session s = Mle.session();
+StringBuilder b = new StringBuilder();
+try { s.runSql("SELECT * FROM bogus"); }
+catch (MleSqlException e) { b.append(e.getErrorCode()).append(' ').append(e.getSqlState()).append(' ').append(e.getMessage()); }
+try { s.prepare("SELECT ?").bind(1, 2); }
+catch (MleSqlException e) { b.append('\n').append(e.getErrorCode()).append(' ').append(e.getMessage()); }
+s.startTransaction();
+s.runSql("INSERT INTO tx VALUES (10)");
+String sp = s.setSavepoint();
+s.runSql("INSERT INTO tx VALUES (11)");
+s.rollbackTo(sp);
+s.commit();
+StringBuilder ks = new StringBuilder();
+for (Row row : s.runSql("SELECT k FROM tx ORDER BY k")) ks.append(row.get(0)).append(' ');
+b.append('\n').append(sp).append(": ").append(ks.toString().trim()).append(", autocommit ").append(s.autocommit());
+r[0] = b.toString();
+$$;
+CALL j_errors(@r);
+SELECT @r;
+@r
+1146 42S02 Table 'test.bogus' doesn't exist
+1210 Incorrect arguments to bind: 2 values for 1 parameter markers
+TxSp1: 1 2 10, autocommit 1
+CREATE PROCEDURE j_uncaught() LANGUAGE JAVA AS $$ Mle.session().runSql("SELECT * FROM bogus"); $$;
+CALL j_uncaught();
+ERROR 42S02: Table 'test.bogus' doesn't exist
+CREATE PROCEDURE j_signal() LANGUAGE JAVA AS $$ throw new MleSqlException(1000, "45000", "Some error"); $$;
+CALL j_signal();
+ERROR 45000: Some error
+DROP PROCEDURE j_api;
+DROP PROCEDURE j_types;
+DROP PROCEDURE j_errors;
+DROP PROCEDURE j_uncaught;
+DROP PROCEDURE j_signal;
+DROP PROCEDURE my_proc;
+DROP FUNCTION getArea;
+DROP TABLE t1, tx;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

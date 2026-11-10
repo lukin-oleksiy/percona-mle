@@ -442,7 +442,7 @@ final class Values {
       return nonNull(c, (v, a) -> {
         if (!(v instanceof VectorRef ref)) throw wrong(v, c);
         // A copy in native memory owned by the call: the arena itself is overwritten by the next
-        // message (e.g. Mle.sql in the routine). Closed, and so unusable, after the call.
+        // message (e.g. SQL from the routine). Closed, and so unusable, after the call.
         MemorySegment s = a.allocate(ref.data().byteSize(), Wire.VECTOR_ALIGNMENT);
         s.copyFrom(ref.data());
         return s.asReadOnly();

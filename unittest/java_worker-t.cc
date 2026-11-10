@@ -314,11 +314,12 @@ TEST_F(MleJavaWorker, SqlCallback) {
   ResultMsg res;
   ASSERT_EQ(prepare(*s_host, 500, "S.f",
                     "import com.percona.mle.api.*;\n"
+                    "import com.percona.mle.sql.*;\n"
                     "public class S { public static String f(long k) {\n"
-                    "  SqlResult r = Mle.sql(\"SELECT name, v FROM t WHERE id "
-                    "= ?\", k);\n"
-                    "  try { Mle.sql(\"INSERT INTO t VALUES (1)\"); }\n"
-                    "  catch (MleSqlException e) { return r.rows().get(0)[0] + "
+                    "  SqlResult r = Mle.session().runSql(\"SELECT name, v FROM t "
+                    "WHERE id = ?\", k);\n"
+                    "  try { Mle.session().runSql(\"INSERT INTO t VALUES (1)\"); }\n"
+                    "  catch (MleSqlException e) { return r.fetchOne().get(0) + "
                     "\" \" + e.getErrorCode(); }\n"
                     "  return \"no error\";\n"
                     "} }",
@@ -349,7 +350,8 @@ TEST_F(MleJavaWorker, SqlCallback) {
   ASSERT_EQ(
       prepare(*s_host, 501, "U.f",
               "public class U { public static long f() { "
-              "com.percona.mle.api.Mle.sql(\"DROP TABLE x\"); return 0; } }",
+              "com.percona.mle.api.Mle.session().runSql(\"DROP TABLE x\"); return 0; "
+              "} }",
               {}, type(Tag::kI64), &res),
       0u);
   auto fail = [](const SqlMsg &, SqlResultMsg *r) {
@@ -371,14 +373,14 @@ TEST_F(MleJavaWorker, NestedCalls) {
   ASSERT_EQ(
       prepare(*s_host, 600, "Outer.f",
               "public class Outer { public static String f() { return "
-              "\"outer(\" + com.percona.mle.api.Mle.sql(\"SELECT inner()\")"
-              ".rows().get(0)[0] + \")\"; } }",
+              "\"outer(\" + com.percona.mle.api.Mle.session().runSql(\"SELECT "
+              "inner()\").fetchOne().get(0) + \")\"; } }",
               {}, type(Tag::kString), &res),
       0u);
   ASSERT_EQ(prepare(*s_host, 601, "Inner.f",
                     "public class Inner { public static String f() { return "
-                    "\"inner(\" + com.percona.mle.api.Mle.sql(\"SELECT 1\")"
-                    ".rows().get(0)[0] + \")\"; } }",
+                    "\"inner(\" + com.percona.mle.api.Mle.session().runSql(\"SELECT "
+                    "1\").fetchOne().get(0) + \")\"; } }",
                     {}, type(Tag::kString), &res),
             0u);
   auto sql = [&](const SqlMsg &m, SqlResultMsg *r) {
@@ -702,8 +704,8 @@ TEST_F(MleJavaWorker, NestingLimit) {
   ResultMsg res;
   ASSERT_EQ(prepare(*h, 1, "Rec.f",
                     "public class Rec { public static String f() { try { "
-                    "return \"(\" + com.percona.mle.api.Mle.sql(\"CALL f()\")"
-                    ".rows().get(0)[0] + \")\"; } catch "
+                    "return \"(\" + com.percona.mle.api.Mle.session().runSql(\"CALL "
+                    "f()\").fetchOne().get(0) + \")\"; } catch "
                     "(com.percona.mle.api.MleSqlException e) { return "
                     "e.getMessage(); } } }",
                     {}, type(Tag::kString), &res),

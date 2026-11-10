@@ -68,6 +68,16 @@ final class GuestSql {
 
     /** A guest options object as SqlOptions; null for null/undefined. */
     SqlOptions options(Value v);
+
+    /** The guest's null (JS null; Python None, not a foreign null). */
+    default Object none() {
+      return null;
+    }
+
+    /** v, or the guest's null. */
+    default Object out(Object v) {
+      return v == null ? none() : v;
+    }
   }
 
   // ------------------------------------------------------------ base
@@ -89,7 +99,7 @@ final class GuestSql {
     public Object getMember(String key) {
       String k = lang.member(key);
       if (!names().contains(k)) return other(key);
-      return (ProxyExecutable) a -> guard(lang, () -> call(k, a));
+      return (ProxyExecutable) a -> lang.out(guard(lang, () -> call(k, a)));
     }
 
     /** A member that is not a method (session variables); null if none. */
@@ -242,22 +252,28 @@ final class GuestSql {
       };
     }
 
+    /** Names starting with __ are never user variables (Python looks such names up itself). */
+    private static boolean variable(String key) {
+      return !key.startsWith("__");
+    }
+
     /** session.x reads @x. */
     @Override
     Object other(String key) {
-      return guard(lang, () -> s.getVariable(key));
+      return variable(key) ? lang.out(guard(lang, () -> s.getVariable(key))) : null;
     }
 
     /** Any name is a member: a user variable if not a method. */
     @Override
     public boolean hasMember(String key) {
-      return true;
+      return variable(key) || super.hasMember(key);
     }
 
     /** session.x = v sets @x. */
     @Override
     public void putMember(String key, Value value) {
-      if (names().contains(lang.member(key))) throw lang.error(new IllegalArgumentException("cannot set " + key));
+      if (names().contains(lang.member(key)) || !variable(key))
+        throw lang.error(new IllegalArgumentException("cannot set " + key));
       guard(lang, () -> {
         s.setVariable(key, value);
         return null;
@@ -291,7 +307,8 @@ final class GuestSql {
     }
   }
 
-  static final class GResult extends Methods {
+  /** Results; also iterable over the rows of the current result set (for ... of / for ... in). */
+  static final class GResult extends Methods implements org.graalvm.polyglot.proxy.ProxyIterable {
     private static final Set<String> NAMES = Set.of("fetchOne", "fetchAll", "hasData", "nextResult", "getColumns",
         "getColumnNames", "getColumnCount", "getAffectedItemsCount", "getAutoIncrementValue", "getWarnings",
         "getWarningsCount", "getExecutionTime", "close");
@@ -300,6 +317,27 @@ final class GuestSql {
     GResult(GSession session, SqlResult r) {
       super(session.lang);
       this.r = r;
+    }
+
+    @Override
+    public Object getIterator() {
+      return new org.graalvm.polyglot.proxy.ProxyIterator() {
+        private Row next;
+
+        @Override
+        public boolean hasNext() {
+          if (next == null) next = (Row) guard(lang, r::fetchOne);
+          return next != null;
+        }
+
+        @Override
+        public Object getNext() {
+          if (!hasNext()) throw new java.util.NoSuchElementException();
+          Row row = next;
+          next = null;
+          return new GRow(lang, row);
+        }
+      };
     }
 
     @Override
@@ -399,13 +437,13 @@ final class GuestSql {
       String k = lang.member(key);
       if (NAMES.contains(k)) {
         return switch (k) {
-          case "getField" -> (ProxyExecutable) a -> guard(lang, () -> row.getField(str(a, 0)));
+          case "getField" -> (ProxyExecutable) a -> lang.out(guard(lang, () -> row.getField(str(a, 0))));
           case "getLength" -> (ProxyExecutable) a -> row.getLength();
           default -> (ProxyExecutable) a -> guard(lang, () -> lang.list(java.util.Arrays.asList(row.toArray())));
         };
       }
       int i = row.indexOf(key);
-      return i < 0 ? null : guard(lang, () -> row.get(i));
+      return i < 0 ? null : lang.out(guard(lang, () -> row.get(i)));
     }
 
     @Override
@@ -425,8 +463,8 @@ final class GuestSql {
 
     @Override
     public Object get(long index) {
-      if (index < 0 || index >= row.getLength()) return null;
-      return guard(lang, () -> row.get((int) index));
+      if (index < 0 || index >= row.getLength()) return lang.none();
+      return lang.out(guard(lang, () -> row.get((int) index)));
     }
 
     @Override
@@ -608,21 +646,23 @@ final class GuestSql {
       Object[] args = new Object[a.length];
       for (int i = 0; i < a.length; i++)
         args[i] = a[i].isProxyObject() && a[i].asProxyObject() instanceof GArgument g ? g.a : a[i];
-      return guard(lang, () -> r.call(args));
+      return lang.out(guard(lang, () -> r.call(args)));
     }
   }
 
   /** An OUT/INOUT argument (mysql.arg()): property val. */
   static final class GArgument implements ProxyObject {
     final Argument a;
+    private final Lang lang;
 
-    GArgument(Value initial) {
+    GArgument(Lang lang, Value initial) {
+      this.lang = lang;
       this.a = new Argument(initial == null || initial.isNull() ? null : initial);
     }
 
     @Override
     public Object getMember(String key) {
-      return key.equals("val") ? a.getVal() : null;
+      return key.equals("val") ? lang.out(a.getVal()) : null;
     }
 
     @Override

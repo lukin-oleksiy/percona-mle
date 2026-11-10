@@ -64,7 +64,7 @@ import javax.tools.ToolProvider;
  *   <li>Entry given (Phase 3 tests, harness): [package.]Class.method.
  * </ul>
  *
- * <p>The routine loader's parent sees only the JDK and com.percona.mle.api. That is tidiness, not
+ * <p>The routine loader's parent sees only the JDK, com.percona.mle.api and com.percona.mle.sql. That is tidiness, not
  * security: the worker process is the sandbox. The polyglot API (org.graalvm.polyglot) is visible
  * too, for calls into JS and Python through Mle.context().
  */
@@ -91,7 +91,7 @@ final class JavaRoutines {
   static final Map<String, Origin> origins = new java.util.concurrent.ConcurrentHashMap<>();
 
   /** Body form: the class, the method and the line-1 prefix length. */
-  private static final String BODY_CLASS = "Routine";
+  private static final String BODY_CLASS = "MleRoutineBody";  // not Routine: com.percona.mle.sql.Routine
   private static final String BODY_METHOD = "call";
 
   private static final Pattern PACKAGE = Pattern.compile("(?m)^\\s*package\\s+([\\w.]+)\\s*;");
@@ -118,7 +118,8 @@ final class JavaRoutines {
 
     @Override
     protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
-      if (name.startsWith("com.percona.mle.api.") || name.startsWith("org.graalvm.polyglot."))
+      if (name.startsWith("com.percona.mle.api.") || name.startsWith("com.percona.mle.sql.")
+          || name.startsWith("org.graalvm.polyglot."))
         return app.loadClass(name);
       return super.loadClass(name, resolve);
     }
@@ -182,7 +183,7 @@ final class JavaRoutines {
   }
 
   private static final String BODY_IMPORTS =
-      "import java.math.*;import java.time.*;import java.util.*;import com.percona.mle.api.*;";
+      "import java.math.*;import java.time.*;import java.util.*;import com.percona.mle.api.*;import com.percona.mle.sql.*;";
 
   /** The class around a method body; the body starts on line 1 after the returned prefix. */
   private static String[] wrapBody(String body, List<Param> params, Values.ParamType ret) {
@@ -344,7 +345,7 @@ final class JavaRoutines {
       files = javac.getStandardFileManager(null, Locale.ROOT, StandardCharsets.UTF_8);
     }
     Matcher t = PUBLIC_TYPE.matcher(source);
-    String typeName = t.find() ? t.group(1) : "Routine";
+    String typeName = t.find() ? t.group(1) : BODY_CLASS;
     String pkg = packageOf(source);
     String path = (pkg.isEmpty() ? "" : pkg.replace('.', '/') + "/") + typeName;
 

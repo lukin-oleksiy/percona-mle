@@ -363,19 +363,19 @@ TEST_F(MlePolyglotWorker, Console) {
 TEST_F(MlePolyglotWorker, SqlFromJsAndPython) {
   ResultMsg res;
   ASSERT_EQ(prepare(*s_host, 500, "js", "f",
-                    "function f(k) { const r = Mle.sql('SELECT name FROM t "
-                    "WHERE id = ?', k); try { Mle.sql('BAD'); } catch (e) { "
-                    "return r.rows()[0][0] + ' ' + e.getErrorCode(); } }",
+                    "function f(k) { const r = session.runSql('SELECT name "
+                    "FROM t WHERE id = ?', [k]); try { session.runSql('BAD'); } "
+                    "catch (e) { return r.fetchOne()[0] + ' ' + e.code; } }",
                     {type(Tag::kI64)}, type(Tag::kString), &res),
             0u)
       << error_of(res);
   ASSERT_EQ(prepare(*s_host, 501, "python", "f",
                     "def f(k):\n"
-                    "    r = Mle.sql('SELECT name FROM t WHERE id = ?', k)\n"
-                    "    try:\n        Mle.sql('BAD')\n"
-                    "    except BaseException as e:\n"
-                    "        return r.rows()[0][0] + ' ' + "
-                    "str(e.getErrorCode())\n",
+                    "    r = session.run_sql('SELECT name FROM t WHERE id = ?', "
+                    "[k])\n"
+                    "    try:\n        session.run_sql('BAD')\n"
+                    "    except SqlError as e:\n"
+                    "        return r.fetch_one()[0] + ' ' + str(e.code)\n",
                     {type(Tag::kI64)}, type(Tag::kString), &res),
             0u)
       << error_of(res);
@@ -399,7 +399,7 @@ TEST_F(MlePolyglotWorker, SqlFromJsAndPython) {
   }
   // Uncaught: the MySQL error is kept.
   ASSERT_EQ(
-      prepare(*s_host, 502, "python", "f", "def f():\n    Mle.sql('BAD')\n", {},
+      prepare(*s_host, 502, "python", "f", "def f():\n    session.run_sql('BAD')\n", {},
               type(Tag::kI64), &res),
       0u);
   EXPECT_EQ(s_host->call(502, {}, &res), uint32_t(Status::kGuestError));

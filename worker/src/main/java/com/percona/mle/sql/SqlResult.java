@@ -28,7 +28,7 @@ import java.util.Map;
  * {@link #nextResult()}. Rows arrive in chunks; {@link #fetchOne()} asks mysqld for the next
  * chunk when one is used up.
  */
-public final class SqlResult {
+public final class SqlResult implements Iterable<Row> {
   /** One result set's columns, as rows see them. */
   static final class Set {
     final List<Column> columns;
@@ -135,6 +135,28 @@ public final class SqlResult {
     List<Row> all = new ArrayList<>(Math.max(0, rows.size() - pos));
     for (Row r = fetchOne(); r != null; r = fetchOne()) all.add(r);
     return all;
+  }
+
+  /** The remaining rows of the current result set, fetched as the iteration goes. */
+  @Override
+  public java.util.Iterator<Row> iterator() {
+    return new java.util.Iterator<>() {
+      private Row next;
+
+      @Override
+      public boolean hasNext() {
+        if (next == null) next = fetchOne();
+        return next != null;
+      }
+
+      @Override
+      public Row next() {
+        if (!hasNext()) throw new java.util.NoSuchElementException();
+        Row r = next;
+        next = null;
+        return r;
+      }
+    };
   }
 
   /** Whether the current result is a result set (rows and columns), not an OK. */

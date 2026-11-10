@@ -216,12 +216,13 @@ TEST_F(MleWorkerFailures, KillDuringSql) {
                             "public class Q { public static long f() { long "
                             "n = 0; while (!Thread.currentThread()"
                             ".isInterrupted()) { com.percona.mle.api.Mle"
-                            ".sql(\"SELECT 1\"); n++; } return n; } }",
+                            ".session().runSql(\"SELECT 1\"); n++; } return n; "
+                            "} }",
                             {}, type_of(Tag::kI64), &res),
             0u)
       << error_of(res);
   ASSERT_EQ(prepare_routine(*h, 2, "js", "f",
-                            "function f() { for (;;) Mle.sql('SELECT 1'); }",
+                            "function f() { for (;;) session.runSql('SELECT 1'); }",
                             {}, type_of(Tag::kI64), &res),
             0u)
       << error_of(res);

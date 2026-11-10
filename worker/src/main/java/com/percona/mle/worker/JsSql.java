@@ -66,7 +66,7 @@ final class JsSql implements GuestSql.Lang {
         "sleep", (ProxyExecutable) a -> Functions.sleep(a[0].asDouble()),
         "uuid", (ProxyExecutable) a -> Functions.uuid(),
         "isUUID", (ProxyExecutable) a -> Functions.isUUID(a[0].isNull() ? null : a[0].asString()),
-        "arg", (ProxyExecutable) a -> new GuestSql.GArgument(a.length == 0 ? null : a[0]));
+        "arg", (ProxyExecutable) a -> new GuestSql.GArgument(this, a.length == 0 ? null : a[0]));
     h = c.eval(Source.create("js", PRELUDE)).execute(ProxyObject.fromMap(bridge));
     array = h.getMember("array");
     bigint = h.getMember("bigint");

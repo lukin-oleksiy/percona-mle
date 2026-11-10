@@ -1,0 +1,231 @@
+--echo #
+--echo # component_mle (P5-W4): the SQL API in Python: Oracle's object model on
+--echo # the Java core, with snake_case names and Python values; the globals
+--echo # session, mysql and SqlError.
+--echo #
+--source include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t1 (c1 INT PRIMARY KEY, c2 INT, c3 VARCHAR(20));
+INSERT INTO t1 VALUES (1, 64, 'banana'), (2, 139, 'apple'), (3, 37, 'peach'),
+  (4, 221, 'watermelon'), (5, 83, 'pear');
+CREATE TABLE tx (k INT PRIMARY KEY AUTO_INCREMENT) ENGINE=InnoDB;
+
+--echo # mysqltest strips leading whitespace from statement lines, which
+--echo # Python blocks need: the Python routines are created from a file by the
+--echo # mysql client.
+--write_file $MYSQLTEST_VARDIR/tmp/sql_py.sql
+CREATE PROCEDURE py_vsimple(IN query VARCHAR(250)) LANGUAGE PYTHON AS $$
+    result = session.sql(query).execute()
+    print(','.join(result.get_column_names()))
+    for row in result:
+        print(row.to_array())
+$$;
+CREATE PROCEDURE py_prep(IN query VARCHAR(200)) LANGUAGE PYTHON AS $$
+    stmt = session.prepare(query)
+    for values in ((3, 4), (2, 3), (5,)):
+        res = stmt.bind(*values).execute()
+        print(res.get_column_names(), [r.to_array() for r in res.fetch_all()], res.get_warnings_count())
+    stmt.deallocate()
+$$;
+CREATE FUNCTION getDiag(w INT, h INT) RETURNS FLOAT DETERMINISTIC LANGUAGE PYTHON AS $$
+    import math
+    return math.sqrt(w ** 2 + h ** 2)
+$$;
+CREATE PROCEDURE py_rect(IN x INT, IN y INT) LANGUAGE PYTHON AS $$
+    s = session.get_default_schema()
+    f = s.get_function('getArea')
+    g = s.get_function('getDiag')
+    print('Width: %d, Height: %d; Area: %s; Diagonal: %r' % (x, y, f(x, y), g(x, y)))
+    f.close()
+    g.close()
+$$;
+CREATE PROCEDURE py_use_my_proc() LANGUAGE PYTHON AS $$
+    p = session.get_default_schema().get_procedure('my_proc')
+    a = mysql.arg()
+    b = mysql.arg('World ')
+    p(42, a, b)
+    print(a.val)
+    print(b.val)
+    p.close()
+    try:
+        p(1, a, b)
+    except RuntimeError as e:
+        print('RuntimeError:', e)
+$$;
+CREATE PROCEDURE py_errors(OUT r TEXT) LANGUAGE PYTHON AS $$
+    out = []
+    try:
+        session.run_sql('SELECT * FROM bogus')
+    except SqlError as e:
+        out.append('%s %s %s %s %s' % (type(e).__name__, isinstance(e, Exception), e.code, e.sql_state, e.message))
+    try:
+        raise mysql.SQLError(45000, 'Some error', 1001)
+    except SqlError as e:
+        out.append(str(e))
+    try:
+        session.prepare('SELECT ?').execute()
+    except SqlError as e:
+        out.append('%d %s' % (e.code, e.message))
+    for bad in (float('nan'), object(), mysql.arg(1)):
+        try:
+            session.run_sql('SELECT ?', [bad])
+        except TypeError as e:
+            out.append('TypeError: ' + str(e))
+    r = '\n'.join(out)
+$$;
+CREATE PROCEDURE py_uncaught() LANGUAGE PYTHON AS $$
+    session.run_sql('SELECT * FROM bogus')
+$$;
+CREATE PROCEDURE py_signal() LANGUAGE PYTHON AS $$
+    raise SqlError(45000, 'Some error', 1000)
+$$;
+CREATE PROCEDURE py_types(OUT r TEXT) LANGUAGE PYTHON AS $$
+    res = session.run_sql("SELECT -5 AS i, CAST(18446744073709551615 AS UNSIGNED) AS ubig, "
+                          "2.5e0 AS d, CAST(1.25 AS DECIMAL(6,3)) AS decm, 'héllo' AS s, x'00ff' AS b, "
+                          "CAST('{\"a\": [1, 2]}' AS JSON) AS j, DATE'2024-01-02' AS dt, "
+                          "TIME'-12:34:56.5' AS tm, TIMESTAMP'2024-01-02 03:04:05.678' AS ts, "
+                          "STRING_TO_VECTOR('[1,2.5]') AS vec, NULL AS nul")
+    row = res.fetch_one()
+    out = []
+    for c in res.get_columns():
+        v = row.get_field(c.get_column_label())
+        out.append('%s: %s: %s %r' % (c.get_column_label(), c.get_type(), type(v).__name__, v))
+    out.append('null is None: %r %r %r' % (row.nul is None, row[11] is None, session.unset is None))
+    d = session.sql('SELECT CAST(1.25 AS DECIMAL(6,3)) AS d', {'decimal_type': 'NUMBER'}).execute().fetch_one().d
+    out.append('NUMBER: %s %r' % (type(d).__name__, d))
+    r = '\n'.join(out)
+$$;
+CREATE PROCEDURE py_params() LANGUAGE PYTHON AS $$
+    import array, datetime, decimal, numpy
+    session.run_sql('INSERT INTO tp VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    [42, decimal.Decimal('1.234'), 'text', b'\x00\xff\x07', {'k': [1, 'x']},
+                     datetime.datetime(2024, 1, 2, 3, 4, 5, 678000), datetime.date(2024, 1, 2),
+                     datetime.timedelta(minutes=-30), numpy.array([1, 2.5], dtype=numpy.float32),
+                     {'a', 'c'}, 18446744073709551615, True])
+    session.run_sql('INSERT INTO tp (i, vec) VALUES (?, ?)', [None, array.array('f', [0.5, 4])])
+$$;
+CREATE PROCEDURE py_rows(OUT r TEXT) LANGUAGE PYTHON AS $$
+    out = []
+    res = session.run_sql('SELECT c1, c3 AS name FROM t1 ORDER BY c1')
+    row = res.fetch_one()
+    out.append('%r %r %r %d %r %r' % (row.c1, row.name, row[1], len(row), list(row), row.get_field('name')))
+    out.append(repr([x.name for x in res]))
+    out.append('%r %r' % (res.has_data(), res.next_result()))
+    ins = session.run_sql('INSERT INTO tx VALUES (NULL), (NULL)')
+    out.append('affected %d id %d' % (ins.get_affected_items_count(), ins.get_auto_increment_value()))
+    session.start_transaction()
+    session.run_sql('INSERT INTO tx VALUES (10)')
+    sp = session.set_savepoint()
+    session.run_sql('INSERT INTO tx VALUES (11)')
+    session.rollback_to(sp)
+    session.commit()
+    out.append(sp + ' ' + repr([x[0] for x in session.run_sql('SELECT k FROM tx ORDER BY k')]))
+    test = session.get_schema('test')
+    out.append('%r %r %r' % (test.get_name(), test.get_table('t1').count(), session.quote_name('a`b')))
+    session.yourvar = 100
+    out.append('%r %r %r %r' % (session.myvar, session.dec, session.unset, session.yourvar))
+    r = '\n'.join(out)
+$$;
+CREATE PROCEDURE py_to_client() LANGUAGE PYTHON AS $$
+    session.sql('SELECT c1, c3 FROM t1 WHERE c1 < 3 ORDER BY c1', {'pass_result_to_client': True}).execute()
+$$;
+CREATE FUNCTION py_fns() RETURNS TEXT LANGUAGE PYTHON AS $$
+    u = mysql.uuid()
+    try:
+        session.run_sql('SELECT 1')
+        e = None
+    except SqlError as x:
+        e = x.code
+    return '%r %r %r %r %r %r' % (0 <= mysql.rand() < 1, mysql.is_uuid(u), mysql.isUUID('nope'),
+                                  mysql.sleep(0.01), mysql.Type.VECTOR, e)
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/sql_py.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/sql_py.sql
+
+--connect (con1, localhost, root,,test)
+
+--echo #
+--echo # 1. Oracle's examples in Python: a simple statement, a prepared one with
+--echo #    partial re-binding, stored functions, OUT/INOUT (here calling
+--echo #    Oracle's JavaScript my_proc), SqlError.
+--echo #
+CALL py_vsimple("SELECT c1, c3 FROM t1 WHERE c1 < 4 ORDER BY c1");
+SELECT mle_session_state('stdout');
+SELECT mle_session_reset('stdout');
+
+CALL py_prep("SELECT * FROM t1 WHERE c1 = ? OR c1 = ? ORDER BY c1");
+SELECT mle_session_state('stdout');
+SELECT mle_session_reset('stdout');
+
+CREATE FUNCTION getArea(w INT, h INT) RETURNS INT DETERMINISTIC RETURN w * h;
+CALL py_rect(5, 10);
+CALL py_rect(2, 25);
+SELECT mle_session_state('stdout');
+SELECT mle_session_reset('stdout');
+
+CREATE PROCEDURE my_proc(IN x INT, OUT y VARCHAR(20), INOUT z TEXT)
+  LANGUAGE JAVASCRIPT AS $$
+    y = "Hello world " + x
+    z += "Hello again JS"
+$$;
+CALL py_use_my_proc();
+SELECT mle_session_state('stdout');
+
+CALL py_errors(@r);
+SELECT @r;
+--error ER_NO_SUCH_TABLE
+CALL py_uncaught();
+--error 1000
+CALL py_signal();
+
+--echo #
+--echo # 2. Values: Python types; decimalType NUMBER; numpy for VECTOR.
+--echo #
+CALL py_types(@r);
+SELECT @r;
+
+CREATE TABLE tp (i BIGINT, d DECIMAL(10,3), s VARCHAR(20), b BLOB, j JSON, dt DATETIME(3),
+  da DATE, tm TIME(6), vec VECTOR(2), st SET('a', 'b', 'c'), u BIGINT UNSIGNED, bo TINYINT);
+CALL py_params();
+SELECT i, d, s, HEX(b), j, dt, da, tm, VECTOR_TO_STRING(vec), st, u, bo FROM tp;
+
+--echo #
+--echo # 3. Rows, iteration, results, transactions, schemas, session variables,
+--echo #    passResultToClient.
+--echo #
+SET @myvar = 27, @dec = 1.5;
+CALL py_rows(@r);
+SELECT @r;
+SELECT @yourvar;
+CALL py_to_client();
+
+--echo #
+--echo # 4. mysql.* in a function (where SQL is refused with 6120).
+--echo #
+SELECT py_fns();
+
+--disconnect con1
+--connection default
+DROP PROCEDURE py_vsimple;
+DROP PROCEDURE py_prep;
+DROP FUNCTION getArea;
+DROP FUNCTION getDiag;
+DROP PROCEDURE py_rect;
+DROP PROCEDURE my_proc;
+DROP PROCEDURE py_use_my_proc;
+DROP PROCEDURE py_errors;
+DROP PROCEDURE py_uncaught;
+DROP PROCEDURE py_signal;
+DROP PROCEDURE py_types;
+DROP PROCEDURE py_params;
+DROP PROCEDURE py_rows;
+DROP PROCEDURE py_to_client;
+DROP FUNCTION py_fns;
+DROP TABLE t1, tx, tp;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
+--source include/wait_until_count_sessions.inc

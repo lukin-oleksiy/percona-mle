@@ -19,7 +19,6 @@ package com.percona.mle.worker;
 
 import com.percona.mle.api.MleSql;
 import com.percona.mle.api.MleSqlException;
-import com.percona.mle.api.SqlResult;
 import java.lang.foreign.Arena;
 import java.util.ArrayList;
 import java.util.List;
@@ -27,7 +26,7 @@ import org.graalvm.polyglot.PolyglotException;
 
 /**
  * Handles the host's requests (PREPARE, CALL, DROP, RESET) on the worker's main thread and posts
- * their RESULTs; runs Mle.sql round trips, serving nested requests from the host meanwhile.
+ * their RESULTs; runs SQL round trips, serving nested requests from the host meanwhile.
  *
  * <p>Nesting: a routine's SQL may call another routine of this worker. The host then sends CALL
  * (or PREPARE) with depth + 1 while the worker waits for SQL_RESULT; it is handled recursively.
@@ -308,7 +307,9 @@ final class Dispatcher {
       org.graalvm.polyglot.Value code = g.getMember("code");
       org.graalvm.polyglot.Value state = g.getMember("sqlState");
       org.graalvm.polyglot.Value message = g.getMember("message");
-      return new ErrorInfo(language, message == null || message.isNull() ? "" : message.toString(), frames,
+      String text = message == null || message.isNull() ? "" : message.isString() ? message.asString()
+          : message.toString();
+      return new ErrorInfo(language, text, frames,
           code != null && code.fitsInInt() ? code.asInt() : 0,
           state != null && state.isString() ? state.asString() : "");
     } catch (RuntimeException e) {
@@ -455,27 +456,6 @@ final class Dispatcher {
       }
       throw new IllegalStateException("unexpected message " + m.op() + " at depth " + m.depth() + " during SQL");
     }
-  }
-
-  /** Phase 3 API (Mle.sql): runs a statement and returns its first result set whole. */
-  SqlResult sql(String statement, Object[] params) {
-    long id = newStatementId();
-    MleSql.Reply r = sqlRequest(Wire.SQL_EXECUTE, id, statement, params, 0, 0);
-    if (!r.hasRows())
-      return new SqlResult(List.of(), List.of(), r.affectedRows(), r.insertId(), warningText(r));
-    List<Object[]> rows = new ArrayList<>(r.rows());
-    MleSql.Reply last = r;
-    while (last.moreRows()) {
-      last = sqlRequest(Wire.SQL_FETCH, id, null, null, 0, 0);
-      rows.addAll(last.rows());
-    }
-    if (last.moreResults()) sqlRequest(Wire.SQL_CLOSE, id, null, null, 0, 0);
-    List<String> names = r.columns().stream().map(MleSql.Column::name).toList();
-    return new SqlResult(names, rows, 0, 0, warningText(r));
-  }
-
-  private static List<String> warningText(MleSql.Reply r) {
-    return r.warnings().stream().map(x -> x.level() + " " + x.code() + " " + x.message()).toList();
   }
 
   /** The top-level call's sequence number (per-call state of the SQL API). */

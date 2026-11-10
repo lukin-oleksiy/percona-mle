@@ -1,0 +1,149 @@
+#
+# component_mle (P5-W4): the SQL API in Python: Oracle's object model on
+# the Java core, with snake_case names and Python values; the globals
+# session, mysql and SqlError.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t1 (c1 INT PRIMARY KEY, c2 INT, c3 VARCHAR(20));
+INSERT INTO t1 VALUES (1, 64, 'banana'), (2, 139, 'apple'), (3, 37, 'peach'),
+(4, 221, 'watermelon'), (5, 83, 'pear');
+CREATE TABLE tx (k INT PRIMARY KEY AUTO_INCREMENT) ENGINE=InnoDB;
+# mysqltest strips leading whitespace from statement lines, which
+# Python blocks need: the Python routines are created from a file by the
+# mysql client.
+#
+# 1. Oracle's examples in Python: a simple statement, a prepared one with
+#    partial re-binding, stored functions, OUT/INOUT (here calling
+#    Oracle's JavaScript my_proc), SqlError.
+#
+CALL py_vsimple("SELECT c1, c3 FROM t1 WHERE c1 < 4 ORDER BY c1");
+SELECT mle_session_state('stdout');
+mle_session_state('stdout')
+c1,c3
+[1, 'banana']
+[2, 'apple']
+[3, 'peach']
+
+SELECT mle_session_reset('stdout');
+mle_session_reset('stdout')
+The session state is successfully reset.
+CALL py_prep("SELECT * FROM t1 WHERE c1 = ? OR c1 = ? ORDER BY c1");
+SELECT mle_session_state('stdout');
+mle_session_state('stdout')
+['c1', 'c2', 'c3'] [[3, 37, 'peach'], [4, 221, 'watermelon']] 0
+['c1', 'c2', 'c3'] [[2, 139, 'apple'], [3, 37, 'peach']] 0
+['c1', 'c2', 'c3'] [[3, 37, 'peach'], [5, 83, 'pear']] 0
+
+SELECT mle_session_reset('stdout');
+mle_session_reset('stdout')
+The session state is successfully reset.
+CREATE FUNCTION getArea(w INT, h INT) RETURNS INT DETERMINISTIC RETURN w * h;
+CALL py_rect(5, 10);
+CALL py_rect(2, 25);
+SELECT mle_session_state('stdout');
+mle_session_state('stdout')
+Width: 5, Height: 10; Area: 50; Diagonal: 11.180339813232422
+Width: 2, Height: 25; Area: 50; Diagonal: 25.079872131347656
+
+SELECT mle_session_reset('stdout');
+mle_session_reset('stdout')
+The session state is successfully reset.
+CREATE PROCEDURE my_proc(IN x INT, OUT y VARCHAR(20), INOUT z TEXT)
+LANGUAGE JAVASCRIPT AS $$
+y = "Hello world " + x
+z += "Hello again JS"
+$$;
+CALL py_use_my_proc();
+SELECT mle_session_state('stdout');
+mle_session_state('stdout')
+Hello world 42
+World Hello again JS
+RuntimeError: procedure my_proc was closed
+
+CALL py_errors(@r);
+SELECT @r;
+@r
+SqlError True 1146 42S02 Table 'test.bogus' doesn't exist
+SqlError: Error code: 1001 Error state: 45000 Error message: Some error
+1210 Incorrect arguments to EXECUTE: 0 of 1 parameter markers bound
+TypeError: cannot bind nan
+TypeError: cannot bind a value of type object
+TypeError: mysql.arg() values are for OUT and INOUT parameters of procedures
+CALL py_uncaught();
+ERROR 42S02: Table 'test.bogus' doesn't exist
+CALL py_signal();
+ERROR 45000: Some error
+#
+# 2. Values: Python types; decimalType NUMBER; numpy for VECTOR.
+#
+CALL py_types(@r);
+SELECT @r;
+@r
+i: BIGINT: int -5
+ubig: BIGINT: int 18446744073709551615
+d: DOUBLE: float 2.5
+decm: DECIMAL: Decimal Decimal('1.250')
+s: STRING: str 'héllo'
+b: BYTES: bytes b'\x00\xff'
+j: JSON: dict {'a': [1, 2]}
+dt: DATE: date datetime.date(2024, 1, 2)
+tm: TIME: timedelta datetime.timedelta(seconds=45296, microseconds=500000)
+ts: DATETIME: datetime datetime.datetime(2024, 1, 2, 3, 4, 5, 678000)
+vec: VECTOR: ndarray array([1. , 2.5], dtype=float32)
+nul: BYTES: ForeignNone None
+null is None: True True True
+NUMBER: float 1.25
+CREATE TABLE tp (i BIGINT, d DECIMAL(10,3), s VARCHAR(20), b BLOB, j JSON, dt DATETIME(3),
+da DATE, tm TIME(6), vec VECTOR(2), st SET('a', 'b', 'c'), u BIGINT UNSIGNED, bo TINYINT);
+CALL py_params();
+SELECT i, d, s, HEX(b), j, dt, da, tm, VECTOR_TO_STRING(vec), st, u, bo FROM tp;
+i	d	s	HEX(b)	j	dt	da	tm	VECTOR_TO_STRING(vec)	st	u	bo
+42	1.234	text	00FF07	{"k": [1, "x"]}	2024-01-02 03:04:05.678	2024-01-02	-00:30:00.000000	[1.00000e+00,2.50000e+00]	a,c	18446744073709551615	1
+NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	[5.00000e-01,4.00000e+00]	NULL	NULL	NULL
+#
+# 3. Rows, iteration, results, transactions, schemas, session variables,
+#    passResultToClient.
+#
+SET @myvar = 27, @dec = 1.5;
+CALL py_rows(@r);
+SELECT @r;
+@r
+1 'banana' 'banana' 2 [1, 'banana'] 'banana'
+['apple', 'peach', 'watermelon', 'pear']
+True False
+affected 2 id 1
+TxSp1 [1, 2, 10]
+'test' 5 '`a``b`'
+27 Decimal('1.5') None 100
+SELECT @yourvar;
+@yourvar
+100
+CALL py_to_client();
+c1	c3
+1	banana
+2	apple
+#
+# 4. mysql.* in a function (where SQL is refused with 6120).
+#
+SELECT py_fns();
+py_fns()
+True 1 0 0 'VECTOR' 6120
+DROP PROCEDURE py_vsimple;
+DROP PROCEDURE py_prep;
+DROP FUNCTION getArea;
+DROP FUNCTION getDiag;
+DROP PROCEDURE py_rect;
+DROP PROCEDURE my_proc;
+DROP PROCEDURE py_use_my_proc;
+DROP PROCEDURE py_errors;
+DROP PROCEDURE py_uncaught;
+DROP PROCEDURE py_signal;
+DROP PROCEDURE py_types;
+DROP PROCEDURE py_params;
+DROP PROCEDURE py_rows;
+DROP PROCEDURE py_to_client;
+DROP FUNCTION py_fns;
+DROP TABLE t1, tx, tp;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

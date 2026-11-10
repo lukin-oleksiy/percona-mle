@@ -20,24 +20,20 @@ package com.percona.mle.api;
 import com.percona.mle.worker.SqlBridge;
 
 /**
- * The host API for routines running in an MLE worker.
- *
- * <p>This is the Phase 3 placeholder: {@link #sql} runs one statement in the calling session (in
- * its transaction, with the routine's privileges) and returns the whole result. The full SQL API
- * comes with Phase 5.
+ * The host API for routines running in an MLE worker: the SQL session ({@link #session()}, Oracle's
+ * SQL API, com.percona.mle.sql) and the polyglot context ({@link #context()}).
  */
 public final class Mle {
   private Mle() {}
 
   /**
-   * Runs a statement with ? placeholders bound to params (Long, Integer, Double, Float,
-   * BigDecimal, BigInteger, String, byte[], LocalDate, LocalDateTime, LocalTime, Duration,
-   * MleJson, float[] for VECTOR, Boolean, or null). Must be called on the routine's thread.
-   *
-   * @throws MleSqlException if the statement fails
+   * The session for SQL from Java routines (the calling session, its transaction, the routine's
+   * privileges): Oracle's object model with Java values (Long, BigInteger, Double, Float,
+   * BigDecimal, String, byte[], MleJson, float[] for VECTOR, LocalDate, LocalDateTime, Duration).
+   * Must be used on the routine's thread. Errors are {@link MleSqlException}s.
    */
-  public static SqlResult sql(String statement, Object... params) {
-    return SqlBridge.sql(statement, params);
+  public static com.percona.mle.sql.Session session() {
+    return SqlBridge.javaSession();
   }
 
   /**

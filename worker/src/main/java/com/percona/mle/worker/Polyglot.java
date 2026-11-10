@@ -139,7 +139,7 @@ final class Polyglot {
       // The worker's main thread stays entered: entering and leaving on every call costs about
       // 1 us (measured, W5). Everything that runs guest code runs on this thread.
       c.enter();
-      // The static side of com.percona.mle.api.Mle: Mle.sql(...) in JS and Python.
+      // The static side of com.percona.mle.api.Mle (Mle.context(), Mle.session()) in JS and Python.
       mleApi = c.asValue(com.percona.mle.api.Mle.class).getMember("static");
       c.getBindings("js").putMember("Mle", mleApi);
       c.getPolyglotBindings().putMember("Mle", mleApi);
@@ -148,6 +148,7 @@ final class Polyglot {
       jsOracle = JsOracle.helpers(c);
       // The SQL API (Phase 5): the globals session, mysql and SqlError.
       new JsSql(c, options);
+      new PySql(c, options);
       // Oracle: console.clear() clears the session's stdout and stderr.
       if (console != null) {
         Value clear = c.asValue((org.graalvm.polyglot.proxy.ProxyExecutable) a -> {
@@ -262,8 +263,12 @@ final class Polyglot {
         def _time(us):
             return _dt.timedelta(microseconds=us)
 
+        # The SQL API's globals (session, mysql, SqlError), filled by PySql.
+        _mle_globals = {}
+
         def _load(src, name, entry, mle):
             ns = {'__name__': name, 'Mle': mle}
+            ns.update(_mle_globals)
             exec(compile(src, name + '.py', 'exec'), ns)
             return ns[entry]
 
@@ -293,6 +298,7 @@ final class Polyglot {
             mod = ast.Module(body=[fn('__mle_routine', list(params), body)], type_ignores=[])
             ast.fix_missing_locations(mod)
             ns = {'__name__': name, 'Mle': mle}
+            ns.update(_mle_globals)
             exec(compile(mod, name, 'exec'), ns)
             return ns['__mle_routine']
 

@@ -261,11 +261,12 @@ void cmd_calls() {
           {type(Tag::kVector)}, type(Tag::kF64));
   prepare(*w, 7, "java", "S.f",
           "public class S { public static long f() { "
-          "com.percona.mle.api.Mle.sql(\"DO 1\"); return 1; } }",
+          "com.percona.mle.api.Mle.session().runSql(\"DO 1\"); return 1; } }",
           {}, type(Tag::kI64));
   prepare(*w, 8, "java", "O.f",
           "public class O { public static long f() { return (Long) "
-          "com.percona.mle.api.Mle.sql(\"SELECT inner()\").rows().get(0)[0]; "
+          "com.percona.mle.api.Mle.session().runSql(\"SELECT inner()\")"
+          ".fetchOne().get(0); "
           "} }",
           {}, type(Tag::kI64));
   prepare(*w, 9, "java", "I.f",
