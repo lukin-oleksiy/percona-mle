@@ -41,6 +41,8 @@
     mle_workers_spawned      worker processes started by the launcher
     mle_worker_failures      workers that died, were killed or misbehaved
     mle_pool_idle            started workers waiting in the pool
+    mle_workers_cached       reset workers kept for sessions of their account
+    mle_worker_reuses        sessions that got a kept worker
     mle_cgroup               ON if workers run in their own cgroups
 */
 
@@ -124,6 +126,14 @@ int show_pool_idle(MYSQL_THD, SHOW_VAR *var, char *buff) {
   return show_number(var, buff, engine_state(true).pool_idle);
 }
 
+int show_workers_cached(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, engine_state(false).cached);
+}
+
+int show_worker_reuses(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, static_cast<long long>(engine_state(false).cache_hits));
+}
+
 int show_cgroup(MYSQL_THD, SHOW_VAR *var, char *buff) {
   return show_text(var, buff, engine_state(false).cgroup ? "ON" : "OFF");
 }
@@ -155,6 +165,8 @@ SHOW_VAR g_status_vars[] = {
     MLE_STATUS("mle_worker_failures",
                &show_counter<&Counters::worker_failures>),
     MLE_STATUS("mle_pool_idle", &show_pool_idle),
+    MLE_STATUS("mle_workers_cached", &show_workers_cached),
+    MLE_STATUS("mle_worker_reuses", &show_worker_reuses),
     MLE_STATUS("mle_cgroup", &show_cgroup),
     {nullptr, nullptr, SHOW_UNDEF, SHOW_SCOPE_UNDEF}};
 

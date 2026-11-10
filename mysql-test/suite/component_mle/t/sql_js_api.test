@@ -385,5 +385,5 @@ DROP PROCEDURE sleeper;
 DROP VIEW v1;
 DROP TABLE t1, tp, tx;
 REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
-UNINSTALL COMPONENT "file://component_mle";
 --source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

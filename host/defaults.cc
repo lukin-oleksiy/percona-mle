@@ -69,6 +69,11 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
       "-Djava.class.path=" + layout.worker_jar,
       "-Dpolyglot.engine.userResourceCache=" + layout.resource_cache,
       "-XX:+UseSerialGC",
+      // A small initial heap that grows as needed (the JVM's default
+      // ratios keep allocation-heavy code fast); the worker trims it with a
+      // full GC whenever it is parked: after start (pool) and after RESET
+      // (reuse cache). Measured in the 2026-11 optimisation round.
+      "-Xms8m",
       "-Xmx" + o.heap,
       "-Xss2m",
       "-XX:CICompilerCount=" + std::to_string(std::max(2, o.compiler_threads)),

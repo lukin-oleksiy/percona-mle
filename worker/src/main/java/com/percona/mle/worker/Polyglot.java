@@ -144,11 +144,10 @@ final class Polyglot {
       c.getBindings("js").putMember("Mle", mleApi);
       c.getPolyglotBindings().putMember("Mle", mleApi);
       js = jsHelpers(c);
-      python = pythonHelpers(c);
       jsOracle = JsOracle.helpers(c);
-      // The SQL API (Phase 5): the globals session, mysql and SqlError.
+      // The SQL API (Phase 5): the globals session, mysql and SqlError. Python's are made
+      // with Python's helpers, on first use (GraalPy costs ~150 MB: JS-only workers skip it).
       new JsSql(c, options);
-      new PySql(c, options);
       // Oracle: console.clear() clears the session's stdout and stderr.
       if (console != null) {
         Value clear = c.asValue((org.graalvm.polyglot.proxy.ProxyExecutable) a -> {
@@ -329,11 +328,24 @@ final class Polyglot {
   }
 
   private Value pythonBodyLoader() {
+    pythonReady();
     return context.getBindings("python").getMember("_mle_helpers").getHashValue("body_loader");
   }
 
+  /** Python's helpers and SQL API, made when the first Python routine is loaded. */
+  private void pythonReady() {
+    if (python != null) return;
+    Context c = context();
+    // All or nothing: an interrupt (KILL) in between leaves Python to be set up again.
+    Helpers h = pythonHelpers(c);
+    new PySql(c, options);
+    python = h;
+  }
+
   private Helpers helpers(String language) {
-    return language.equals("js") ? js : python;
+    if (language.equals("js")) return js;
+    pythonReady();
+    return python;
   }
 
   // ------------------------------------------------------------ routines

@@ -63,6 +63,8 @@ ulonglong g_memory_max = 0;
 ulonglong g_heap_max = 0;
 uint g_pool_size = 0;
 uint g_max_workers = 0;
+uint g_worker_cache_size = 0;
+uint g_worker_cache_timeout = 0;
 uint g_spin_us = 0;
 uint g_interrupt_grace_ms = 0;
 ulonglong g_sql_result_max = 0;
@@ -166,7 +168,8 @@ Registered g_registered[] = {
     {"max_workers", false}, {"spin_us", false},    {"interrupt_grace_ms", false},
     {"languages", false},  {"cgroup_base", false}, {"dir", false},
     {"java_home", false},  {"sql_result_max", false}, {"sql_row_max", false},
-    {"sql_statements_max", false}, {"sql_chunk_rows", false}};
+    {"sql_statements_max", false}, {"sql_chunk_rows", false},
+    {"worker_cache_size", false}, {"worker_cache_timeout", false}};
 
 void mark(const char *name) {
   for (auto &r : g_registered)
@@ -228,7 +231,7 @@ bool register_settings() {
     return true;
 
   INTEGRAL_CHECK_ARG(uint) pool_size;
-  pool_size.def_val = 1;
+  pool_size.def_val = 2;  // measured: first sessions of new accounts (12 §17)
   pool_size.min_val = 0;
   pool_size.max_val = kPoolSizeMax;
   pool_size.blk_sz = 0;
@@ -249,6 +252,28 @@ bool register_settings() {
           "Most MLE workers held by sessions at a time (one per session and "
           "principal); beyond it calls fail with a concurrency limit error.",
           nullptr, nullptr, &max_workers, &g_max_workers))
+    return true;
+
+  // Reuse of workers by later sessions of the same principal (12 §17).
+  uint_check_arg_s cache_size;
+  cache_size.def_val = 4;
+  cache_size.min_val = 0;
+  cache_size.max_val = 1024;
+  cache_size.blk_sz = 0;
+  if (reg("worker_cache_size", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Most idle workers kept, after a reset, for later sessions of the "
+          "same account (user@host); 0: a session's workers end with it.",
+          nullptr, nullptr, &cache_size, &g_worker_cache_size))
+    return true;
+
+  uint_check_arg_s cache_timeout;
+  cache_timeout.def_val = 60;
+  cache_timeout.min_val = 1;
+  cache_timeout.max_val = 86400;
+  cache_timeout.blk_sz = 0;
+  if (reg("worker_cache_timeout", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Seconds a kept idle worker waits for a session before it ends.",
+          nullptr, nullptr, &cache_timeout, &g_worker_cache_timeout))
     return true;
 
   uint_check_arg_s spin_us;
@@ -384,6 +409,8 @@ Settings current_settings() {
 unsigned enabled_languages() { return g_language_bits.load(); }
 
 uint32_t max_workers() { return g_max_workers; }
+size_t worker_cache_size() { return g_worker_cache_size; }
+uint32_t worker_cache_timeout() { return g_worker_cache_timeout; }
 size_t sql_result_max() { return static_cast<size_t>(g_sql_result_max); }
 size_t sql_row_max() { return static_cast<size_t>(g_sql_row_max); }
 size_t sql_statements_max() { return g_sql_statements_max; }

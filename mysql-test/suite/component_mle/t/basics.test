@@ -138,5 +138,5 @@ DROP FUNCTION js_f;
 DROP PROCEDURE js_p;
 DROP FUNCTION py_f;
 DROP FUNCTION java_f;
-UNINSTALL COMPONENT "file://component_mle";
 --source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

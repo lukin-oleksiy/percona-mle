@@ -49,6 +49,9 @@ public final class Main {
         if (prewarm.contains("js")) polyglot.context().eval("js", "1");
         if (prewarm.contains("python")) polyglot.context().eval("python", "1");
         if (prewarm.contains("numpy")) polyglot.context().eval("python", "import numpy");
+        // Starting leaves garbage and a grown heap; a worker often waits in the pool, so give
+        // the memory back now (with the small-heap settings of the worker class).
+        System.gc();
         info = "ready in " + (System.nanoTime() - t0) / 1_000_000 + " ms";
       } catch (Throwable t) {
         status = Wire.INTERNAL;

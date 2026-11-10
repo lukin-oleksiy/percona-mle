@@ -61,6 +61,9 @@ struct EngineState {
   /** Workers idle in the pool, and spawned since the engine started. */
   uint32_t pool_idle = 0;
   uint64_t spawned = 0;
+  /** Workers kept for reuse, and how often one was reused. */
+  uint32_t cached = 0;
+  uint64_t cache_hits = 0;
 };
 
 /**
@@ -93,8 +96,21 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
                                                AcquireError *why,
                                                std::string *error);
 
-/** A session gives a worker back: it is destroyed (killed), not reused. */
-void engine_release_worker(std::unique_ptr<mle::Worker> worker);
+/**
+  A session gives a worker back. With the principal it ran for, a healthy
+  idle worker is reset (RESET: no routines, memory trimmed) and kept for a
+  later session of the same principal (mle.worker_cache_size,
+  mle.worker_cache_timeout; 12 §17); otherwise it is destroyed (killed).
+*/
+void engine_release_worker(std::unique_ptr<mle::Worker> worker,
+                           const std::string &principal = "");
+
+/**
+  A kept worker of this principal (READY, reset), counted like
+  engine_new_worker()'s; nullptr if none (or at max_workers).
+*/
+std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
+                                                 uint32_t max_workers);
 
 /** Java heap in use over all session workers, % of their summed limits
     (mle_memory_used). */

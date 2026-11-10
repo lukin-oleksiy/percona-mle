@@ -1,0 +1,59 @@
+#
+# component_mle: workers kept for later sessions of the same account
+# (mle.worker_cache_size, mle.worker_cache_timeout; 12 §17). A kept worker
+# was reset: no routines; its runtime stays warm.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE USER u1@localhost;
+GRANT EXECUTE ON test.* TO u1@localhost;
+SELECT @@mle.worker_cache_size, @@mle.worker_cache_timeout;
+@@mle.worker_cache_size	@@mle.worker_cache_timeout
+4	60
+# A session uses a worker and ends: the worker is kept.
+CREATE FUNCTION js_add(a INT, b INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return a + b $$;
+CREATE FUNCTION js_inv(a INT) RETURNS INT SQL SECURITY INVOKER LANGUAGE JAVASCRIPT AS $$ return a $$;
+CREATE FUNCTION py_leftover(v VARCHAR(10)) RETURNS VARCHAR(40) LANGUAGE PYTHON AS $$
+import builtins
+old = getattr(builtins, 'mle_leftover', None)
+builtins.mle_leftover = v
+return 'found ' + str(old)
+$$;
+SELECT js_add(1, 2), py_leftover('one');
+js_add(1, 2)	py_leftover('one')
+3	found None
+# The next session of the same account gets it: the same process, its
+# routines prepared again. State in the languages' own modules stays
+# (same account, same privileges; documented).
+SELECT js_add(2, 3), py_leftover('two');
+js_add(2, 3)	py_leftover('two')
+5	found one
+same worker process: 1
+reuses: 1
+# Another account does not get it (an INVOKER routine runs as u1).
+SELECT js_inv(7);
+js_inv(7)
+7
+another process for u1: 1
+# Kept workers end after mle.worker_cache_timeout.
+SET GLOBAL mle.worker_cache_timeout = 1;
+SET GLOBAL mle.worker_cache_timeout = DEFAULT;
+# mle.worker_cache_size = 0: a session's workers end with it.
+SET GLOBAL mle.worker_cache_size = 0;
+SELECT js_add(4, 5);
+js_add(4, 5)
+9
+SELECT VARIABLE_VALUE AS kept FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+kept
+0
+SET GLOBAL mle.worker_cache_size = DEFAULT;
+# UNINSTALL ends kept workers.
+SELECT js_add(5, 6);
+js_add(5, 6)
+11
+DROP FUNCTION js_add;
+DROP FUNCTION js_inv;
+DROP FUNCTION py_leftover;
+DROP USER u1@localhost;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

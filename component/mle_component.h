@@ -91,6 +91,9 @@ Settings current_settings();
 unsigned enabled_languages();
 /** mle.max_workers, mle.spin_us, mle.interrupt_grace_ms. */
 uint32_t max_workers();
+/** mle.worker_cache_size, mle.worker_cache_timeout (seconds). */
+size_t worker_cache_size();
+uint32_t worker_cache_timeout();
 int spin_us();
 int interrupt_grace_ms();
 /** SQL from routines (sql.cc): mle.sql_result_max, mle.sql_row_max,

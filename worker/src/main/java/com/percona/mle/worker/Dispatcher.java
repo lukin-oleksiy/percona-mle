@@ -111,6 +111,8 @@ final class Dispatcher {
         case Wire.RESET -> {
           java.reset();
           polyglot.reset();
+          // A reset worker is usually parked for reuse: give its memory back (12 §17).
+          System.gc();
           result(Wire.OK, null, null, null);
         }
         case Wire.OPTIONS -> options(m);

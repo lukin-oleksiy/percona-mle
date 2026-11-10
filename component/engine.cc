@@ -24,7 +24,11 @@
 #include <ctime>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <fstream>
+#include <thread>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -38,6 +42,8 @@
 namespace mle_component {
 
 void log_info(const std::string &message);  // component.cc
+size_t worker_cache_size();       // settings.cc
+uint32_t worker_cache_timeout();  // settings.cc
 
 namespace {
 
@@ -53,6 +59,63 @@ Settings g_settings;                        // guarded by g_mutex
 /** Workers held by sessions (for mle_memory_used). */
 std::set<const mle::Worker *> g_live;       // guarded by g_mutex
 std::atomic<long> g_workers_in_use{0};
+
+/** Reset workers kept for later sessions of the same principal (12 §17);
+    newest at the back. */
+struct Cached {
+  std::string principal;
+  std::unique_ptr<mle::Worker> worker;
+  std::chrono::steady_clock::time_point since;
+};
+std::deque<Cached> g_cache;  // guarded by g_mutex
+std::atomic<uint64_t> g_cache_hits{0};
+/** Ends kept workers idle longer than mle.worker_cache_timeout. */
+std::thread g_reaper;
+std::condition_variable g_reaper_cv;
+bool g_reaper_stop = false;  // guarded by g_mutex
+
+/** Takes every kept worker out (to be destroyed without the mutex). */
+std::vector<std::unique_ptr<mle::Worker>> take_cache_locked() {
+  std::vector<std::unique_ptr<mle::Worker>> out;
+  for (Cached &c : g_cache) out.push_back(std::move(c.worker));
+  g_cache.clear();
+  return out;
+}
+
+void reaper() {
+  std::unique_lock<std::mutex> lock(g_mutex);
+  while (!g_reaper_stop) {
+    g_reaper_cv.wait_for(lock, std::chrono::seconds(1));
+    const auto limit = std::chrono::seconds(worker_cache_timeout());
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<std::unique_ptr<mle::Worker>> expired;
+    while (!g_cache.empty() && (now - g_cache.front().since >= limit ||
+                                g_cache.size() > worker_cache_size())) {
+      expired.push_back(std::move(g_cache.front().worker));
+      g_cache.pop_front();
+    }
+    if (expired.empty()) continue;
+    lock.unlock();
+    expired.clear();  // kills the processes
+    lock.lock();
+  }
+}
+
+void start_reaper_locked() {
+  if (g_reaper.joinable()) return;
+  g_reaper_stop = false;
+  g_reaper = std::thread(reaper);
+}
+
+/** Stops the reaper; caller does not hold g_mutex. */
+void stop_reaper() {
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_reaper_stop = true;
+  }
+  g_reaper_cv.notify_all();
+  if (g_reaper.joinable()) g_reaper.join();
+}
 
 std::string read_file(const std::string &path) {
   std::ifstream in(path);
@@ -150,6 +213,8 @@ std::string auto_cgroup_base(std::string *why) {
 
 /** Starts the launcher; caller holds g_mutex. */
 bool start_locked(const Settings &s, std::string *error, std::string *info) {
+  // Kept workers have the old settings.
+  { auto old = take_cache_locked(); }
   g_launcher.reset();
   g_error.clear();
   g_settings = s;
@@ -182,6 +247,19 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   const std::string zone = system_time_zone();
   options.extra_jvm_options.push_back(
       "-Duser.timezone=" + (zone[0] == '+' || zone[0] == '-' ? "GMT" + zone : zone));
+  // Undocumented, for measurements: more JVM options for the workers.
+  if (const char *extra = getenv("MLE_JVM_OPTIONS"); extra != nullptr) {
+    std::string word;
+    for (const char *c = extra;; c++) {
+      if (*c == ' ' || *c == '\0') {
+        if (!word.empty()) options.extra_jvm_options.push_back(word);
+        word.clear();
+        if (*c == '\0') break;
+      } else {
+        word += *c;
+      }
+    }
+  }
   config.classes = {mle::jvm_worker_class(layout, options)};
 
   std::string launcher_error;
@@ -220,10 +298,19 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
 
 bool engine_start(const Settings &s, std::string *error, std::string *info) {
   std::lock_guard<std::mutex> lock(g_mutex);
-  return start_locked(s, error, info);
+  const bool ok = start_locked(s, error, info);
+  if (ok) start_reaper_locked();
+  return ok;
 }
 
 void engine_stop() {
+  stop_reaper();
+  std::vector<std::unique_ptr<mle::Worker>> kept;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    kept = take_cache_locked();
+  }
+  kept.clear();
   std::lock_guard<std::mutex> lock(g_mutex);
   g_launcher.reset();
   g_error.clear();
@@ -237,6 +324,8 @@ EngineState engine_state(bool with_stats) {
   st.active = true;
   st.launcher_pid = g_launcher->info().pid;
   st.cgroup = g_launcher->info().cgroup_enabled;
+  st.cached = static_cast<uint32_t>(g_cache.size());
+  st.cache_hits = g_cache_hits.load();
   if (with_stats) {
     std::vector<mle::ClassStats> stats;
     std::string error;
@@ -311,14 +400,63 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
   return worker;
 }
 
-void engine_release_worker(std::unique_ptr<mle::Worker> worker) {
+void engine_release_worker(std::unique_ptr<mle::Worker> worker,
+                           const std::string &principal) {
   if (!worker) return;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_live.erase(worker.get());
   }
-  worker.reset();
   --g_workers_in_use;
+  // Only a healthy worker that is not running anything is kept, after RESET
+  // (it forgets the session's routines and trims its heap).
+  if (!principal.empty() && worker_cache_size() > 0 && worker->usable() &&
+      !worker->stats().tainted && worker->depth() == 0) {
+    std::string error;
+    if (worker->reset(&error) == mle::Status::kOk && worker->usable()) {
+      std::vector<std::unique_ptr<mle::Worker>> evicted;
+      {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_launcher) {
+          g_cache.push_back(
+              {principal, std::move(worker), std::chrono::steady_clock::now()});
+          while (g_cache.size() > worker_cache_size()) {
+            evicted.push_back(std::move(g_cache.front().worker));
+            g_cache.pop_front();
+          }
+        }
+      }
+      evicted.clear();
+      if (!worker) return;
+    }
+  }
+  worker.reset();
+}
+
+std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
+                                                 uint32_t max_workers) {
+  std::unique_ptr<mle::Worker> worker;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (auto it = g_cache.end(); it != g_cache.begin();) {
+      --it;
+      if (it->principal != principal) continue;
+      worker = std::move(it->worker);
+      g_cache.erase(it);
+      break;
+    }
+  }
+  if (!worker) return nullptr;
+  if (!worker->usable() || ++g_workers_in_use > static_cast<long>(max_workers)) {
+    if (worker->usable()) --g_workers_in_use;
+    return nullptr;  // destroyed: died while kept, or no room
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_live.insert(worker.get());
+  }
+  ++g_cache_hits;
+  return worker;
 }
 
 long engine_memory_used_percent() {

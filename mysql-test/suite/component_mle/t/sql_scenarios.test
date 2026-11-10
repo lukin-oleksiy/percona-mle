@@ -120,5 +120,5 @@ DROP PROCEDURE js_rollback;
 DROP PROCEDURE js_fail;
 DROP TABLE t1, t2;
 REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
-UNINSTALL COMPONENT "file://component_mle";
 --source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

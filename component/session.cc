@@ -202,7 +202,7 @@ Session *Session::current(bool create) {
 
 Session::~Session() {
   for (auto &[principal, slot] : m_workers)
-    engine_release_worker(std::move(slot.worker));
+    engine_release_worker(std::move(slot.worker), principal);
   for (auto &w : m_retired) engine_release_worker(std::move(w));
   g_counters.sessions = --g_sessions;
 }
@@ -269,9 +269,13 @@ Session::Slot *Session::worker_for(const std::string &principal,
 
   AcquireError why = AcquireError::kNone;
   std::string error;
+  // A worker kept from an earlier session of this principal (warm), else a
+  // new one from the pool.
   std::unique_ptr<mle::Worker> worker =
-      engine_new_worker(max_workers(), spin_us(), interrupt_grace_ms(), &why,
-                        &error);
+      engine_reuse_worker(principal, max_workers());
+  if (!worker)
+    worker = engine_new_worker(max_workers(), spin_us(), interrupt_grace_ms(),
+                               &why, &error);
   switch (why) {
     case AcquireError::kNone:
       break;
@@ -517,7 +521,7 @@ void Session::reset_output(bool out, bool err) {
 
 void Session::reset() {
   for (auto &[principal, slot] : m_workers)
-    engine_release_worker(std::move(slot.worker));
+    engine_release_worker(std::move(slot.worker), principal);
   m_workers.clear();
   m_programs.clear();
   m_stack.clear();
