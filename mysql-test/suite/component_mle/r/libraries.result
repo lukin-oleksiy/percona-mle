@@ -1,0 +1,131 @@
+#
+# component_mle (Phase 6): database libraries (CREATE LIBRARY) in
+# JavaScript, Oracle's model (MySQL 9.7 manual 27.3.8): USING, static and
+# dynamic import, libraries importing libraries; the examples are written
+# for this test, the values are Oracle's.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+CREATE DATABASE jslib;
+CREATE DATABASE db1;
+CREATE DATABASE other;
+#
+# 1. Two libraries, a function using both (USING with aliases):
+#    6, 9, -30, 6, 3 (INTEGER rounds 1.5 to 2 and 1.2 to 1).
+#
+CREATE LIBRARY IF NOT EXISTS jslib.lib1 LANGUAGE JAVASCRIPT AS $$
+export function f(n) {
+return n
+}
+$$;
+CREATE LIBRARY jslib.lib2 LANGUAGE JAVASCRIPT AS $$ export function g(n) { return n * 2 } $$;
+CREATE FUNCTION foo(n INTEGER) RETURNS INTEGER LANGUAGE JAVASCRIPT
+USING (jslib.lib1 AS mylib, jslib.lib2 AS yourlib)
+AS $$ return mylib.f(n) + yourlib.g(n) $$;
+SELECT foo(2), foo(3), foo(-10), foo(1.5), foo(1.2);
+foo(2)	foo(3)	foo(-10)	foo(1.5)	foo(1.2)
+6	9	-30	6	3
+SELECT LIBRARY_SCHEMA, LIBRARY_NAME, LANGUAGE FROM information_schema.LIBRARIES
+WHERE LIBRARY_SCHEMA = 'jslib' ORDER BY LIBRARY_NAME;
+LIBRARY_SCHEMA	LIBRARY_NAME	LANGUAGE
+jslib	lib1	JAVASCRIPT
+jslib	lib2	JAVASCRIPT
+SELECT ROUTINE_NAME, LIBRARY_SCHEMA, LIBRARY_NAME FROM information_schema.ROUTINE_LIBRARIES
+WHERE ROUTINE_SCHEMA = 'test' ORDER BY LIBRARY_NAME;
+ROUTINE_NAME	LIBRARY_SCHEMA	LIBRARY_NAME
+foo	jslib	lib1
+foo	jslib	lib2
+#
+# 2. Dynamic import with a computed path; destructuring the module.
+#
+CREATE LIBRARY db1.lib_square LANGUAGE JAVASCRIPT AS $$
+export default class Square { constructor() { this.size = 2 } toString() { return 'Square of size ' + this.size } }
+$$;
+CREATE LIBRARY db1.lib_rectangle LANGUAGE JAVASCRIPT AS $$
+export default class Rectangle { toString() { return 'Rectangle of size 2 by 3' } }
+export function area(w, h) { return w * h }
+$$;
+CREATE FUNCTION db1.printObject(object_type VARCHAR(20)) RETURNS VARCHAR(40) LANGUAGE JAVASCRIPT AS $$
+const m = await import(`/db1/lib_${object_type}`)
+return String(new m.default())
+$$;
+CREATE FUNCTION db1.computeRectangle() RETURNS INT LANGUAGE JAVASCRIPT AS $$
+let {default: myRectangle, area: area} = await import("/db1/lib_rectangle")
+return area(2, 3)
+$$;
+SELECT db1.printObject("square");
+db1.printObject("square")
+Square of size 2
+SELECT db1.printObject("rectangle");
+db1.printObject("rectangle")
+Rectangle of size 2 by 3
+SELECT db1.computeRectangle();
+db1.computeRectangle()
+6
+#
+# 3. A library importing a library: 85, 94; the imported one is not
+#    visible to the routine (ReferenceError).
+#
+CREATE LIBRARY db1.mylib LANGUAGE JAVASCRIPT AS $$ export function foo() { return 42 } $$;
+CREATE LIBRARY db1.theirlib LANGUAGE JAVASCRIPT AS $$
+import {foo} from "/db1/mylib"
+  export function bar() { return 2 * foo() }
+$$;
+CREATE FUNCTION db1.myfunc(x INT) RETURNS INT LANGUAGE JAVASCRIPT USING (db1.theirlib)
+AS $$ return theirlib.bar() + x $$;
+CREATE FUNCTION db1.myfunc2(x INT) RETURNS INT LANGUAGE JAVASCRIPT USING (db1.theirlib)
+AS $$ return mylib.foo() + x $$;
+SELECT db1.myfunc(1), db1.myfunc(10);
+db1.myfunc(1)	db1.myfunc(10)
+85	94
+SELECT db1.myfunc2(1), db1.myfunc2(10);
+ERROR HY000: JavaScript> ReferenceError: mylib is not defined
+#
+# 4. Library code runs when imported, not at CREATE; syntax is checked at
+#    CREATE.
+#
+CREATE LIBRARY my_lib LANGUAGE JAVASCRIPT AS $$ throw "MyError" $$;
+CREATE FUNCTION my_func(x INTEGER) RETURNS INTEGER LANGUAGE JAVASCRIPT NO SQL
+USING (my_lib) AS $$ return x * 10 $$;
+SELECT my_func(8);
+ERROR HY000: JavaScript> MyError
+CREATE LIBRARY lib3 LANGUAGE JAVASCRIPT AS $$
+export function h() {
+return 1 +* 2
+}
+$$;
+ERROR HY000: JavaScript> SyntaxError: lib3:3:10 Expected an operand but found *
+#
+# 5. Ours: a changed library is used at the next call; a dropped one
+#    fails the call; libraries of other schemas need USING.
+#
+SELECT foo(2);
+foo(2)
+6
+DROP LIBRARY jslib.lib2;
+CREATE LIBRARY jslib.lib2 LANGUAGE JAVASCRIPT AS $$ export function g(n) { return n * 100 } $$;
+SELECT foo(2);
+foo(2)
+202
+DROP LIBRARY jslib.lib1;
+SELECT foo(2);
+Got one of the listed errors
+CREATE LIBRARY other.secret LANGUAGE JAVASCRIPT AS $$ export const value = 'from other' $$;
+CREATE FUNCTION peek() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$ return (await import('/other/secret')).value $$;
+SELECT peek();
+ERROR HY000: JavaScript> Error: Error reading module '/other/secret' imported from peek: library other.secret is not importable from test.peek (import it with USING, or use a library of the routine's schema)
+CREATE FUNCTION peek_using() RETURNS TEXT LANGUAGE JAVASCRIPT USING (other.secret)
+AS $$ return secret.value + ' / ' + (await import('/other/secret')).value $$;
+SELECT peek_using();
+peek_using()
+from other / from other
+DROP DATABASE jslib;
+DROP DATABASE db1;
+DROP DATABASE other;
+DROP FUNCTION foo;
+DROP FUNCTION my_func;
+DROP LIBRARY my_lib;
+DROP FUNCTION peek;
+DROP FUNCTION peek_using;
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

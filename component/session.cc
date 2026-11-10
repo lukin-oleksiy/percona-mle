@@ -27,6 +27,7 @@
 
 #include <mysql/components/component_implementation.h>
 #include <mysql/components/services/bits/mysql_thd_attributes_bits.h>
+#include <mysql/components/services/mysql_library.h>
 #include <mysql/components/services/mysql_runtime_error_service.h>
 #include <mysql/components/services/mysql_system_variable.h>
 #include <mysql/components/services/dynamic_privilege.h>
@@ -40,6 +41,7 @@
 #include "mle_component.h"
 
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_error);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_library);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_current_thread_reader);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_store);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
@@ -64,10 +66,70 @@ std::atomic<long> g_sessions{0};
 constexpr size_t kConsoleKeep = 64 * 1024;
 
 /** The SQL layer's side of a call: SQL from routines (Phase 5) and KILL. */
+/** Forgets an error the server put in the diagnostics area meanwhile. */
+void clear_server_error(MYSQL_THD thd) {
+  uint16_t empty = STATUS_DA_EMPTY;
+  (void)mysql_service_mysql_thd_attributes->set(thd, "da_status", &empty);
+}
+
 class Hooks : public mle::CallHooks {
  public:
-  explicit Hooks(MYSQL_THD thd, SqlRunner *sql = nullptr)
-      : m_thd(thd), m_sql(sql) {}
+  explicit Hooks(MYSQL_THD thd, SqlRunner *sql = nullptr,
+                 const Routine *routine = nullptr)
+      : m_thd(thd), m_sql(sql), m_routine(routine) {}
+
+  /**
+    A database library the routine imports (Phase 6, 14 §2). Importable:
+    the routine's schema, its USING libraries and their schemas (the server
+    checked EXECUTE on the USING libraries at CREATE; components cannot check
+    routine privileges at run time).
+  */
+  void library(const mle::LibraryMsg &m, mle::LibraryResultMsg *r) override {
+    r->status = mle::wire::LibraryStatus::kRefused;
+    const std::string what = m.schema + "." + m.name;
+    if (m_routine == nullptr) {
+      r->message = "library " + what + ": no routine to import it";
+      return;
+    }
+    bool allowed = m.schema == m_routine->schema;
+    for (const mle::Import &i : m_routine->prepare.imports)
+      allowed = allowed || i.schema == m.schema;
+    if (!allowed) {
+      r->message = "library " + what + " is not importable from " +
+                   m_routine->qualified_name +
+                   " (import it with USING, or use a library of the routine's schema)";
+      return;
+    }
+    my_h_library h = nullptr;
+    if (mysql_service_mysql_library->init(
+            m_thd, {m.schema.data(), m.schema.size()}, {m.name.data(), m.name.size()},
+            {"", 0}, &h) ||
+        h == nullptr) {
+      r->message = "library " + what + " does not exist";
+      clear_server_error(m_thd);
+      return;
+    }
+    mysql_cstring_with_length body{nullptr, 0}, language{nullptr, 0};
+    if (mysql_service_mysql_library->get_body(h, &body) ||
+        mysql_service_mysql_library->get_language(h, &language)) {
+      (void)mysql_service_mysql_library->deinit(h);
+      r->message = "library " + what + " cannot be read";
+      return;
+    }
+    const std::string_view text(body.str == nullptr ? "" : body.str, body.length);
+    r->hash = mle::library_hash(text);
+    const unsigned bit = language_bit({language.str, language.length});
+    r->language = bit == kJavaScript ? "js" : bit == kPython ? "python" : bit == kJava ? "java" : "";
+    if (r->language.empty()) {
+      r->message = "library " + what + " is in a language MLE does not run";
+    } else if (r->hash == m.known_hash) {
+      r->status = mle::wire::LibraryStatus::kUnchanged;
+    } else {
+      r->status = mle::wire::LibraryStatus::kBody;
+      r->body.assign(text);
+    }
+    (void)mysql_service_mysql_library->deinit(h);
+  }
 
   /** SQL from the routine (Phase 5): the call's statements (sql.cc). */
   void sql(const mle::SqlMsg &m, mle::SqlResultMsg *r) override {
@@ -86,6 +148,7 @@ class Hooks : public mle::CallHooks {
  private:
   MYSQL_THD m_thd;
   SqlRunner *m_sql;
+  const Routine *m_routine;
 };
 
 std::string session_time_zone(MYSQL_THD thd) {
@@ -312,7 +375,7 @@ Session::Slot *Session::worker_for(const std::string &principal,
 bool Session::prepare_in(const std::string &principal, Slot &slot,
                          const Routine &routine) {
   if (slot.prepared.count(routine.id) != 0) return true;
-  Hooks hooks(m_thd);
+  Hooks hooks(m_thd, nullptr, &routine);
   ResultMsg result;
   std::string error;
   Status s;
@@ -356,7 +419,7 @@ bool Session::execute(Routine &routine) {
   if (slot == nullptr || !prepare_in(who, *slot, routine)) return false;
 
   SqlRunner sql(m_thd);  // the call's statements; closed when it returns
-  Hooks hooks(m_thd, &sql);
+  Hooks hooks(m_thd, &sql, &routine);
   ResultMsg result;
   std::string error;
   raise_max(g_counters.threads_max, ++g_counters.threads);
@@ -572,6 +635,32 @@ void unregister_privileges() {
   for (const char *p : kPrivileges)
     (void)mysql_service_dynamic_privilege_register->unregister_privilege(
         p, strlen(p));
+}
+
+bool Session::parse_library(unsigned language, const std::string &name,
+                            const std::string &body) {
+  Routine routine;  // for the worker and the messages
+  routine.language = language;
+  routine.name = name;
+  routine.qualified_name = name;
+  const std::string &who = principal();
+  Slot *slot = worker_for(who, routine);
+  if (slot == nullptr) return false;
+  mle::ParseLibraryMsg m;
+  m.language = language == kJavaScript ? "js" : language == kPython ? "python" : "java";
+  m.name = name;
+  m.body = body;
+  Hooks hooks(m_thd);
+  ResultMsg result;
+  std::string error;
+  Status s;
+  {
+    const KillGuard kill(this, slot->worker.get());
+    s = slot->worker->parse_library(m, hooks, &result, &error);
+  }
+  if (s == Status::kOk) return true;
+  report(who, s, result, error, routine, nullptr);
+  return false;
 }
 
 bool has_global_privilege(MYSQL_THD thd, const char *privilege) {

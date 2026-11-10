@@ -68,6 +68,10 @@ class Session {
   /** CREATE (and loading into the session's routine cache): the worker of
       the current principal compiles the routine (syntax errors -> 6113). */
   bool parse(Routine &routine);
+  /** CREATE LIBRARY: syntax check in the account's worker; false after
+      reporting the error (6113 "JavaScript> SyntaxError: ..."). */
+  bool parse_library(unsigned language, const std::string &name,
+                     const std::string &body);
   /** Runs the routine for the current principal. False after reporting
       the error. */
   bool execute(Routine &routine);

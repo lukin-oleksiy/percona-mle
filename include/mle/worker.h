@@ -73,6 +73,12 @@ class CallHooks {
   /** True once the session was killed or ran out of time; polled while
       waiting (every few milliseconds) and after each SQL request. */
   virtual bool killed() { return false; }
+  /** A database library the routine imports (Phase 6); by default none. */
+  virtual void library(const LibraryMsg &request, LibraryResultMsg *result) {
+    (void)request;
+    result->status = wire::LibraryStatus::kRefused;
+    result->message = "libraries are not available here";
+  }
 };
 
 /** CallHooks for requests that must not run SQL (PREPARE, DROP, RESET). */
@@ -120,6 +126,10 @@ class Worker {
   Status options(const OptionsMsg &options, std::string *error);
   /** mle_session_reset(): the worker forgets all routines and state. */
   Status reset(std::string *error);
+  /** CREATE LIBRARY: syntax check of a library body (nothing runs). A
+      syntax error is kGuestError with result->error. */
+  Status parse_library(const ParseLibraryMsg &library, CallHooks &hooks,
+                       ResultMsg *result, std::string *error);
 
   /** Interrupts the running top-level call (any thread). Without a running
       call it does nothing; CallHooks::killed covers the next call. */

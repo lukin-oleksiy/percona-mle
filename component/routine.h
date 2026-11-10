@@ -85,6 +85,8 @@ struct Routine {
   uint16_t sp_type = 0;
   std::string name;
   std::string qualified_name;
+  /** The routine's schema (libraries of this schema may be imported). */
+  std::string schema;
   std::vector<ParamInfo> params;
   std::optional<ParamInfo> ret;
   /** PREPARE for the workers (body form: empty entry). */

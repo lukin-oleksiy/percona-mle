@@ -73,6 +73,12 @@ final class Wire {
   static final int RESET = 9;
   static final int CONTINUE = 10;
   static final int OPTIONS = 11;
+  static final int PARSE_LIBRARY = 12;
+  static final int LIBRARY = 13;
+  static final int LIBRARY_RESULT = 14;
+  static final int LIBRARY_REFUSED = 0;
+  static final int LIBRARY_UNCHANGED = 1;
+  static final int LIBRARY_BODY = 2;
 
   // IntegerType (Oracle's integer_type) and DecimalType (decimal_type)
   static final int INT_UNSAFE_STRING = 0;

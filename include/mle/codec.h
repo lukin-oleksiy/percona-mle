@@ -195,6 +195,15 @@ struct ReadyMsg {
   bool operator==(const ReadyMsg &) const = default;
 };
 
+/** A library of a routine's USING clause (Phase 6). */
+struct Import {
+  std::string schema;
+  std::string name;
+  /** "": the routine uses the library's name. */
+  std::string alias;
+  bool operator==(const Import &) const = default;
+};
+
 struct PrepareMsg {
   uint64_t routine_id = 0;
   std::string language;
@@ -204,8 +213,38 @@ struct PrepareMsg {
   std::string source;
   std::vector<Param> params;
   std::optional<ParamType> returns;
+  std::vector<Import> imports;
   bool operator==(const PrepareMsg &) const = default;
 };
+
+/** CREATE LIBRARY's syntax check (Phase 6). */
+struct ParseLibraryMsg {
+  std::string language;
+  std::string name;
+  std::string body;
+  bool operator==(const ParseLibraryMsg &) const = default;
+};
+
+/** A library the worker imports (Phase 6). */
+struct LibraryMsg {
+  std::string schema;
+  std::string name;
+  uint64_t known_hash = 0;
+  bool operator==(const LibraryMsg &) const = default;
+};
+
+struct LibraryResultMsg {
+  wire::LibraryStatus status = wire::LibraryStatus::kRefused;
+  std::string language;
+  std::string body;
+  uint64_t hash = 0;
+  std::string message;
+  bool operator==(const LibraryResultMsg &) const = default;
+};
+
+/** The hash of a library body in kLibrary/kLibraryResult (FNV-1a 64; 0 is
+    reserved for "none"). */
+uint64_t library_hash(std::string_view body);
 
 struct CallMsg {
   uint64_t routine_id = 0;
@@ -280,6 +319,9 @@ void encode(const SqlMsg &m, std::string *out);
 void encode(const SqlResultMsg &m, std::string *out);
 void encode(const DropMsg &m, std::string *out);
 void encode(const OptionsMsg &m, std::string *out);
+void encode(const ParseLibraryMsg &m, std::string *out);
+void encode(const LibraryMsg &m, std::string *out);
+void encode(const LibraryResultMsg &m, std::string *out);
 
 bool decode(std::string_view body, ReadyMsg *m, std::string *error);
 bool decode(std::string_view body, PrepareMsg *m, std::string *error);
@@ -289,6 +331,9 @@ bool decode(std::string_view body, SqlMsg *m, std::string *error);
 bool decode(std::string_view body, SqlResultMsg *m, std::string *error);
 bool decode(std::string_view body, DropMsg *m, std::string *error);
 bool decode(std::string_view body, OptionsMsg *m, std::string *error);
+bool decode(std::string_view body, ParseLibraryMsg *m, std::string *error);
+bool decode(std::string_view body, LibraryMsg *m, std::string *error);
+bool decode(std::string_view body, LibraryResultMsg *m, std::string *error);
 
 // ---------------------------------------------------------------- chunks
 

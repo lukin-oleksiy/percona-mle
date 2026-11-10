@@ -34,6 +34,7 @@
 
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_error);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_metadata_query);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_import_metadata_query);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_argument_metadata_query);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_metadata_query);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_int);
@@ -527,6 +528,7 @@ Routine *Routine::create(stored_program_handle sp) {
   r->sp_type = type;
   r->name = get_string("sp_name");
   r->qualified_name = get_string("qualified_name");
+  r->schema = get_string("database_name");
   for (uint32_t i = 0; i < n; i++) {
     ParamInfo p;
     const char *name = nullptr;
@@ -558,6 +560,22 @@ Routine *Routine::create(stored_program_handle sp) {
   m.language = worker_language(bit);
   m.name = r->name;
   m.source = get_string("sp_body");
+  // USING (Phase 6): the libraries the routine imports.
+  uint32_t imports = 0;
+  (void)mysql_service_mysql_stored_program_metadata_query->get(sp, "import_count", &imports);
+  for (uint32_t i = 0; i < imports; i++) {
+    mysql_cstring_with_length schema{nullptr, 0}, lib{nullptr, 0}, version{nullptr, 0},
+        alias{nullptr, 0};
+    if (mysql_service_mysql_stored_program_import_metadata_query->get(
+            sp, i, &schema, &lib, &version, &alias, nullptr))
+      continue;
+    mle::Import imp;
+    imp.schema.assign(schema.str == nullptr ? r->schema.c_str() : schema.str,
+                      schema.str == nullptr ? r->schema.size() : schema.length);
+    if (lib.str != nullptr) imp.name.assign(lib.str, lib.length);
+    if (alias.str != nullptr) imp.alias.assign(alias.str, alias.length);
+    m.imports.push_back(std::move(imp));
+  }
   for (const ParamInfo &p : r->params) m.params.push_back({p.name, p.mode, p.type});
   if (r->ret) m.returns = r->ret->type;
   ++g_alive;

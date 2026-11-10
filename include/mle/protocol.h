@@ -96,7 +96,9 @@ enum class Op : uint32_t {
   kReady = 1,
   /** h->w. u64 routine id, str language, str name (the routine's name, for
       stack traces and messages), str entry, str source, u32 n + n x Param,
-      u8 has_return [, ParamType return type]. An empty entry means the
+      u8 has_return [, ParamType return type], u32 n + n x (str schema,
+      str library, str alias) libraries of USING (Phase 6; alias "": the
+      library's name). An empty entry means the
       source is a routine *body* (CREATE ... AS $$ body $$): the worker
       wraps it with the parameters as named variables (Oracle's form for
       JavaScript). Answered by kResult (OK, or kGuestError with the compile
@@ -141,8 +143,31 @@ enum class Op : uint32_t {
       Answered by kResult (kGuestError with language "MLE-TimeZone" for a
       zone the worker does not know). */
   kOptions = 11,
+  /** h->w. str language, str name, str body: syntax check of a library
+      (CREATE LIBRARY), nothing runs. Answered by kResult (OK, or kGuestError
+      with the syntax error). Phase 6. */
+  kParseLibrary = 12,
+  /** w->h, only while the host waits for a PREPARE's or CALL's RESULT.
+      str schema, str name, u64 hash of the body the worker has (0: none):
+      a database library (CREATE LIBRARY) the routine imports. Answered by
+      kLibraryResult. Phase 6. */
+  kLibrary = 13,
+  /** h->w. u8 LibraryStatus, str language, str body (kBody only), u64 hash
+      of the body, str message (kRefused: why). */
+  kLibraryResult = 14,
 };
-constexpr uint32_t kMaxOp = 11;
+constexpr uint32_t kMaxOp = 14;
+
+/** The answer to kLibrary. */
+enum class LibraryStatus : uint8_t {
+  /** Not there, or not importable from this routine (message says why). */
+  kRefused = 0,
+  /** The worker has the current body (same hash). */
+  kUnchanged = 1,
+  /** The body follows. */
+  kBody = 2,
+};
+constexpr uint8_t kMaxLibraryStatus = 2;
 
 /** How JavaScript gets SQL integers (Oracle's integer_type option). A safe
     integer is within +-(2^53 - 1). */

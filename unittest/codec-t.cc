@@ -356,10 +356,44 @@ TEST(MleCodec, PrepareRoundTrip) {
               {"k", ParamMode::kInOut, u},
               {"total", ParamMode::kOut, dec}};
   m.returns = vector_type(3);
+  m.imports = {{"jslib", "lib1", "mylib"}, {"db1", "theirlib", ""}};
   EXPECT_EQ(message_round_trip(m), m);
   m.returns.reset();
   m.params.clear();
+  m.imports.clear();
   EXPECT_EQ(message_round_trip(m), m);
+}
+
+// Phase 6: CREATE LIBRARY's check and the libraries a routine imports.
+TEST(MleCodec, LibraryMessagesRoundTrip) {
+  ParseLibraryMsg p;
+  p.language = "js";
+  p.name = "lib1";
+  p.body = "export function f(n) { return n }";
+  EXPECT_EQ(message_round_trip(p), p);
+  LibraryMsg l;
+  l.schema = "db1";
+  l.name = "theirlib";
+  l.known_hash = 0x9a91d68a5f842a47;
+  EXPECT_EQ(message_round_trip(l), l);
+  LibraryResultMsg r;
+  r.status = wire::LibraryStatus::kBody;
+  r.language = "js";
+  r.body = "import {foo} from \"/db1/mylib\"";
+  r.hash = library_hash(r.body);
+  EXPECT_EQ(message_round_trip(r), r);
+  r.status = wire::LibraryStatus::kRefused;
+  r.message = "library other.secret is not importable";
+  EXPECT_EQ(message_round_trip(r), r);
+  // A bad status is rejected.
+  std::string bytes;
+  encode(r, &bytes);
+  bytes[0] = 7;
+  LibraryResultMsg bad;
+  EXPECT_FALSE(decode(bytes, &bad, nullptr));
+  // The hash is never 0 (reserved for "no body").
+  EXPECT_NE(library_hash(""), 0u);
+  EXPECT_NE(library_hash("a"), library_hash("b"));
 }
 
 TEST(MleCodec, CallRoundTrip) {

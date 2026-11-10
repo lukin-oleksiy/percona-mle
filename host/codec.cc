@@ -529,6 +529,12 @@ void encode(const PrepareMsg &m, std::string *out) {
   }
   w.u8(m.returns ? 1 : 0);
   if (m.returns) put_param_type(w, *m.returns);
+  w.u32(static_cast<uint32_t>(m.imports.size()));
+  for (const Import &i : m.imports) {
+    w.str(i.schema);
+    w.str(i.name);
+    w.str(i.alias);
+  }
 }
 
 bool decode(std::string_view body, PrepareMsg *m, std::string *error) {
@@ -554,7 +560,69 @@ bool decode(std::string_view body, PrepareMsg *m, std::string *error) {
       x->returns.emplace();
       if (!get_param_type(r, &*x->returns)) return false;
     }
+    if (!r.count(&n, 3 * kMinStr)) return false;
+    x->imports.clear();
+    x->imports.resize(n);
+    for (Import &i : x->imports)
+      if (!r.str(&i.schema) || !r.str(&i.name) || !r.str(&i.alias)) return false;
     return true;
+  });
+}
+
+uint64_t library_hash(std::string_view body) {
+  uint64_t h = 1469598103934665603ULL;
+  for (const char c : body) {
+    h ^= static_cast<unsigned char>(c);
+    h *= 1099511628211ULL;
+  }
+  return h == 0 ? 1 : h;
+}
+
+void encode(const ParseLibraryMsg &m, std::string *out) {
+  out->clear();
+  Writer w(out);
+  w.str(m.language);
+  w.str(m.name);
+  w.str(m.body);
+}
+
+bool decode(std::string_view body, ParseLibraryMsg *m, std::string *error) {
+  return decode_with<ParseLibraryMsg>(body, m, error, [](Reader &r, ParseLibraryMsg *x) {
+    return r.str(&x->language) && r.str(&x->name) && r.str(&x->body);
+  });
+}
+
+void encode(const LibraryMsg &m, std::string *out) {
+  out->clear();
+  Writer w(out);
+  w.str(m.schema);
+  w.str(m.name);
+  w.u64(m.known_hash);
+}
+
+bool decode(std::string_view body, LibraryMsg *m, std::string *error) {
+  return decode_with<LibraryMsg>(body, m, error, [](Reader &r, LibraryMsg *x) {
+    return r.str(&x->schema) && r.str(&x->name) && r.u64(&x->known_hash);
+  });
+}
+
+void encode(const LibraryResultMsg &m, std::string *out) {
+  out->clear();
+  Writer w(out);
+  w.u8(static_cast<uint8_t>(m.status));
+  w.str(m.language);
+  w.str(m.body);
+  w.u64(m.hash);
+  w.str(m.message);
+}
+
+bool decode(std::string_view body, LibraryResultMsg *m, std::string *error) {
+  return decode_with<LibraryResultMsg>(body, m, error, [](Reader &r, LibraryResultMsg *x) {
+    uint8_t status;
+    if (!r.u8(&status)) return false;
+    if (status > wire::kMaxLibraryStatus) return r.fail("bad library status");
+    x->status = static_cast<wire::LibraryStatus>(status);
+    return r.str(&x->language) && r.str(&x->body) && r.u64(&x->hash) && r.str(&x->message);
   });
 }
 

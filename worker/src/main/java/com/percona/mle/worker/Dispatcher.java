@@ -116,6 +116,7 @@ final class Dispatcher {
           result(Wire.OK, null, null, null);
         }
         case Wire.OPTIONS -> options(m);
+        case Wire.PARSE_LIBRARY -> parseLibrary(m);
         default -> result(Wire.INTERNAL, null, null, internal("unexpected message " + m.op()));
       }
     } finally {
@@ -142,6 +143,46 @@ final class Dispatcher {
     result(Wire.OK, null, null, null);
   }
 
+  /** CREATE LIBRARY: a syntax check; nothing runs. */
+  private void parseLibrary(Mailbox.Message m) {
+    MessageReader r = new MessageReader(m.body());
+    String language = r.str();
+    String name = r.str();
+    String body = r.str();
+    r.finish();
+    String error;
+    try {
+      error = polyglot.parseLibrary(language, name, body);
+    } catch (Throwable t) {
+      failed(t, false);
+      return;
+    }
+    if (error == null) result(Wire.OK, null, null, null);
+    else result(Wire.GUEST_ERROR, null, null, guest(language, error));
+  }
+
+  /** A database library's body from the host (Phase 6); see LibraryFileSystem. */
+  LibraryFileSystem.Reply libraryRequest(String schema, String name, long knownHash) {
+    if (Thread.currentThread() != thread)
+      throw new IllegalStateException("libraries must be loaded on the routine's thread");
+    w.reset();
+    w.str(schema);
+    w.str(name);
+    w.u64(knownHash);
+    mb.send(Wire.LIBRARY, Wire.OK, depth, seq, w);
+    Mailbox.Message m = mb.receive();
+    if (m.op() != Wire.LIBRARY_RESULT || m.depth() != depth)
+      throw new IllegalStateException("unexpected message " + m.op() + " while loading a library");
+    MessageReader r = new MessageReader(m.body());
+    int status = r.u8();
+    String language = r.str();
+    String body = r.str();
+    long hash = r.u64();
+    String message = r.str();
+    r.finish();
+    return new LibraryFileSystem.Reply(status, language, body, hash, message);
+  }
+
   private void prepare(Mailbox.Message m) {
     MessageReader r = new MessageReader(m.body());
     long id = r.u64();
@@ -153,6 +194,9 @@ final class Dispatcher {
     List<JavaRoutines.Param> params = new ArrayList<>(n);
     for (int i = 0; i < n; i++) params.add(new JavaRoutines.Param(r.str(), r.u8(), Values.readParamType(r)));
     Values.ParamType ret = r.flag() ? Values.readParamType(r) : null;
+    int ni = r.count();
+    List<LibraryFileSystem.Import> imports = new ArrayList<>(ni);
+    for (int i = 0; i < ni; i++) imports.add(new LibraryFileSystem.Import(r.str(), r.str(), r.str()));
     r.finish();
 
     if (!language.equals("java") && !Polyglot.isGuest(language)) {
@@ -171,7 +215,7 @@ final class Dispatcher {
       java.drop(id);
       polyglot.drop(id);
       if (language.equals("java")) java.prepare(id, name, entry, source, params, ret);
-      else polyglot.prepare(id, language, name, entry, source, params, ret);
+      else polyglot.prepare(id, language, name, entry, source, params, ret, imports);
     } catch (JavaRoutines.CompileException e) {
       compileError = e.getMessage();
     } catch (Throwable t) {

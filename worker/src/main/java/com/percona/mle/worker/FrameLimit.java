@@ -68,7 +68,7 @@ public final class FrameLimit extends TruffleInstrument {
         .rootNameIs(name -> !JsOracle.WRAPPER.equals(name))
         .sourceIs(s -> {
           URI uri = s.getURI();
-          return uri != null && Polyglot.ROUTINE_SCHEME.equals(uri.getScheme());
+          return Polyglot.isRoutineUri(uri);
         })
         .build();
     env.getInstrumenter().attachExecutionEventFactory(filter, FrameLimit::counter);

@@ -135,10 +135,12 @@ final class JsOracle {
 
   /** Compiles a body; throws PolyglotException for syntax errors. */
   static Routine prepare(Context c, Value helpers, String name, String body, List<JavaRoutines.Param> params,
-      Values.ParamType ret, java.net.URI uri) {
+      Values.ParamType ret, java.net.URI uri, List<LibraryFileSystem.Import> imports) {
     int n = params.size();
     StringBuilder pre = new StringBuilder("(function($c){const $G=globalThis;return ");
-    boolean async = AWAIT.matcher(body).find();
+    // USING (Phase 6): each library is imported (once per worker, see LibraryFileSystem) and
+    // bound to its name or alias, so the routine is async.
+    boolean async = AWAIT.matcher(body).find() || !imports.isEmpty();
     if (async) pre.append("async ");
     pre.append("function " + WRAPPER + "(");
     for (int i = 0; i < n; i++) pre.append(i == 0 ? "" : ",").append("$a").append(i);
@@ -158,6 +160,8 @@ final class JsOracle {
     int[] outs = new int[outCount];
     // The body runs in an arrow function: it may return early, and its own
     // declarations (Oracle's myfunc: "var x") shadow the parameters.
+    for (LibraryFileSystem.Import i : imports)
+      pre.append("const ").append(i.binding()).append("=await import(").append(jsString(i.path())).append(");");
     pre.append("const $r=").append(async ? "await(async()=>{" : "(()=>{");
     StringBuilder post = new StringBuilder("\n");
     if (outCount == 0) {
@@ -175,6 +179,10 @@ final class JsOracle {
     Polyglot.prefixes.put(uri, pre.length());  // also for the positions of syntax errors
     Value factory = c.eval(Source.newBuilder("js", text, name).uri(uri).buildLiteral());
     return new Routine(factory.execute(helpers), types, outs, ret, async, pre.length(), name);
+  }
+
+  private static String jsString(String s) {
+    return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
   }
 
   // ------------------------------------------------------------ arguments

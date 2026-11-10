@@ -75,6 +75,20 @@ final class Polyglot {
 
   /** Scheme of the URIs of routine sources (stack frames are kept only for these). */
   static final String ROUTINE_SCHEME = "mle-routine";
+  /**
+   * Routine sources are file URIs below this (virtual, never read) directory, so that module paths
+   * in them ("/schema/library") resolve to files of LibraryFileSystem (Phase 6).
+   */
+  static final String ROUTINE_DIR = "/.mle-routines/";
+
+  static java.net.URI routineUri(long id) {
+    return java.net.URI.create("file://" + ROUTINE_DIR + id + ".js");
+  }
+
+  static boolean isRoutineUri(java.net.URI uri) {
+    return uri != null && ("file".equals(uri.getScheme()) && uri.getPath() != null
+        && uri.getPath().startsWith(ROUTINE_DIR) || ROUTINE_SCHEME.equals(uri.getScheme()));
+  }
 
   private final Console console;
   private final Options options;
@@ -179,8 +193,9 @@ final class Polyglot {
         .allowNativeAccess(true)  // numpy and other native extensions
         .allowEnvironmentAccess(EnvironmentAccess.NONE)
         .allowIO(IOAccess.newBuilder()
-            .fileSystem(FileSystem.allowInternalResourceAccess(FileSystem.allowLanguageHomeAccess(
-                FileSystem.newReadOnlyFileSystem(FileSystem.newDefaultFileSystem()))))
+            // Database libraries (Phase 6) are modules at "/schema/library".
+            .fileSystem(new LibraryFileSystem(FileSystem.allowInternalResourceAccess(FileSystem.allowLanguageHomeAccess(
+                FileSystem.newReadOnlyFileSystem(FileSystem.newDefaultFileSystem())))))
             .allowHostSocketAccess(false)
             .build())
         .option("engine.WarnInterpreterOnly", "false")
@@ -372,7 +387,7 @@ final class Polyglot {
 
   void drop(long id) {
     routines.remove(id);
-    prefixes.remove(java.net.URI.create(ROUTINE_SCHEME + ":" + id));
+    prefixes.remove(routineUri(id));
   }
 
   void reset() {
@@ -386,14 +401,15 @@ final class Polyglot {
    * with an empty entry, the source is the routine body (JavaScript: Oracle's form, JsOracle).
    */
   void prepare(long id, String language, String routineName, String entry, String source,
-      List<JavaRoutines.Param> params, Values.ParamType ret) throws JavaRoutines.CompileException {
+      List<JavaRoutines.Param> params, Values.ParamType ret, List<LibraryFileSystem.Import> imports)
+      throws JavaRoutines.CompileException {
     boolean bodyForm = entry.isEmpty();
     if (!bodyForm && !IDENTIFIER.matcher(entry).matches())
       throw new JavaRoutines.CompileException("the entry must be a function name, not '" + entry + "'");
     Context c = context();
     Helpers h = helpers(language);
     String name = routineName.isEmpty() ? "routine_" + id : routineName;
-    java.net.URI uri = java.net.URI.create(ROUTINE_SCHEME + ":" + id);
+    java.net.URI uri = routineUri(id);
     Values.ParamType[] types = new Values.ParamType[params.size()];
     for (int i = 0; i < types.length; i++) types[i] = params.get(i).type();
     int[] outs = java.util.stream.IntStream.range(0, params.size())
@@ -405,7 +421,7 @@ final class Polyglot {
         for (JavaRoutines.Param p : params)
           if (!IDENTIFIER.matcher(p.name()).matches())
             throw new JavaRoutines.CompileException("'" + p.name() + "' is not a JavaScript identifier");
-        jsRoutine = JsOracle.prepare(c, jsOracle, name, source, params, ret, uri);
+        jsRoutine = JsOracle.prepare(c, jsOracle, name, source, params, ret, uri, imports);
         fn = jsRoutine.fn();
       } else if (language.equals("js")) {
         // Same first line, so that positions in errors match the source.
@@ -633,6 +649,33 @@ final class Polyglot {
 
   // ------------------------------------------------------------ errors
 
+  /**
+   * CREATE LIBRARY: checks a library body without running it; the syntax error (Oracle's form,
+   * "SyntaxError: name:line:col message") or null.
+   */
+  String parseLibrary(String language, String name, String body) {
+    Context c = context();
+    try {
+      switch (language) {
+        case "js" -> c.parse(Source.newBuilder("js", body, name).mimeType("application/javascript+module")
+            .buildLiteral());
+        case "python" -> {
+          pythonReady();
+          c.eval("python", "compile").execute(body, name, "exec");
+        }
+        default -> {
+          return "libraries in " + language + " are not supported";
+        }
+      }
+      return null;
+    } catch (PolyglotException e) {
+      if (e.isInterrupted() || e.isCancelled() || e.isResourceExhausted()) throw e;
+      String m = e.getMessage() == null ? e.toString() : e.getMessage();
+      int nl = m.indexOf('\n');
+      return nl < 0 ? m : m.substring(0, nl);
+    }
+  }
+
   /** "routine_7.js:3:5: SyntaxError: ..." for syntax errors, else the message. */
   static String describe(PolyglotException e, boolean withLocation) {
     String msg = e.getMessage() == null ? e.toString() : e.getMessage();
@@ -671,7 +714,7 @@ final class Polyglot {
   /** Whether a source is a routine's (not the worker's own helpers). */
   static boolean isRoutineSource(org.graalvm.polyglot.Source src) {
     java.net.URI uri = src.getURI();
-    return (uri != null && ROUTINE_SCHEME.equals(uri.getScheme())) || pythonSources.contains(src.getName());
+    return isRoutineUri(uri) || pythonSources.contains(src.getName());
   }
 
   /** Column on the body's first line: the wrapper text before the body is not counted. */

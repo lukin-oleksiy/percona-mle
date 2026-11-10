@@ -86,6 +86,12 @@ const char *op_name(uint32_t op) {
       return "CONTINUE";
     case wire::Op::kOptions:
       return "OPTIONS";
+    case wire::Op::kParseLibrary:
+      return "PARSE_LIBRARY";
+    case wire::Op::kLibrary:
+      return "LIBRARY";
+    case wire::Op::kLibraryResult:
+      return "LIBRARY_RESULT";
   }
   return "?";
 }
@@ -410,9 +416,29 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
       if (w != Wait::kMessage) return lost(w);
       continue;
     }
+    if (m.h.op == uint32_t(wire::Op::kLibrary) &&
+        (op == wire::Op::kCall || op == wire::Op::kPrepare)) {
+      LibraryMsg lib;
+      if (!decode(m.body, &lib, &why)) return broke("bad LIBRARY: " + why);
+      LibraryResultMsg r;
+      hooks.library(lib, &r);
+      if (!m_usable) return died(error);
+      std::string reply;
+      encode(r, &reply);
+      w = send(wire::Op::kLibraryResult, reply, &hooks, &why);
+      if (w != Wait::kMessage) return lost(w);
+      continue;
+    }
     return broke(std::string("unexpected ") + op_name(m.h.op) + " during " +
                  op_name(uint32_t(op)));
   }
+}
+
+Status Worker::parse_library(const ParseLibraryMsg &library, CallHooks &hooks,
+                             ResultMsg *result, std::string *error) {
+  std::string body;
+  encode(library, &body);
+  return request(wire::Op::kParseLibrary, body, hooks, nullptr, result, error);
 }
 
 Status Worker::prepare(const PrepareMsg &routine, CallHooks &hooks,

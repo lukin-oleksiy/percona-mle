@@ -42,6 +42,7 @@
 #include <mysql/components/services/component_status_var_service.h>
 #include <mysql/components/services/component_sys_var_service.h>
 #include <mysql/components/services/language_service.h>
+#include <mysql/components/services/mysql_library.h>
 #include <mysql/components/services/log_builtins.h>
 #include <mysql/components/services/mysql_runtime_error_service.h>
 #include <mysql/components/services/mysql_runtime_warning.h>
@@ -66,6 +67,8 @@
 REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_error);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_warning);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_metadata_query);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_import_metadata_query);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_library);
 REQUIRES_SERVICE_PLACEHOLDER(component_sys_variable_register);
 REQUIRES_SERVICE_PLACEHOLDER(component_sys_variable_unregister);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_system_variable_reader);
@@ -275,6 +278,50 @@ mysql_service_status_t deinit() {
 using mle_component::Services;
 
 // clang-format off
+/** CREATE LIBRARY (Phase 6, 14 §2): a syntax check in the account's worker;
+    nothing runs. */
+class Libraries {
+ public:
+  static DEFINE_BOOL_METHOD(is_language_supported,
+                            (mysql_cstring_with_length language, bool *result)) {
+    *result = (mle_component::language_bit({language.str, language.length}) &
+               mle_component::enabled_languages()) != 0;
+    return false;
+  }
+
+  static DEFINE_BOOL_METHOD(parse, (mysql_cstring_with_length name,
+                                    mysql_cstring_with_length language,
+                                    mysql_cstring_with_length body)) {
+    bool ok = false;
+    return parse_ext(name, language, body, false, &ok);
+  }
+
+  static DEFINE_BOOL_METHOD(parse_ext, (mysql_cstring_with_length name,
+                                        mysql_cstring_with_length language,
+                                        mysql_cstring_with_length body,
+                                        bool is_binary, bool *result)) {
+    *result = false;
+    const unsigned bit = mle_component::language_bit({language.str, language.length});
+    if ((bit & mle_component::enabled_languages()) == 0) {
+      my_error(ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE, MYF(0),
+               std::string(language.str, language.length).c_str());
+      return true;
+    }
+    if (is_binary) {
+      my_error(ER_LANGUAGE_COMPONENT, MYF(0),
+               "MLE> Libraries are source code (WebAssembly is not supported).");
+      return true;
+    }
+    mle_component::Session *s = mle_component::Session::current(true);
+    if (s == nullptr) return true;
+    if (!s->parse_library(bit, std::string(name.str, name.length),
+                          std::string(body.str == nullptr ? "" : body.str, body.length)))
+      return true;
+    *result = true;
+    return false;
+  }
+};
+
 BEGIN_SERVICE_IMPLEMENTATION(mle, external_program_capability_query)
   Services::get,
 END_SERVICE_IMPLEMENTATION();
@@ -286,15 +333,28 @@ BEGIN_SERVICE_IMPLEMENTATION(mle, external_program_execution)
   Services::execute,
 END_SERVICE_IMPLEMENTATION();
 
+BEGIN_SERVICE_IMPLEMENTATION(mle, external_library)
+  Libraries::is_language_supported,
+  Libraries::parse,
+END_SERVICE_IMPLEMENTATION();
+
+BEGIN_SERVICE_IMPLEMENTATION(mle, external_library_ext)
+  Libraries::parse_ext,
+END_SERVICE_IMPLEMENTATION();
+
 BEGIN_COMPONENT_PROVIDES(mle)
   PROVIDES_SERVICE(mle, external_program_capability_query),
   PROVIDES_SERVICE(mle, external_program_execution),
+  PROVIDES_SERVICE(mle, external_library),
+  PROVIDES_SERVICE(mle, external_library_ext),
 END_COMPONENT_PROVIDES();
 
 BEGIN_COMPONENT_REQUIRES(mle)
   REQUIRES_SERVICE(mysql_runtime_error),
   REQUIRES_SERVICE(mysql_runtime_warning),
   REQUIRES_SERVICE(mysql_stored_program_metadata_query),
+  REQUIRES_SERVICE(mysql_stored_program_import_metadata_query),
+  REQUIRES_SERVICE(mysql_library),
   REQUIRES_SERVICE(component_sys_variable_register),
   REQUIRES_SERVICE(component_sys_variable_unregister),
   REQUIRES_SERVICE(mysql_system_variable_reader),
