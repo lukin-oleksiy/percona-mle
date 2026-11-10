@@ -365,6 +365,7 @@ final class Dispatcher {
     }
     w.bytes(console.takeOut());
     w.bytes(console.takeErr());
+    w.u8(console.takeCleared() ? 1 : 0);
     if (error == null) {
       w.u8(0);
       return;

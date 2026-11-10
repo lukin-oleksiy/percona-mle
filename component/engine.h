@@ -96,6 +96,10 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
 /** A session gives a worker back: it is destroyed (killed), not reused. */
 void engine_release_worker(std::unique_ptr<mle::Worker> worker);
 
+/** Java heap in use over all session workers, % of their summed limits
+    (mle_memory_used). */
+long engine_memory_used_percent();
+
 /**
   mle.cgroup_base = AUTO: the parent of mysqld's cgroup, if it is delegated
   to mysqld (writable) and has no processes of its own (systemd Delegate=yes

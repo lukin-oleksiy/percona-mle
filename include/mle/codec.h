@@ -209,6 +209,8 @@ struct ResultMsg {
   std::vector<std::pair<uint32_t, Value>> out_params;
   std::string console_out;
   std::string console_err;
+  /** The routine cleared the console (before console_out/err). */
+  bool console_cleared = false;
   std::optional<Error> error;
   bool operator==(const ResultMsg &) const = default;
 };

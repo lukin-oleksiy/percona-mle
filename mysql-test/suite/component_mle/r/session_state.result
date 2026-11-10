@@ -1,0 +1,140 @@
+#
+# component_mle (P4-W5): Oracle's session UDFs mle_session_state(),
+# mle_session_reset() and mle_set_session_state(): console output,
+# stack traces, program counts, options.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+# Before any MLE use.
+SELECT mle_session_state('is_active') AS is_active,
+mle_session_state('stdout') AS stdout,
+mle_session_state('stored_programs') AS programs,
+mle_session_state('no_such_key') AS unknown;
+is_active	stdout	programs	unknown
+0		0	NULL
+CREATE PROCEDURE pc1() LANGUAGE JAVASCRIPT AS $$
+console.log("pc1: hello");
+console.error("pc1: a warning");
+$$;
+CREATE PROCEDURE pc2() LANGUAGE JAVASCRIPT AS $$
+console.log("pc2: before the error");
+const o = null;
+o.boom();
+$$;
+CREATE FUNCTION f1() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+# Console output accumulates across calls, a line per console.log.
+CALL pc1();
+CALL pc1();
+SELECT mle_session_state('stdout') AS stdout, mle_session_state('stderr') AS stderr;
+stdout	stderr
+pc1: hello
+pc1: hello
+	pc1: a warning
+pc1: a warning
+
+# A runtime error keeps its stack trace (Oracle: <js> name:line:columns).
+CALL pc2();
+ERROR HY000: JavaScript> TypeError: Cannot read property 'boom' of null
+SELECT mle_session_state('stack_trace') AS stack_trace;
+stack_trace
+<js> pc2:4:1-6
+
+SELECT mle_session_state('stdout') AS stdout;
+stdout
+pc1: hello
+pc1: hello
+pc2: before the error
+
+# The next call starts without a stack trace.
+SELECT f1();
+f1()
+1
+SELECT mle_session_state('stack_trace') = '' AS no_stack_trace;
+no_stack_trace
+1
+# Programs cached in this session.
+SELECT mle_session_state('is_active') AS is_active,
+mle_session_state('stored_functions') AS functions,
+mle_session_state('stored_procedures') AS procedures,
+mle_session_state('stored_programs') AS programs;
+is_active	functions	procedures	programs
+1	1	2	3
+# Partial resets.
+SELECT mle_session_reset('stdout');
+mle_session_reset('stdout')
+The session state is successfully reset.
+SELECT mle_session_state('stdout') = '' AS stdout_empty,
+mle_session_state('stderr') <> '' AS stderr_kept;
+stdout_empty	stderr_kept
+1	1
+SELECT mle_session_reset('OUTPUT');
+mle_session_reset('OUTPUT')
+The session state is successfully reset.
+SELECT mle_session_state('stderr') = '' AS stderr_empty;
+stderr_empty
+1
+SELECT mle_session_reset('everything');
+ERROR HY000: mle_session_reset<string> UDF failed; the argument must be stdout, stderr or output
+# console.clear() clears both outputs (also what came before in the call).
+CREATE PROCEDURE pc3() LANGUAGE JAVASCRIPT AS $$
+console.log("gone");
+console.clear();
+console.log("kept");
+$$;
+CALL pc1();
+CALL pc3();
+SELECT mle_session_state('stdout') AS stdout, mle_session_state('stderr') AS stderr;
+stdout	stderr
+kept
+	
+# Python and Java print to stdout too.
+CREATE PROCEDURE py_print() LANGUAGE PYTHON AS $$ print("from Python") $$;
+CREATE PROCEDURE java_print() LANGUAGE JAVA AS $$ System.out.println("from Java"); $$;
+CALL py_print();
+CALL java_print();
+SELECT mle_session_state('stdout') AS stdout;
+stdout
+kept
+from Python
+from Java
+
+# Options can be set only without cached programs (Oracle: 1123).
+SELECT mle_set_session_state('{"integer_type": "BIGINT"}');
+ERROR HY000: Can't initialize function 'mle_set_session_state'; Cannot set options of an active session. Please reset the session first.
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+SELECT mle_session_state('is_active') AS is_active,
+mle_session_state('stored_programs') AS programs,
+mle_session_state('stdout') = '' AS stdout_empty;
+is_active	programs	stdout_empty
+0	0	1
+SELECT mle_set_session_state('{"integer_type": "HUGE"}');
+ERROR HY000: mle_set_session_state<int> UDF failed; invalid integer_type 'HUGE'
+SELECT mle_set_session_state('{"integer_type": "BIGINT", "decimal_type": "number"}');
+mle_set_session_state('{"integer_type": "BIGINT", "decimal_type": "number"}')
+1
+CREATE FUNCTION kinds(i INT, d DECIMAL(5,2)) RETURNS VARCHAR(40) LANGUAGE JAVASCRIPT
+AS $$ return typeof i + ' ' + typeof d $$;
+SELECT kinds(1, 1.5);
+kinds(1, 1.5)
+bigint number
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+SELECT kinds(1, 1.5) AS defaults_again;
+defaults_again
+number string
+SELECT VARIABLE_VALUE >= 2 AS resets_counted FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_session_resets';
+resets_counted
+1
+DROP PROCEDURE pc1;
+DROP PROCEDURE pc2;
+DROP PROCEDURE pc3;
+DROP PROCEDURE py_print;
+DROP PROCEDURE java_print;
+DROP FUNCTION f1;
+DROP FUNCTION kinds;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

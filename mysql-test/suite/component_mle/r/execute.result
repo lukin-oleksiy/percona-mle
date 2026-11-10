@@ -4,6 +4,8 @@
 # session and principal.
 #
 INSTALL COMPONENT "file://component_mle";
+# CREATE needs the language's privilege too (D-3; not in Oracle).
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
 CREATE USER u1@localhost;
 GRANT ALL ON test.* TO u1@localhost;
 # MLE sessions block UNINSTALL until they disconnect: work in con1.
@@ -281,4 +283,5 @@ SELECT VARIABLE_VALUE AS mle_workers FROM performance_schema.global_status
 WHERE VARIABLE_NAME = 'mle_workers';
 mle_workers
 0
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_mle";

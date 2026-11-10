@@ -106,7 +106,8 @@ enum class Op : uint32_t {
   kCall = 3,
   /** w->h. u8 has_return [, value], u32 n + n x (u32 parameter index,
       value) for OUT and INOUT parameters, str stdout, str stderr,
-      u8 has_error [, Error]. */
+      u8 console cleared (console.clear(): the host drops the output it
+      kept before this message's), u8 has_error [, Error]. */
   kResult = 4,
   /** w->h. str statement, u32 n + n x value (parameters), u32 max rows per
       chunk (0 = host default). */

@@ -52,6 +52,23 @@ final class Console {
     return originalErr;
   }
 
+  private boolean cleared;
+
+  /** console.clear(): drops the output so far, and the host's (RESULT flag). */
+  synchronized void clear() {
+    System.out.flush();
+    System.err.flush();
+    out.take();
+    err.take();
+    cleared = true;
+  }
+
+  synchronized boolean takeCleared() {
+    boolean c = cleared;
+    cleared = false;
+    return c;
+  }
+
   byte[] takeOut() {
     System.out.flush();
     return out.take();

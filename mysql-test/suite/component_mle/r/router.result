@@ -6,6 +6,7 @@
 INSTALL COMPONENT "file://component_js_lang";
 INSTALL COMPONENT "file://component_mle";
 INSTALL COMPONENT "file://component_lang_router";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
 SELECT VARIABLE_VALUE AS backends FROM performance_schema.global_status
 WHERE VARIABLE_NAME = 'Lang_router_backends';
 backends
@@ -41,6 +42,7 @@ DROP FUNCTION v8_f;
 DROP FUNCTION mle_js;
 DROP FUNCTION mle_py;
 DROP PROCEDURE mle_java;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_lang_router";
 UNINSTALL COMPONENT "file://component_mle";
 UNINSTALL COMPONENT "file://component_js_lang";

@@ -22,6 +22,7 @@ MYSQL_ADD_COMPONENT(mle
   session.cc
   settings.cc
   status.cc
+  udfs.cc
   LINK_LIBRARIES mle_host
   MODULE_ONLY
   )

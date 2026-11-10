@@ -100,7 +100,7 @@ int show_languages(MYSQL_THD, SHOW_VAR *var, char *buff) {
 }
 
 int show_memory_used(MYSQL_THD, SHOW_VAR *var, char *buff) {
-  return show_number(var, buff, 0);  // workers' memory: W4
+  return show_number(var, buff, engine_memory_used_percent());
 }
 
 int show_programs(MYSQL_THD, SHOW_VAR *var, char *buff) {

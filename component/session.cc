@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <climits>
+#include <cstring>
 #include <cstdlib>
 #include <ctime>
 
@@ -28,7 +29,9 @@
 #include <mysql/components/services/bits/mysql_thd_attributes_bits.h>
 #include <mysql/components/services/mysql_runtime_error_service.h>
 #include <mysql/components/services/mysql_system_variable.h>
+#include <mysql/components/services/dynamic_privilege.h>
 #include <mysql/components/services/mysql_thd_attributes.h>
+#include <mysql/components/services/mysql_thd_kill_handler.h>
 #include <mysql/components/services/mysql_thd_store_service.h>
 #include <mysql/components/services/security_context.h>
 #include <mysql/mysql_lex_string.h>
@@ -43,6 +46,9 @@ extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_security_context);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_options);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_system_variable_reader);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_kill_handler);
+extern REQUIRES_SERVICE_PLACEHOLDER(dynamic_privilege_register);
+extern REQUIRES_SERVICE_PLACEHOLDER(global_grants_check);
 
 namespace mle_component {
 
@@ -123,6 +129,28 @@ void append_capped(std::string *buffer, const std::string &more) {
 }
 
 }  // namespace
+
+/** KILL QUERY / KILL CONNECTION / max_execution_time interrupt the worker
+    at once (the worker's killed() polling is the backstop). */
+class Session::KillGuard {
+ public:
+  KillGuard(MYSQL_THD thd, mle::Worker *worker) : m_thd(thd) {
+    (void)mysql_service_mysql_thd_kill_handler->set(
+        thd,
+        [](MYSQL_THD, uint16_t, void *data) {
+          static_cast<mle::Worker *>(data)->interrupt();
+        },
+        worker);
+  }
+  ~KillGuard() {
+    (void)mysql_service_mysql_thd_kill_handler->set(m_thd, nullptr, nullptr);
+  }
+  KillGuard(const KillGuard &) = delete;
+  KillGuard &operator=(const KillGuard &) = delete;
+
+ private:
+  MYSQL_THD m_thd;
+};
 
 // ------------------------------------------------------------- lifetime
 
@@ -257,25 +285,32 @@ bool Session::prepare_in(const std::string &principal, Slot &slot,
   Hooks hooks(m_thd);
   ResultMsg result;
   std::string error;
-  const Status s = slot.worker->prepare(routine.prepare, hooks, &result, &error);
+  Status s;
+  {
+    const KillGuard kill(m_thd, slot.worker.get());
+    s = slot.worker->prepare(routine.prepare, hooks, &result, &error);
+  }
   keep_console(result);
   if (s != Status::kOk) {
     report(principal, s, result, error, routine, nullptr);
     return false;
   }
   slot.prepared.insert(routine.id);
+  m_programs[routine.id] = routine.sp_type;
   return true;
 }
 
 // ------------------------------------------------------------- requests
 
 bool Session::parse(Routine &routine) {
+  if (!check_create_privilege(m_thd, routine)) return false;
   const std::string who = principal();
   Slot *slot = worker_for(who, routine);
   return slot != nullptr && prepare_in(who, *slot, routine);
 }
 
 bool Session::execute(Routine &routine) {
+  m_stack.clear();  // Oracle: the trace of the last call only
   std::vector<Value> args;
   if (!routine.read_args(&args)) return false;
   const std::string who = principal();
@@ -286,8 +321,11 @@ bool Session::execute(Routine &routine) {
   ResultMsg result;
   std::string error;
   raise_max(g_counters.threads_max, ++g_counters.threads);
-  const Status s =
-      slot->worker->call(routine.id, 0, args, hooks, &result, &error);
+  Status s;
+  {
+    const KillGuard kill(m_thd, slot->worker.get());
+    s = slot->worker->call(routine.id, 0, args, hooks, &result, &error);
+  }
   --g_counters.threads;
   keep_console(result);
   if (s != Status::kOk) {
@@ -298,6 +336,7 @@ bool Session::execute(Routine &routine) {
 }
 
 void Session::forget(const Routine &routine) {
+  m_programs.erase(routine.id);
   for (auto &[principal, slot] : m_workers) {
     if (slot.prepared.erase(routine.id) == 0) continue;
     std::string error;
@@ -307,6 +346,10 @@ void Session::forget(const Routine &routine) {
 }
 
 void Session::keep_console(const ResultMsg &result) {
+  if (result.console_cleared) {
+    m_out.clear();
+    m_err.clear();
+  }
   append_capped(&m_out, result.console_out);
   append_capped(&m_err, result.console_err);
 }
@@ -335,6 +378,7 @@ void Session::report(const std::string &principal, Status status,
       const char *language = e->language.empty()
                                  ? routine.display_language()
                                  : display_language(e->language);
+      keep_stack_trace(*e, routine);
       my_error(ER_LANGUAGE_COMPONENT_RUNTIME, MYF(0), language,
                e->message.c_str());
       const auto it = m_workers.find(principal);
@@ -370,6 +414,133 @@ void Session::report(const std::string &principal, Status status,
               routine.qualified_name + ": " + why);
   }
   my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+}
+
+}  // namespace mle_component
+
+namespace mle_component {
+
+// ------------------------------------------------------------- state
+
+void Session::keep_stack_trace(const mle::Error &e, const Routine &routine) {
+  // Oracle: "<js> pc2:3:6-54", one line per frame.
+  const std::string language =
+      e.language.empty() ? routine.prepare.language : e.language;
+  m_stack.clear();
+  for (const mle::StackFrame &f : e.stack) {
+    m_stack += "<" + language + "> " + f.file + ":" + std::to_string(f.line);
+    if (f.column > 0) {
+      m_stack += ":" + std::to_string(f.column);
+      if (f.end_column > f.column) m_stack += "-" + std::to_string(f.end_column);
+    }
+    m_stack += "\n";
+  }
+}
+
+std::optional<std::string> Session::state(const Session *s,
+                                          const std::string &key) {
+  auto count = [&](uint16_t type) {
+    long n = 0;
+    if (s != nullptr)
+      for (const auto &[id, t] : s->m_programs) n += (type == 0 || t == type);
+    return std::to_string(n);
+  };
+  if (key == "is_active")
+    return s != nullptr && !s->m_workers.empty() ? "1" : "0";
+  if (key == "stdout") return s != nullptr ? s->m_out : "";
+  if (key == "stderr") return s != nullptr ? s->m_err : "";
+  if (key == "stack_trace") return s != nullptr ? s->m_stack : "";
+  if (key == "stored_functions")
+    return count(MYSQL_STORED_PROGRAM_DATA_QUERY_TYPE_FUNCTION);
+  if (key == "stored_procedures")
+    return count(MYSQL_STORED_PROGRAM_DATA_QUERY_TYPE_PROCEDURE);
+  if (key == "stored_programs") return count(0);
+  return std::nullopt;
+}
+
+long Session::worker_pid() {
+  const auto it = m_workers.find(principal());
+  if (it == m_workers.end() || !it->second.worker) return -1;
+  return it->second.worker->process().pid();
+}
+
+void Session::reset_output(bool out, bool err) {
+  if (out) m_out.clear();
+  if (err) m_err.clear();
+}
+
+void Session::reset() {
+  for (auto &[principal, slot] : m_workers)
+    engine_release_worker(std::move(slot.worker));
+  m_workers.clear();
+  m_programs.clear();
+  m_stack.clear();
+  m_out.clear();
+  m_err.clear();
+  m_options = mle::OptionsMsg();
+  m_options_bound = false;
+  ++g_counters.session_resets;
+}
+
+bool Session::set_options(mle::wire::IntegerType integer_type,
+                          mle::wire::DecimalType decimal_type) {
+  if (has_programs()) return false;
+  m_options.integer_type = integer_type;
+  m_options.decimal_type = decimal_type;
+  for (auto &[principal, slot] : m_workers) {
+    std::string error;
+    if (slot.worker && slot.worker->usable() &&
+        slot.worker->options(m_options, &error) != Status::kOk)
+      log_warning("Options for the worker of " + principal + ": " + error);
+  }
+  return true;
+}
+
+// ------------------------------------------------------------- privileges
+
+namespace {
+constexpr const char *kPrivileges[] = {"CREATE_JAVASCRIPT_ROUTINE",
+                                       "CREATE_PYTHON_ROUTINE",
+                                       "CREATE_JAVA_ROUTINE"};
+
+const char *privilege_of(const Routine &r) {
+  return r.language == kJavaScript ? kPrivileges[0]
+         : r.language == kPython   ? kPrivileges[1]
+                                   : kPrivileges[2];
+}
+}  // namespace
+
+bool register_privileges() {
+  for (const char *p : kPrivileges)
+    if (mysql_service_dynamic_privilege_register->register_privilege(
+            p, strlen(p)))
+      return true;
+  return false;
+}
+
+void unregister_privileges() {
+  for (const char *p : kPrivileges)
+    (void)mysql_service_dynamic_privilege_register->unregister_privilege(
+        p, strlen(p));
+}
+
+bool check_create_privilege(MYSQL_THD thd, const Routine &routine) {
+  mysql_cstring_with_length command{nullptr, 0};
+  if (mysql_service_mysql_thd_attributes->get(thd, "sql_command", &command) ||
+      command.str == nullptr)
+    return true;
+  // sql_statement_names (mysqld.cc): SQLCOM_CREATE_SPFUNCTION is
+  // "create_function" (a UDF is "create_udf").
+  const std::string cmd(command.str, command.length);
+  if (cmd != "create_procedure" && cmd != "create_function") return true;
+  Security_context_handle sctx = nullptr;
+  if (mysql_service_mysql_thd_security_context->get(thd, &sctx)) return true;
+  const char *privilege = privilege_of(routine);
+  if (mysql_service_global_grants_check->has_global_grant(sctx, privilege,
+                                                          strlen(privilege)))
+    return true;
+  my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), privilege);
+  return false;
 }
 
 }  // namespace mle_component

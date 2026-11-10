@@ -586,6 +586,7 @@ void encode(const ResultMsg &m, std::string *out) {
   }
   w.str(m.console_out);
   w.str(m.console_err);
+  w.u8(m.console_cleared ? 1 : 0);
   w.u8(m.error ? 1 : 0);
   if (m.error) put_error(w, *m.error);
 }
@@ -605,7 +606,8 @@ bool decode(std::string_view body, ResultMsg *m, std::string *error) {
     for (auto &[index, v] : x->out_params)
       if (!r.u32(&index) || !r.value(&v)) return false;
     // Console output may hold any bytes the guest printed.
-    if (!r.bytes(&x->console_out) || !r.bytes(&x->console_err) || !r.flag(&has))
+    if (!r.bytes(&x->console_out) || !r.bytes(&x->console_err) ||
+        !r.flag(&x->console_cleared) || !r.flag(&has))
       return false;
     if (has) {
       x->error.emplace();

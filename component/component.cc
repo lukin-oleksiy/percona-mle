@@ -49,7 +49,11 @@
 #include <mysql/components/services/mysql_current_thread_reader.h>
 #include <mysql/components/services/mysql_string.h>
 #include <mysql/components/services/mysql_system_variable.h>
+#include <mysql/components/services/dynamic_privilege.h>
 #include <mysql/components/services/mysql_thd_attributes.h>
+#include <mysql/components/services/mysql_thd_kill_handler.h>
+#include <mysql/components/services/udf_metadata.h>
+#include <mysql/components/services/udf_registration.h>
 #include <mysql/components/services/mysql_thd_store_service.h>
 #include <mysql/components/services/security_context.h>
 #include <mysqld_error.h>
@@ -85,6 +89,11 @@ REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_store);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_security_context);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_options);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_kill_handler);
+REQUIRES_SERVICE_PLACEHOLDER(dynamic_privilege_register);
+REQUIRES_SERVICE_PLACEHOLDER(global_grants_check);
+REQUIRES_SERVICE_PLACEHOLDER(udf_registration);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_udf_metadata);
 REQUIRES_SERVICE_PLACEHOLDER(log_builtins);
 REQUIRES_SERVICE_PLACEHOLDER(log_builtins_string);
 
@@ -157,7 +166,9 @@ class Services {
                                      stored_program_handle)) {
     if (lang_sp == nullptr) return false;
     Routine *routine = routine_of(lang_sp);
-    if (Session *session = Session::of(thd)) session->forget(*routine);
+    // The handle CREATE used may come without a THD: it is the current one.
+    Session *session = thd != nullptr ? Session::of(thd) : Session::current(false);
+    if (session != nullptr) session->forget(*routine);
     (routine->is_function() ? g_counters.functions : g_counters.procedures)--;
     Routine::destroy(routine);
     return false;
@@ -202,8 +213,10 @@ mysql_service_status_t init() {
   log_bi = mysql_service_log_builtins;
   log_bs = mysql_service_log_builtins_string;
   if (register_settings() || register_status() || Session::register_slot() ||
-      start_engine()) {
+      register_privileges() || register_udfs() || start_engine()) {
     engine_stop();
+    (void)unregister_udfs();
+    unregister_privileges();
     Session::unregister_slot();
     unregister_status();
     unregister_settings();
@@ -225,7 +238,13 @@ mysql_service_status_t deinit() {
     my_error(ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL, MYF(0));
     return 1;
   }
+  /* A UDF that is running keeps its registration: refuse, try later. */
+  if (unregister_udfs()) {
+    my_error(ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL, MYF(0));
+    return 1;
+  }
   engine_stop();
+  unregister_privileges();
   Session::unregister_slot();
   unregister_status();
   unregister_settings();
@@ -285,6 +304,11 @@ BEGIN_COMPONENT_REQUIRES(mle)
   REQUIRES_SERVICE(mysql_thd_attributes),
   REQUIRES_SERVICE(mysql_thd_security_context),
   REQUIRES_SERVICE(mysql_security_context_options),
+  REQUIRES_SERVICE(mysql_thd_kill_handler),
+  REQUIRES_SERVICE(dynamic_privilege_register),
+  REQUIRES_SERVICE(global_grants_check),
+  REQUIRES_SERVICE(udf_registration),
+  REQUIRES_SERVICE(mysql_udf_metadata),
   REQUIRES_SERVICE(log_builtins),
   REQUIRES_SERVICE(log_builtins_string),
 END_COMPONENT_REQUIRES();

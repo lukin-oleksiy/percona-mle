@@ -1,0 +1,105 @@
+--echo #
+--echo # component_mle (P4-W5): Oracle's session UDFs mle_session_state(),
+--echo # mle_session_reset() and mle_set_session_state(): console output,
+--echo # stack traces, program counts, options.
+--echo #
+--source include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+
+--echo # Before any MLE use.
+SELECT mle_session_state('is_active') AS is_active,
+  mle_session_state('stdout') AS stdout,
+  mle_session_state('stored_programs') AS programs,
+  mle_session_state('no_such_key') AS unknown;
+
+CREATE PROCEDURE pc1() LANGUAGE JAVASCRIPT AS $$
+  console.log("pc1: hello");
+  console.error("pc1: a warning");
+$$;
+CREATE PROCEDURE pc2() LANGUAGE JAVASCRIPT AS $$
+  console.log("pc2: before the error");
+  const o = null;
+  o.boom();
+$$;
+CREATE FUNCTION f1() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+
+--echo # Console output accumulates across calls, a line per console.log.
+CALL pc1();
+CALL pc1();
+SELECT mle_session_state('stdout') AS stdout, mle_session_state('stderr') AS stderr;
+
+--echo # A runtime error keeps its stack trace (Oracle: <js> name:line:columns).
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CALL pc2();
+SELECT mle_session_state('stack_trace') AS stack_trace;
+SELECT mle_session_state('stdout') AS stdout;
+--echo # The next call starts without a stack trace.
+SELECT f1();
+SELECT mle_session_state('stack_trace') = '' AS no_stack_trace;
+
+--echo # Programs cached in this session.
+SELECT mle_session_state('is_active') AS is_active,
+  mle_session_state('stored_functions') AS functions,
+  mle_session_state('stored_procedures') AS procedures,
+  mle_session_state('stored_programs') AS programs;
+
+--echo # Partial resets.
+SELECT mle_session_reset('stdout');
+SELECT mle_session_state('stdout') = '' AS stdout_empty,
+  mle_session_state('stderr') <> '' AS stderr_kept;
+SELECT mle_session_reset('OUTPUT');
+SELECT mle_session_state('stderr') = '' AS stderr_empty;
+--error ER_UDF_ERROR
+SELECT mle_session_reset('everything');
+
+--echo # console.clear() clears both outputs (also what came before in the call).
+CREATE PROCEDURE pc3() LANGUAGE JAVASCRIPT AS $$
+  console.log("gone");
+  console.clear();
+  console.log("kept");
+$$;
+CALL pc1();
+CALL pc3();
+SELECT mle_session_state('stdout') AS stdout, mle_session_state('stderr') AS stderr;
+
+--echo # Python and Java print to stdout too.
+CREATE PROCEDURE py_print() LANGUAGE PYTHON AS $$ print("from Python") $$;
+CREATE PROCEDURE java_print() LANGUAGE JAVA AS $$ System.out.println("from Java"); $$;
+CALL py_print();
+CALL java_print();
+SELECT mle_session_state('stdout') AS stdout;
+
+--echo # Options can be set only without cached programs (Oracle: 1123).
+--error ER_CANT_INITIALIZE_UDF
+SELECT mle_set_session_state('{"integer_type": "BIGINT"}');
+SELECT mle_session_reset();
+SELECT mle_session_state('is_active') AS is_active,
+  mle_session_state('stored_programs') AS programs,
+  mle_session_state('stdout') = '' AS stdout_empty;
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('{"integer_type": "HUGE"}');
+SELECT mle_set_session_state('{"integer_type": "BIGINT", "decimal_type": "number"}');
+CREATE FUNCTION kinds(i INT, d DECIMAL(5,2)) RETURNS VARCHAR(40) LANGUAGE JAVASCRIPT
+  AS $$ return typeof i + ' ' + typeof d $$;
+SELECT kinds(1, 1.5);
+SELECT mle_session_reset();
+SELECT kinds(1, 1.5) AS defaults_again;
+SELECT VARIABLE_VALUE >= 2 AS resets_counted FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_session_resets';
+
+--connection default
+--disconnect con1
+--source include/wait_until_count_sessions.inc
+DROP PROCEDURE pc1;
+DROP PROCEDURE pc2;
+DROP PROCEDURE pc3;
+DROP PROCEDURE py_print;
+DROP PROCEDURE java_print;
+DROP FUNCTION f1;
+DROP FUNCTION kinds;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

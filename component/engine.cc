@@ -23,6 +23,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <vector>
 
@@ -32,7 +33,11 @@
 
 namespace mle_component {
 
+void log_info(const std::string &message);  // component.cc
+
 namespace {
+
+void log_restart(const std::string &message) { log_info(message); }
 
 /** The one worker class of Phase 4 (defaults.h). */
 constexpr char kWorkerClass[] = "jvm";
@@ -40,6 +45,9 @@ constexpr char kWorkerClass[] = "jvm";
 std::mutex g_mutex;
 std::unique_ptr<mle::Launcher> g_launcher;  // guarded by g_mutex
 std::string g_error;                        // guarded by g_mutex
+Settings g_settings;                        // guarded by g_mutex
+/** Workers held by sessions (for mle_memory_used). */
+std::set<const mle::Worker *> g_live;       // guarded by g_mutex
 std::atomic<long> g_workers_in_use{0};
 
 std::string read_file(const std::string &path) {
@@ -112,10 +120,11 @@ std::string auto_cgroup_base(std::string *why) {
   return parent;
 }
 
-bool engine_start(const Settings &s, std::string *error, std::string *info) {
-  std::lock_guard<std::mutex> lock(g_mutex);
+/** Starts the launcher; caller holds g_mutex. */
+bool start_locked(const Settings &s, std::string *error, std::string *info) {
   g_launcher.reset();
   g_error.clear();
+  g_settings = s;
 
   const mle::Layout layout = mle::Layout::installed(s.dir, s.java_home);
   *error = check_layout(layout, s);
@@ -176,6 +185,11 @@ bool engine_start(const Settings &s, std::string *error, std::string *info) {
   return true;
 }
 
+bool engine_start(const Settings &s, std::string *error, std::string *info) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return start_locked(s, error, info);
+}
+
 void engine_stop() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_launcher.reset();
@@ -228,6 +242,17 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
       return nullptr;
     }
     process = g_launcher->acquire(kWorkerClass, error);
+    if (!process && !g_launcher->alive()) {
+      // mle_launcher ended (killed, crashed); its workers died with it.
+      // Start a new one with the same settings and try once more.
+      log_restart("mle_launcher ended unexpectedly; starting it again.");
+      std::string info;
+      const Settings settings = g_settings;
+      if (start_locked(settings, error, &info)) {
+        log_restart(info);
+        process = g_launcher->acquire(kWorkerClass, error);
+      }
+    }
   }
   if (!process) {
     --g_workers_in_use;
@@ -246,13 +271,29 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
     return nullptr;
   }
   *why = AcquireError::kNone;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_live.insert(worker.get());
+  }
   return worker;
 }
 
 void engine_release_worker(std::unique_ptr<mle::Worker> worker) {
   if (!worker) return;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_live.erase(worker.get());
+  }
   worker.reset();
   --g_workers_in_use;
+}
+
+long engine_memory_used_percent() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (g_live.empty() || g_settings.heap_max == 0) return 0;
+  uint64_t used = 0;
+  for (const mle::Worker *w : g_live) used += w->stats().heap_used;
+  return static_cast<long>(used * 100 / (g_settings.heap_max * g_live.size()));
 }
 
 }  // namespace mle_component

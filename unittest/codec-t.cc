@@ -375,6 +375,7 @@ TEST(MleCodec, ResultRoundTrip) {
   m.ret = Value::vector({0.25f, 0.5f});
   m.out_params = {{1, Value::u64(3)}, {2, Value::decimal("1.50")}};
   m.console_out = "hello\n";
+  m.console_cleared = true;
   m.console_err = std::string("\xff binary from a guest", 21);
   EXPECT_EQ(message_round_trip(m), m);
 

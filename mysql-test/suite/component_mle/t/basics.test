@@ -7,6 +7,8 @@
 --source include/count_sessions.inc
 
 INSTALL COMPONENT "file://component_mle";
+--echo # CREATE needs the language's privilege too (D-3; not in Oracle).
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
 
 --echo # The engine runs from INSTALL on (Oracle: Inactive until first use).
 SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status
@@ -109,6 +111,7 @@ SET GLOBAL mle.java_home = '/tmp';
 --error ER_INCORRECT_GLOBAL_LOCAL_VAR
 SET GLOBAL mle.cgroup_base = 'NONE';
 
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
 --echo #
 --echo # UNINSTALL stops the engine; INSTALL ... SET applies settings at once.
 --echo #

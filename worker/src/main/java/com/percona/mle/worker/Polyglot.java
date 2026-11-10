@@ -146,6 +146,14 @@ final class Polyglot {
       js = jsHelpers(c);
       python = pythonHelpers(c);
       jsOracle = JsOracle.helpers(c);
+      // Oracle: console.clear() clears the session's stdout and stderr.
+      if (console != null) {
+        Value clear = c.asValue((org.graalvm.polyglot.proxy.ProxyExecutable) a -> {
+          console.clear();
+          return null;
+        });
+        c.eval("js", "(f) => { console.clear = () => { f(); }; }").execute(clear);
+      }
       context = c;
       applyOptions();
     }

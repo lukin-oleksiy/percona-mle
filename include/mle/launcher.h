@@ -140,6 +140,9 @@ class Launcher {
   ~Launcher();
 
   const LauncherInfo &info() const;
+  /** False once mle_launcher has exited (killed, crashed): acquire() fails
+      from then on; start a new Launcher. */
+  bool alive() const;
 
   /** A fresh worker of the class (from the pool, or spawned now). The
       worker may still be starting: wait for its READY in the mailbox. */

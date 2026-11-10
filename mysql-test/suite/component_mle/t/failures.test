@@ -1,0 +1,144 @@
+--echo #
+--echo # component_mle (P4-W5): KILL, max_execution_time, workers and the
+--echo # launcher lost, heap exhaustion, privileges. The server survives all of
+--echo # them and the session works on.
+--echo #
+--source include/have_mle_component.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+
+call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+
+INSTALL COMPONENT "file://component_mle";
+--echo # A small heap, so that exhausting it is quick; a short KILL grace.
+SET GLOBAL mle.heap_max = 128 * 1024 * 1024, GLOBAL mle.interrupt_grace_ms = 300;
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+
+--connect (con1, localhost, root,,test)
+CREATE FUNCTION js_loop() RETURNS INT LANGUAGE JAVASCRIPT AS $$ for (;;) {} $$;
+CREATE FUNCTION java_loop() RETURNS INT LANGUAGE JAVA
+  AS $$ long x = 0; while (x >= 0) { x = (x + 1) % 1000; } return 0; $$;
+CREATE FUNCTION js_ok() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 7 $$;
+CREATE FUNCTION js_hog() RETURNS INT LANGUAGE JAVASCRIPT AS $$
+  const keep = [];
+  for (;;) keep.push(new Array(1000000).fill(1.5));
+$$;
+SELECT js_ok();
+--let $con1_id = `SELECT CONNECTION_ID()`
+--let $pid0 = `SELECT mle_debug_worker_pid()`
+
+--echo #
+--echo # 1. KILL QUERY of a JavaScript loop: the worker stops the call and stays.
+--echo #
+--send SELECT js_loop()
+--connection default
+--let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE id = $con1_id AND info LIKE 'SELECT js_loop%'
+--source include/wait_condition.inc
+--sleep 0.5
+--replace_result $con1_id CON1
+--eval KILL QUERY $con1_id
+--connection con1
+--error ER_QUERY_INTERRUPTED
+--reap
+SELECT js_ok();
+--let $pid1 = `SELECT mle_debug_worker_pid()`
+--let $assert_text = The same worker after KILL QUERY
+--let $assert_cond = $pid1 = $pid0
+--source include/assert.inc
+
+--echo #
+--echo # 2. max_execution_time.
+--echo #
+--error ER_QUERY_TIMEOUT
+SELECT /*+ MAX_EXECUTION_TIME(500) */ js_loop();
+SELECT js_ok();
+
+--echo #
+--echo # 3. KILL QUERY of a Java loop that does not stop: the worker is killed
+--echo #    after mle.interrupt_grace_ms; the next call gets a fresh one.
+--echo #
+--send SELECT java_loop()
+--connection default
+--let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE id = $con1_id AND info LIKE 'SELECT java_loop%'
+--source include/wait_condition.inc
+--sleep 0.5
+--replace_result $con1_id CON1
+--eval KILL QUERY $con1_id
+--connection con1
+--error ER_QUERY_INTERRUPTED
+--reap
+SELECT js_ok();
+--let $pid2 = `SELECT mle_debug_worker_pid()`
+--let $assert_text = A new worker after the old one was killed
+--let $assert_cond = $pid2 <> $pid1
+--source include/assert.inc
+
+--echo #
+--echo # 4. The worker killed from outside: the call fails (6111), the next one
+--echo #    runs in a fresh worker.
+--echo #
+--exec kill -9 $pid2
+--error ER_LANGUAGE_COMPONENT_INTERNAL
+SELECT js_ok();
+SELECT js_ok();
+
+--echo #
+--echo # 5. Heap exhausted: a guest error; the worker is retired.
+--echo #
+--let $pid3 = `SELECT mle_debug_worker_pid()`
+--replace_regex /JavaScript> .*/JavaScript> <out of memory>/
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_hog();
+SELECT js_ok();
+--let $pid4 = `SELECT mle_debug_worker_pid()`
+--let $assert_text = A new worker after heap exhaustion
+--let $assert_cond = $pid4 <> $pid3
+--source include/assert.inc
+
+--echo #
+--echo # 6. The launcher killed: its workers die with it; the engine starts a
+--echo #    new launcher when the next worker is needed.
+--echo #
+--let $pid_file = `SELECT @@pid_file`
+--exec pkill -9 -x -P `cat $pid_file` mle_launcher
+--error ER_LANGUAGE_COMPONENT_INTERNAL
+SELECT js_ok();
+SELECT js_ok();
+SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_status';
+--echo # Lost: the killed Java loop, kill -9, the launcher (OOM counts apart).
+SELECT VARIABLE_VALUE >= 3 AS failures_counted FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_worker_failures';
+SELECT VARIABLE_VALUE >= 1 AS oom_counted FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_oom_errors';
+
+--echo #
+--echo # 7. CREATE needs CREATE_<LANGUAGE>_ROUTINE (D-3); calling does not.
+--echo #
+CREATE USER u2@localhost;
+GRANT CREATE ROUTINE, EXECUTE ON test.* TO u2@localhost;
+GRANT CREATE_PYTHON_ROUTINE ON *.* TO u2@localhost;
+--connect (con_u2, localhost, u2,,test)
+--error ER_SPECIFIC_ACCESS_DENIED_ERROR
+CREATE FUNCTION u2_js() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+--error ER_SPECIFIC_ACCESS_DENIED_ERROR
+CREATE FUNCTION u2_java() RETURNS INT LANGUAGE JAVA AS $$ return 1; $$;
+CREATE FUNCTION u2_py() RETURNS INT LANGUAGE PYTHON AS $$ return 3 $$;
+SELECT u2_py(), js_ok();
+--disconnect con_u2
+--connection con1
+
+--echo # The server is fine.
+SELECT 1 AS alive;
+
+--connection default
+--disconnect con1
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION js_loop;
+DROP FUNCTION java_loop;
+DROP FUNCTION js_ok;
+DROP FUNCTION js_hog;
+DROP FUNCTION u2_py;
+DROP USER u2@localhost;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

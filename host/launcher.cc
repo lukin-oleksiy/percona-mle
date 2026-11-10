@@ -113,6 +113,8 @@ class LauncherChannel {
   bool request(Msg type, uint64_t id, const std::string &body, Msg reply_type,
                std::string *reply, std::vector<int> *fds, std::string *error);
   uint64_t next_id() { return ++m_last_id; }
+  /** False once the launcher process has exited. */
+  bool alive() const { return m_pidfd >= 0 && !pidfd_wait(m_pidfd, 0); }
 
   /** Caller holds mutex. */
   void track_locked(uint64_t worker_id) { m_live.insert(worker_id); }
@@ -419,6 +421,8 @@ std::unique_ptr<Launcher> Launcher::start(const LauncherConfig &config,
 Launcher::~Launcher() = default;
 
 const LauncherInfo &Launcher::info() const { return m_channel->info; }
+
+bool Launcher::alive() const { return m_channel->alive(); }
 
 std::unique_ptr<WorkerProcess> Launcher::acquire(const std::string &cls,
                                                  std::string *error) {

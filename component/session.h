@@ -35,6 +35,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -70,9 +71,23 @@ class Session {
   /** The routine is gone (ALTER, DROP, cache eviction): workers drop it. */
   void forget(const Routine &routine);
 
-  /** Console output kept for mle_session_state() (P4-W5), last 64K. */
-  const std::string &out() const { return m_out; }
-  const std::string &err() const { return m_err; }
+  /** mle_session_state(key): is_active, stdout, stderr, stack_trace,
+      stored_functions, stored_procedures, stored_programs; nullopt for an
+      unknown key. Without a session (s == nullptr) the empty state. */
+  static std::optional<std::string> state(const Session *s,
+                                          const std::string &key);
+  /** mle_session_reset('stdout' | 'stderr' | 'output'). */
+  void reset_output(bool out, bool err);
+  /** mle_session_reset(): workers closed, programs, stack trace, options
+      and time-zone binding forgotten. */
+  void reset();
+  /** Programs prepared in this session's workers (Oracle: "active"). */
+  bool has_programs() const { return !m_programs.empty(); }
+  /** The pid of the current principal's worker, or -1 (debug UDF). */
+  long worker_pid();
+  /** mle_set_session_state(): sent to the session's workers at once. */
+  bool set_options(mle::wire::IntegerType integer_type,
+                   mle::wire::DecimalType decimal_type);
 
  private:
   struct Slot {
@@ -94,7 +109,10 @@ class Session {
               const mle::ResultMsg &result, const std::string &error,
               const Routine &routine, const std::vector<mle::Value> *args);
   void keep_console(const mle::ResultMsg &result);
+  void keep_stack_trace(const mle::Error &error, const Routine &routine);
   void drop_worker(const std::string &principal);
+  /** KILL handler on the session for the duration of a request. */
+  class KillGuard;
 
   MYSQL_THD m_thd;
   std::map<std::string, Slot> m_workers;
@@ -102,7 +120,19 @@ class Session {
   bool m_options_bound = false;
   std::string m_out;
   std::string m_err;
+  /** Oracle's stack_trace: the frames of the last call's runtime error. */
+  std::string m_stack;
+  /** Routine id -> its type (stored_functions / stored_procedures). */
+  std::map<uint64_t, uint16_t> m_programs;
 };
+
+/** CREATE FUNCTION/PROCEDURE needs CREATE_<LANGUAGE>_ROUTINE too (D-3);
+    false after reporting the missing privilege. Other statements pass. */
+bool check_create_privilege(MYSQL_THD thd, const Routine &routine);
+
+/** CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE. */
+bool register_privileges();
+void unregister_privileges();
 
 }  // namespace mle_component
 

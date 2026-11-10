@@ -98,6 +98,10 @@ int interrupt_grace_ms();
 bool register_status();
 void unregister_status();
 
+/* udfs.cc: mle_session_state, mle_session_reset, mle_set_session_state. */
+bool register_udfs();
+bool unregister_udfs();
+
 /* component.cc: the error log. */
 void log_info(const std::string &message);
 void log_warning(const std::string &message);
