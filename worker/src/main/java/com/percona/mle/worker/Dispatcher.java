@@ -22,6 +22,7 @@ import com.percona.mle.api.SqlResult;
 import java.lang.foreign.Arena;
 import java.util.ArrayList;
 import java.util.List;
+import org.graalvm.polyglot.PolyglotException;
 
 /**
  * Handles the host's requests (PREPARE, CALL, DROP, RESET) on the worker's main thread and posts
@@ -34,6 +35,7 @@ final class Dispatcher {
   private final Mailbox mb;
   private final MessageWriter w;
   private final JavaRoutines java;
+  private final Polyglot polyglot;
   private final Console console;
   private final Control control;
   private final Thread thread;
@@ -42,24 +44,32 @@ final class Dispatcher {
   private long seq;
   private boolean tainted;
 
-  record ErrorInfo(String language, String message, StackTraceElement[] frames, int sqlErrno, String sqlState) {}
+  record Frame(String function, String file, int line, int column) {}
 
-  Dispatcher(Mailbox mb, JavaRoutines java, Console console, Control control, int maxDepth) {
+  record ErrorInfo(String language, String message, List<Frame> frames, int sqlErrno, String sqlState) {}
+
+  Dispatcher(Mailbox mb, JavaRoutines java, Polyglot polyglot, Console console, Control control, int maxDepth) {
     this.mb = mb;
     this.w = new MessageWriter(mb.arena);
     this.java = java;
+    this.polyglot = polyglot;
     this.console = console;
     this.control = control;
     this.thread = Thread.currentThread();
     this.maxDepth = maxDepth;
   }
 
+  Polyglot polyglot() {
+    return polyglot;
+  }
+
   void ready(int status, String info) {
     w.reset();
     w.u32(Wire.VERSION);
     w.str(System.getProperty("mle.class", "jvm"));
-    w.u32(1);
+    w.u32(1 + Polyglot.LANGUAGES.size());
     w.str("java");
+    for (String l : Polyglot.LANGUAGES) w.str(l);
     w.str("Java " + Runtime.version() + " (" + System.getProperty("java.vm.name") + ")");
     w.str(info);
     mb.stats(Wire.STATE_IDLE, false);
@@ -86,12 +96,15 @@ final class Dispatcher {
         case Wire.CALL -> call(m);
         case Wire.DROP -> {
           MessageReader r = new MessageReader(m.body());
-          java.drop(r.u64());
+          long id = r.u64();
           r.finish();
+          java.drop(id);
+          polyglot.drop(id);
           result(Wire.OK, null, null, null);
         }
         case Wire.RESET -> {
           java.reset();
+          polyglot.reset();
           result(Wire.OK, null, null, null);
         }
         default -> result(Wire.INTERNAL, null, null, internal("unexpected message " + m.op()));
@@ -114,21 +127,27 @@ final class Dispatcher {
     Values.ParamType ret = r.flag() ? Values.readParamType(r) : null;
     r.finish();
 
-    if (!language.equals("java")) {
+    if (!language.equals("java") && !Polyglot.isGuest(language)) {
       result(Wire.GUEST_ERROR, null, null, guest(language, "the language " + language + " is not available in this worker"));
       return;
     }
     for (JavaRoutines.Param p : params)
       if (p.mode() != Wire.MODE_IN) {
-        result(Wire.GUEST_ERROR, null, null, guest("java", "OUT and INOUT parameters are not supported yet"));
+        result(Wire.GUEST_ERROR, null, null, guest(language, "OUT and INOUT parameters are not supported yet"));
         return;
       }
     mb.stats(Wire.STATE_COMPILING, tainted);
     try {
-      java.prepare(id, entry, source, params, ret);
+      // A routine id is prepared again after ALTER; it may change language.
+      java.drop(id);
+      polyglot.drop(id);
+      if (language.equals("java")) java.prepare(id, entry, source, params, ret);
+      else polyglot.prepare(id, language, entry, source, params, ret);
       result(Wire.OK, null, null, null);
     } catch (JavaRoutines.CompileException e) {
-      result(Wire.GUEST_ERROR, null, null, guest("java", e.getMessage()));
+      result(Wire.GUEST_ERROR, null, null, guest(language, e.getMessage()));
+    } catch (PolyglotException e) {
+      failed(e, false);  // e.g. the context could not be created
     }
   }
 
@@ -141,30 +160,39 @@ final class Dispatcher {
     for (int i = 0; i < n; i++) args[i] = Values.read(r);
     r.finish();
     JavaRoutines.Routine routine = java.get(id);
-    if (routine == null || routine.converters().length != n) {
+    Polyglot.Routine guestRoutine = routine == null ? polyglot.get(id) : null;
+    int arity = routine != null ? routine.converters().length
+        : guestRoutine != null ? guestRoutine.converters().length : -1;
+    if (arity != n) {
       result(Wire.INTERNAL, null, null, internal("routine " + id + " is not prepared with " + n + " parameters"));
       return;
     }
+    Values.ParamType retType = routine != null ? routine.ret() : guestRoutine.ret();
 
     boolean top = depth == 0;
-    if (top) control.begin(seq);
+    if (top) control.begin(seq, guestRoutine != null);
     mb.stats(Wire.STATE_RUNNING, tainted);
     // The call's arena owns MemorySegment arguments; closing it makes them unusable afterwards.
     try (Arena callArena = Arena.ofConfined()) {
       Object ret = null;
       Throwable failure = null;
       try {
-        ret = java.invoke(routine, args, callArena);
+        ret = routine != null ? java.invoke(routine, args, callArena) : polyglot.invoke(guestRoutine, args);
       } catch (Throwable t) {
         failure = t;
       }
       boolean interrupted = top && control.end();
-      if (failure == null) result(Wire.OK, ret, routine.ret(), null);
+      if (top) polyglot.settleInterrupt(control.takeInterrupter());
+      if (failure == null) result(Wire.OK, ret, retType, null);
       else failed(failure, interrupted);
     }
   }
 
   private void failed(Throwable t, boolean interrupted) {
+    if (t instanceof PolyglotException pe) {
+      failedGuest(pe, interrupted);
+      return;
+    }
     if (t instanceof OutOfMemoryError || t instanceof StackOverflowError) {
       tainted = true;  // the host retires this worker after the call
       result(Wire.EXHAUSTED, null, null, new ErrorInfo("java", t.toString(), userFrames(t), 0, ""));
@@ -179,6 +207,43 @@ final class Dispatcher {
     }
   }
 
+  /** Errors from JS and Python (or from Java code they called). */
+  private void failedGuest(PolyglotException e, boolean interrupted) {
+    String language = Polyglot.languageOf(e);
+    List<Frame> frames = Polyglot.frames(e);
+    if (e.isInterrupted() || e.isCancelled()) {
+      result(Wire.INTERRUPTED, null, null, new ErrorInfo(language, "interrupted", frames, 0, ""));
+      return;
+    }
+    if (e.isResourceExhausted()) {
+      tainted = true;
+      result(Wire.EXHAUSTED, null, null, new ErrorInfo(language, Polyglot.describe(e, false), frames, 0, ""));
+      return;
+    }
+    if (e.isHostException()) {
+      Throwable h = e.asHostException();
+      if (h instanceof OutOfMemoryError || h instanceof StackOverflowError) {
+        tainted = true;
+        result(Wire.EXHAUSTED, null, null, new ErrorInfo(language, h.toString(), frames, 0, ""));
+        return;
+      }
+      if (h instanceof MleSqlException sql) {
+        result(Wire.GUEST_ERROR, null, null,
+            new ErrorInfo(language, sql.getMessage(), frames, sql.getErrorCode(), sql.getSqlState()));
+        return;
+      }
+      if (h instanceof Values.ConversionException c) {
+        result(Wire.GUEST_ERROR, null, null, new ErrorInfo(language, c.getMessage(), frames, 0, ""));
+        return;
+      }
+    }
+    if (interrupted) {
+      result(Wire.INTERRUPTED, null, null, new ErrorInfo(language, "interrupted", frames, 0, ""));
+      return;
+    }
+    result(Wire.GUEST_ERROR, null, null, new ErrorInfo(language, Polyglot.describe(e, false), frames, 0, ""));
+  }
+
   private static String describe(Throwable t) {
     StringBuilder s = new StringBuilder(t.toString());
     for (Throwable c = t.getCause(); c != null && c != t; c = c.getCause()) s.append("; caused by ").append(c);
@@ -186,22 +251,24 @@ final class Dispatcher {
   }
 
   /** The routine's own frames (classes from routine loaders). */
-  private static StackTraceElement[] userFrames(Throwable t) {
-    List<StackTraceElement> frames = new ArrayList<>();
+  private static List<Frame> userFrames(Throwable t) {
+    List<Frame> frames = new ArrayList<>();
     for (StackTraceElement e : t.getStackTrace()) {
       String loader = e.getClassLoaderName();
-      if (loader != null && loader.startsWith(JavaRoutines.LOADER_PREFIX)) frames.add(e);
+      if (loader != null && loader.startsWith(JavaRoutines.LOADER_PREFIX))
+        frames.add(new Frame(e.getClassName() + "." + e.getMethodName(),
+            e.getFileName() == null ? "" : e.getFileName(), Math.max(0, e.getLineNumber()), 0));
       if (frames.size() == Wire.MAX_STACK_FRAMES) break;
     }
-    return frames.toArray(new StackTraceElement[0]);
+    return frames;
   }
 
   private static ErrorInfo guest(String language, String message) {
-    return new ErrorInfo(language, message, new StackTraceElement[0], 0, "");
+    return new ErrorInfo(language, message, List.of(), 0, "");
   }
 
   private static ErrorInfo internal(String message) {
-    return new ErrorInfo("", message, new StackTraceElement[0], 0, "");
+    return new ErrorInfo("", message, List.of(), 0, "");
   }
 
   /** Posts a RESULT. A return value that cannot be converted turns into a guest error. */
@@ -234,12 +301,12 @@ final class Dispatcher {
     w.u8(1);
     w.str(error.language());
     w.str(error.message());
-    w.u32(error.frames().length);
-    for (StackTraceElement f : error.frames()) {
-      w.str(f.getClassName() + "." + f.getMethodName());
-      w.str(f.getFileName() == null ? "" : f.getFileName());
-      w.u32(Math.max(0, f.getLineNumber()));
-      w.u32(0);
+    w.u32(error.frames().size());
+    for (Frame f : error.frames()) {
+      w.str(f.function());
+      w.str(f.file());
+      w.u32(f.line());
+      w.u32(f.column());
     }
     w.u32(error.sqlErrno());
     w.str(error.sqlState() == null ? "" : error.sqlState());

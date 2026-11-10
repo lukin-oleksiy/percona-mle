@@ -32,13 +32,17 @@ import java.lang.foreign.ValueLayout;
  */
 final class Control implements Runnable {
   private final Thread main;
+  private final Polyglot polyglot;
+  private boolean guest;
+  private Thread interrupter;
   private long running = -1;
   private long pending = -1;
   private long last;
   private boolean interrupted;
 
-  Control(Thread main) {
+  Control(Thread main, Polyglot polyglot) {
     this.main = main;
+    this.polyglot = polyglot;
   }
 
   void start() {
@@ -62,20 +66,52 @@ final class Control implements Runnable {
   private synchronized void interrupt(long seq) {
     if (seq == running) {
       interrupted = true;
-      main.interrupt();
+      stop();
     } else if (seq > last) {
       pending = seq;
     }
   }
 
-  /** A top-level call starts (on the main thread). */
-  synchronized void begin(long seq) {
+  /**
+   * Java routines: Thread.interrupt. JS and Python routines: Context.interrupt, which stops guest
+   * code at its next safepoint (done on another thread: it waits for the guest to stop). Only one of
+   * the two: interrupting a guest's thread as well delays the guest interrupt (S-10).
+   */
+  private void stop() {
+    if (!guest) {
+      main.interrupt();
+      return;
+    }
+    org.graalvm.polyglot.Context c = polyglot.contextIfCreated();
+    if (c == null) return;
+    Thread t = new Thread(() -> {
+      try {
+        c.interrupt(java.time.Duration.ofSeconds(5));
+      } catch (Exception e) {
+        // timed out or the context is gone: the host's SIGKILL covers it
+      }
+    }, "mle-interrupt");
+    t.setDaemon(true);
+    interrupter = t;
+    t.start();
+  }
+
+  /** The thread running a Context.interrupt for the ended call, if any (see Polyglot). */
+  synchronized Thread takeInterrupter() {
+    Thread t = interrupter;
+    interrupter = null;
+    return t;
+  }
+
+  /** A top-level call starts (on the main thread); guest: a JS or Python routine. */
+  synchronized void begin(long seq, boolean guest) {
     running = seq;
+    this.guest = guest;
     interrupted = false;
     if (pending == seq) {
       pending = -1;
       interrupted = true;
-      main.interrupt();
+      stop();
     }
   }
 

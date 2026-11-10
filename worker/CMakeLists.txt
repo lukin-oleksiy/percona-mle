@@ -52,5 +52,23 @@ ADD_CUSTOM_COMMAND(OUTPUT ${MLE_WORKER_JAR}
   COMMENT "Building mle-worker.jar with Maven"
   VERBATIM
   )
-ADD_CUSTOM_TARGET(mle_worker_jar ALL DEPENDS ${MLE_WORKER_JAR})
+
+# GraalJS/GraalPy extract their resources (e.g. the Python standard library)
+# into a cache on first use. Workers cannot write anywhere, so the cache is
+# filled here, at build time, and workers read it
+# (-Dpolyglot.engine.userResourceCache).
+SET(MLE_RESOURCE_CACHE ${CMAKE_CURRENT_BINARY_DIR}/resources)
+SET(MLE_RESOURCE_STAMP ${MLE_RESOURCE_CACHE}/.mle-setup-done)
+ADD_CUSTOM_COMMAND(OUTPUT ${MLE_RESOURCE_STAMP}
+  COMMAND ${MLE_JAVA_HOME}/bin/java
+    -Dpolyglot.engine.userResourceCache=${MLE_RESOURCE_CACHE}
+    --enable-native-access=ALL-UNNAMED
+    -cp ${MLE_WORKER_JAR} com.percona.mle.worker.Setup
+  COMMAND ${CMAKE_COMMAND} -E touch ${MLE_RESOURCE_STAMP}
+  DEPENDS ${MLE_WORKER_JAR}
+  COMMENT "Extracting GraalJS/GraalPy resources for MLE workers"
+  VERBATIM
+  )
+ADD_CUSTOM_TARGET(mle_worker_jar ALL DEPENDS ${MLE_WORKER_JAR} ${MLE_RESOURCE_STAMP})
 SET_PROPERTY(GLOBAL PROPERTY MLE_WORKER_JAR ${MLE_WORKER_JAR})
+SET_PROPERTY(GLOBAL PROPERTY MLE_RESOURCE_CACHE ${MLE_RESOURCE_CACHE})

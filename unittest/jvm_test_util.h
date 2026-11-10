@@ -1,0 +1,149 @@
+/* Copyright (c) 2026 Percona LLC and/or its affiliates. All rights
+   reserved.
+
+   This program is free software; you can redistribute it and/or
+   modify it under the terms of the GNU General Public License
+   as published by the Free Software Foundation; version 2 of
+   the License.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
+
+// Helpers shared by the JVM worker tests (java_worker-t.cc,
+// polyglot_worker-t.cc).
+
+#ifndef MLE_JVM_TEST_UTIL_H
+#define MLE_JVM_TEST_UTIL_H
+
+#include <gtest/gtest.h>
+
+#include <sys/socket.h>
+
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <string>
+#include <vector>
+
+#include "mle/codec.h"
+#include "mle/launcher.h"
+#include "mle/worker.h"
+
+namespace mle_test {
+
+using namespace mle;
+
+inline std::string dir_of(const std::string &path) {
+  return path.substr(0, path.rfind('/'));
+}
+
+/** The GraalPy venv with numpy for the tests, or nullptr. */
+inline const char *python_venv() {
+  static const std::string v = MLE_TEST_PYTHON_VENV;
+  return v.empty() ? nullptr : v.c_str();
+}
+
+/** A JVM worker class (D-10) under the full lockdown. prewarm: a comma list
+    of java, js, python, numpy (see Main). */
+inline ClassConfig jvm_class(const std::string &name,
+                             const std::string &prewarm = "java",
+                             const std::string &xmx = "512m") {
+  ClassConfig c;
+  c.name = name;
+  c.executable = MLE_WORKER_EXE;
+  c.args = {
+      std::string("--jvm=") + MLE_JAVA_HOME + "/lib/server/libjvm.so",
+      std::string("-Djava.class.path=") + MLE_WORKER_JAR,
+      std::string("-Dpolyglot.engine.userResourceCache=") + MLE_RESOURCE_CACHE,
+      "-XX:+UseSerialGC",
+      "-Xmx" + xmx,
+      "-Xss2m",
+      "-XX:CICompilerCount=2",
+      "-XX:-UsePerfData",
+      "--enable-native-access=ALL-UNNAMED",
+      "--add-modules=jdk.incubator.vector",
+      "-Dmle.class=" + name};
+  if (!prewarm.empty()) c.args.push_back("-Dmle.prewarm=" + prewarm);
+  if (python_venv() != nullptr)
+    c.args.push_back(std::string("-Dmle.python.venv=") + python_venv());
+  if (const char *extra = getenv("MLE_TEST_JVM_OPT")) c.args.push_back(extra);
+  if (const char *spin = getenv("MLE_TEST_SPIN"))
+    c.args.push_back(std::string("-Dmle.spin=") + spin);
+  c.exec_paths = {dir_of(MLE_WORKER_EXE), MLE_JAVA_HOME};
+  c.read_paths = {dir_of(MLE_WORKER_JAR), MLE_RESOURCE_CACHE};
+  if (python_venv() != nullptr) c.read_paths.push_back(python_venv());
+  c.inherit_stderr = getenv("MLE_TEST_STDERR") != nullptr;
+  return c;
+}
+
+// ---------------------------------------------------------------- test host
+
+/** The host's Worker with test hooks; host-side errors are put into the
+    result's error so that tests can print them uniformly. */
+class TestHost {
+ public:
+  using SqlHandler = std::function<void(const SqlMsg &, SqlResultMsg *)>;
+
+  explicit TestHost(std::unique_ptr<WorkerProcess> w, WorkerOptions o = {})
+      : worker(std::move(w), o) {}
+
+  bool wait_ready(ReadyMsg *m, std::string *err, int timeout_ms = 60000) {
+    return worker.wait_ready(timeout_ms, m, err) == Status::kOk;
+  }
+  const wire::RegionHeader &header() { return *worker.process().header(); }
+
+  uint32_t prepare(const PrepareMsg &p, ResultMsg *res) {
+    std::string err;
+    const Status s = worker.prepare(p, hooks, res, &err);
+    if (!err.empty() && !res->error) res->error = Error{"host", err, {}, 0, ""};
+    return uint32_t(s);
+  }
+
+  /** sql serves the routine's SQL (kept for nested calls). */
+  uint32_t call(uint64_t routine, const std::vector<Value> &args,
+                ResultMsg *res, SqlHandler sql = nullptr) {
+    if (sql && worker.depth() == 0) hooks.handler = std::move(sql);
+    std::string err;
+    const Status s = worker.call(routine, 0, args, hooks, res, &err);
+    if (!err.empty() && !res->error) res->error = Error{"host", err, {}, 0, ""};
+    return uint32_t(s);
+  }
+
+  /** INTERRUPT for a given call sequence, sent directly (to test the
+      worker's handling of an interrupt that precedes its call). */
+  void raw_interrupt(uint64_t call_seq) {
+    unsigned char b[9];
+    b[0] = uint8_t(wire::Control::kInterrupt);
+    memcpy(b + 1, &call_seq, 8);
+    EXPECT_EQ(send(worker.process().control_fd(), b, sizeof b, MSG_NOSIGNAL),
+              9);
+  }
+
+  struct Hooks : CallHooks {
+    SqlHandler handler;
+    std::atomic<bool> kill{false};
+    void sql(const SqlMsg &m, SqlResultMsg *r) override {
+      if (handler)
+        handler(m, r);
+      else
+        NoSql().sql(m, r);
+    }
+    bool killed() override { return kill.load(); }
+  } hooks;
+  Worker worker;
+};
+
+inline std::string error_of(const ResultMsg &r) {
+  return r.error ? r.error->message : "";
+}
+
+}  // namespace mle_test
+
+#endif  // MLE_JVM_TEST_UTIL_H

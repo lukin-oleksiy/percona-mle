@@ -33,4 +33,10 @@ public final class SqlBridge {
     if (d == null) throw new IllegalStateException("MLE worker not running");
     return d.sql(statement, params == null ? new Object[0] : params);
   }
+
+  public static org.graalvm.polyglot.Context context() {
+    Dispatcher d = dispatcher;
+    if (d == null) throw new IllegalStateException("MLE worker not running");
+    return d.polyglot().context();
+  }
 }

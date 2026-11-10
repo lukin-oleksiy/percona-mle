@@ -53,7 +53,8 @@ import javax.tools.ToolProvider;
  * <p>A routine's source is a compilation unit with a public class; the entry is
  * [package.]Class.method, a public static method with one parameter per SQL parameter. The routine
  * loader's parent sees only the JDK and com.percona.mle.api. That is tidiness, not security: the
- * worker process is the sandbox.
+ * worker process is the sandbox. The polyglot API (org.graalvm.polyglot) is visible too, for calls
+ * into JS and Python through Mle.context().
  */
 final class JavaRoutines {
   static final String LOADER_PREFIX = "mle-routine-";
@@ -94,7 +95,8 @@ final class JavaRoutines {
 
     @Override
     protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
-      if (name.startsWith("com.percona.mle.api.")) return app.loadClass(name);
+      if (name.startsWith("com.percona.mle.api.") || name.startsWith("org.graalvm.polyglot."))
+        return app.loadClass(name);
       return super.loadClass(name, resolve);
     }
   }

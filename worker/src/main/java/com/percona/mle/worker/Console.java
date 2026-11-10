@@ -38,6 +38,15 @@ final class Console {
     System.setErr(new PrintStream(err, true, StandardCharsets.UTF_8));
   }
 
+  /** The capture streams, for the polyglot Context's out and err. */
+  OutputStream outStream() {
+    return out;
+  }
+
+  OutputStream errStream() {
+    return err;
+  }
+
   /** The worker's own diagnostics (stderr of the process: /dev/null unless inherited). */
   PrintStream log() {
     return originalErr;

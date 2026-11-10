@@ -37,6 +37,7 @@
 #include <thread>
 #include <vector>
 
+#include "jvm_test_util.h"
 #include "mle/codec.h"
 #include "mle/launcher.h"
 #include "mle/worker.h"
@@ -44,95 +45,11 @@
 namespace mle_java_worker_unittest {
 
 using namespace mle;
+using namespace mle_test;
 using Clock = std::chrono::steady_clock;
 using wire::MessageHeader;
 using wire::Op;
 using wire::Status;
-
-std::string dir_of(const std::string &path) {
-  return path.substr(0, path.rfind('/'));
-}
-
-ClassConfig jvm_class(const std::string &name, bool prewarm = true) {
-  ClassConfig c;
-  c.name = name;
-  c.executable = MLE_WORKER_EXE;
-  c.args = {std::string("--jvm=") + MLE_JAVA_HOME + "/lib/server/libjvm.so",
-            std::string("-Djava.class.path=") + MLE_WORKER_JAR,
-            "-XX:+UseSerialGC",
-            "-Xmx256m",
-            "-Xss2m",
-            "-XX:CICompilerCount=2",
-            "-XX:-UsePerfData",
-            "--enable-native-access=ALL-UNNAMED",
-            "--add-modules=jdk.incubator.vector",
-            "-Dmle.class=" + name};
-  if (prewarm) c.args.push_back("-Dmle.prewarm=java");
-  if (const char *extra = getenv("MLE_TEST_JVM_OPT")) c.args.push_back(extra);
-  if (const char *spin = getenv("MLE_TEST_SPIN"))
-    c.args.push_back(std::string("-Dmle.spin=") + spin);
-  c.exec_paths = {dir_of(MLE_WORKER_EXE), MLE_JAVA_HOME};
-  c.read_paths = {dir_of(MLE_WORKER_JAR)};
-  c.inherit_stderr = getenv("MLE_TEST_STDERR") != nullptr;
-  return c;
-}
-
-// ---------------------------------------------------------------- test host
-
-/** The host's Worker with test hooks; host-side errors are put into the
-    result's error so that tests can print them uniformly. */
-class TestHost {
- public:
-  using SqlHandler = std::function<void(const SqlMsg &, SqlResultMsg *)>;
-
-  explicit TestHost(std::unique_ptr<WorkerProcess> w, WorkerOptions o = {})
-      : worker(std::move(w), o) {}
-
-  bool wait_ready(ReadyMsg *m, std::string *err, int timeout_ms = 60000) {
-    return worker.wait_ready(timeout_ms, m, err) == Status::kOk;
-  }
-  const wire::RegionHeader &header() { return *worker.process().header(); }
-
-  uint32_t prepare(const PrepareMsg &p, ResultMsg *res) {
-    std::string err;
-    const Status s = worker.prepare(p, hooks, res, &err);
-    if (!err.empty() && !res->error) res->error = Error{"host", err, {}, 0, ""};
-    return uint32_t(s);
-  }
-
-  /** sql serves the routine's SQL (kept for nested calls). */
-  uint32_t call(uint64_t routine, const std::vector<Value> &args,
-                ResultMsg *res, SqlHandler sql = nullptr) {
-    if (sql && worker.depth() == 0) hooks.handler = std::move(sql);
-    std::string err;
-    const Status s = worker.call(routine, 0, args, hooks, res, &err);
-    if (!err.empty() && !res->error) res->error = Error{"host", err, {}, 0, ""};
-    return uint32_t(s);
-  }
-
-  /** INTERRUPT for a given call sequence, sent directly (to test the
-      worker's handling of an interrupt that precedes its call). */
-  void raw_interrupt(uint64_t call_seq) {
-    unsigned char b[9];
-    b[0] = uint8_t(wire::Control::kInterrupt);
-    memcpy(b + 1, &call_seq, 8);
-    EXPECT_EQ(send(worker.process().control_fd(), b, sizeof b, MSG_NOSIGNAL),
-              9);
-  }
-
-  struct Hooks : CallHooks {
-    SqlHandler handler;
-    std::atomic<bool> kill{false};
-    void sql(const SqlMsg &m, SqlResultMsg *r) override {
-      if (handler)
-        handler(m, r);
-      else
-        NoSql().sql(m, r);
-    }
-    bool killed() override { return kill.load(); }
-  } hooks;
-  Worker worker;
-};
 
 // ---------------------------------------------------------------- fixture
 
@@ -142,7 +59,8 @@ class MleJavaWorker : public ::testing::Test {
     LauncherConfig c;
     c.launcher_exe = MLE_LAUNCHER_EXE;
     c.arena_size = wire::kMinArenaSize;  // 64 KiB: chunking is easy to reach
-    c.classes = {jvm_class("jvm"), jvm_class("jvm-cold", false)};
+    c.classes = {jvm_class("jvm", "java", "256m"),
+                 jvm_class("jvm-cold", "", "256m")};
     std::string err;
     s_launcher = Launcher::start(c, &err).release();
     ASSERT_NE(s_launcher, nullptr) << err;
@@ -198,10 +116,6 @@ class MleJavaWorker : public ::testing::Test {
 Launcher *MleJavaWorker::s_launcher = nullptr;
 TestHost *MleJavaWorker::s_host = nullptr;
 
-std::string error_of(const ResultMsg &r) {
-  return r.error ? r.error->message : "";
-}
-
 // ---------------------------------------------------------------- tests
 
 TEST_F(MleJavaWorker, Ready) {
@@ -209,7 +123,8 @@ TEST_F(MleJavaWorker, Ready) {
   TestHost *h = new_host("jvm-cold", &ready);
   ASSERT_NE(h, nullptr);
   EXPECT_EQ(ready.worker_class, "jvm-cold");
-  EXPECT_EQ(ready.languages, std::vector<std::string>{"java"});
+  EXPECT_EQ(ready.languages,
+            (std::vector<std::string>{"java", "js", "python"}));
   EXPECT_NE(ready.runtime.find("Java 25"), std::string::npos) << ready.runtime;
   std::cout << "[ INFO     ] " << ready.runtime << ", " << ready.info << "\n";
   EXPECT_EQ(h->header().stats.state, uint32_t(wire::WorkerState::kIdle));

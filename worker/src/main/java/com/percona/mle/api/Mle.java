@@ -39,4 +39,13 @@ public final class Mle {
   public static SqlResult sql(String statement, Object... params) {
     return SqlBridge.sql(statement, params);
   }
+
+  /**
+   * The worker's polyglot Context (JS and Python), for calls from Java routines into the other
+   * languages, e.g. {@code Mle.context().eval("python", "import numpy; numpy.dot")}. Must be used
+   * on the routine's thread.
+   */
+  public static org.graalvm.polyglot.Context context() {
+    return SqlBridge.context();
+  }
 }

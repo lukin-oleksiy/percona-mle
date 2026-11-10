@@ -32,7 +32,31 @@
     <maven.compiler.release>25</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <mle.build.dir>${project.basedir}/target</mle.build.dir>
+    <graalvm.version>25.5.5.0.3</graalvm.version>
   </properties>
+
+  <!-- GraalJS and GraalPy on the worker's JVM (one polyglot Context with
+       Java routines). Copied to deps/ next to the jar and listed in its
+       manifest Class-Path, so the worker's class path is just the jar. -->
+  <dependencies>
+    <dependency>
+      <groupId>org.graalvm.polyglot</groupId>
+      <artifactId>polyglot</artifactId>
+      <version>${graalvm.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.graalvm.polyglot</groupId>
+      <artifactId>js-community</artifactId>
+      <version>${graalvm.version}</version>
+      <type>pom</type>
+    </dependency>
+    <dependency>
+      <groupId>org.graalvm.polyglot</groupId>
+      <artifactId>python-community</artifactId>
+      <version>${graalvm.version}</version>
+      <type>pom</type>
+    </dependency>
+  </dependencies>
 
   <build>
     <directory>${mle.build.dir}</directory>
@@ -47,6 +71,36 @@
             <arg>-Xlint:all</arg>
             <arg>-Werror</arg>
           </compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.8.1</version>
+        <executions>
+          <execution>
+            <id>copy-deps</id>
+            <phase>package</phase>
+            <goals><goal>copy-dependencies</goal></goals>
+            <configuration>
+              <outputDirectory>${mle.build.dir}/deps</outputDirectory>
+              <includeScope>runtime</includeScope>
+              <excludeTypes>pom</excludeTypes>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.2</version>
+        <configuration>
+          <archive>
+            <manifest>
+              <addClasspath>true</addClasspath>
+              <classpathPrefix>deps/</classpathPrefix>
+            </manifest>
+          </archive>
         </configuration>
       </plugin>
     </plugins>

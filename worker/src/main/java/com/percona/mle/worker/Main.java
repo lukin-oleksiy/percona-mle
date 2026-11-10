@@ -21,8 +21,8 @@ package com.percona.mle.worker;
  * Entry of the MLE JVM worker, called by mle_worker (JNI) after the lockdown.
  *
  * <p>System properties: mle.class (worker class name for READY), mle.spin (spin iterations
- * before sleeping on the futex, default 2000), mle.prewarm (comma list; "java" loads javac
- * before READY), mle.maxDepth (nested calls, default 32).
+ * before sleeping on the futex, default 2000), mle.prewarm (comma list of java, js, python,
+ * numpy: loaded before READY), mle.maxDepth (nested calls, default 32), mle.python.venv.
  */
 public final class Main {
   private Main() {}
@@ -33,15 +33,20 @@ public final class Main {
     try {
       Mailbox mb = Mailbox.open(Integer.getInteger("mle.spin", 2000));
       console.install();
-      Control control = new Control(Thread.currentThread());
+      Polyglot polyglot = new Polyglot(console);
+      Control control = new Control(Thread.currentThread(), polyglot);
       control.start();
       JavaRoutines java = new JavaRoutines();
-      Dispatcher d = new Dispatcher(mb, java, console, control, Integer.getInteger("mle.maxDepth", 32));
+      Dispatcher d = new Dispatcher(mb, java, polyglot, console, control, Integer.getInteger("mle.maxDepth", 32));
       SqlBridge.dispatcher = d;
       int status = Wire.OK;
       String info;
       try {
-        if (System.getProperty("mle.prewarm", "").contains("java")) java.prewarm();
+        String prewarm = System.getProperty("mle.prewarm", "");
+        if (prewarm.contains("java")) java.prewarm();
+        if (prewarm.contains("js")) polyglot.context().eval("js", "1");
+        if (prewarm.contains("python")) polyglot.context().eval("python", "1");
+        if (prewarm.contains("numpy")) polyglot.context().eval("python", "import numpy");
         info = "ready in " + (System.nanoTime() - t0) / 1_000_000 + " ms";
       } catch (Throwable t) {
         status = Wire.INTERNAL;
