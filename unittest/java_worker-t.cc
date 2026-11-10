@@ -39,6 +39,7 @@
 
 #include "mle/codec.h"
 #include "mle/launcher.h"
+#include "mle/worker.h"
 
 namespace mle_java_worker_unittest {
 
@@ -78,164 +79,59 @@ ClassConfig jvm_class(const std::string &name, bool prewarm = true) {
 
 // ---------------------------------------------------------------- test host
 
-struct Reply {
-  MessageHeader h{};
-  std::string body;
-};
-
-/** Synchronous host side of one worker: polls the mailbox (never sleeps on
-    the futex), sends and reassembles chunks. */
+/** The host's Worker with test hooks; host-side errors are put into the
+    result's error so that tests can print them uniformly. */
 class TestHost {
  public:
-  using SqlHandler =
-      std::function<void(const SqlMsg &, uint32_t depth, TestHost &)>;
+  using SqlHandler = std::function<void(const SqlMsg &, SqlResultMsg *)>;
 
-  explicit TestHost(std::unique_ptr<WorkerProcess> w) : m_w(std::move(w)) {}
-  WorkerProcess &worker() { return *m_w; }
-  const wire::RegionHeader &header() { return *m_w->header(); }
+  explicit TestHost(std::unique_ptr<WorkerProcess> w, WorkerOptions o = {})
+      : worker(std::move(w), o) {}
 
   bool wait_ready(ReadyMsg *m, std::string *err, int timeout_ms = 60000) {
-    Reply r;
-    if (!receive(&r, err, timeout_ms)) return false;
-    if (r.h.op != uint32_t(Op::kReady)) return *err = "not READY", false;
-    if (!decode(r.body, m, err)) return false;
-    if (r.h.status != 0)
-      return *err =
-                 "READY status " + std::to_string(r.h.status) + ": " + m->info,
-             false;
-    return true;
+    return worker.wait_ready(timeout_ms, m, err) == Status::kOk;
+  }
+  const wire::RegionHeader &header() { return *worker.process().header(); }
+
+  uint32_t prepare(const PrepareMsg &p, ResultMsg *res) {
+    std::string err;
+    const Status s = worker.prepare(p, hooks, res, &err);
+    if (!err.empty() && !res->error) res->error = Error{"host", err, {}, 0, ""};
+    return uint32_t(s);
   }
 
-  void post(Op op, const std::string &body, uint32_t depth,
-            uint32_t status = 0) {
-    wire::RegionHeader *h = m_w->header();
-    const uint32_t arena = m_w->arena_size();
-    size_t sent = 0;
-    do {
-      const size_t len = std::min<size_t>(arena, body.size() - sent);
-      memcpy(m_w->arena(), body.data() + sent, len);
-      const bool more = sent + len < body.size();
-      h->msg = MessageHeader{};
-      h->msg.op = uint32_t(op);
-      h->msg.status = status;
-      h->msg.flags = more ? uint32_t{wire::kMore} : 0U;
-      h->msg.depth = depth;
-      h->msg.len = uint32_t(len);
-      h->msg.total_len = body.size();
-      h->msg.call_seq = seq;
-      h->to_w.fetch_add(1, std::memory_order_seq_cst);
-      if (h->w_sleep.load(std::memory_order_seq_cst) != 0)
-        syscall(SYS_futex, reinterpret_cast<uint32_t *>(&h->to_w), FUTEX_WAKE,
-                1, nullptr, nullptr, 0);
-      sent += len;
-      if (more) {
-        std::string err;
-        EXPECT_TRUE(wait_change(30000, &err)) << err;
-        EXPECT_EQ(h->msg.op, uint32_t(Op::kContinue));
-      }
-    } while (sent < body.size());
+  /** sql serves the routine's SQL (kept for nested calls). */
+  uint32_t call(uint64_t routine, const std::vector<Value> &args,
+                ResultMsg *res, SqlHandler sql = nullptr) {
+    if (sql && worker.depth() == 0) hooks.handler = std::move(sql);
+    std::string err;
+    const Status s = worker.call(routine, 0, args, hooks, res, &err);
+    if (!err.empty() && !res->error) res->error = Error{"host", err, {}, 0, ""};
+    return uint32_t(s);
   }
 
-  bool receive(Reply *r, std::string *err, int timeout_ms = 30000) {
-    Assembler a(m_w->arena_size(), wire::kMaxMessageSize);
-    while (true) {
-      if (!wait_change(timeout_ms, err)) return false;
-      const MessageHeader h = m_w->header()->msg;  // copy, then check
-      if (!check_worker_header(h, m_w->arena_size(), err)) return false;
-      switch (a.add(h, m_w->arena())) {
-        case Assembler::Step::kDone:
-          r->h = a.header();
-          r->body = a.body();
-          return true;
-        case Assembler::Step::kError:
-          return *err = a.error(), false;
-        case Assembler::Step::kNeedMore:
-          post(Op::kContinue, "", h.depth);
-          break;
-      }
-    }
-  }
-
-  /** PREPARE; returns the RESULT status, the decoded result in *res. */
-  uint32_t prepare(const PrepareMsg &p, ResultMsg *res, uint32_t depth = 0) {
-    std::string body, err;
-    encode(p, &body);
-    if (depth == 0) seq++;
-    post(Op::kPrepare, body, depth);
-    Reply r;
-    EXPECT_TRUE(receive(&r, &err)) << err;
-    EXPECT_EQ(r.h.op, uint32_t(Op::kResult));
-    EXPECT_TRUE(decode(r.body, res, &err)) << err;
-    return r.h.status;
-  }
-
-  /** CALL; serves SQL requests with sql until the RESULT. */
-  uint32_t call(uint64_t routine, std::vector<Value> args, ResultMsg *res,
-                const SqlHandler &sql = nullptr, uint32_t depth = 0) {
-    CallMsg c;
-    c.routine_id = routine;
-    c.args = std::move(args);
-    std::string body, err;
-    encode(c, &body);
-    if (depth == 0) seq++;
-    post(Op::kCall, body, depth);
-    while (true) {
-      Reply r;
-      if (!receive(&r, &err)) {
-        ADD_FAILURE() << err;
-        return uint32_t(Status::kDied);
-      }
-      EXPECT_EQ(r.h.depth, depth);
-      EXPECT_EQ(r.h.call_seq, seq);
-      if (r.h.op == uint32_t(Op::kResult)) {
-        EXPECT_TRUE(decode(r.body, res, &err)) << err;
-        return r.h.status;
-      }
-      if (r.h.op != uint32_t(Op::kSql) || !sql) {
-        ADD_FAILURE() << "unexpected op " << r.h.op;
-        return uint32_t(Status::kProtocolError);
-      }
-      SqlMsg m;
-      EXPECT_TRUE(decode(r.body, &m, &err)) << err;
-      sql(m, depth, *this);  // posts SQL_RESULT
-    }
-  }
-
-  void sql_result(const SqlResultMsg &m, uint32_t depth) {
-    std::string body;
-    encode(m, &body);
-    post(Op::kSqlResult, body, depth);
-  }
-
-  void interrupt(uint64_t call_seq) {
+  /** INTERRUPT for a given call sequence, sent directly (to test the
+      worker's handling of an interrupt that precedes its call). */
+  void raw_interrupt(uint64_t call_seq) {
     unsigned char b[9];
     b[0] = uint8_t(wire::Control::kInterrupt);
     memcpy(b + 1, &call_seq, 8);
-    EXPECT_EQ(send(m_w->control_fd(), b, sizeof b, MSG_NOSIGNAL), 9);
+    EXPECT_EQ(send(worker.process().control_fd(), b, sizeof b, MSG_NOSIGNAL),
+              9);
   }
 
-  uint64_t seq = 0;
-
- private:
-  bool wait_change(int timeout_ms, std::string *err) {
-    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
-    for (int i = 0;; i++) {
-      const uint32_t v = m_w->header()->to_h.load(std::memory_order_acquire);
-      if (v != m_seen) {
-        m_seen = v;
-        return true;
-      }
-      if (i < 20000) continue;  // spin first
-      if ((i & 255) == 0 && !m_w->alive())
-        return *err = "worker died: " + m_w->exit_info(2000).describe(), false;
-      if ((i & 255) == 0 && Clock::now() > deadline)
-        return *err = "timeout", false;
-      std::this_thread::sleep_for(std::chrono::microseconds(20));
+  struct Hooks : CallHooks {
+    SqlHandler handler;
+    std::atomic<bool> kill{false};
+    void sql(const SqlMsg &m, SqlResultMsg *r) override {
+      if (handler)
+        handler(m, r);
+      else
+        NoSql().sql(m, r);
     }
-  }
-
-  std::unique_ptr<WorkerProcess> m_w;
-  uint32_t m_seen = 0;
+    bool killed() override { return kill.load(); }
+  } hooks;
+  Worker worker;
 };
 
 // ---------------------------------------------------------------- fixture
@@ -258,12 +154,13 @@ class MleJavaWorker : public ::testing::Test {
   }
 
   static TestHost *new_host(const std::string &cls,
-                            ReadyMsg *ready_out = nullptr) {
+                            ReadyMsg *ready_out = nullptr,
+                            WorkerOptions options = {}) {
     std::string err;
     auto w = s_launcher->acquire(cls, &err);
     EXPECT_NE(w, nullptr) << err;
     if (!w) return nullptr;
-    auto *h = new TestHost(std::move(w));
+    auto *h = new TestHost(std::move(w), options);
     ReadyMsg ready;
     EXPECT_TRUE(h->wait_ready(&ready, &err)) << err;
     if (ready_out) *ready_out = ready;
@@ -514,8 +411,8 @@ TEST_F(MleJavaWorker, SqlCallback) {
             0u)
       << error_of(res);
   int calls = 0;
-  auto sql = [&](const SqlMsg &m, uint32_t depth, TestHost &h) {
-    SqlResultMsg r;
+  auto sql = [&](const SqlMsg &m, SqlResultMsg *out) {
+    SqlResultMsg &r = *out;
     if (calls++ == 0) {
       EXPECT_EQ(m.statement, "SELECT name, v FROM t WHERE id = ?");
       EXPECT_EQ(m.params, std::vector<Value>{Value::i64(9)});
@@ -529,7 +426,6 @@ TEST_F(MleJavaWorker, SqlCallback) {
       r.sqlstate = "23000";
       r.message = "Duplicate entry '1' for key 't.PRIMARY'";
     }
-    h.sql_result(r, depth);
   };
   ASSERT_EQ(s_host->call(500, {Value::i64(9)}, &res, sql), 0u) << error_of(res);
   EXPECT_EQ(*res.ret, Value::string("nine 1062"));
@@ -541,13 +437,11 @@ TEST_F(MleJavaWorker, SqlCallback) {
               "com.percona.mle.api.Mle.sql(\"DROP TABLE x\"); return 0; } }",
               {}, type(Tag::kI64), &res),
       0u);
-  auto fail = [](const SqlMsg &, uint32_t depth, TestHost &h) {
-    SqlResultMsg r;
-    r.kind = SqlResultKind::kError;
-    r.sql_errno = 1051;
-    r.sqlstate = "42S02";
-    r.message = "Unknown table 'test.x'";
-    h.sql_result(r, depth);
+  auto fail = [](const SqlMsg &, SqlResultMsg *r) {
+    r->kind = SqlResultKind::kError;
+    r->sql_errno = 1051;
+    r->sqlstate = "42S02";
+    r->message = "Unknown table 'test.x'";
   };
   EXPECT_EQ(s_host->call(501, {}, &res, fail), uint32_t(Status::kGuestError));
   ASSERT_TRUE(res.error.has_value());
@@ -572,22 +466,19 @@ TEST_F(MleJavaWorker, NestedCalls) {
                     ".rows().get(0)[0] + \")\"; } }",
                     {}, type(Tag::kString), &res),
             0u);
-  std::function<void(const SqlMsg &, uint32_t, TestHost &)> sql =
-      [&](const SqlMsg &m, uint32_t depth, TestHost &h) {
-        SqlResultMsg r;
-        r.kind = SqlResultKind::kRows;
-        r.columns = {{"c", "", type(Tag::kString)}};
-        if (m.statement == "SELECT inner()") {
-          ResultMsg inner;
-          EXPECT_EQ(h.call(601, {}, &inner, sql, depth + 1), 0u)
-              << error_of(inner);
-          r.rows = {*inner.ret};
-        } else {
-          EXPECT_EQ(depth, 1u);
-          r.rows = {Value::string("1")};
-        }
-        h.sql_result(r, depth);
-      };
+  auto sql = [&](const SqlMsg &m, SqlResultMsg *r) {
+    r->kind = SqlResultKind::kRows;
+    r->columns = {{"c", "", type(Tag::kString)}};
+    if (m.statement == "SELECT inner()") {
+      EXPECT_EQ(s_host->worker.depth(), 1u);
+      ResultMsg inner;
+      EXPECT_EQ(s_host->call(601, {}, &inner), 0u) << error_of(inner);
+      r->rows = {*inner.ret};
+    } else {
+      EXPECT_EQ(s_host->worker.depth(), 2u);  // inside the nested call
+      r->rows = {Value::string("1")};
+    }
+  };
   ASSERT_EQ(s_host->call(600, {}, &res, sql), 0u) << error_of(res);
   EXPECT_EQ(*res.ret, Value::string("outer(inner(1))"));
 }
@@ -663,14 +554,8 @@ TEST_F(MleJavaWorker, DropAndReset) {
                     {}, type(Tag::kI64), &res),
             0u);
   ASSERT_EQ(s_host->call(900, {}, &res), 0u);
-  DropMsg d{900};
-  std::string body, err;
-  encode(d, &body);
-  s_host->seq++;
-  s_host->post(Op::kDrop, body, 0);
-  Reply r;
-  ASSERT_TRUE(s_host->receive(&r, &err)) << err;
-  EXPECT_EQ(r.h.status, 0u);
+  std::string err;
+  ASSERT_EQ(s_host->worker.drop(900, &err), Status::kOk) << err;
   EXPECT_EQ(s_host->call(900, {}, &res), uint32_t(Status::kInternal));
 }
 
@@ -757,13 +642,14 @@ TEST_F(MleJavaWorker, InterruptCooperativeLoop) {
                     "throw new RuntimeException(\"stopped after \" + n); } }",
                     {}, type(Tag::kI64), &res),
             0u);
-  std::thread killer([h, seq = h->seq + 1] {
+  std::thread killer([h] {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    h->interrupt(seq);
+    h->hooks.kill = true;  // the session was killed: Worker sends INTERRUPT
   });
   const auto t0 = Clock::now();
   EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kInterrupted));
   killer.join();
+  h->hooks.kill = false;  // the next statement of the session
   std::cout
       << "[ INFO     ] interrupted after "
       << std::chrono::duration<double, std::milli>(Clock::now() - t0).count()
@@ -788,7 +674,7 @@ TEST_F(MleJavaWorker, InterruptBeforeTheCallStarts) {
                     "{ Thread.sleep(60000); return 0; } }",
                     {}, type(Tag::kI64), &res),
             0u);
-  h->interrupt(h->seq + 1);  // the next call's sequence number
+  h->raw_interrupt(2);  // the next call's sequence number (PREPARE was 1)
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   const auto t0 = Clock::now();
   EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kInterrupted));
@@ -809,6 +695,12 @@ TEST_F(MleJavaWorker, ExhaustedTaintsTheWorker) {
   EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kExhausted));
   EXPECT_NE(error_of(res).find("StackOverflowError"), std::string::npos);
   EXPECT_EQ(h->header().stats.tainted, 1u);
+  // Retired: killed once the call was over.
+  EXPECT_FALSE(h->worker.usable());
+  EXPECT_TRUE(h->worker.process().wait_exit(2000));
+  delete h;
+  h = new_host("jvm");
+  ASSERT_NE(h, nullptr);
   ASSERT_EQ(prepare(*h, 2, "M.f",
                     "public class M { public static long f() { "
                     "java.util.List<long[]> l = new java.util.ArrayList<>(); "
@@ -817,6 +709,108 @@ TEST_F(MleJavaWorker, ExhaustedTaintsTheWorker) {
             0u);
   EXPECT_EQ(h->call(2, {}, &res), uint32_t(Status::kExhausted));
   EXPECT_NE(error_of(res).find("OutOfMemoryError"), std::string::npos);
+  delete h;
+}
+
+TEST_F(MleJavaWorker, KillTightLoopIgnoringInterrupts) {
+  WorkerOptions o;
+  o.interrupt_grace_ms = 300;
+  TestHost *h = new_host("jvm", nullptr, o);
+  ASSERT_NE(h, nullptr);
+  ResultMsg res;
+  ASSERT_EQ(prepare(*h, 1, "Spin.f",
+                    "public class Spin { static volatile long n; public static "
+                    "long f() { while (true) n++; } }",
+                    {}, type(Tag::kI64), &res),
+            0u);
+  std::thread killer([h] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    h->hooks.kill = true;
+  });
+  const auto t0 = Clock::now();
+  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kKilled));
+  killer.join();
+  const auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0)
+          .count();
+  EXPECT_GE(ms, 400);
+  EXPECT_LT(ms, 2000);
+  EXPECT_FALSE(h->worker.usable());
+  EXPECT_EQ(h->worker.process().exit_info(2000).describe(),
+            "killed by signal 9 (Killed)");
+  delete h;
+}
+
+// The KILL handler of mysqld runs on another thread: Worker::interrupt.
+TEST_F(MleJavaWorker, InterruptFromAnotherThread) {
+  TestHost *h = new_host("jvm");
+  ASSERT_NE(h, nullptr);
+  ResultMsg res;
+  ASSERT_EQ(prepare(*h, 1, "Sleep.f",
+                    "public class Sleep { public static long f() throws "
+                    "Exception { Thread.sleep(60000); return 0; } }",
+                    {}, type(Tag::kI64), &res),
+            0u);
+  std::thread killer([h] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    h->worker.interrupt();
+  });
+  const auto t0 = Clock::now();
+  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kInterrupted));
+  killer.join();
+  EXPECT_LT(Clock::now() - t0, std::chrono::seconds(2));
+  EXPECT_TRUE(h->worker.usable());
+  delete h;
+}
+
+TEST_F(MleJavaWorker, WorkerExitsDuringACall) {
+  TestHost *h = new_host("jvm");
+  ASSERT_NE(h, nullptr);
+  ResultMsg res;
+  ASSERT_EQ(prepare(*h, 1, "Halt.f",
+                    "public class Halt { public static long f() { "
+                    "Runtime.getRuntime().halt(7); return 0; } }",
+                    {}, type(Tag::kI64), &res),
+            0u);
+  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kDied));
+  EXPECT_EQ(error_of(res), "the MLE worker died: exited with status 7");
+  EXPECT_FALSE(h->worker.usable());
+  delete h;
+}
+
+// routine -> SQL -> the same routine ...: the host stops at max_depth.
+TEST_F(MleJavaWorker, NestingLimit) {
+  WorkerOptions o;
+  o.max_depth = 3;
+  TestHost *h = new_host("jvm", nullptr, o);
+  ASSERT_NE(h, nullptr);
+  ResultMsg res;
+  ASSERT_EQ(prepare(*h, 1, "Rec.f",
+                    "public class Rec { public static String f() { try { "
+                    "return \"(\" + com.percona.mle.api.Mle.sql(\"CALL f()\")"
+                    ".rows().get(0)[0] + \")\"; } catch "
+                    "(com.percona.mle.api.MleSqlException e) { return "
+                    "e.getMessage(); } } }",
+                    {}, type(Tag::kString), &res),
+            0u);
+  auto sql = [h](const SqlMsg &, SqlResultMsg *r) {
+    ResultMsg inner;
+    const uint32_t st = h->call(1, {}, &inner);
+    if (st != 0) {
+      r->kind = SqlResultKind::kError;
+      r->sql_errno = 1;
+      r->sqlstate = "HY000";
+      r->message = error_of(inner);
+      return;
+    }
+    r->kind = SqlResultKind::kRows;
+    r->columns = {{"c", "", type(Tag::kString)}};
+    r->rows = {*inner.ret};
+  };
+  ASSERT_EQ(h->call(1, {}, &res, sql), 0u) << error_of(res);
+  EXPECT_EQ(
+      *res.ret,
+      Value::string("((too many nested routine calls (the limit is 3)))"));
   delete h;
 }
 
@@ -856,6 +850,36 @@ TEST_F(MleJavaWorker, CallRoundTrip) {
               << ns[ns.size() * 99 / 100] / 1000 << " us\n";
   }
   EXPECT_EQ(*res.ret, Value::i64(8));
+  delete h;
+}
+
+// The same call when the host does not spin and sleeps on the futex at
+// once: the cost of a sleep and a wake on both sides.
+TEST_F(MleJavaWorker, CallRoundTripWithoutSpinning) {
+  WorkerOptions o;
+  o.spin_us = 0;
+  TestHost *h = new_host("jvm", nullptr, o);
+  ASSERT_NE(h, nullptr);
+  ResultMsg res;
+  ASSERT_EQ(
+      prepare(*h, 1, "P.f",
+              "public class P { public static long f(long a) { return a; } }",
+              {type(Tag::kI64)}, type(Tag::kI64), &res),
+      0u);
+  const std::vector<Value> args = {Value::i64(1)};
+  for (int i = 0; i < 100000; i++) h->call(1, args, &res);
+  std::vector<double> ns;
+  for (int i = 0; i < 20000; i++) {
+    const auto t0 = Clock::now();
+    h->call(1, args, &res);
+    ns.push_back(
+        std::chrono::duration<double, std::nano>(Clock::now() - t0).count());
+  }
+  std::sort(ns.begin(), ns.end());
+  std::cout << "[ INFO     ] Java call, host sleeps on the futex at once: p50 "
+            << ns[ns.size() / 2] / 1000 << " us, p90 "
+            << ns[ns.size() * 9 / 10] / 1000 << " us, p99 "
+            << ns[ns.size() * 99 / 100] / 1000 << " us\n";
   delete h;
 }
 

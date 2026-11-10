@@ -19,6 +19,7 @@ ADD_LIBRARY(mle_host STATIC
   codec.cc
   launcher.cc
   launcher_protocol.cc
+  worker.cc
   )
 TARGET_INCLUDE_DIRECTORIES(mle_host PUBLIC ${CMAKE_SOURCE_DIR}/components/mle/include)
 SET_TARGET_PROPERTIES(mle_host PROPERTIES POSITION_INDEPENDENT_CODE ON)

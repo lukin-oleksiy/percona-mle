@@ -24,6 +24,7 @@ SET(MLE_TESTS
   codec_fuzz
   launcher
   java_worker
+  worker_protocol
   )
 
 FOREACH(test ${MLE_TESTS})
@@ -43,6 +44,11 @@ TARGET_COMPILE_DEFINITIONS(mle_launcher-t PRIVATE
   MLE_TEST_WORKER_EXE="$<TARGET_FILE:mle_test_worker>"
   )
 ADD_DEPENDENCIES(mle_launcher-t mle_launcher mle_test_worker)
+TARGET_COMPILE_DEFINITIONS(mle_worker_protocol-t PRIVATE
+  MLE_LAUNCHER_EXE="$<TARGET_FILE:mle_launcher>"
+  MLE_TEST_WORKER_EXE="$<TARGET_FILE:mle_test_worker>"
+  )
+ADD_DEPENDENCIES(mle_worker_protocol-t mle_launcher mle_test_worker)
 
 GET_PROPERTY(MLE_WORKER_JAR GLOBAL PROPERTY MLE_WORKER_JAR)
 TARGET_COMPILE_DEFINITIONS(mle_java_worker-t PRIVATE

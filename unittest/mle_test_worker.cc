@@ -25,6 +25,8 @@
 //   oom               READY, then allocate memory until killed
 //   ignore_eof        READY, then never exit on its own
 //   fork N            fork N children that sleep, report how many worked
+//   proto BEHAVIOUR   READY, then answer requests, well (good) or badly
+//                     (see proto_loop), for the host's protocol checks
 
 #include <dirent.h>
 #include <linux/futex.h>
@@ -154,6 +156,105 @@ std::string environment_report() {
   return r;
 }
 
+void post_msg(wire::RegionHeader *h, wire::Op op, uint32_t status,
+              uint32_t flags, uint32_t depth, uint32_t len, uint64_t total,
+              uint64_t seq, const std::string &body) {
+  memcpy(reinterpret_cast<char *>(h) + wire::kHeaderSize, body.data(),
+         std::min<size_t>(body.size(), h->arena_size));
+  h->msg = wire::MessageHeader{};
+  h->msg.op = static_cast<uint32_t>(op);
+  h->msg.status = status;
+  h->msg.flags = flags;
+  h->msg.depth = depth;
+  h->msg.len = len;
+  h->msg.total_len = total;
+  h->msg.call_seq = seq;
+  h->to_h.fetch_add(1, std::memory_order_seq_cst);
+  if (h->h_sleep.load(std::memory_order_seq_cst) != 0)
+    syscall(SYS_futex, reinterpret_cast<uint32_t *>(&h->to_h), FUTEX_WAKE, 1,
+            nullptr, nullptr, 0);
+}
+
+/** Answers host requests. behaviour "good" answers correctly; every other
+    behaviour breaks one rule, once, at the first CALL (or PREPARE where
+    noted). */
+[[noreturn]] void proto_loop(wire::RegionHeader *h, const std::string &how) {
+  if (how == "silent") signal(SIGTERM, SIG_IGN);
+  uint32_t seen = 0;
+  while (true) {
+    while (h->to_w.load(std::memory_order_acquire) == seen) usleep(10);
+    seen = h->to_w.load(std::memory_order_acquire);
+    const wire::MessageHeader m = h->msg;
+    const bool call = m.op == static_cast<uint32_t>(wire::Op::kCall);
+    ResultMsg good;
+    if (call) good.ret = Value::i64(42);
+    std::string body;
+    encode(good, &body);
+    const auto len = static_cast<uint32_t>(body.size());
+    auto answer = [&](const std::string &b, uint32_t status = 0,
+                      uint32_t depth_delta = 0, uint64_t seq_delta = 0) {
+      post_msg(h, wire::Op::kResult, status, 0, m.depth + depth_delta,
+               static_cast<uint32_t>(b.size()), b.size(),
+               m.call_seq + seq_delta, b);
+    };
+    if (how == "sql_in_prepare" &&
+        m.op == static_cast<uint32_t>(wire::Op::kPrepare)) {
+      SqlMsg sql;
+      sql.statement = "SELECT 1";
+      std::string b;
+      encode(sql, &b);
+      post_msg(h, wire::Op::kSql, 0, 0, m.depth,
+               static_cast<uint32_t>(b.size()), b.size(), m.call_seq, b);
+      continue;
+    }
+    if (!call || how == "good") {
+      answer(body);
+      continue;
+    }
+    if (how == "bad_op") {
+      post_msg(h, static_cast<wire::Op>(99), 0, 0, m.depth, len, len,
+               m.call_seq, body);
+    } else if (how == "big_len") {
+      post_msg(h, wire::Op::kResult, 0, 0, m.depth, h->arena_size + 1,
+               h->arena_size + 1ULL, m.call_seq, body);
+    } else if (how == "bad_body") {
+      answer(std::string("\x05", 1));
+    } else if (how == "wrong_depth") {
+      answer(body, 0, 5);
+    } else if (how == "wrong_seq") {
+      answer(body, 0, 0, 1);
+    } else if (how == "status_without_error") {
+      answer(body, static_cast<uint32_t>(wire::Status::kGuestError));
+    } else if (how == "missing_return") {
+      ResultMsg r;
+      std::string b;
+      encode(r, &b);
+      answer(b);
+    } else if (how == "host_status") {
+      answer(body, static_cast<uint32_t>(wire::Status::kKilled));
+    } else if (how == "chunk_lie") {
+      post_msg(h, wire::Op::kResult, 0, wire::kMore, m.depth, len, len,
+               m.call_seq, body);
+    } else if (how == "die") {
+      _exit(7);
+    } else if (how == "silent") {
+      // never answers
+    } else if (how == "bad_stats") {
+      h->stats.heap_used = ~0ULL;
+      h->stats.heap_max = 100;
+      h->stats.state = 77;
+      answer(body);
+    } else if (how == "tainted") {
+      h->stats.tainted = 1;
+      answer(body);
+    } else if (how == "resize_mailbox") {
+      const int rc = ftruncate(wire::kMailboxFd, 0);  // sealed: must fail
+      if (rc == 0) _exit(8);
+      answer(body);
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -190,6 +291,10 @@ int main(int argc, char **argv) {
     signal(SIGTERM, SIG_IGN);
     post_ready(h, "ignoring EOF");
     while (true) pause();
+  }
+  if (mode == "proto" && argc == 3) {
+    post_ready(h, "proto");
+    proto_loop(h, argv[2]);
   }
   if (mode == "fork" && argc == 3) {
     int ok = 0;

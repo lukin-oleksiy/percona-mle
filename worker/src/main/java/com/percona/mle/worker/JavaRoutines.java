@@ -197,12 +197,14 @@ final class JavaRoutines {
   }
 
   private static Class<?> load(ClassLoader loader, String name, String pkg) throws CompileException {
+    // Not initialized here: static initializers run at the first call, as
+    // usual in Java, so no routine code runs during PREPARE.
     try {
-      return Class.forName(name, true, loader);
+      return Class.forName(name, false, loader);
     } catch (ClassNotFoundException e) {
       if (!pkg.isEmpty() && name.indexOf('.') < 0) {
         try {
-          return Class.forName(pkg + "." + name, true, loader);
+          return Class.forName(pkg + "." + name, false, loader);
         } catch (ClassNotFoundException e2) {
           // fall through
         }
