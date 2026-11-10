@@ -26,6 +26,7 @@ SET(MLE_TESTS
   java_worker
   worker_protocol
   polyglot_worker
+  worker_failures
   )
 
 FOREACH(test ${MLE_TESTS})
@@ -56,7 +57,7 @@ ADD_DEPENDENCIES(mle_worker_protocol-t mle_launcher mle_test_worker)
 SET(MLE_TEST_PYTHON_VENV "" CACHE PATH "GraalPy venv with numpy for the MLE tests")
 GET_PROPERTY(MLE_WORKER_JAR GLOBAL PROPERTY MLE_WORKER_JAR)
 GET_PROPERTY(MLE_RESOURCE_CACHE GLOBAL PROPERTY MLE_RESOURCE_CACHE)
-FOREACH(test java_worker polyglot_worker)
+FOREACH(test java_worker polyglot_worker worker_failures)
   TARGET_COMPILE_DEFINITIONS(mle_${test}-t PRIVATE
     MLE_LAUNCHER_EXE="$<TARGET_FILE:mle_launcher>"
     MLE_WORKER_EXE="$<TARGET_FILE:mle_worker>"

@@ -45,6 +45,7 @@
 #include <thread>
 #include <vector>
 
+#include "cgroup_test_util.h"
 #include "escape_probes.h"
 #include "mle/codec.h"
 #include "mle/launcher.h"
@@ -52,6 +53,7 @@
 namespace mle_launcher_unittest {
 
 using namespace mle;
+using mle_test::test_cgroup;
 using Clock = std::chrono::steady_clock;
 
 // ---------------------------------------------------------------- helpers
@@ -544,48 +546,6 @@ TEST(MleLauncher, LockdownDeniesEscapes) {
 }
 
 // ---------------------------------------------------------------- cgroup
-
-/** A cgroup base for the tests, or "" (with *why) when this process does
-    not run in a delegated cgroup of its own. Moves this process into a
-    leaf "host" so that the base has no processes. */
-std::string test_cgroup(std::string *why) {
-  static std::string base, reason;
-  static bool done = false;
-  if (done) return *why = reason, base;
-  done = true;
-  std::ifstream in("/proc/self/cgroup");
-  std::string line;
-  std::getline(in, line);
-  const std::string dir = "/sys/fs/cgroup" + line.substr(line.find("::") + 2);
-  std::ifstream procs(dir + "/cgroup.procs");
-  std::vector<std::string> pids;
-  for (std::string p; procs >> p;) pids.push_back(p);
-  if (pids.size() != 1 || pids[0] != std::to_string(getpid())) {
-    reason = dir +
-             " has other processes; run under "
-             "systemd-run --user --scope -p Delegate=yes";
-    return *why = reason, "";
-  }
-  const std::string host = dir + "/host";
-  mkdir(host.c_str(), 0755);
-  std::ofstream(host + "/cgroup.procs") << getpid();
-  std::ifstream check("/proc/self/cgroup");
-  std::getline(check, line);
-  if (line.find("/host") == std::string::npos) {
-    reason = "cannot create a child cgroup in " + dir;
-    return *why = reason, "";
-  }
-  base = dir;
-  return *why = "", base;
-}
-
-#define NEED_CGROUP(base)                           \
-  std::string why;                                  \
-  const std::string base = test_cgroup(&why);       \
-  if (base.empty()) {                               \
-    GTEST_SKIP() << "no delegated cgroup: " << why; \
-  }                                                 \
-  static_assert(true)
 
 int count_leaves(const std::string &base) {
   int n = 0;

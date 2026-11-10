@@ -198,21 +198,26 @@ Worker::Wait Worker::wait_change(CallHooks *hooks, int timeout_ms,
     }
     // A tick: is the worker alive, was the session killed, time is up?
     if (!m_process->alive()) return Wait::kDied;
-    if (hooks != nullptr && m_running.load() != 0 && hooks->killed()) {
-      const int64_t now_ms = now_ns() / 1000000;
-      if (m_interrupted_at_ms == 0) {
-        interrupt();
-        m_interrupted_at_ms = now_ms;
-      } else if (now_ms - m_interrupted_at_ms > m_options.interrupt_grace_ms) {
-        m_process->kill();
-        return Wait::kKilled;
-      }
-    }
+    if (check_kill(hooks) == Wait::kKilled) return Wait::kKilled;
     if (now_ns() > deadline) {
       if (error != nullptr) *error = "timed out waiting for the MLE worker";
       return Wait::kTimeout;
     }
   }
+}
+
+Worker::Wait Worker::check_kill(CallHooks *hooks) {
+  if (hooks == nullptr || m_running.load() == 0 || !hooks->killed())
+    return Wait::kMessage;
+  const int64_t now_ms = now_ns() / 1000000;
+  if (m_interrupted_at_ms == 0) {
+    interrupt();
+    m_interrupted_at_ms = now_ms;
+  } else if (now_ms - m_interrupted_at_ms > m_options.interrupt_grace_ms) {
+    m_process->kill();
+    return Wait::kKilled;
+  }
+  return Wait::kMessage;
 }
 
 Worker::Wait Worker::receive(Message *m, CallHooks *hooks, int timeout_ms,
@@ -326,6 +331,16 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
                 "the MLE worker broke the protocol: " + what, error);
   };
   auto lost = [&](Wait w) {
+    // A worker that ends while a KILL is being delivered was ended by the
+    // KILL (e.g. GraalPy exits when an interrupt hits a native extension's
+    // callback, U-5): report it as such.
+    if (w == Wait::kDied && m_interrupted_at_ms != 0) {
+      died(nullptr);
+      return fail(Status::kKilled,
+                  "the MLE worker ended after KILL (" +
+                      m_process->exit_info(kExitReportMs).describe() + ")",
+                  error);
+    }
     if (w == Wait::kDied) return died(error);
     if (w == Wait::kKilled)
       return fail(Status::kKilled,
@@ -376,6 +391,9 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
       SqlResultMsg r;
       hooks.sql(sql, &r);  // may run nested calls on this worker
       if (!m_usable) return died(error);
+      // A routine that keeps the worker busy with SQL never lets the wait
+      // reach a tick: check for KILL after every statement too.
+      if (check_kill(&hooks) == Wait::kKilled) return lost(Wait::kKilled);
       std::string reply;
       encode(r, &reply);
       w = send(wire::Op::kSqlResult, reply, &hooks, &why);

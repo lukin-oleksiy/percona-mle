@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -142,6 +143,32 @@ class TestHost {
 
 inline std::string error_of(const ResultMsg &r) {
   return r.error ? r.error->message : "";
+}
+
+inline ParamType type_of(Tag tag, bool is_unsigned = false) {
+  ParamType t;
+  t.tag = tag;
+  t.is_unsigned = is_unsigned;
+  return t;
+}
+
+/** PREPAREs a routine with IN parameters of the given types. */
+inline uint32_t prepare_routine(TestHost &h, uint64_t id,
+                                const std::string &lang,
+                                const std::string &entry,
+                                const std::string &src,
+                                std::vector<ParamType> params,
+                                std::optional<ParamType> ret, ResultMsg *res) {
+  PrepareMsg p;
+  p.routine_id = id;
+  p.language = lang;
+  p.entry = entry;
+  p.source = src;
+  for (size_t i = 0; i < params.size(); i++)
+    p.params.push_back(
+        {"p" + std::to_string(i + 1), wire::ParamMode::kIn, params[i]});
+  p.returns = ret;
+  return h.prepare(p, res);
 }
 
 }  // namespace mle_test

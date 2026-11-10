@@ -137,18 +137,28 @@ final class Dispatcher {
         return;
       }
     mb.stats(Wire.STATE_COMPILING, tainted);
+    // Loading runs routine code too (Python module level, JS top level), so PREPARE can be
+    // interrupted like a call.
+    boolean top = depth == 0;
+    if (top) control.begin(seq, Polyglot.isGuest(language));
+    String compileError = null;
+    Throwable failure = null;
     try {
       // A routine id is prepared again after ALTER; it may change language.
       java.drop(id);
       polyglot.drop(id);
       if (language.equals("java")) java.prepare(id, entry, source, params, ret);
       else polyglot.prepare(id, language, entry, source, params, ret);
-      result(Wire.OK, null, null, null);
     } catch (JavaRoutines.CompileException e) {
-      result(Wire.GUEST_ERROR, null, null, guest(language, e.getMessage()));
-    } catch (PolyglotException e) {
-      failed(e, false);  // e.g. the context could not be created
+      compileError = e.getMessage();
+    } catch (Throwable t) {
+      failure = t;
     }
+    boolean interrupted = top && control.end();
+    if (top) polyglot.settleInterrupt(control.takeInterrupter());
+    if (failure != null) failed(failure, interrupted);
+    else if (compileError != null) result(Wire.GUEST_ERROR, null, null, guest(language, compileError));
+    else result(Wire.OK, null, null, null);
   }
 
   private void call(Mailbox.Message m) {
@@ -183,7 +193,9 @@ final class Dispatcher {
       }
       boolean interrupted = top && control.end();
       if (top) polyglot.settleInterrupt(control.takeInterrupter());
-      if (failure == null) result(Wire.OK, ret, retType, null);
+      // A killed statement reports the KILL, even if the routine then ended normally.
+      if (failure == null && interrupted) result(Wire.INTERRUPTED, null, null, guest("", "interrupted"));
+      else if (failure == null) result(Wire.OK, ret, retType, null);
       else failed(failure, interrupted);
     }
   }
@@ -191,6 +203,10 @@ final class Dispatcher {
   private void failed(Throwable t, boolean interrupted) {
     if (t instanceof PolyglotException pe) {
       failedGuest(pe, interrupted);
+      return;
+    }
+    if (interrupted && !(t instanceof OutOfMemoryError)) {
+      result(Wire.INTERRUPTED, null, null, guest("java", "interrupted"));
       return;
     }
     if (t instanceof OutOfMemoryError || t instanceof StackOverflowError) {
@@ -215,7 +231,10 @@ final class Dispatcher {
       result(Wire.INTERRUPTED, null, null, new ErrorInfo(language, "interrupted", frames, 0, ""));
       return;
     }
-    if (e.isResourceExhausted()) {
+    // GraalPy turns an exhausted Java heap into a Python MemoryError; treat it as exhaustion (the
+    // worker is retired), also when numpy merely refused a too large array: better safe.
+    if (e.isResourceExhausted() || (language.equals("python") && e.isGuestException()
+        && String.valueOf(e.getMessage()).startsWith("MemoryError"))) {
       tainted = true;
       result(Wire.EXHAUSTED, null, null, new ErrorInfo(language, Polyglot.describe(e, false), frames, 0, ""));
       return;

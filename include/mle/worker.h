@@ -154,6 +154,9 @@ class Worker {
   Wait receive(Message *m, CallHooks *hooks, int timeout_ms,
                std::string *error);
   Wait wait_change(CallHooks *hooks, int timeout_ms, std::string *error);
+  /** KILL handling: INTERRUPT once, SIGKILL after the grace. kKilled when the
+      worker was killed, else kMessage. */
+  Wait check_kill(CallHooks *hooks);
   void post(wire::Op op, uint32_t flags, const char *data, size_t len,
             uint64_t total);
   /** Kills the worker and makes it unusable; returns status. */

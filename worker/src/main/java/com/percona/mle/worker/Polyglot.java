@@ -291,6 +291,10 @@ final class Polyglot {
         fn = h.loader().execute(source, name, entry, mleApi);
       }
     } catch (PolyglotException e) {
+      // KILL and exhaustion while loading are not compile errors.
+      if (e.isInterrupted() || e.isCancelled() || e.isResourceExhausted()
+          || (e.isHostException() && e.asHostException() instanceof Error))
+        throw e;
       throw new JavaRoutines.CompileException(describe(e, true));
     }
     if (fn == null || !fn.canExecute())
