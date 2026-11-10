@@ -87,6 +87,8 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
   if (!o.prewarm.empty()) c.args.push_back("-Dmle.prewarm=" + o.prewarm);
   if (!layout.python_venv.empty())
     c.args.push_back("-Dmle.python.venv=" + layout.python_venv);
+  if (!layout.package_dir.empty())
+    c.args.push_back("-Dmle.packages=" + layout.package_dir);
   c.args.insert(c.args.end(), o.extra_jvm_options.begin(),
                 o.extra_jvm_options.end());
 
@@ -95,6 +97,7 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
   c.exec_paths = {dir_of(layout.worker_exe), layout.java_home};
   c.read_paths = {dir_of(layout.worker_jar), layout.resource_cache};
   if (!layout.python_venv.empty()) c.read_paths.push_back(layout.python_venv);
+  if (!layout.package_dir.empty()) c.read_paths.push_back(layout.package_dir);
   if (!layout.aot_cache.empty()) c.read_paths.push_back(layout.aot_cache);
   c.memory_max = o.memory_max;
   c.pids_max = o.pids_max;

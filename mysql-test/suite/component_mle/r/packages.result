@@ -1,0 +1,75 @@
+#
+# component_mle (Phase 6): third-party packages installed by the DBA
+# (mle_package, mle.package_dir; 14-phase6-libraries.md §3) used from
+# JavaScript, Python and Java routines. The fixture in std_data stands
+# for npm, PyPI and Maven packages.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+SELECT @@mle.package_dir;
+@@mle.package_dir
+<std_data>/mle_packages
+# What is installed (the manifest mle_package writes).
+SELECT mle_packages() AS packages;
+packages
+{"updated": "2026-11-10T00:00:00+00:00", "by": "mtr", "packages": [
+ {"language": "js", "name": "mle-demo-cjs", "version": "1.0.0"},
+ {"language": "js", "name": "mle-demo-esm", "version": "1.0.0"},
+ {"language": "python", "name": "mle-demo-py", "version": "1.0.0"},
+ {"language": "java", "name": "mle-demo", "version": "1.0.0"}]}
+
+SELECT JSON_EXTRACT(mle_packages(), '$.packages[*].name') AS names;
+names
+["mle-demo-cjs", "mle-demo-esm", "mle-demo-py", "mle-demo"]
+# JavaScript: require() of a CommonJS package, import() of an ES module.
+CREATE FUNCTION js_slug(s VARCHAR(100)) RETURNS VARCHAR(100) LANGUAGE JAVASCRIPT
+AS $$ return require('mle-demo-cjs').slugify(s) $$;
+CREATE FUNCTION js_greet(s VARCHAR(100)) RETURNS VARCHAR(100) LANGUAGE JAVASCRIPT
+AS $$ const m = await import('mle-demo-esm'); return m.greet(s) + ' (' + m.default.kind + ')' $$;
+SELECT js_slug('  Hello, MLE World! '), js_greet('Percona');
+js_slug('  Hello, MLE World! ')	js_greet('Percona')
+hello-mle-world	Hello, Percona! (esm)
+# Python: import from the package directory.
+CREATE FUNCTION py_stats(a DOUBLE, b DOUBLE, c DOUBLE) RETURNS VARCHAR(100) LANGUAGE PYTHON AS $$
+import mle_demo_py
+m, spread = mle_demo_py.mean_and_spread([a, b, c])
+return '%s %.2f %.2f' % (mle_demo_py.__version__, m, spread)
+$$;
+SELECT py_stats(1, 5, 9);
+py_stats(1, 5, 9)
+1.0.0 5.00 8.00
+# Java: classes of the package jars.
+CREATE FUNCTION java_median(a DOUBLE, b DOUBLE, c DOUBLE, d DOUBLE) RETURNS DOUBLE LANGUAGE JAVA
+AS $$ return demo.Stats.median(a, b, c, d); $$;
+SELECT java_median(4, 1, 3, 10);
+java_median(4, 1, 3, 10)
+3.5
+# Routines cannot change the packages (read-only for workers).
+SELECT py_write();
+py_write()
+PermissionError
+# Not installed: an error of the language.
+CREATE FUNCTION js_missing() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return require('left-pad')('x', 3) $$;
+SELECT js_missing();
+ERROR HY000: JavaScript> TypeError: Cannot load module: 'left-pad'
+# mle_packages_refresh(): only with SYSTEM_VARIABLES_ADMIN, and not
+# while sessions hold workers.
+SELECT mle_packages_refresh();
+ERROR HY000: mle_packages_refresh<string> UDF failed; cannot refresh: 1 session workers are in use; try again when the sessions ended (or after mle_session_reset() in them)
+CREATE USER u1@localhost;
+SELECT mle_packages_refresh();
+ERROR HY000: mle_packages_refresh<string> UDF failed; mle_packages_refresh() needs the SYSTEM_VARIABLES_ADMIN privilege
+SET GLOBAL mle.worker_cache_size = 0;
+SET GLOBAL mle.worker_cache_size = DEFAULT;
+SELECT mle_packages_refresh();
+mle_packages_refresh()
+New MLE workers will see the installed packages.
+DROP FUNCTION js_slug;
+DROP FUNCTION js_greet;
+DROP FUNCTION py_stats;
+DROP FUNCTION java_median;
+DROP FUNCTION py_write;
+DROP FUNCTION js_missing;
+DROP USER u1@localhost;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

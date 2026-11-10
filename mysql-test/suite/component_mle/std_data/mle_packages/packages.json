@@ -1,0 +1,5 @@
+{"updated": "2026-11-10T00:00:00+00:00", "by": "mtr", "packages": [
+ {"language": "js", "name": "mle-demo-cjs", "version": "1.0.0"},
+ {"language": "js", "name": "mle-demo-esm", "version": "1.0.0"},
+ {"language": "python", "name": "mle-demo-py", "version": "1.0.0"},
+ {"language": "java", "name": "mle-demo", "version": "1.0.0"}]}

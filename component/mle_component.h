@@ -30,6 +30,8 @@
 #include <string>
 #include <string_view>
 
+#include <mysql/components/services/mysql_current_thread_reader.h>
+
 #include "engine.h"
 
 namespace mle_component {
@@ -91,6 +93,8 @@ Settings current_settings();
 unsigned enabled_languages();
 /** mle.max_workers, mle.spin_us, mle.interrupt_grace_ms. */
 uint32_t max_workers();
+/** Whether the session's account has a global (dynamic) privilege. */
+bool has_global_privilege(MYSQL_THD thd, const char *privilege);
 /** mle.worker_cache_size, mle.worker_cache_timeout (seconds). */
 size_t worker_cache_size();
 uint32_t worker_cache_timeout();

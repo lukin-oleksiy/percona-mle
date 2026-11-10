@@ -53,9 +53,15 @@ ADD_CUSTOM_TARGET(mle_build_layout ALL
     ${MLE_PYTHON_VENV_PARENT} ${MLE_BUILD_LAYOUT}/python-venv
   COMMAND ${CMAKE_COMMAND} -E create_symlink
     ${MLE_AOT_CACHE} ${MLE_BUILD_LAYOUT}/mle.aot
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/mle_package ${MLE_BUILD_LAYOUT}/mle_package
   COMMENT "Linking the MLE layout into plugin_output_directory/mle"
   VERBATIM
   )
 ADD_DEPENDENCIES(mle_build_layout mle_launcher mle_worker mle_worker_jar)
+
+# The DBA's tool for third-party packages (14-phase6-libraries.md §3).
+INSTALL(PROGRAMS tools/mle_package DESTINATION ${INSTALL_PLUGINDIR}/mle
+  COMPONENT MleWorker)
 
 ADD_SUBDIRECTORY(component)

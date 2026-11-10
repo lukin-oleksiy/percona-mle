@@ -219,7 +219,10 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   g_error.clear();
   g_settings = s;
 
-  const mle::Layout layout = mle::Layout::installed(s.dir, s.java_home);
+  mle::Layout layout = mle::Layout::installed(s.dir, s.java_home);
+  if (char real[PATH_MAX]; !s.package_dir.empty() &&
+                           realpath(s.package_dir.c_str(), real) != nullptr)
+    layout.package_dir = real;  // a missing directory: no packages
   *error = check_layout(layout, s);
   if (!error->empty()) {
     g_error = *error;
@@ -291,6 +294,7 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
           ", JDK " + layout.java_home +
           (layout.aot_cache.empty() ? ", no AOT cache" : "") +
           (layout.python_venv.empty() ? ", no Python venv (no numpy)" : "") +
+          (layout.package_dir.empty() ? "" : ", packages in " + layout.package_dir) +
           ".";
   g_launcher = std::move(launcher);
   return true;
@@ -338,6 +342,26 @@ EngineState engine_state(bool with_stats) {
 }
 
 long engine_workers_in_use() { return g_workers_in_use.load(); }
+
+bool engine_refresh(std::string *error) {
+  std::vector<std::unique_ptr<mle::Worker>> kept;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_launcher) {
+    *error = "the MLE engine is not running";
+    return false;
+  }
+  // Workers of running sessions die with the launcher: refuse then.
+  if (g_workers_in_use.load() > 0) {
+    *error = std::to_string(g_workers_in_use.load()) +
+             " session workers are in use; try again when the sessions ended "
+             "(or after mle_session_reset() in them)";
+    return false;
+  }
+  kept = take_cache_locked();
+  std::string info;
+  const Settings settings = g_settings;
+  return start_locked(settings, error, &info);
+}
 
 namespace {
 /** How long a session waits for its worker to be READY (a pool hit is

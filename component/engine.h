@@ -50,6 +50,8 @@ struct Settings {
   std::string cgroup_base = "AUTO";
   std::string dir;
   std::string java_home;
+  /** Third-party packages installed by the DBA (14 §3); "": <dir>/packages. */
+  std::string package_dir;
 };
 
 struct EngineState {
@@ -83,6 +85,13 @@ EngineState engine_state(bool with_stats);
 /** Workers held by sessions; settings that shape workers can change only
     while this is 0. */
 long engine_workers_in_use();
+
+/**
+  mle_packages_refresh(): ends kept workers and restarts the launcher (its
+  pool) so that new workers see newly installed packages. False, with
+  *error, while sessions hold workers.
+*/
+bool engine_refresh(std::string *error);
 
 /** Why engine_new_worker failed. */
 enum class AcquireError { kNone, kInactive, kLimit, kFailed };

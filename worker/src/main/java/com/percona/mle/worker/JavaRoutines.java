@@ -99,13 +99,45 @@ final class JavaRoutines {
       "\\bpublic\\s+(?:(?:final|abstract|sealed|non-sealed|strictfp)\\s+)*(?:class|record|interface|enum)\\s+(\\w+)");
 
   private final Map<Long, Routine> routines = new HashMap<>();
-  private final ClassLoader apiLoader = new ApiLoader(JavaRoutines.class.getClassLoader());
+  /** The API, then the DBA's third-party jars (14 §3), for every routine. */
+  private final ClassLoader apiLoader = packageLoader(new ApiLoader(JavaRoutines.class.getClassLoader()));
   private JavaCompiler javac;
   private StandardJavaFileManager files;
   private final List<String> options = List.of(
       "-g", "-proc:none", "-encoding", "UTF-8", "-Xlint:none", "-nowarn",
       "--add-modules", "jdk.incubator.vector",
-      "-classpath", System.getProperty("java.class.path", ""));
+      "-classpath", classPath());
+
+  /** The jars in <mle.packages>/java (sorted, for a stable order). */
+  static List<java.nio.file.Path> packageJars() {
+    String dir = System.getProperty("mle.packages", "");
+    if (dir.isEmpty()) return List.of();
+    java.nio.file.Path jarDir = java.nio.file.Path.of(dir, "java");
+    if (!java.nio.file.Files.isDirectory(jarDir)) return List.of();
+    try (var s = java.nio.file.Files.list(jarDir)) {
+      return s.filter(p -> p.toString().endsWith(".jar")).sorted().toList();
+    } catch (java.io.IOException e) {
+      return List.of();
+    }
+  }
+
+  private static String classPath() {
+    StringBuilder cp = new StringBuilder(System.getProperty("java.class.path", ""));
+    for (var jar : packageJars()) cp.append(java.io.File.pathSeparatorChar).append(jar);
+    return cp.toString();
+  }
+
+  private static ClassLoader packageLoader(ClassLoader api) {
+    List<java.nio.file.Path> jars = packageJars();
+    if (jars.isEmpty()) return api;
+    java.net.URL[] urls = new java.net.URL[jars.size()];
+    try {
+      for (int i = 0; i < urls.length; i++) urls[i] = jars.get(i).toUri().toURL();
+    } catch (java.net.MalformedURLException e) {
+      return api;
+    }
+    return new java.net.URLClassLoader("mle-packages", urls, api);
+  }
 
   /** Loads JDK and the API, nothing of the worker. */
   static final class ApiLoader extends ClassLoader {

@@ -1,0 +1,88 @@
+--echo #
+--echo # component_mle (Phase 6): third-party packages installed by the DBA
+--echo # (mle_package, mle.package_dir; 14-phase6-libraries.md §3) used from
+--echo # JavaScript, Python and Java routines. The fixture in std_data stands
+--echo # for npm, PyPI and Maven packages.
+--echo #
+--source include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+--replace_regex /.*std_data/<std_data>/
+SELECT @@mle.package_dir;
+--echo # What is installed (the manifest mle_package writes).
+SELECT mle_packages() AS packages;
+SELECT JSON_EXTRACT(mle_packages(), '$.packages[*].name') AS names;
+
+--connect (con1, localhost, root,,test)
+--echo # JavaScript: require() of a CommonJS package, import() of an ES module.
+CREATE FUNCTION js_slug(s VARCHAR(100)) RETURNS VARCHAR(100) LANGUAGE JAVASCRIPT
+  AS $$ return require('mle-demo-cjs').slugify(s) $$;
+CREATE FUNCTION js_greet(s VARCHAR(100)) RETURNS VARCHAR(100) LANGUAGE JAVASCRIPT
+  AS $$ const m = await import('mle-demo-esm'); return m.greet(s) + ' (' + m.default.kind + ')' $$;
+SELECT js_slug('  Hello, MLE World! '), js_greet('Percona');
+
+--echo # Python: import from the package directory.
+CREATE FUNCTION py_stats(a DOUBLE, b DOUBLE, c DOUBLE) RETURNS VARCHAR(100) LANGUAGE PYTHON AS $$
+    import mle_demo_py
+    m, spread = mle_demo_py.mean_and_spread([a, b, c])
+    return '%s %.2f %.2f' % (mle_demo_py.__version__, m, spread)
+$$;
+SELECT py_stats(1, 5, 9);
+
+--echo # Java: classes of the package jars.
+CREATE FUNCTION java_median(a DOUBLE, b DOUBLE, c DOUBLE, d DOUBLE) RETURNS DOUBLE LANGUAGE JAVA
+  AS $$ return demo.Stats.median(a, b, c, d); $$;
+SELECT java_median(4, 1, 3, 10);
+
+--echo # Routines cannot change the packages (read-only for workers).
+--write_file $MYSQLTEST_VARDIR/tmp/py_write.sql
+CREATE FUNCTION py_write() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import mle_demo_py, os
+    try:
+        open(os.path.join(os.path.dirname(mle_demo_py.__file__), 'evil.py'), 'w')
+        return 'written'
+    except OSError as e:
+        return type(e).__name__
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/py_write.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/py_write.sql
+SELECT py_write();
+--echo # Not installed: an error of the language.
+CREATE FUNCTION js_missing() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return require('left-pad')('x', 3) $$;
+--replace_regex /Cannot load CommonJS module.*/Cannot load CommonJS module .../
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_missing();
+
+--echo # mle_packages_refresh(): only with SYSTEM_VARIABLES_ADMIN, and not
+--echo # while sessions hold workers.
+--error ER_UDF_ERROR
+SELECT mle_packages_refresh();
+--disconnect con1
+--connection default
+CREATE USER u1@localhost;
+--connect (con2, localhost, u1,,test)
+--error ER_UDF_ERROR
+SELECT mle_packages_refresh();
+--disconnect con2
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.worker_cache_size = 0;
+SET GLOBAL mle.worker_cache_size = DEFAULT;
+SELECT mle_packages_refresh();
+
+--connect (con3, localhost, root,,test)
+DROP FUNCTION js_slug;
+DROP FUNCTION js_greet;
+DROP FUNCTION py_stats;
+DROP FUNCTION java_median;
+DROP FUNCTION py_write;
+DROP FUNCTION js_missing;
+--disconnect con3
+--connection default
+DROP USER u1@localhost;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

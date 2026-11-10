@@ -574,6 +574,13 @@ void unregister_privileges() {
         p, strlen(p));
 }
 
+bool has_global_privilege(MYSQL_THD thd, const char *privilege) {
+  Security_context_handle sctx = nullptr;
+  if (mysql_service_mysql_thd_security_context->get(thd, &sctx)) return false;
+  return mysql_service_global_grants_check->has_global_grant(
+      sctx, privilege, strlen(privilege));
+}
+
 bool check_create_privilege(MYSQL_THD thd, const Routine &routine) {
   mysql_cstring_with_length command{nullptr, 0};
   if (mysql_service_mysql_thd_attributes->get(thd, "sql_command", &command) ||

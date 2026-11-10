@@ -23,6 +23,7 @@ mle.java_home	/home/al/.sdkman/candidates/java/current
 mle.languages	JAVASCRIPT,PYTHON,JAVA
 mle.max_workers	64
 mle.memory_max	2147483648
+mle.package_dir	
 mle.pool_size	2
 mle.spin_us	50
 mle.sql_chunk_rows	1000

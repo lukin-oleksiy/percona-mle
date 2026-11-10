@@ -294,7 +294,18 @@ final class Dispatcher {
       result(Wire.GUEST_ERROR, null, null, sql);
       return;
     }
-    result(Wire.GUEST_ERROR, null, null, new ErrorInfo(language, Polyglot.describe(e, false), frames, 0, ""));
+    // A Java error inside a language runtime (e.g. a class that failed to initialise): the
+    // causes say why.
+    String message = e.isHostException() && e.asHostException().getCause() != null
+        ? describe(e.asHostException()) : Polyglot.describe(e, false);
+    if (e.isInternalError()) {
+      // A bug of a language runtime: the beginning of its trace helps to find it.
+      java.io.StringWriter trace = new java.io.StringWriter();
+      e.printStackTrace(new java.io.PrintWriter(trace));
+      String t = trace.toString();
+      message += " (internal error; " + t.substring(0, Math.min(t.length(), 1500)).replace('\n', ' ') + ")";
+    }
+    result(Wire.GUEST_ERROR, null, null, new ErrorInfo(language, message, frames, 0, ""));
   }
 
   /**

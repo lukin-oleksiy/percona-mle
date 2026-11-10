@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 Percona LLC and/or its affiliates. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+"""mle_package: third-party packages for MLE routines (component_mle).
+
+Run by the DBA on the database host, as an OS user who may write the package
+directory (mle.package_dir; default <mle.dir>/packages). mysqld and its
+workers only read it; regular database users cannot add packages.
+
+  mle_package [--dir DIR] install js     lodash@4.17.21 date-fns
+  mle_package [--dir DIR] install python pandas networkx
+  mle_package [--dir DIR] install java   org.apache.commons:commons-math3:3.6.1
+  mle_package [--dir DIR] remove  js|python|java NAME...
+  mle_package [--dir DIR] list
+
+Then, in mysqld: SELECT mle_packages_refresh();  (new workers see the change)
+
+Layout: js/ (npm --prefix: node_modules, package.json), python/site-packages
+(pip --target with GraalPy, using GraalPy's binary wheels where they exist),
+java/*.jar (Maven, with dependencies). packages.json lists what is installed.
+"""
+
+import argparse
+import datetime
+import getpass
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# The MLE directory the tool is started from (the build layout links it).
+HERE = os.path.dirname(os.path.abspath(__file__))
+GRAALPY_WHEELS = "https://www.graalvm.org/python/wheels/"
+
+
+def run(cmd, **kw):
+    print("+ " + " ".join(cmd), file=sys.stderr)
+    subprocess.run(cmd, check=True, **kw)
+
+
+def graalpy(args):
+    if args.graalpy:
+        return args.graalpy
+    for c in (os.path.join(HERE, "python-venv", "venv", "bin", "graalpy"),
+              shutil.which("graalpy") or ""):
+        if c and os.access(c, os.X_OK):
+            return c
+    sys.exit("mle_package: no GraalPy found (use --graalpy); Python packages "
+             "must be installed with the GraalPy that runs the routines")
+
+
+# ---------------------------------------------------------------- install
+
+def install_js(d, specs):
+    os.makedirs(os.path.join(d, "js"), exist_ok=True)
+    run(["npm", "install", "--prefix", os.path.join(d, "js"), "--no-audit",
+         "--no-fund", "--save-exact", *specs])
+
+
+def install_python(d, specs, args):
+    site = os.path.join(d, "python", "site-packages")
+    os.makedirs(site, exist_ok=True)
+    run([graalpy(args), "-m", "pip", "install", "--disable-pip-version-check",
+         "--upgrade", "--prefer-binary", "--target", site,
+         "--extra-index-url", GRAALPY_WHEELS,
+         *specs])
+
+
+def install_java(d, specs):
+    out = os.path.join(d, "java")
+    os.makedirs(out, exist_ok=True)
+    deps = []
+    for s in specs:
+        parts = s.split(":")
+        if len(parts) != 3:
+            sys.exit("mle_package: a Java package is group:artifact:version, not " + s)
+        deps.append("<dependency><groupId>%s</groupId><artifactId>%s</artifactId>"
+                    "<version>%s</version></dependency>" % tuple(parts))
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "pom.xml"), "w") as f:
+            f.write('<project xmlns="http://maven.apache.org/POM/4.0.0">'
+                    "<modelVersion>4.0.0</modelVersion><groupId>mle</groupId>"
+                    "<artifactId>packages</artifactId><version>1</version>"
+                    "<dependencies>%s</dependencies></project>" % "".join(deps))
+        run(["mvn", "-q", "-B", "-f", os.path.join(tmp, "pom.xml"),
+             "dependency:copy-dependencies", "-DincludeScope=runtime",
+             "-DoutputDirectory=" + out])
+
+
+# ---------------------------------------------------------------- inventory
+
+def js_packages(d):
+    try:
+        with open(os.path.join(d, "js", "package.json")) as f:
+            deps = json.load(f).get("dependencies", {})
+    except (OSError, ValueError):
+        return []
+    out = []
+    for name in sorted(deps):
+        try:
+            with open(os.path.join(d, "js", "node_modules", name, "package.json")) as f:
+                version = json.load(f).get("version", "")
+        except (OSError, ValueError):
+            version = deps[name]
+        out.append({"language": "js", "name": name, "version": version})
+    return out
+
+
+def python_packages(d):
+    out = []
+    for info in sorted(glob.glob(os.path.join(d, "python", "site-packages", "*.dist-info"))):
+        m = re.match(r"(.+)-([^-]+)\.dist-info$", os.path.basename(info))
+        if m:
+            out.append({"language": "python", "name": m.group(1).replace("_", "-").lower(),
+                        "version": m.group(2)})
+    return out
+
+
+def java_packages(d):
+    out = []
+    for jar in sorted(glob.glob(os.path.join(d, "java", "*.jar"))):
+        m = re.match(r"(.+?)-(\d[^/]*)\.jar$", os.path.basename(jar))
+        out.append({"language": "java", "name": m.group(1) if m else os.path.basename(jar),
+                    "version": m.group(2) if m else ""})
+    return out
+
+
+def inventory(d):
+    return js_packages(d) + python_packages(d) + java_packages(d)
+
+
+def write_manifest(d):
+    data = {"updated": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "by": getpass.getuser(), "packages": inventory(d)}
+    tmp = os.path.join(d, ".packages.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, os.path.join(d, "packages.json"))
+
+
+# ---------------------------------------------------------------- remove
+
+def remove(d, language, names):
+    if language == "js":
+        run(["npm", "uninstall", "--prefix", os.path.join(d, "js"), *names])
+        return
+    if language == "java":
+        for n in names:
+            for jar in glob.glob(os.path.join(d, "java", n + "-*.jar")):
+                os.remove(jar)
+        return
+    site = os.path.join(d, "python", "site-packages")
+    for n in names:
+        key = n.replace("-", "_").lower()
+        for info in glob.glob(os.path.join(site, "*.dist-info")):
+            if not os.path.basename(info).lower().startswith(key + "-"):
+                continue
+            record = os.path.join(info, "RECORD")
+            if os.path.exists(record):
+                with open(record) as f:
+                    for line in f:
+                        path = os.path.normpath(os.path.join(site, line.split(",")[0]))
+                        if path.startswith(site) and os.path.isfile(path):
+                            os.remove(path)
+            shutil.rmtree(info, ignore_errors=True)
+        for left in (os.path.join(site, key),):
+            if os.path.isdir(left) and not os.listdir(left):
+                os.rmdir(left)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--dir", default=os.environ.get("MLE_PACKAGE_DIR", os.path.join(HERE, "packages")),
+                   help="the package directory (mle.package_dir)")
+    p.add_argument("--graalpy", help="GraalPy for Python packages (default: the MLE venv's)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for c in ("install", "remove"):
+        s = sub.add_parser(c)
+        s.add_argument("language", choices=["js", "python", "java"])
+        s.add_argument("names", nargs="+")
+    sub.add_parser("list")
+    args = p.parse_args()
+    d = os.path.realpath(args.dir)
+    os.makedirs(d, exist_ok=True)
+    if args.cmd == "install":
+        {"js": lambda: install_js(d, args.names),
+         "python": lambda: install_python(d, args.names, args),
+         "java": lambda: install_java(d, args.names)}[args.language]()
+        write_manifest(d)
+    elif args.cmd == "remove":
+        remove(d, args.language, args.names)
+        write_manifest(d)
+    else:
+        for pkg in inventory(d):
+            print("%-7s %-30s %s" % (pkg["language"], pkg["name"], pkg["version"]))
+        return
+    print("Done. In mysqld: SELECT mle_packages_refresh();", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

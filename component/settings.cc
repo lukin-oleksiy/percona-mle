@@ -75,6 +75,7 @@ char *g_languages = nullptr;
 char *g_cgroup_base = nullptr;
 char *g_dir = nullptr;
 char *g_java_home = nullptr;
+char *g_package_dir = nullptr;
 
 std::atomic<unsigned> g_language_bits{kAllLanguages};
 
@@ -169,7 +170,8 @@ Registered g_registered[] = {
     {"languages", false},  {"cgroup_base", false}, {"dir", false},
     {"java_home", false},  {"sql_result_max", false}, {"sql_row_max", false},
     {"sql_statements_max", false}, {"sql_chunk_rows", false},
-    {"worker_cache_size", false}, {"worker_cache_timeout", false}};
+    {"worker_cache_size", false}, {"worker_cache_timeout", false},
+    {"package_dir", false}};
 
 void mark(const char *name) {
   for (auto &r : g_registered)
@@ -382,6 +384,18 @@ bool register_settings() {
           "GraalVM JDK 25 that runs the MLE workers.", nullptr, nullptr,
           &java_home, &g_java_home))
     return true;
+
+  // Third-party packages (14 §3): installed by the DBA with mle_package on
+  // the server host; routines can only read them.
+  STR_CHECK_ARG(package_dir) package_dir;
+  package_dir.def_val = const_cast<char *>("");
+  if (reg("package_dir",
+          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY,
+          "Directory of third-party packages for routines (js/node_modules, "
+          "python/site-packages, java/*.jar), installed by the DBA with "
+          "mle_package; empty: <mle.dir>/packages.",
+          nullptr, nullptr, &package_dir, &g_package_dir))
+    return true;
   return false;
 }
 
@@ -392,7 +406,7 @@ void unregister_settings() {
             kName, r.name))
       r.done = false;
   }
-  g_languages = g_cgroup_base = g_dir = g_java_home = nullptr;
+  g_languages = g_cgroup_base = g_dir = g_java_home = g_package_dir = nullptr;
 }
 
 Settings current_settings() {
@@ -403,6 +417,8 @@ Settings current_settings() {
   s.cgroup_base = text(g_cgroup_base);
   s.dir = text(g_dir);
   s.java_home = text(g_java_home);
+  s.package_dir = text(g_package_dir);
+  if (s.package_dir.empty()) s.package_dir = s.dir + "/packages";
   return s;
 }
 

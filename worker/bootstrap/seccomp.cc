@@ -27,6 +27,7 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <sys/socket.h>
 #include <sched.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -77,6 +78,9 @@ class Filter {
     stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
     stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
   }
+  /** nr allowed only when its first argument is value (e.g. a socket
+      domain); otherwise EPERM. */
+  void only_arg0(long nr, uint32_t value) { only_self(nr, static_cast<pid_t>(value)); }
   /** clone: threads only (CLONE_THREAD), no new processes. */
   void threads_only(long nr) {
     stmt(BPF_LD | BPF_W | BPF_ABS, kNr);
@@ -137,7 +141,10 @@ int install_seccomp() {
   // Network and local sockets (the worker talks to the host only through
   // descriptors it already has).
   f.deny(__NR_socket);
-  f.deny(__NR_socketpair);
+  // AF_UNIX pairs only: two connected descriptors inside the process (the
+  // JDK's NIO dispatcher makes one when it starts; GraalPy's os.pipe() uses
+  // NIO). They reach no network and no other process.
+  f.only_arg0(__NR_socketpair, AF_UNIX);
   f.deny(__NR_connect);
   f.deny(__NR_bind);
   f.deny(__NR_listen);

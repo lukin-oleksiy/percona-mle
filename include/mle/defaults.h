@@ -52,6 +52,8 @@ struct Layout {
   std::string aot_cache;
   /** The GraalVM JDK 25 that runs the worker. */
   std::string java_home;
+  /** Third-party packages (read-only for workers); empty: none. */
+  std::string package_dir;
 
   /** The installed layout below dir; optional parts that do not exist are
       left empty. Symlinks are resolved (the build tree has a layout of

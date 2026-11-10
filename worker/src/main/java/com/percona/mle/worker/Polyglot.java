@@ -190,6 +190,20 @@ final class Polyglot {
         .option("python.NoUserSiteFlag", "true")
         .option("python.WarnExperimentalFeatures", "false")
         .environment("HOME", "/nonexistent");  // GraalPy looks up the home directory (U-1)
+    // Third-party packages installed by the DBA (14 §3): npm packages for require() and
+    // import of bare names (CommonJS support is an experimental GraalJS option), Python
+    // packages on the module path.
+    String packages = System.getProperty("mle.packages", "");
+    if (!packages.isEmpty()) {
+      Path js = Path.of(packages, "js");
+      if (java.nio.file.Files.isDirectory(js.resolve("node_modules")))
+        b.allowExperimentalOptions(true)
+            .option("js.commonjs-require", "true")
+            .option("js.commonjs-require-cwd", js.toString())
+            .option("js.esm-bare-specifier-relative-lookup", "true");
+      Path site = Path.of(packages, "python", "site-packages");
+      if (java.nio.file.Files.isDirectory(site)) b.option("python.PythonPath", site.toString());
+    }
     String venv = System.getProperty("mle.python.venv", "");
     if (!venv.isEmpty())
       b.option("python.Executable", Path.of(venv).resolve("bin/python").toString())

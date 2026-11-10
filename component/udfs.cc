@@ -36,6 +36,8 @@
 
 #include <array>
 #include <cstdarg>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -48,12 +50,14 @@
 #include <mysqlpp/udf_registration.hpp>
 #include <mysqlpp/udf_wrappers.hpp>
 
+#include "engine.h"
 #include "mle_component.h"
 #include "session.h"
 
 extern REQUIRES_SERVICE_PLACEHOLDER(udf_registration);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_udf_metadata);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_error);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_current_thread_reader);
 
 namespace {
 
@@ -138,6 +142,49 @@ std::string json_string(const std::string &json, const std::string &key) {
   return json.substr(open + 1, close - open - 1);
 }
 
+/** mle_packages(): the DBA's package manifest (14 §3) as JSON text. */
+class mle_packages_impl {
+ public:
+  explicit mle_packages_impl(mysqlpp::udf_context &ctx) {
+    if (ctx.get_number_of_args() != 0)
+      throw std::invalid_argument("Wrong argument list: should be ()");
+    ctx.mark_result_nullable(false);
+    ctx.mark_result_const(false);
+    utf8_result(ctx);
+  }
+  mysqlpp::udf_result_t<STRING_RESULT> calculate(const mysqlpp::udf_context &) {
+    std::ifstream in(mle_component::current_settings().package_dir +
+                     "/packages.json");
+    if (!in) return std::string("[]");
+    std::stringstream text;
+    text << in.rdbuf();
+    return text.str();
+  }
+};
+
+/** mle_packages_refresh(): new workers for newly installed packages. */
+class mle_packages_refresh_impl {
+ public:
+  explicit mle_packages_refresh_impl(mysqlpp::udf_context &ctx) {
+    if (ctx.get_number_of_args() != 0)
+      throw std::invalid_argument("Wrong argument list: should be ()");
+    ctx.mark_result_nullable(false);
+    ctx.mark_result_const(false);
+    utf8_result(ctx);
+  }
+  mysqlpp::udf_result_t<STRING_RESULT> calculate(const mysqlpp::udf_context &) {
+    MYSQL_THD thd = nullptr;
+    if (mysql_service_mysql_current_thread_reader->get(&thd) ||
+        !mle_component::has_global_privilege(thd, "SYSTEM_VARIABLES_ADMIN"))
+      throw std::invalid_argument(
+          "mle_packages_refresh() needs the SYSTEM_VARIABLES_ADMIN privilege");
+    std::string error;
+    if (!mle_component::engine_refresh(&error))
+      throw std::invalid_argument("cannot refresh: " + error);
+    return std::string("New MLE workers will see the installed packages.");
+  }
+};
+
 class mle_set_session_state_impl {
  public:
   explicit mle_set_session_state_impl(mysqlpp::udf_context &ctx) {
@@ -210,6 +257,8 @@ class mle_debug_worker_pid_impl {
 DECLARE_STRING_UDF_AUTO(mle_session_state)
 DECLARE_STRING_UDF_AUTO(mle_session_reset)
 DECLARE_INT_UDF_AUTO(mle_set_session_state)
+DECLARE_STRING_UDF_AUTO(mle_packages)
+DECLARE_STRING_UDF_AUTO(mle_packages_refresh)
 #ifndef NDEBUG
 DECLARE_INT_UDF_AUTO(mle_debug_worker_pid)
 #endif
@@ -218,6 +267,8 @@ namespace {
 
 std::array g_udfs{DECLARE_UDF_INFO_AUTO(mle_session_state),
                   DECLARE_UDF_INFO_AUTO(mle_session_reset),
+                  DECLARE_UDF_INFO_AUTO(mle_packages),
+                  DECLARE_UDF_INFO_AUTO(mle_packages_refresh),
                   DECLARE_UDF_INFO_AUTO(mle_set_session_state)
 #ifndef NDEBUG
                       ,
