@@ -1,0 +1,75 @@
+#
+# component_mle (P4-W6): a multi-language engine in one session.
+# A small vector search: Python with numpy ranks products, JavaScript
+# calls numpy through the shared polyglot context, Java calls JavaScript,
+# and Percona's V8 LANGUAGE JS runs next to MLE in the same statement.
+#
+INSTALL COMPONENT "file://component_js_lang";
+INSTALL COMPONENT "file://component_mle";
+INSTALL COMPONENT "file://component_lang_router";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+GRANT CREATE_JS_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(40), price DECIMAL(8,2),
+embedding VECTOR(4));
+INSERT INTO products VALUES
+(1, 'red apple',    0.50, STRING_TO_VECTOR('[0.9, 0.1, 0.0, 0.2]')),
+(2, 'green apple',  0.45, STRING_TO_VECTOR('[0.8, 0.3, 0.0, 0.1]')),
+(3, 'banana',       0.25, STRING_TO_VECTOR('[0.1, 0.9, 0.1, 0.0]')),
+(4, 'apple juice',  2.10, STRING_TO_VECTOR('[0.7, 0.0, 0.6, 0.3]')),
+(5, 'orange',       0.60, STRING_TO_VECTOR('[0.3, 0.6, 0.2, 0.1]'));
+# Python with numpy: cosine similarity of two vectors.
+CREATE FUNCTION py_cosine(a VECTOR(4), b VECTOR(4)) RETURNS DOUBLE LANGUAGE PYTHON AS $$
+import numpy as np
+return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+$$;
+# JavaScript (GraalJS in the MLE worker) asks numpy for a vector's norm.
+CREATE FUNCTION js_norm(v VECTOR(4)) RETURNS DOUBLE LANGUAGE JAVASCRIPT AS $$
+const norm = Polyglot.eval('python',
+'import numpy\nlambda xs: float(numpy.linalg.norm(list(xs)))');
+return Math.round(norm(v) * 1000) / 1000;
+$$;
+# Java: exact money arithmetic, and a JavaScript helper for the text.
+CREATE FUNCTION java_offer(name VARCHAR(40), price DECIMAL(8,2), qty INT)
+RETURNS VARCHAR(80) LANGUAGE JAVA AS $$
+BigDecimal total = price.multiply(BigDecimal.valueOf(qty));
+String title = com.percona.mle.api.Mle.context()
+.eval("js", "(s) => s.replace(/\\b\\w/g, (c) => c.toUpperCase())")
+.execute(name).asString();
+return qty + " x " + title + " = " + total;
+$$;
+# V8 (Percona's LANGUAGE JS, in mysqld) in the same statement.
+CREATE FUNCTION v8_stars(score DOUBLE) RETURNS VARCHAR(5) LANGUAGE JS
+AS $$ return '*'.repeat(Math.round(score * 5)) $$;
+# Which products are like a red apple?
+SET @query = STRING_TO_VECTOR('[1.0, 0.1, 0.0, 0.1]');
+SELECT name, ROUND(py_cosine(embedding, @query), 4) AS similarity,
+v8_stars(py_cosine(embedding, @query)) AS stars,
+js_norm(embedding) AS norm,
+java_offer(name, price, 3) AS offer
+FROM products ORDER BY similarity DESC;
+name	similarity	stars	norm	offer
+red apple	0.993	*****	0.927	3 x Red Apple = 1.50
+green apple	0.9669	*****	0.86	3 x Green Apple = 1.35
+apple juice	0.7455	****	0.97	3 x Apple Juice = 6.30
+orange	0.5181	***	0.707	3 x Orange = 1.80
+banana	0.2065	*	0.911	3 x Banana = 0.75
+# One MLE worker served Python, JavaScript and Java for this session.
+SELECT mle_session_state('stored_functions') AS mle_functions;
+mle_functions
+3
+SELECT VARIABLE_VALUE AS mle_workers FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_workers';
+mle_workers
+1
+DROP TABLE products;
+DROP FUNCTION py_cosine;
+DROP FUNCTION js_norm;
+DROP FUNCTION java_offer;
+DROP FUNCTION v8_stars;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+REVOKE CREATE_JS_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_lang_router";
+UNINSTALL COMPONENT "file://component_mle";
+UNINSTALL COMPONENT "file://component_js_lang";
+# js_lang cannot be installed again without a restart (V8).
+# restart

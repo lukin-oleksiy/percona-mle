@@ -40,17 +40,18 @@ import org.graalvm.polyglot.Value;
  * <p>The wrapper, all on the body's first line so that line numbers match the body:
  *
  * <pre>
- * (function($c){const $G=globalThis;return function($a0,..){"use strict";
- *   const globalThis=Object.create($G);let p0=$c.int($a0),..;BODY
- * }})
+ * (function($c){const $G=globalThis;return function $mle$routine($a0,..){"use strict";
+ *   const globalThis=Object.create($G);let p0=$c.int($a0),..;const $r=(()=>{BODY
+ * })();return $r;}})
  * </pre>
  *
  * <ul>
  *   <li>globalThis is a fresh object per invocation (S-1): what a call stores there is gone
  *       afterwards; built-ins are reached as usual. Strict mode, as in Oracle.
  *   <li>Arguments are converted inside the wrapper ($c.*), so a call is one host-to-guest call.
- *   <li>OUT and INOUT parameters: the body runs in an arrow function (it can return early) and the
- *       wrapper returns [result, out1, ...]; OUT starts as null.
+ *   <li>The body runs in an arrow function: it can return early, and what it declares shadows the
+ *       parameters (Oracle: "var x" in the body hides the parameter x). With OUT and INOUT
+ *       parameters the wrapper returns [result, out1, ...]; OUT starts as null.
  *   <li>A body that uses await runs as an async function; the promise has settled when control
  *       returns to the host (pending jobs run then), and {@code settle} reads it.
  * </ul>
@@ -63,6 +64,10 @@ final class JsOracle {
       int prefix, String name) {}
 
   private static final Pattern AWAIT = Pattern.compile("\\bawait\\b");
+
+  /** Name of the wrapper function around the body's arrow function; its frame
+      is not counted against the frame limit (the arrow is the routine's). */
+  static final String WRAPPER = "$mle$routine";
 
   /** Converters used by the wrappers, written in JavaScript; $o holds the session options. */
   static Value helpers(Context c) {
@@ -135,7 +140,7 @@ final class JsOracle {
     StringBuilder pre = new StringBuilder("(function($c){const $G=globalThis;return ");
     boolean async = AWAIT.matcher(body).find();
     if (async) pre.append("async ");
-    pre.append("function(");
+    pre.append("function " + WRAPPER + "(");
     for (int i = 0; i < n; i++) pre.append(i == 0 ? "" : ",").append("$a").append(i);
     pre.append("){\"use strict\";const globalThis=Object.create($G);");
     Values.ParamType[] types = new Values.ParamType[n];
@@ -151,11 +156,13 @@ final class JsOracle {
     }
     if (n > 0) pre.append(';');
     int[] outs = new int[outCount];
+    // The body runs in an arrow function: it may return early, and its own
+    // declarations (Oracle's myfunc: "var x") shadow the parameters.
+    pre.append("const $r=").append(async ? "await(async()=>{" : "(()=>{");
     StringBuilder post = new StringBuilder("\n");
     if (outCount == 0) {
-      post.append("}})");
+      post.append("})();return $r;}})");
     } else {
-      pre.append("const $r=").append(async ? "await(async()=>{" : "(()=>{");
       post.append("})();return[$r");
       for (int i = 0, k = 0; i < n; i++)
         if (params.get(i).mode() != Wire.MODE_IN) {

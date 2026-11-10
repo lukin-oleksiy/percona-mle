@@ -97,7 +97,7 @@ class Session {
 
   explicit Session(MYSQL_THD thd) : m_thd(thd) {}
 
-  std::string principal() const;
+  const std::string &principal() const;
   /** The principal's worker, started (and given the options) if needed;
       nullptr after reporting the error. */
   Slot *worker_for(const std::string &principal, const Routine &routine);
@@ -116,6 +116,13 @@ class Session {
 
   MYSQL_THD m_thd;
   std::map<std::string, Slot> m_workers;
+  /** principal() of the last call, by the security context's identity. */
+  mutable const void *m_principal_sctx = nullptr;
+  mutable const char *m_principal_user = nullptr;
+  mutable const char *m_principal_host = nullptr;
+  mutable std::string m_principal;
+  /** Argument buffer of the top-level call, reused. */
+  std::vector<mle::Value> m_args;
   mle::OptionsMsg m_options;
   bool m_options_bound = false;
   std::string m_out;

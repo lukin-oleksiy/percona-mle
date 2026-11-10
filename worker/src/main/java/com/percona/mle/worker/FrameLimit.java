@@ -64,6 +64,8 @@ public final class FrameLimit extends TruffleInstrument {
     if (!env.getOptions().get(ENABLED)) return;
     SourceSectionFilter filter = SourceSectionFilter.newBuilder()
         .tagIs(StandardTags.RootTag.class)
+        // The wrapper around a body is not the routine's code (JsOracle).
+        .rootNameIs(name -> !JsOracle.WRAPPER.equals(name))
         .sourceIs(s -> {
           URI uri = s.getURI();
           return uri != null && Polyglot.ROUTINE_SCHEME.equals(uri.getScheme());

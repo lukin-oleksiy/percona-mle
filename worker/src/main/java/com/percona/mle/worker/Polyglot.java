@@ -656,6 +656,7 @@ final class Polyglot {
       var src = loc.getSource();
       if (!isRoutineSource(src)) continue;
       String root = f.getRootName() == null ? "" : f.getRootName();
+      if (root.equals(JsOracle.WRAPPER)) continue;  // ours, not the routine's
       int line = loc.getStartLine();
       frames.add(new Dispatcher.Frame(root, src.getName(), line, bodyColumn(src, line, loc.getStartColumn()),
           loc.getEndLine() == line ? bodyColumn(src, line, loc.getEndColumn()) : loc.getEndColumn()));

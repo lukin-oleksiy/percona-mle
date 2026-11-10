@@ -88,28 +88,6 @@ class Hooks : public mle::CallHooks {
   MYSQL_THD m_thd;
 };
 
-/** The zone of the system (time_zone = SYSTEM): an IANA name if known,
-    else the current UTC offset. */
-std::string system_time_zone() {
-  char target[PATH_MAX];
-  const ssize_t n = readlink("/etc/localtime", target, sizeof target - 1);
-  if (n > 0) {
-    const std::string path(target, static_cast<size_t>(n));
-    const size_t at = path.find("zoneinfo/");
-    if (at != std::string::npos) return path.substr(at + 9);
-  }
-  if (const char *tz = getenv("TZ"); tz != nullptr && *tz != '\0')
-    return tz[0] == ':' ? tz + 1 : tz;
-  const time_t now = time(nullptr);
-  struct tm local;
-  localtime_r(&now, &local);
-  const long off = local.tm_gmtoff;
-  char b[48];
-  snprintf(b, sizeof b, "%c%02ld:%02ld", off < 0 ? '-' : '+', labs(off) / 3600,
-           labs(off) % 3600 / 60);
-  return b;
-}
-
 std::string session_time_zone(MYSQL_THD thd) {
   char buffer[256];
   void *value = buffer;
@@ -198,17 +176,30 @@ Session::~Session() {
   g_counters.sessions = --g_sessions;
 }
 
-std::string Session::principal() const {
+const std::string &Session::principal() const {
   Security_context_handle sctx = nullptr;
   MYSQL_LEX_CSTRING user{"", 0}, host{"", 0};
   if (mysql_service_mysql_thd_security_context->get(m_thd, &sctx) ||
       mysql_service_mysql_security_context_options->get(sctx, "priv_user",
                                                         &user) ||
       mysql_service_mysql_security_context_options->get(sctx, "priv_host",
-                                                        &host))
-    return "?";
-  return std::string(user.str, user.length) + "@" +
-         std::string(host.str, host.length);
+                                                        &host)) {
+    m_principal_sctx = nullptr;
+    m_principal = "?";
+    return m_principal;
+  }
+  // The same security context with the same account strings: the same
+  // principal (the strings are the context's own buffers).
+  if (sctx != m_principal_sctx || user.str != m_principal_user ||
+      host.str != m_principal_host) {
+    m_principal.assign(user.str, user.length);
+    m_principal += '@';
+    m_principal.append(host.str, host.length);
+    m_principal_sctx = sctx;
+    m_principal_user = user.str;
+    m_principal_host = host.str;
+  }
+  return m_principal;
 }
 
 // ------------------------------------------------------------- workers
@@ -311,9 +302,9 @@ bool Session::parse(Routine &routine) {
 
 bool Session::execute(Routine &routine) {
   m_stack.clear();  // Oracle: the trace of the last call only
-  std::vector<Value> args;
+  std::vector<Value> args = std::move(m_args);  // reused; a nested call allocates
   if (!routine.read_args(&args)) return false;
-  const std::string who = principal();
+  const std::string &who = principal();
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr || !prepare_in(who, *slot, routine)) return false;
 
@@ -328,11 +319,11 @@ bool Session::execute(Routine &routine) {
   }
   --g_counters.threads;
   keep_console(result);
-  if (s != Status::kOk) {
-    report(who, s, result, error, routine, &args);
-    return false;
-  }
-  return routine.store_results(result);
+  const bool ok = s == Status::kOk;
+  if (!ok) report(who, s, result, error, routine, &args);
+  args.clear();
+  m_args = std::move(args);
+  return ok && routine.store_results(result);
 }
 
 void Session::forget(const Routine &routine) {

@@ -240,7 +240,7 @@ Worker::Wait Worker::receive(Message *m, CallHooks *hooks, int timeout_ms,
     switch (a.add(h, m_process->arena())) {
       case Assembler::Step::kDone:
         m->h = a.header();
-        m->body = a.body();
+        m->body = a.release_body();
         return Wait::kMessage;
       case Assembler::Step::kError:
         *error = "the MLE worker broke the protocol: " + a.error();
@@ -436,7 +436,11 @@ Status Worker::call(uint64_t routine_id, uint32_t events,
     return Status::kInternal;
   }
   const RoutineInfo info = it->second;  // a nested DROP may erase it
-  std::string body;
+  // The top-level call reuses one buffer (no allocation per call); a nested
+  // call, made while the outer one waits, gets its own.
+  std::string nested;
+  std::string &body = m_depth == 0 ? m_call_body : nested;
+  body.clear();
   Writer w(&body);
   w.u64(routine_id);
   w.u32(events);

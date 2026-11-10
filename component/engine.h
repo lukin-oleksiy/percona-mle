@@ -101,6 +101,14 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker);
 long engine_memory_used_percent();
 
 /**
+  mysqld's system time zone (time_zone = SYSTEM), as Java and the workers
+  understand it: an IANA name (TZ=Area/City or /etc/localtime), else the
+  current UTC offset "+hh:mm" (POSIX TZ strings like GMT-3 mean UTC+3 to
+  libc but UTC-3 to Java).
+*/
+std::string system_time_zone();
+
+/**
   mle.cgroup_base = AUTO: the parent of mysqld's cgroup, if it is delegated
   to mysqld (writable) and has no processes of its own (systemd Delegate=yes
   with DelegateSubgroup=). Otherwise "" and *why.

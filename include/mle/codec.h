@@ -297,6 +297,8 @@ class Assembler {
   /** The first chunk's header (total_len is the body size). */
   const wire::MessageHeader &header() const { return m_first; }
   const std::string &body() const { return m_body; }
+  /** The body, moved out (the Assembler is done with it). */
+  std::string release_body() { return std::move(m_body); }
   const std::string &error() const { return m_error; }
   void reset();
 

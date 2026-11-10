@@ -19,6 +19,10 @@
 
 #include <unistd.h>
 
+#include <climits>
+#include <cstdlib>
+#include <ctime>
+
 #include <atomic>
 #include <fstream>
 #include <memory>
@@ -88,6 +92,30 @@ std::string check_layout(const mle::Layout &l, const Settings &s) {
 
 }  // namespace
 
+std::string system_time_zone() {
+  if (const char *tz = getenv("TZ"); tz != nullptr && *tz != '\0') {
+    const std::string zone = tz[0] == ':' ? tz + 1 : tz;
+    if (zone.find('/') != std::string::npos && zone[0] != '/') return zone;
+    if (zone == "UTC") return zone;
+  } else {
+    char target[PATH_MAX];
+    const ssize_t n = readlink("/etc/localtime", target, sizeof target - 1);
+    if (n > 0) {
+      const std::string path(target, static_cast<size_t>(n));
+      const size_t at = path.find("zoneinfo/");
+      if (at != std::string::npos) return path.substr(at + 9);
+    }
+  }
+  const time_t now = time(nullptr);
+  struct tm local;
+  localtime_r(&now, &local);
+  const long off = local.tm_gmtoff;
+  char b[48];
+  snprintf(b, sizeof b, "%c%02ld:%02ld", off < 0 ? '-' : '+', labs(off) / 3600,
+           labs(off) % 3600 / 60);
+  return b;
+}
+
 std::string auto_cgroup_base(std::string *why) {
   const std::string self = read_file("/proc/self/cgroup");
   const size_t at = self.find("0::");
@@ -149,6 +177,11 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   options.memory_max = s.memory_max;
   options.heap = std::to_string(s.heap_max >> 20) + "m";
   options.pool_size = s.pool_size;
+  // JavaScript's local time (Date.toString(), getHours()) follows mysqld's
+  // system time zone; the worker cannot read the system's zone itself.
+  const std::string zone = system_time_zone();
+  options.extra_jvm_options.push_back(
+      "-Duser.timezone=" + (zone[0] == '+' || zone[0] == '-' ? "GMT" + zone : zone));
   config.classes = {mle::jvm_worker_class(layout, options)};
 
   std::string launcher_error;

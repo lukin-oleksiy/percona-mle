@@ -1,0 +1,180 @@
+--echo #
+--echo # component_mle (P4-W6): the behaviour of Oracle MySQL's documented
+--echo # JavaScript examples (MySQL 9.7 manual, chapter 27.3: add_nos, js_pow and
+--echo # a trigger, gcd and argument coercion, d1, the session state example,
+--echo # recursive_sum, myfunc, dot_product), with the results the manual shows.
+--echo # The routines are written for this test; the values are Oracle's.
+--echo #
+--source include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+--echo # D-3 (ours, not Oracle's): CREATE needs the language privilege.
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+
+--echo #
+--echo # add_nos (27.3): 64, 5, 27.
+--echo #
+CREATE FUNCTION add_nos(arg1 INT, arg2 INT) RETURNS INT LANGUAGE JAVASCRIPT
+  AS $$ return arg1 + arg2 $$;
+SET @x = 2;
+SELECT add_nos(12, 52) AS r1, add_nos(POW(2, @x), 1) AS r2,
+  POW(add_nos(@x, @@server_id), add_nos(@x, 1)) AS r3;
+
+--echo #
+--echo # js_pow (27.3.1) and a BEFORE INSERT trigger (27.3.12): INT columns
+--echo # round 2.49 to 2 and 4.725 to 5 before JavaScript sees them.
+--echo #
+CREATE FUNCTION js_pow(arg1 INT, arg2 INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+  let x = Math.pow(arg1, arg2);
+  return x;
+$$;
+SELECT js_pow(2, 3);
+CREATE TABLE t2 (c1 INT, c2 INT, c3 INT);
+CREATE TRIGGER jst BEFORE INSERT ON t2 FOR EACH ROW
+  SET NEW.c2 = js_pow(NEW.c1, 2), NEW.c3 = js_pow(NEW.c1, 3);
+INSERT INTO t2 (c1) VALUES (1), (2.49), (-3), (4.725);
+TABLE t2;
+
+--echo #
+--echo # gcd (27.3.12): table columns, WHERE, and coercion of INT arguments
+--echo # (500.3 -> 500: 100; 500.5 -> 501: 3).
+--echo #
+--echo # Oracle's example quotes the body with a tagged dollar quote (mle);
+--echo # mysqltest skips semicolons only inside plain dollar quotes.
+DELIMITER |;
+CREATE FUNCTION gcd(a INT, b INT) RETURNS INT LANGUAGE JAVASCRIPT AS $mle$
+  let x = Math.abs(a);
+  let y = Math.abs(b);
+  while (y) {
+    const t = y;
+    y = x % y;
+    x = t;
+  }
+  return x;
+$mle$|
+DELIMITER ;|
+SELECT gcd(75, 220), gcd(75, 225);
+CREATE TABLE t1 (c1 INT, c2 INT);
+INSERT INTO t1 VALUES (12, 70), (81, 9);
+SELECT c1, c2, gcd(c1, c2) FROM t1 ORDER BY c1;
+SELECT c1, c2 FROM t1 WHERE gcd(c1, c2) > 5;
+SELECT gcd(500.3, 600), gcd(500.5, 600);
+
+--echo #
+--echo # d1 (27.3.12): an OUT value too long for VARCHAR(25) is an error (not
+--echo # truncated); VARCHAR(50) holds Date().toString().
+--echo #
+CREATE PROCEDURE d1(OUT res VARCHAR(25)) LANGUAGE JAVASCRIPT
+  AS $$ res = new Date().toString() $$;
+--error ER_DATA_TOO_LONG
+CALL d1(@today);
+DROP PROCEDURE d1;
+CREATE PROCEDURE d1(OUT res VARCHAR(50)) LANGUAGE JAVASCRIPT
+  AS $$ res = new Date().toString() $$;
+CALL d1(@today);
+--replace_regex /^[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{2} [0-9]{4} [0-9:]{8} /<date> /
+SELECT @today;
+
+--echo #
+--echo # The session state example (27.3.5): output accumulates, a runtime
+--echo # error keeps a stack trace, the counts, and mle_session_reset().
+--echo #
+DELIMITER |;
+CREATE PROCEDURE mle_states()
+BEGIN
+  SELECT mle_session_state("is_active") AS is_active,
+    mle_session_state("stdout") AS stdout,
+    mle_session_state("stderr") AS stderr,
+    mle_session_state("stack_trace") AS stack_trace,
+    mle_session_state("stored_functions") AS stored_functions,
+    mle_session_state("stored_procedures") AS stored_procedures,
+    mle_session_state("stored_programs") AS stored_programs;
+END|
+DELIMITER ;|
+--connect (con2, localhost, root,,test)
+CALL mle_states();
+CREATE PROCEDURE pc1() LANGUAGE JAVASCRIPT AS $$
+  for (let i = 1; i <= 3; i++) {
+    console.log(`This is message #${i} to stdout.`);
+    console.error(`This is message #${i} to stderr.`);
+  }
+$$;
+--echo # CREATE starts the MLE session (is_active 1), nothing cached yet.
+CALL mle_states();
+CALL pc1();
+CALL mle_states();
+CALL pc1();
+CALL mle_states();
+CREATE PROCEDURE pc2() LANGUAGE JAVASCRIPT AS $$
+  for (let i = 1; i <= 3; i++) {
+    console.lob(`This is message #${i} to stdout.`);
+    console.error(`This is message #${i} to stderr.`);
+  }
+$$;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CALL pc2();
+CALL mle_states();
+SELECT mle_session_reset();
+CALL mle_states();
+--disconnect con2
+--connection con1
+
+--echo #
+--echo # recursive_sum (27.3.11): 1, 3, 210, 5050; 1000 exceeds the frame limit.
+--echo #
+CREATE FUNCTION recursive_sum(my_num INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+  function sum(n) {
+    if (n <= 1) return n;
+    return n + sum(--n);
+  }
+  return sum(my_num);
+$$;
+SELECT recursive_sum(1), recursive_sum(2), recursive_sum(20), recursive_sum(100);
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT recursive_sum(1000);
+
+--echo #
+--echo # myfunc (27.3.4): "var x" in the body hides the argument: NaN.
+--echo #
+CREATE FUNCTION myfunc(x INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+  var x
+
+  return 2*x
+$$;
+--error ER_LANGUAGE_COMPONENT
+SELECT myfunc(10);
+
+--echo #
+--echo # dot_product (27.3.12): VECTOR arguments; 20000, 250, 335000.
+--echo #
+CREATE FUNCTION dot_product(a VECTOR, b VECTOR) RETURNS FLOAT LANGUAGE JAVASCRIPT AS $$
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += a[i] * b[i];
+  return sum;
+$$;
+CREATE TABLE v2 (c1 VECTOR(3), c2 VECTOR(3));
+INSERT INTO v2 VALUES
+  (STRING_TO_VECTOR('[50, 100, 50]'), STRING_TO_VECTOR('[0, 200, 0]')),
+  (STRING_TO_VECTOR('[100, 0, -50]'), STRING_TO_VECTOR('[5, 10, 5]')),
+  (STRING_TO_VECTOR('[250, 350, 450]'), STRING_TO_VECTOR('[-150, 1000, 50]'));
+SELECT VECTOR_TO_STRING(c1) AS c1, VECTOR_TO_STRING(c2) AS c2,
+  dot_product(c1, c2) AS dot FROM v2;
+
+--connection default
+--disconnect con1
+--source include/wait_until_count_sessions.inc
+DROP TABLE t1, t2, v2;
+DROP FUNCTION add_nos;
+DROP FUNCTION js_pow;
+DROP FUNCTION gcd;
+DROP PROCEDURE d1;
+DROP PROCEDURE mle_states;
+DROP PROCEDURE pc1;
+DROP PROCEDURE pc2;
+DROP FUNCTION recursive_sum;
+DROP FUNCTION myfunc;
+DROP FUNCTION dot_product;
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

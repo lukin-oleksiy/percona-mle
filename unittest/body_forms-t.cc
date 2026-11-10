@@ -434,6 +434,20 @@ TEST_F(MleBodyForms, JsCompileErrors) {
   EXPECT_NE(err.find("not a JavaScript identifier"), std::string::npos) << err;
 }
 
+TEST_F(MleBodyForms, JsBodyDeclarationsShadowParameters) {
+  // Oracle's myfunc: "var x" in the body hides the parameter x (NaN).
+  const uint64_t id = prepare("js", "myfunc", "\n  var x\n\n  return 2*x\n",
+                              {{"x", ParamMode::kIn, kInt}}, kInt);
+  ASSERT_NE(id, 0u);
+  ResultMsg r = call(id, {Value::i64(10)});
+  EXPECT_EQ(error_of(r), "Cannot convert value 'NaN' to INT from MLE");
+  // let/const of a parameter's name is allowed too (a new scope).
+  const uint64_t shadow = prepare("js", "sh", "let a = 5; return a;",
+                                  {{"a", ParamMode::kIn, kInt}}, kInt);
+  ASSERT_NE(shadow, 0u);
+  EXPECT_EQ(ret(shadow, {Value::i64(1)}), Value::i64(5));
+}
+
 TEST_F(MleBodyForms, JsFrameLimit) {
   // Oracle: at most 1000 frames of routine code; the routine's own frame
   // counts, the worker's helpers do not.
@@ -451,6 +465,24 @@ TEST_F(MleBodyForms, JsFrameLimit) {
   EXPECT_EQ(r.error->language, "js");
   // The count starts again with each call.
   EXPECT_EQ(ret(id, {Value::i64(998)}), Value::i64(998 * 999 / 2));
+  // Oracle's recursive_sum: sum(1000) recurses to sum(1); 1000 frames + 1.
+  const uint64_t oracle = prepare("js", "recursive_sum",
+                                  "function sum(n) { if (n <= 1) return n; return n + sum(--n); }\n"
+                                  "return sum(my_num);",
+                                  {{"my_num", ParamMode::kIn, kInt}}, kInt);
+  ASSERT_NE(oracle, 0u);
+  EXPECT_EQ(ret(oracle, {Value::i64(100)}), Value::i64(5050));
+  r = call(oracle, {Value::i64(1000)}, &s);
+  EXPECT_EQ(error_of(r), "Maximum frame limit of 1000 exceeded. Frames on stack: 1001.");
+  // With OUT parameters the routine is still one frame.
+  const uint64_t out = prepare("js", "rs_out",
+                               "function sum(k) { return k <= 0 ? 0 : k + sum(k - 1); }\nr = sum(a);",
+                               {{"a", ParamMode::kIn, kInt}, {"r", ParamMode::kOut, kBigint}},
+                               std::nullopt);
+  ASSERT_NE(out, 0u);
+  EXPECT_EQ(call(out, {Value::i64(998), Value::null()}, &s).out_params.size(), 1u);
+  r = call(out, {Value::i64(999), Value::null()}, &s);
+  EXPECT_EQ(error_of(r), "Maximum frame limit of 1000 exceeded. Frames on stack: 1001.");
   r = call(id, {Value::i64(5000)}, &s);
   EXPECT_EQ(error_of(r), "Maximum frame limit of 1000 exceeded. Frames on stack: 1001.");
 }

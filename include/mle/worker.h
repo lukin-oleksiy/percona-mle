@@ -183,6 +183,8 @@ class Worker {
   bool m_killed_by_us = false;
   std::unordered_map<uint64_t, RoutineInfo> m_routines;
   std::string m_buf;
+  /** Body of the top-level CALL, reused. */
+  std::string m_call_body;
 };
 
 }  // namespace mle

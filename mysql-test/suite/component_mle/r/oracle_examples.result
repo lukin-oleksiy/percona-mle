@@ -1,0 +1,226 @@
+#
+# component_mle (P4-W6): the behaviour of Oracle MySQL's documented
+# JavaScript examples (MySQL 9.7 manual, chapter 27.3: add_nos, js_pow and
+# a trigger, gcd and argument coercion, d1, the session state example,
+# recursive_sum, myfunc, dot_product), with the results the manual shows.
+# The routines are written for this test; the values are Oracle's.
+#
+INSTALL COMPONENT "file://component_mle";
+# D-3 (ours, not Oracle's): CREATE needs the language privilege.
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+#
+# add_nos (27.3): 64, 5, 27.
+#
+CREATE FUNCTION add_nos(arg1 INT, arg2 INT) RETURNS INT LANGUAGE JAVASCRIPT
+AS $$ return arg1 + arg2 $$;
+SET @x = 2;
+SELECT add_nos(12, 52) AS r1, add_nos(POW(2, @x), 1) AS r2,
+POW(add_nos(@x, @@server_id), add_nos(@x, 1)) AS r3;
+r1	r2	r3
+64	5	27
+#
+# js_pow (27.3.1) and a BEFORE INSERT trigger (27.3.12): INT columns
+# round 2.49 to 2 and 4.725 to 5 before JavaScript sees them.
+#
+CREATE FUNCTION js_pow(arg1 INT, arg2 INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+let x = Math.pow(arg1, arg2);
+return x;
+$$;
+SELECT js_pow(2, 3);
+js_pow(2, 3)
+8
+CREATE TABLE t2 (c1 INT, c2 INT, c3 INT);
+CREATE TRIGGER jst BEFORE INSERT ON t2 FOR EACH ROW
+SET NEW.c2 = js_pow(NEW.c1, 2), NEW.c3 = js_pow(NEW.c1, 3);
+INSERT INTO t2 (c1) VALUES (1), (2.49), (-3), (4.725);
+TABLE t2;
+c1	c2	c3
+1	1	1
+2	4	8
+-3	9	-27
+5	25	125
+#
+# gcd (27.3.12): table columns, WHERE, and coercion of INT arguments
+# (500.3 -> 500: 100; 500.5 -> 501: 3).
+#
+# Oracle's example quotes the body with a tagged dollar quote (mle);
+# mysqltest skips semicolons only inside plain dollar quotes.
+CREATE FUNCTION gcd(a INT, b INT) RETURNS INT LANGUAGE JAVASCRIPT AS $mle$
+let x = Math.abs(a);
+let y = Math.abs(b);
+while (y) {
+const t = y;
+y = x % y;
+x = t;
+}
+return x;
+$mle$|
+SELECT gcd(75, 220), gcd(75, 225);
+gcd(75, 220)	gcd(75, 225)
+5	75
+CREATE TABLE t1 (c1 INT, c2 INT);
+INSERT INTO t1 VALUES (12, 70), (81, 9);
+SELECT c1, c2, gcd(c1, c2) FROM t1 ORDER BY c1;
+c1	c2	gcd(c1, c2)
+12	70	2
+81	9	9
+SELECT c1, c2 FROM t1 WHERE gcd(c1, c2) > 5;
+c1	c2
+81	9
+SELECT gcd(500.3, 600), gcd(500.5, 600);
+gcd(500.3, 600)	gcd(500.5, 600)
+100	3
+#
+# d1 (27.3.12): an OUT value too long for VARCHAR(25) is an error (not
+# truncated); VARCHAR(50) holds Date().toString().
+#
+CREATE PROCEDURE d1(OUT res VARCHAR(25)) LANGUAGE JAVASCRIPT
+AS $$ res = new Date().toString() $$;
+CALL d1(@today);
+ERROR 22001: Data too long for column 'res' at row 1
+DROP PROCEDURE d1;
+CREATE PROCEDURE d1(OUT res VARCHAR(50)) LANGUAGE JAVASCRIPT
+AS $$ res = new Date().toString() $$;
+CALL d1(@today);
+SELECT @today;
+@today
+<date> GMT+0300 (GMT+3)
+#
+# The session state example (27.3.5): output accumulates, a runtime
+# error keeps a stack trace, the counts, and mle_session_reset().
+#
+CREATE PROCEDURE mle_states()
+BEGIN
+SELECT mle_session_state("is_active") AS is_active,
+mle_session_state("stdout") AS stdout,
+mle_session_state("stderr") AS stderr,
+mle_session_state("stack_trace") AS stack_trace,
+mle_session_state("stored_functions") AS stored_functions,
+mle_session_state("stored_procedures") AS stored_procedures,
+mle_session_state("stored_programs") AS stored_programs;
+END|
+CALL mle_states();
+is_active	stdout	stderr	stack_trace	stored_functions	stored_procedures	stored_programs
+0				0	0	0
+CREATE PROCEDURE pc1() LANGUAGE JAVASCRIPT AS $$
+for (let i = 1; i <= 3; i++) {
+console.log(`This is message #${i} to stdout.`);
+console.error(`This is message #${i} to stderr.`);
+}
+$$;
+# CREATE starts the MLE session (is_active 1), nothing cached yet.
+CALL mle_states();
+is_active	stdout	stderr	stack_trace	stored_functions	stored_procedures	stored_programs
+1				0	0	0
+CALL pc1();
+CALL mle_states();
+is_active	stdout	stderr	stack_trace	stored_functions	stored_procedures	stored_programs
+1	This is message #1 to stdout.
+This is message #2 to stdout.
+This is message #3 to stdout.
+	This is message #1 to stderr.
+This is message #2 to stderr.
+This is message #3 to stderr.
+		0	1	1
+CALL pc1();
+CALL mle_states();
+is_active	stdout	stderr	stack_trace	stored_functions	stored_procedures	stored_programs
+1	This is message #1 to stdout.
+This is message #2 to stdout.
+This is message #3 to stdout.
+This is message #1 to stdout.
+This is message #2 to stdout.
+This is message #3 to stdout.
+	This is message #1 to stderr.
+This is message #2 to stderr.
+This is message #3 to stderr.
+This is message #1 to stderr.
+This is message #2 to stderr.
+This is message #3 to stderr.
+		0	1	1
+CREATE PROCEDURE pc2() LANGUAGE JAVASCRIPT AS $$
+for (let i = 1; i <= 3; i++) {
+console.lob(`This is message #${i} to stdout.`);
+console.error(`This is message #${i} to stderr.`);
+}
+$$;
+CALL pc2();
+ERROR HY000: JavaScript> TypeError: (intermediate value).lob is not a function
+CALL mle_states();
+is_active	stdout	stderr	stack_trace	stored_functions	stored_procedures	stored_programs
+1	This is message #1 to stdout.
+This is message #2 to stdout.
+This is message #3 to stdout.
+This is message #1 to stdout.
+This is message #2 to stdout.
+This is message #3 to stdout.
+	This is message #1 to stderr.
+This is message #2 to stderr.
+This is message #3 to stderr.
+This is message #1 to stderr.
+This is message #2 to stderr.
+This is message #3 to stderr.
+	<js> pc2:3:1-47
+	0	2	2
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+CALL mle_states();
+is_active	stdout	stderr	stack_trace	stored_functions	stored_procedures	stored_programs
+0				0	0	0
+#
+# recursive_sum (27.3.11): 1, 3, 210, 5050; 1000 exceeds the frame limit.
+#
+CREATE FUNCTION recursive_sum(my_num INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+function sum(n) {
+if (n <= 1) return n;
+return n + sum(--n);
+}
+return sum(my_num);
+$$;
+SELECT recursive_sum(1), recursive_sum(2), recursive_sum(20), recursive_sum(100);
+recursive_sum(1)	recursive_sum(2)	recursive_sum(20)	recursive_sum(100)
+1	3	210	5050
+SELECT recursive_sum(1000);
+ERROR HY000: JavaScript> Maximum frame limit of 1000 exceeded. Frames on stack: 1001.
+#
+# myfunc (27.3.4): "var x" in the body hides the argument: NaN.
+#
+CREATE FUNCTION myfunc(x INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+var x
+return 2*x
+$$;
+SELECT myfunc(10);
+ERROR HY000: MLE-Type> Cannot convert value 'NaN' to INT from MLE in 'myfunc(10)'
+#
+# dot_product (27.3.12): VECTOR arguments; 20000, 250, 335000.
+#
+CREATE FUNCTION dot_product(a VECTOR, b VECTOR) RETURNS FLOAT LANGUAGE JAVASCRIPT AS $$
+let sum = 0;
+for (let i = 0; i < a.length; i++) sum += a[i] * b[i];
+return sum;
+$$;
+CREATE TABLE v2 (c1 VECTOR(3), c2 VECTOR(3));
+INSERT INTO v2 VALUES
+(STRING_TO_VECTOR('[50, 100, 50]'), STRING_TO_VECTOR('[0, 200, 0]')),
+(STRING_TO_VECTOR('[100, 0, -50]'), STRING_TO_VECTOR('[5, 10, 5]')),
+(STRING_TO_VECTOR('[250, 350, 450]'), STRING_TO_VECTOR('[-150, 1000, 50]'));
+SELECT VECTOR_TO_STRING(c1) AS c1, VECTOR_TO_STRING(c2) AS c2,
+dot_product(c1, c2) AS dot FROM v2;
+c1	c2	dot
+[5.00000e+01,1.00000e+02,5.00000e+01]	[0.00000e+00,2.00000e+02,0.00000e+00]	20000
+[1.00000e+02,0.00000e+00,-5.00000e+01]	[5.00000e+00,1.00000e+01,5.00000e+00]	250
+[2.50000e+02,3.50000e+02,4.50000e+02]	[-1.50000e+02,1.00000e+03,5.00000e+01]	335000
+DROP TABLE t1, t2, v2;
+DROP FUNCTION add_nos;
+DROP FUNCTION js_pow;
+DROP FUNCTION gcd;
+DROP PROCEDURE d1;
+DROP PROCEDURE mle_states;
+DROP PROCEDURE pc1;
+DROP PROCEDURE pc2;
+DROP FUNCTION recursive_sum;
+DROP FUNCTION myfunc;
+DROP FUNCTION dot_product;
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
