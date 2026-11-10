@@ -59,6 +59,12 @@
 
 namespace mle::wire {
 
+/** File descriptors a worker process starts with (besides 0, 1, 2, which
+    are /dev/null or inherited for debugging): the shared memory region and
+    its end of the control socket. */
+constexpr int kMailboxFd = 3;
+constexpr int kControlFd = 4;
+
 /** "MLE1" read as a little-endian u32. */
 constexpr uint32_t kMagic = 0x31454c4d;
 constexpr uint32_t kVersion = 1;

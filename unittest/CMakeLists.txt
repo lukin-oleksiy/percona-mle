@@ -22,6 +22,7 @@ INCLUDE_DIRECTORIES(SYSTEM ${GMOCK_INCLUDE_DIRS})
 SET(MLE_TESTS
   codec
   codec_fuzz
+  launcher
   )
 
 FOREACH(test ${MLE_TESTS})
@@ -30,3 +31,14 @@ FOREACH(test ${MLE_TESTS})
     LINK_LIBRARIES mle_host gunit_small
     )
 ENDFOREACH()
+
+# A minimal worker (no GraalVM) for the launcher tests.
+MYSQL_ADD_EXECUTABLE(mle_test_worker mle_test_worker.cc
+  LINK_LIBRARIES mle_host
+  SKIP_INSTALL
+  )
+TARGET_COMPILE_DEFINITIONS(mle_launcher-t PRIVATE
+  MLE_LAUNCHER_EXE="$<TARGET_FILE:mle_launcher>"
+  MLE_TEST_WORKER_EXE="$<TARGET_FILE:mle_test_worker>"
+  )
+ADD_DEPENDENCIES(mle_launcher-t mle_launcher mle_test_worker)
