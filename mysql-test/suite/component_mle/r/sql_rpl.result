@@ -1,0 +1,90 @@
+#
+# component_mle (P5-W5): replication of what MLE routines change with
+# SQL. The component is installed on the source only: with ROW the
+# replica applies the rows, with STATEMENT the routines' inner statements
+# (as for SQL procedures, the CALL itself is not logged); the routine
+# definitions replicate and the replica needs no MLE.
+#
+include/rpl/init_source_replica.inc
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+[connection master]
+CREATE TABLE t1 (id INT PRIMARY KEY, v VARCHAR(40), n DOUBLE) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 'one', 1);
+# The routines are created and called in their own connection (UNINSTALL
+# needs no MLE sessions).
+CREATE PROCEDURE js_dml() LANGUAGE JAVASCRIPT AS $$
+session.runSql("INSERT INTO t1 VALUES (2, 'js', 2.5)")
+const p = session.prepare('UPDATE t1 SET v = CONCAT(v, ?) WHERE id = ?')
+p.bind('!', 1).execute()
+p.bind('?', 2).execute()
+p.deallocate()
+session.runSql('DELETE FROM t1 WHERE id = ?', [99])
+$$;
+CREATE PROCEDURE py_dml() LANGUAGE PYTHON AS $$
+[session.run_sql('INSERT INTO t1 VALUES (?, ?, ?)', [i, 'python %d' % i, i / 4]) for i in range(10, 13)]
+$$;
+CREATE PROCEDURE java_dml() LANGUAGE JAVA AS $$
+PreparedStatement p = Mle.session().prepare("INSERT INTO t1 VALUES (?, ?, ?)");
+for (int i = 20; i < 23; i++) p.bind(i, "java " + i, i * 1.5).execute();
+p.deallocate();
+$$;
+CREATE PROCEDURE js_commit() LANGUAGE JAVASCRIPT AS $$
+session.startTransaction()
+session.runSql("INSERT INTO t1 VALUES (30, 'committed inside', 0)")
+session.commit()
+$$;
+CREATE PROCEDURE js_insert(IN i INT) LANGUAGE JAVASCRIPT
+AS $$ session.runSql('INSERT INTO t1 VALUES (?, ?, 0)', [i, 'rolled back']) $$;
+CALL js_dml();
+CALL py_dml();
+CALL java_dml();
+CALL js_commit();
+START TRANSACTION;
+CALL js_insert(40);
+ROLLBACK;
+SELECT * FROM t1 ORDER BY id;
+id	v	n
+1	one!	1
+2	js?	2.5
+10	python 10	2.5
+11	python 11	2.75
+12	python 12	3
+20	java 20	30
+21	java 21	31.5
+22	java 22	33
+30	committed inside	0
+include/rpl/sync_to_replica.inc
+# The replica (no MLE): the same rows, the routine definitions, a healthy
+# applier.
+SELECT * FROM t1 ORDER BY id;
+id	v	n
+1	one!	1
+2	js?	2.5
+10	python 10	2.5
+11	python 11	2.75
+12	python 12	3
+20	java 20	30
+21	java 21	31.5
+22	java 22	33
+30	committed inside	0
+SELECT ROUTINE_NAME, EXTERNAL_LANGUAGE FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = 'test' ORDER BY ROUTINE_NAME;
+ROUTINE_NAME	EXTERNAL_LANGUAGE
+java_dml	JAVA
+js_commit	JAVASCRIPT
+js_dml	JAVASCRIPT
+js_insert	JAVASCRIPT
+py_dml	PYTHON
+Replica_SQL_Running: Yes
+MLE installed on the replica: 0
+# MLE routines can be dropped without MLE (as on the replica).
+DROP PROCEDURE js_dml;
+DROP PROCEDURE py_dml;
+DROP PROCEDURE java_dml;
+DROP PROCEDURE js_commit;
+DROP PROCEDURE js_insert;
+DROP TABLE t1;
+include/rpl/sync_to_replica.inc
+include/rpl/deinit.inc

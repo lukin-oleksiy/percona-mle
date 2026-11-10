@@ -1,0 +1,124 @@
+--echo #
+--echo # component_mle (P5-W5): SQL from routines in the server's situations
+--echo # (S-3): triggers, nesting across languages, recursion limits, the
+--echo # caller's transaction. Replication: sql_rpl.
+--echo #
+--source include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t1 (id INT PRIMARY KEY, v VARCHAR(40)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+CREATE TABLE t2 (id INT, v VARCHAR(40)) ENGINE=InnoDB;
+
+--connect (con1, localhost, root,,test)
+
+--echo #
+--echo # 1. Triggers: a function without SQL works; SQL in a function (also
+--echo #    when a trigger calls it) is refused, with or without parameters (the
+--echo #    server misses a function in a trigger for direct statements: the
+--echo #    component asks the prepared path); caught, the trigger goes on.
+--echo #
+CREATE FUNCTION js_label(i INT) RETURNS VARCHAR(40) LANGUAGE JAVASCRIPT AS $$ return 'row ' + i $$;
+CREATE FUNCTION js_lookup(i INT) RETURNS VARCHAR(40) LANGUAGE JAVASCRIPT
+  AS $$ return session.runSql('SELECT v FROM t1 WHERE id = ?', [i]).fetchOne().v $$;
+CREATE FUNCTION js_safe(i INT) RETURNS VARCHAR(40) LANGUAGE JAVASCRIPT AS $$
+  try { return session.runSql('SELECT 1').fetchOne()[0] } catch (e) { return 'no SQL here: ' + e.code }
+$$;
+CREATE TRIGGER t2_bi BEFORE INSERT ON t2 FOR EACH ROW SET NEW.v = js_label(NEW.id);
+INSERT INTO t2 (id) VALUES (1), (2);
+DROP TRIGGER t2_bi;
+CREATE TRIGGER t2_bi BEFORE INSERT ON t2 FOR EACH ROW SET NEW.v = js_lookup(NEW.id);
+--error ER_STMT_EXECUTION_NOT_ALLOWED_WITHIN_SP_OR_TRG_OR_UDF
+INSERT INTO t2 (id) VALUES (3);
+DROP TRIGGER t2_bi;
+CREATE TRIGGER t2_bi BEFORE INSERT ON t2 FOR EACH ROW SET NEW.v = js_safe(NEW.id);
+INSERT INTO t2 (id) VALUES (4);
+DROP TRIGGER t2_bi;
+SELECT * FROM t2 ORDER BY id;
+
+--echo #
+--echo # 2. Nesting across languages through the stored routine API:
+--echo #    JavaScript -> SQL -> Python -> SQL -> Java -> SQL.
+--echo #
+CREATE PROCEDURE java_l3(IN x INT, OUT r TEXT) LANGUAGE JAVA
+  AS $$ r[0] = "java(" + Mle.session().runSql("SELECT v FROM t1 WHERE id = ?", x).fetchOne().get(0) + ")"; $$;
+CREATE PROCEDURE py_l2(IN x INT, OUT r TEXT) LANGUAGE PYTHON AS $$
+a = mysql.arg()
+session.get_default_schema().get_procedure('java_l3')(x, a)
+r = 'python(' + a.val + ')'
+$$;
+CREATE PROCEDURE js_l1(IN x INT, OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const a = mysql.arg()
+  session.getDefaultSchema().getProcedure('py_l2')(x, a)
+  r = 'js(' + a.val + ')'
+$$;
+CALL js_l1(2, @r);
+SELECT @r;
+
+--echo #
+--echo # 3. Recursion: the server's max_sp_recursion_depth applies; the worker
+--echo #    allows 32 nested calls; the session stays usable after both errors.
+--echo #
+CREATE PROCEDURE js_rec(IN n INT, OUT r INT) LANGUAGE JAVASCRIPT AS $$
+  if (n == 0) { r = 0; return }
+  const a = mysql.arg()
+  session.getDefaultSchema().getProcedure('js_rec')(n - 1, a)
+  r = a.val + 1
+$$;
+--error ER_SP_RECURSION_LIMIT
+CALL js_rec(3, @r);
+SET max_sp_recursion_depth = 10;
+CALL js_rec(5, @r);
+SELECT @r;
+SET max_sp_recursion_depth = 255;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CALL js_rec(40, @r);
+CALL js_rec(4, @r);
+SELECT @r;
+SET max_sp_recursion_depth = DEFAULT;
+
+--echo #
+--echo # 4. The caller's transaction (as with SQL procedures): an inner COMMIT
+--echo #    commits the caller's work, an inner ROLLBACK undoes it; with
+--echo #    autocommit each inner statement commits on its own.
+--echo #
+CREATE PROCEDURE js_commit(IN i INT) LANGUAGE JAVASCRIPT
+  AS $$ session.runSql('INSERT INTO t1 VALUES (?, ?)', [i, 'inner']); session.commit() $$;
+CREATE PROCEDURE js_rollback(IN i INT) LANGUAGE JAVASCRIPT
+  AS $$ session.runSql('INSERT INTO t1 VALUES (?, ?)', [i, 'inner']); session.rollback() $$;
+CREATE PROCEDURE js_fail(IN i INT) LANGUAGE JAVASCRIPT
+  AS $$ session.runSql('INSERT INTO t1 VALUES (?, ?)', [i, 'kept']); throw new Error('failed after the insert') $$;
+START TRANSACTION;
+INSERT INTO t1 VALUES (10, 'outer');
+CALL js_commit(11);
+ROLLBACK;
+START TRANSACTION;
+INSERT INTO t1 VALUES (20, 'outer');
+CALL js_rollback(21);
+COMMIT;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CALL js_fail(30);
+START TRANSACTION;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CALL js_fail(40);
+ROLLBACK;
+SELECT * FROM t1 ORDER BY id;
+
+--disconnect con1
+--connection default
+DROP FUNCTION js_label;
+DROP FUNCTION js_lookup;
+DROP FUNCTION js_safe;
+DROP PROCEDURE java_l3;
+DROP PROCEDURE py_l2;
+DROP PROCEDURE js_l1;
+DROP PROCEDURE js_rec;
+DROP PROCEDURE js_commit;
+DROP PROCEDURE js_rollback;
+DROP PROCEDURE js_fail;
+DROP TABLE t1, t2;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
+--source include/wait_until_count_sessions.inc

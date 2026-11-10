@@ -203,7 +203,7 @@ CREATE FUNCTION f_sql() RETURNS INT LANGUAGE JAVA AS $$
 return ((Long) MleSql.execute(MleSql.newStatementId(), "SELECT 1", null, false, 0).rows().get(0)[0]).intValue();
 $$;
 SELECT f_sql();
-ERROR HY000: Executing SQL statement using Regular Statement Handle Interface is not allowed within stored function, trigger or loadable function (UDF).
+ERROR HY000: Executing SQL statement using Prepared Statement Handle Interface is not allowed within stored function, trigger or loadable function (UDF).
 # a function throwing an SqlError: SIGNAL is not possible there
 CREATE FUNCTION f_throw() RETURNS INT LANGUAGE JAVA AS $$
 throw new MleSqlException(1000, "45000", "from a function");

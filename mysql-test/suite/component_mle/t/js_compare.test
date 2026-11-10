@@ -1,0 +1,156 @@
+--echo #
+--echo # js_lang (Percona, V8 in mysqld: LANGUAGE JS) and component_mle
+--echo # (GraalJS in a worker process: LANGUAGE JAVASCRIPT, Oracle's form) side
+--echo # by side: the same bodies, what each engine gives. A comparison, not a
+--echo # conformance test: differences are expected and shown.
+--echo # Not compared here (they would stop a debug server): VECTOR arguments in
+--echo # js_lang (no VECTOR conversion: assert(false)), and V8 called from SQL
+--echo # inside an MLE routine (js_lang asserts when another component holds the
+--echo # session's KILL handler).
+--echo #
+--source include/have_mle_component.inc
+--source include/have_js_lang_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_js_lang";
+INSTALL COMPONENT "file://component_mle";
+INSTALL COMPONENT "file://component_lang_router";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_JS_ROUTINE ON *.* TO root@localhost;
+
+--connect (con1, localhost, root,,test)
+
+--echo #
+--echo # 1. Arguments: what JavaScript sees for each SQL type.
+--echo #
+let $show = (v) => v === null ? 'null' : (v instanceof Date ? 'Date ' + v.toISOString() : v instanceof DataView ? 'DataView ' + v.byteLength : v instanceof Set ? 'Set ' + [...v].join(',') : ArrayBuffer.isView(v) ? v.constructor.name + ' ' + Array.from(v).join(',') : typeof v === 'object' ? 'object ' + JSON.stringify(v) : typeof v + ' ' + String(v));
+--let $args = i BIGINT, u BIGINT UNSIGNED, d DECIMAL(10,3), f DOUBLE, s VARCHAR(10), b VARBINARY(4), j JSON, dt DATE, ts DATETIME(3), tm TIME, st SET('a','b','c'), bt BIT(8), y YEAR
+--let $body = const show = $show; return [i, u, d, f, s, b, j, dt, ts, tm, st, bt, y].map(show).join(' | ')
+--eval CREATE FUNCTION v8_args($args) RETURNS TEXT LANGUAGE JS AS \$\$ $body \$\$
+--eval CREATE FUNCTION mle_args($args) RETURNS TEXT LANGUAGE JAVASCRIPT AS \$\$ $body \$\$
+let $call = (9007199254740993, 18446744073709551615, 1.25, 2.5, 'héllo', x'00ff', '{"a": [1, 2]}', '2024-01-02', '2024-01-02 03:04:05.678', '12:34:56', 'a,c', b'101', 2024);
+SET time_zone = '+00:00';
+--eval SELECT REPLACE(v8_args$call, ' | ', '\n') AS js_lang
+--eval SELECT REPLACE(mle_args$call, ' | ', '\n') AS mle
+SET time_zone = DEFAULT;
+
+--echo #
+--echo # 2. Results: the same JavaScript values returned as SQL types.
+--echo #
+--let $rbody = return { dt: new Date(Date.UTC(2024, 0, 2, 3, 4, 5)), big: 2n ** 64n - 1n, set: new Set(['a', 'c']), obj: { k: [1, 'x'] }, dec: 1 / 3 }[which]
+--eval CREATE FUNCTION v8_ret_dt(which VARCHAR(10)) RETURNS DATETIME LANGUAGE JS AS \$\$ $rbody \$\$
+--eval CREATE FUNCTION mle_ret_dt(which VARCHAR(10)) RETURNS DATETIME LANGUAGE JAVASCRIPT AS \$\$ $rbody \$\$
+--eval CREATE FUNCTION v8_ret_big(which VARCHAR(10)) RETURNS BIGINT UNSIGNED LANGUAGE JS AS \$\$ $rbody \$\$
+--eval CREATE FUNCTION mle_ret_big(which VARCHAR(10)) RETURNS BIGINT UNSIGNED LANGUAGE JAVASCRIPT AS \$\$ $rbody \$\$
+--eval CREATE FUNCTION v8_ret_text(which VARCHAR(10)) RETURNS TEXT LANGUAGE JS AS \$\$ $rbody \$\$
+--eval CREATE FUNCTION mle_ret_text(which VARCHAR(10)) RETURNS TEXT LANGUAGE JAVASCRIPT AS \$\$ $rbody \$\$
+--eval CREATE FUNCTION v8_ret_json(which VARCHAR(10)) RETURNS JSON LANGUAGE JS AS \$\$ $rbody \$\$
+--eval CREATE FUNCTION mle_ret_json(which VARCHAR(10)) RETURNS JSON LANGUAGE JAVASCRIPT AS \$\$ $rbody \$\$
+--eval CREATE FUNCTION v8_ret_dec(which VARCHAR(10)) RETURNS DECIMAL(10,4) LANGUAGE JS AS \$\$ $rbody \$\$
+--eval CREATE FUNCTION mle_ret_dec(which VARCHAR(10)) RETURNS DECIMAL(10,4) LANGUAGE JAVASCRIPT AS \$\$ $rbody \$\$
+SET time_zone = '+00:00';
+--echo # js_lang: a Date becomes its string form, which MySQL does not take.
+--error ER_TRUNCATED_WRONG_VALUE
+SELECT v8_ret_dt('dt') AS js_lang_date;
+--echo # MLE (as Oracle): a Date is a DATETIME in local time (here mysqld's zone).
+SELECT mle_ret_dt('dt') AS mle_date;
+SELECT v8_ret_big('big') AS js_lang_bigint, mle_ret_big('big') AS mle_bigint;
+SELECT v8_ret_text('set') AS js_lang_set, mle_ret_text('set') AS mle_set;
+SELECT v8_ret_json('obj') AS js_lang_json, mle_ret_json('obj') AS mle_json;
+SELECT v8_ret_dec('dec') AS js_lang_decimal, mle_ret_dec('dec') AS mle_decimal;
+SET time_zone = DEFAULT;
+
+--echo #
+--echo # 3. Errors: what the client gets for a thrown Error; the trace.
+--echo #
+--let $ebody = function inner() { throw new Error('boom ' + x) }; inner()
+--eval CREATE FUNCTION v8_err(x INT) RETURNS INT LANGUAGE JS AS \$\$ $ebody \$\$
+--eval CREATE FUNCTION mle_err(x INT) RETURNS INT LANGUAGE JAVASCRIPT AS \$\$ $ebody \$\$
+--error ER_LANGUAGE_COMPONENT
+SELECT v8_err(1);
+SELECT JS_GET_LAST_ERROR_INFO() AS js_lang_error_info;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT mle_err(1);
+SELECT mle_session_state('stack_trace') AS mle_stack_trace;
+
+--echo #
+--echo # 4. State between calls: js_lang keeps globalThis per connection and
+--echo #    user; MLE (as Oracle) gives each call a fresh globalThis.
+--echo #
+--let $gbody = globalThis.n = (globalThis.n || 0) + 1; return globalThis.n
+--eval CREATE FUNCTION v8_counter() RETURNS INT LANGUAGE JS AS \$\$ $gbody \$\$
+--eval CREATE FUNCTION mle_counter() RETURNS INT LANGUAGE JAVASCRIPT AS \$\$ $gbody \$\$
+SELECT v8_counter(), v8_counter(), v8_counter();
+SELECT mle_counter(), mle_counter(), mle_counter();
+
+--echo #
+--echo # 5. async: js_lang converts the returned Promise; MLE awaits it.
+--echo #
+--let $abody = const v = await Promise.resolve(41); return v + 1
+--eval CREATE FUNCTION v8_async() RETURNS TEXT LANGUAGE JS AS \$\$ return (async () => { $abody })() \$\$
+--eval CREATE FUNCTION mle_async() RETURNS TEXT LANGUAGE JAVASCRIPT AS \$\$ $abody \$\$
+SELECT v8_async() AS js_lang, mle_async() AS mle;
+
+--echo #
+--echo # 6. Console output: per engine its own UDF.
+--echo #
+CREATE PROCEDURE v8_log() LANGUAGE JS AS $$ console.log('hello', 42, [1, 2]) $$;
+CREATE PROCEDURE mle_log() LANGUAGE JAVASCRIPT AS $$ console.log('hello', 42, [1, 2]) $$;
+CALL v8_log();
+CALL mle_log();
+SELECT JS_GET_CONSOLE_LOG() AS js_lang_console, mle_session_state('stdout') AS mle_stdout;
+
+--echo #
+--echo # 7. SQL from JavaScript: only MLE has an API (js_lang: none).
+--echo #
+--let $sbody = return typeof session === 'object' ? session.runSql('SELECT COUNT(*) AS n FROM information_schema.SCHEMATA').fetchOne().n > 0 : 'no session object'
+--eval CREATE PROCEDURE v8_sql(OUT r TEXT) LANGUAGE JS AS \$\$ r = (() => { $sbody })() \$\$
+--eval CREATE PROCEDURE mle_sql(OUT r TEXT) LANGUAGE JAVASCRIPT AS \$\$ r = (() => { $sbody })() \$\$
+CALL v8_sql(@a);
+CALL mle_sql(@b);
+SELECT @a AS js_lang, @b AS mle;
+
+--echo #
+--echo # 8. Deep recursion: V8's own stack limit; MLE's frame limit (Oracle's).
+--echo #
+--let $rbody2 = const f = (k) => k === 0 ? 0 : 1 + f(k - 1); return f(n)
+--eval CREATE FUNCTION v8_deep(n INT) RETURNS INT LANGUAGE JS AS \$\$ $rbody2 \$\$
+--eval CREATE FUNCTION mle_deep(n INT) RETURNS INT LANGUAGE JAVASCRIPT AS \$\$ $rbody2 \$\$
+SELECT v8_deep(500) AS js_lang_500, mle_deep(500) AS mle_500;
+--error ER_LANGUAGE_COMPONENT
+SELECT v8_deep(1000000);
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT mle_deep(1000000);
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION v8_args;
+DROP FUNCTION mle_args;
+DROP FUNCTION v8_ret_dt;
+DROP FUNCTION mle_ret_dt;
+DROP FUNCTION v8_ret_big;
+DROP FUNCTION mle_ret_big;
+DROP FUNCTION v8_ret_text;
+DROP FUNCTION mle_ret_text;
+DROP FUNCTION v8_ret_json;
+DROP FUNCTION mle_ret_json;
+DROP FUNCTION v8_ret_dec;
+DROP FUNCTION mle_ret_dec;
+DROP FUNCTION v8_err;
+DROP FUNCTION mle_err;
+DROP FUNCTION v8_counter;
+DROP FUNCTION mle_counter;
+DROP FUNCTION v8_async;
+DROP FUNCTION mle_async;
+DROP PROCEDURE v8_log;
+DROP PROCEDURE mle_log;
+DROP PROCEDURE v8_sql;
+DROP PROCEDURE mle_sql;
+DROP FUNCTION v8_deep;
+DROP FUNCTION mle_deep;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_JS_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_lang_router";
+UNINSTALL COMPONENT "file://component_mle";
+UNINSTALL COMPONENT "file://component_js_lang";
+--echo # js_lang cannot be installed again without a restart (V8).
+--source include/restart_mysqld.inc

@@ -1,18 +1,15 @@
 --echo #
---echo # component_mle (P4-W6): a multi-language engine in one session.
+--echo # component_mle (P4-W6, P5-W5): a multi-language engine in one session.
 --echo # A small vector search: Python with numpy ranks products, JavaScript
 --echo # calls numpy through the shared polyglot context, Java calls JavaScript,
---echo # and Percona's V8 LANGUAGE JS runs next to MLE in the same statement.
+--echo # all in one statement. Then a shop with SQL from all three languages
+--echo # (Phase 5).
 --echo #
 --source include/have_mle_component.inc
---source include/have_js_lang_component.inc
 --source include/count_sessions.inc
 
-INSTALL COMPONENT "file://component_js_lang";
 INSTALL COMPONENT "file://component_mle";
-INSTALL COMPONENT "file://component_lang_router";
 GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
-GRANT CREATE_JS_ROUTINE ON *.* TO root@localhost;
 
 --connect (con1, localhost, root,,test)
 CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(40), price DECIMAL(8,2),
@@ -47,17 +44,67 @@ CREATE FUNCTION java_offer(name VARCHAR(40), price DECIMAL(8,2), qty INT)
   return qty + " x " + title + " = " + total;
 $$;
 
---echo # V8 (Percona's LANGUAGE JS, in mysqld) in the same statement.
-CREATE FUNCTION v8_stars(score DOUBLE) RETURNS VARCHAR(5) LANGUAGE JS
+--echo # JavaScript: a rating.
+CREATE FUNCTION js_stars(score DOUBLE) RETURNS VARCHAR(5) LANGUAGE JAVASCRIPT
   AS $$ return '*'.repeat(Math.round(score * 5)) $$;
 
 --echo # Which products are like a red apple?
 SET @query = STRING_TO_VECTOR('[1.0, 0.1, 0.0, 0.1]');
 SELECT name, ROUND(py_cosine(embedding, @query), 4) AS similarity,
-  v8_stars(py_cosine(embedding, @query)) AS stars,
+  js_stars(py_cosine(embedding, @query)) AS stars,
   js_norm(embedding) AS norm,
   java_offer(name, price, 3) AS offer
 FROM products ORDER BY similarity DESC;
+
+--echo #
+--echo # A shop in one CALL: JavaScript orchestrates through the stored routine
+--echo # API; Python reads the embeddings with SQL and ranks them with one numpy
+--echo # matrix product; Java books the order lines in a transaction with
+--echo # BigDecimal money; the report (its stars by a JavaScript function called
+--echo # from the SQL of the JavaScript routine) goes to the client.
+--echo #
+CREATE TABLE recommendations (rank_no INT, product_id INT, similarity DOUBLE);
+CREATE TABLE order_lines (id INT AUTO_INCREMENT PRIMARY KEY, product_id INT, qty INT,
+  amount DECIMAL(10,2)) ENGINE=InnoDB;
+CREATE PROCEDURE py_recommend(IN q VECTOR(4), IN k INT) LANGUAGE PYTHON AS $$
+    import numpy as np
+    rows = session.run_sql('SELECT id, embedding FROM products ORDER BY id').fetch_all()
+    ids = [r.id for r in rows]
+    m = np.stack([r.embedding for r in rows])
+    sims = m @ q / (np.linalg.norm(m, axis=1) * np.linalg.norm(q))
+    insert = session.prepare('INSERT INTO recommendations VALUES (?, ?, ?)')
+    [insert.bind(n + 1, ids[i], round(float(sims[i]), 4)).execute() for n, i in enumerate(np.argsort(-sims)[:k])]
+    insert.deallocate()
+$$;
+CREATE PROCEDURE java_order(IN qty INT, OUT total DECIMAL(10,2)) LANGUAGE JAVA AS $$
+  Session s = Mle.session();
+  s.startTransaction();
+  PreparedStatement line = s.prepare("INSERT INTO order_lines (product_id, qty, amount) VALUES (?, ?, ?)");
+  BigDecimal sum = BigDecimal.ZERO;
+  for (Row r : s.runSql("SELECT p.id, p.price FROM recommendations r JOIN products p ON p.id = r.product_id ORDER BY r.rank_no")) {
+    BigDecimal amount = ((BigDecimal) r.get(1)).multiply(BigDecimal.valueOf(qty));
+    line.bind(r.get(0), qty, amount).execute();
+    sum = sum.add(amount);
+  }
+  line.deallocate();
+  s.commit();
+  total[0] = sum;
+$$;
+CREATE PROCEDURE js_shop(IN q VECTOR(4), IN k INT, IN qty INT) LANGUAGE JAVASCRIPT AS $$
+  console.clear()
+  session.runSql('DELETE FROM recommendations')
+  const shop = session.getDefaultSchema()
+  shop.getProcedure('py_recommend')(q, k)
+  const total = mysql.arg()
+  shop.getProcedure('java_order')(qty, total)
+  session.sql(`SELECT r.rank_no, p.name, r.similarity, js_stars(r.similarity) AS stars, l.qty, l.amount
+               FROM recommendations r JOIN products p ON p.id = r.product_id
+               JOIN order_lines l ON l.product_id = p.id ORDER BY r.rank_no`,
+              { passResultToClient: true }).execute()
+  console.log('order total: ' + total.val)
+$$;
+CALL js_shop(@query, 3, 2);
+SELECT mle_session_state('stdout') AS shop;
 
 --echo # One MLE worker served Python, JavaScript and Java for this session.
 SELECT mle_session_state('stored_functions') AS mle_functions;
@@ -71,11 +118,10 @@ DROP TABLE products;
 DROP FUNCTION py_cosine;
 DROP FUNCTION js_norm;
 DROP FUNCTION java_offer;
-DROP FUNCTION v8_stars;
+DROP FUNCTION js_stars;
+DROP PROCEDURE py_recommend;
+DROP PROCEDURE java_order;
+DROP PROCEDURE js_shop;
+DROP TABLE recommendations, order_lines;
 REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
-REVOKE CREATE_JS_ROUTINE ON *.* FROM root@localhost;
-UNINSTALL COMPONENT "file://component_lang_router";
 UNINSTALL COMPONENT "file://component_mle";
-UNINSTALL COMPONENT "file://component_js_lang";
---echo # js_lang cannot be installed again without a restart (V8).
---source include/restart_mysqld.inc

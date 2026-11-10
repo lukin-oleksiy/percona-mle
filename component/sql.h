@@ -107,9 +107,14 @@ class SqlRunner {
   void statement_error(Statement &s, mle::SqlResultMsg *result);
   void clear_pending_error();
   void close(uint64_t id);
+  /** True (and the server's error in result) if statements are not allowed
+      here: in a stored function or trigger. */
+  bool refused_here(mle::SqlResultMsg *result);
 
   MYSQL_THD m_thd;
   std::map<uint64_t, std::unique_ptr<Statement>> m_statements;
+  bool m_context_checked = false;
+  bool m_refused = false;
   /** The inner statement error now in the diagnostics area, if any. */
   bool m_pending = false;
   uint32_t m_pending_errno = 0;

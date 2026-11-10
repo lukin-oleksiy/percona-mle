@@ -300,6 +300,23 @@ bool bind_values(my_h_statement h, const std::vector<Value> &values) {
 
 }  // namespace
 
+bool SqlRunner::refused_here(SqlResultMsg *result) {
+  // The server refuses statements in stored functions and triggers, but its
+  // check for direct statements misses a function called by a trigger
+  // (in_sub_stmt compared with ==, not as a mask); the prepared path checks
+  // it right. Ask that path once per call (and again while it refuses, so
+  // that each refusal is in the diagnostics area).
+  if (m_context_checked && !m_refused) return false;
+  m_context_checked = true;
+  Statement probe;
+  probe.h = new_statement(false, 500);
+  if (probe.h == nullptr) return false;
+  const mysql_cstring_with_length text = cstr("DO 0");
+  m_refused = mysql_service_mysql_stmt_execute->prepare(text, probe.h);
+  if (m_refused) statement_error(probe, result);
+  return m_refused;
+}
+
 void SqlRunner::execute_text(const mle::SqlMsg &request,
                              SqlResultMsg *result) {
   if (m_statements.count(request.stmt_id) != 0)
@@ -328,6 +345,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
              bind_values(s->h, request.params) ||
              mysql_service_mysql_stmt_execute->execute(s->h);
   } else {
+    if (refused_here(result)) return;
     failed = mysql_service_mysql_stmt_execute_direct->execute(text, s->h);
   }
   if (failed) return statement_error(*s, result);

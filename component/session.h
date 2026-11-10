@@ -127,6 +127,11 @@ class Session {
       even if the KILL was consumed by an inner statement). */
   std::atomic<uint64_t> m_kills{0};
   bool m_kill_installed = false;
+  /** Requests of this session in progress (nested: routine -> SQL ->
+      routine). A worker dropped by a nested request is kept here until the
+      outermost one ends: outer requests still run in it. */
+  size_t m_calls = 0;
+  std::vector<std::unique_ptr<mle::Worker>> m_retired;
 
   MYSQL_THD m_thd;
   std::map<std::string, Slot> m_workers;

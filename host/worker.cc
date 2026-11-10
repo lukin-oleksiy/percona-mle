@@ -314,6 +314,11 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
   if (m_depth >= m_options.max_depth) {
     *error = "too many nested routine calls (the limit is " +
              std::to_string(m_options.max_depth) + ")";
+    // An error of the call, not of the worker (which outer calls still use).
+    if (result != nullptr) {
+      *result = ResultMsg();
+      result->error = Error{"", *error, {}, 0, ""};
+    }
     return Status::kGuestError;
   }
   if (m_depth == 0) {

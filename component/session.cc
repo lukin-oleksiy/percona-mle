@@ -113,6 +113,7 @@ void append_capped(std::string *buffer, const std::string &more) {
 class Session::KillGuard {
  public:
   KillGuard(Session *s, mle::Worker *worker) : m_session(s) {
+    ++s->m_calls;
     const size_t n = s->m_running_n.load();
     m_pushed = n < kMaxNesting;
     if (m_pushed) {
@@ -144,6 +145,11 @@ class Session::KillGuard {
       (void)mysql_service_mysql_thd_kill_handler->set(m_session->m_thd,
                                                       nullptr, nullptr);
       m_session->m_kill_installed = false;
+    }
+    if (--m_session->m_calls == 0) {
+      // The outermost request ended: no request runs in a retired worker.
+      for (auto &w : m_session->m_retired) engine_release_worker(std::move(w));
+      m_session->m_retired.clear();
     }
   }
   KillGuard(const KillGuard &) = delete;
@@ -197,6 +203,7 @@ Session *Session::current(bool create) {
 Session::~Session() {
   for (auto &[principal, slot] : m_workers)
     engine_release_worker(std::move(slot.worker));
+  for (auto &w : m_retired) engine_release_worker(std::move(w));
   g_counters.sessions = --g_sessions;
 }
 
@@ -231,7 +238,11 @@ const std::string &Session::principal() const {
 void Session::drop_worker(const std::string &principal) {
   auto it = m_workers.find(principal);
   if (it == m_workers.end()) return;
-  engine_release_worker(std::move(it->second.worker));
+  // Outer requests of this session may still run in it (nested calls).
+  if (m_calls > 0)
+    m_retired.push_back(std::move(it->second.worker));
+  else
+    engine_release_worker(std::move(it->second.worker));
   m_workers.erase(it);
 }
 
@@ -301,16 +312,24 @@ bool Session::prepare_in(const std::string &principal, Slot &slot,
   ResultMsg result;
   std::string error;
   Status s;
+  mle::Worker *worker = slot.worker.get();
   {
-    const KillGuard kill(this, slot.worker.get());
-    s = slot.worker->prepare(routine.prepare, hooks, &result, &error);
+    const KillGuard kill(this, worker);
+    s = worker->prepare(routine.prepare, hooks, &result, &error);
   }
   keep_console(result);
   if (s != Status::kOk) {
     report(principal, s, result, error, routine, nullptr);
     return false;
   }
-  slot.prepared.insert(routine.id);
+  // Loading runs routine code, which may run SQL and nested calls; one of
+  // them may have retired this worker (and its slot) meanwhile.
+  const auto it = m_workers.find(principal);
+  if (it == m_workers.end() || it->second.worker.get() != worker) {
+    my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+    return false;
+  }
+  it->second.prepared.insert(routine.id);
   m_programs[routine.id] = routine.sp_type;
   return true;
 }

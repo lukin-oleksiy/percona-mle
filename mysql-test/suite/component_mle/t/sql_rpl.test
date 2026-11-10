@@ -1,0 +1,90 @@
+--echo #
+--echo # component_mle (P5-W5): replication of what MLE routines change with
+--echo # SQL. The component is installed on the source only: with ROW the
+--echo # replica applies the rows, with STATEMENT the routines' inner statements
+--echo # (as for SQL procedures, the CALL itself is not logged); the routine
+--echo # definitions replicate and the replica needs no MLE.
+--echo #
+--source include/have_mle_component.inc
+--source include/have_binlog_format_row_or_statement.inc
+--source include/rpl/init_source_replica.inc
+
+--connection master
+--disable_query_log
+SET sql_log_bin = 0;
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+SET sql_log_bin = 1;
+--enable_query_log
+CREATE TABLE t1 (id INT PRIMARY KEY, v VARCHAR(40), n DOUBLE) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 'one', 1);
+
+--echo # The routines are created and called in their own connection (UNINSTALL
+--echo # needs no MLE sessions).
+--connect (mle, 127.0.0.1, root,,test,$MASTER_MYPORT,)
+--let $mle_id = `SELECT CONNECTION_ID()`
+CREATE PROCEDURE js_dml() LANGUAGE JAVASCRIPT AS $$
+  session.runSql("INSERT INTO t1 VALUES (2, 'js', 2.5)")
+  const p = session.prepare('UPDATE t1 SET v = CONCAT(v, ?) WHERE id = ?')
+  p.bind('!', 1).execute()
+  p.bind('?', 2).execute()
+  p.deallocate()
+  session.runSql('DELETE FROM t1 WHERE id = ?', [99])
+$$;
+CREATE PROCEDURE py_dml() LANGUAGE PYTHON AS $$
+[session.run_sql('INSERT INTO t1 VALUES (?, ?, ?)', [i, 'python %d' % i, i / 4]) for i in range(10, 13)]
+$$;
+CREATE PROCEDURE java_dml() LANGUAGE JAVA AS $$
+PreparedStatement p = Mle.session().prepare("INSERT INTO t1 VALUES (?, ?, ?)");
+for (int i = 20; i < 23; i++) p.bind(i, "java " + i, i * 1.5).execute();
+p.deallocate();
+$$;
+CREATE PROCEDURE js_commit() LANGUAGE JAVASCRIPT AS $$
+  session.startTransaction()
+  session.runSql("INSERT INTO t1 VALUES (30, 'committed inside', 0)")
+  session.commit()
+$$;
+CREATE PROCEDURE js_insert(IN i INT) LANGUAGE JAVASCRIPT
+  AS $$ session.runSql('INSERT INTO t1 VALUES (?, ?, 0)', [i, 'rolled back']) $$;
+
+CALL js_dml();
+CALL py_dml();
+CALL java_dml();
+CALL js_commit();
+START TRANSACTION;
+CALL js_insert(40);
+ROLLBACK;
+--disconnect mle
+--connection master
+--let $wait_condition = SELECT COUNT(*) = 0 FROM information_schema.PROCESSLIST WHERE ID = $mle_id
+--source include/wait_condition.inc
+SELECT * FROM t1 ORDER BY id;
+--source include/rpl/sync_to_replica.inc
+
+--echo # The replica (no MLE): the same rows, the routine definitions, a healthy
+--echo # applier.
+--connection slave
+SELECT * FROM t1 ORDER BY id;
+SELECT ROUTINE_NAME, EXTERNAL_LANGUAGE FROM information_schema.ROUTINES
+  WHERE ROUTINE_SCHEMA = 'test' ORDER BY ROUTINE_NAME;
+--let $status = query_get_value(SHOW REPLICA STATUS, Replica_SQL_Running, 1)
+--echo Replica_SQL_Running: $status
+--let $installed = `SELECT COUNT(*) FROM mysql.component WHERE component_urn LIKE '%mle%'`
+--echo MLE installed on the replica: $installed
+
+--connection master
+--disable_query_log
+SET sql_log_bin = 0;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
+SET sql_log_bin = 1;
+--enable_query_log
+--echo # MLE routines can be dropped without MLE (as on the replica).
+DROP PROCEDURE js_dml;
+DROP PROCEDURE py_dml;
+DROP PROCEDURE java_dml;
+DROP PROCEDURE js_commit;
+DROP PROCEDURE js_insert;
+DROP TABLE t1;
+--source include/rpl/sync_to_replica.inc
+--source include/rpl/deinit.inc
