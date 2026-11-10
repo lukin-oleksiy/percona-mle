@@ -1,0 +1,246 @@
+#
+# component_mle (P5-W3): Oracle's JavaScript SQL API (session, SqlResult,
+# Row, Column, PreparedStatement, Schema, Table, stored routines,
+# transactions, mysql.*, SqlError) over the Java core com.percona.mle.sql.
+# Part 1: Oracle's documented examples (MySQL 9.7 manual, 27.3.6-27.3.7)
+# on our own tables holding the manual's values; the routines are written
+# for this test.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE country (Code CHAR(3) PRIMARY KEY, Name CHAR(52), LocalName CHAR(45),
+Population INT, Capital INT);
+INSERT INTO country VALUES ('DNK', 'Denmark', 'Danmark', 5330000, 3315),
+('FIN', 'Finland', 'Suomi', 5171300, 3236), ('NOR', 'Norway', 'Norge', 4478500, 2807),
+('SWE', 'Sweden', 'Sverige', 8861400, 3048), ('DEU', 'Germany', 'Deutschland', 82164700, 3068);
+CREATE TABLE countrylanguage (CountryCode CHAR(3), Language CHAR(30));
+INSERT INTO countrylanguage VALUES ('DNK', 'Swedish'), ('FIN', 'Swedish'),
+('NOR', 'Swedish'), ('SWE', 'Swedish'), ('DEU', 'German');
+CREATE TABLE city (ID INT PRIMARY KEY, Name CHAR(35));
+INSERT INTO city VALUES (3315, 'København'), (3236, 'Helsinki [Helsingfors]'),
+(2807, 'Oslo'), (3048, 'Stockholm'), (3068, 'Berlin');
+CREATE TABLE t1 (c1 INT PRIMARY KEY, c2 INT, c3 VARCHAR(20));
+INSERT INTO t1 VALUES (1, 64, 'banana'), (2, 139, 'apple'), (3, 37, 'peach'),
+(4, 221, 'watermelon'), (5, 83, 'pear');
+#
+# jssp_vsimple (27.3.7.1): a simple statement, column names, rows.
+#
+CREATE PROCEDURE jssp_vsimple(IN query VARCHAR(250)) LANGUAGE JAVASCRIPT AS $mle$
+let stmt = session.sql(query)
+let result = stmt.execute()
+console.log(result.getColumnNames())
+let row = result.fetchOne()
+while(row) {
+console.log(row.toArray())
+row = result.fetchOne()
+}
+$mle$|
+CALL jssp_vsimple("
+  SELECT c.Name, c.LocalName, c.Population, l.Language
+  FROM country c
+  JOIN countrylanguage l
+  ON c.Code=l.CountryCode
+  WHERE l.Language='Swedish'
+");
+SELECT mle_session_state('stdout');
+mle_session_state('stdout')
+Name,LocalName,Population,Language
+Denmark,Danmark,5330000,Swedish
+Finland,Suomi,5171300,Swedish
+Norway,Norge,4478500,Swedish
+Sweden,Sverige,8861400,Swedish
+
+#
+# Column metadata (27.3.7.3): names, labels, schema, tables, types.
+#
+CREATE PROCEDURE jssp_meta(IN query VARCHAR(250)) LANGUAGE JAVASCRIPT AS $mle$
+console.clear()
+let result = session.sql(query).execute()
+let out = result.getColumnNames() + "\nCOLUMN INFO:"
+  let cols = result.getColumns()
+let cnt = result.getColumnCount()
+for (var i=0; i<cnt; i++) {
+let col = cols[i]
+out += "\nColumn: " + col.getColumnName() + "(" + col.getColumnLabel() + ")"
+    out += "; Schema: " + col.getSchemaName()
+out += "; Table: " + col.getTableName() + "(" + col.getTableLabel() + ")"
+    out += "; Type: " + col.getType();
+}
+out += "\n\nROWS:"
+  let row = result.fetchOne()
+while (row) {
+out += "\n" + row.toArray()
+row = result.fetchOne()
+}
+console.log(out)
+$mle$|
+CALL jssp_meta("SELECT c.Name, c.LocalName, t.Name AS Capital, c.Population
+  FROM country c JOIN city t ON c.Capital = t.ID JOIN countrylanguage l
+  ON c.Code = l.CountryCode WHERE l.Language = 'Swedish' ORDER BY c.Name");
+SELECT mle_session_state('stdout');
+mle_session_state('stdout')
+Name,LocalName,Capital,Population
+COLUMN INFO:
+Column: Name(Name); Schema: test; Table: country(c); Type: STRING
+Column: LocalName(LocalName); Schema: test; Table: country(c); Type: STRING
+Column: Name(Capital); Schema: test; Table: city(t); Type: STRING
+Column: Population(Population); Schema: test; Table: country(c); Type: INT
+
+ROWS:
+Denmark,Danmark,København,5330000
+Finland,Suomi,Helsinki [Helsingfors],5171300
+Norway,Norge,Oslo,4478500
+Sweden,Sverige,Stockholm,8861400
+
+#
+# jssp_prep1 (27.3.7.2): a prepared statement executed three times; the
+# third binds only the first marker (the second keeps 3).
+#
+CREATE PROCEDURE jssp_prep1(IN query VARCHAR(200)) LANGUAGE JAVASCRIPT AS $mle$
+console.clear()
+function print_result(result) {
+console.log(result.getColumnNames())
+let row = result.fetchOne()
+while(row) {
+console.log(row.toArray())
+row = result.fetchOne()
+}
+}
+function fetch_warnings(result) {
+console.log("Number of warnings: " + result.getWarningsCount())
+for (var w in result.getWarnings()) {
+console.log(w.level + ", " + w.code + ", " + w.message)
+}
+}
+let stmt = session.prepare(query)
+stmt.bind(3, 4)
+let res1 = stmt.execute()
+print_result(res1)
+fetch_warnings(res1)
+stmt.bind(2, 3)
+let res2 = stmt.execute()
+print_result(res2)
+fetch_warnings(res2)
+stmt.bind(5)
+let res3 = stmt.execute()
+print_result(res3)
+fetch_warnings(res3)
+stmt.deallocate()
+$mle$|
+CALL jssp_prep1("
+  SELECT *
+  FROM t1
+  WHERE c1 = ? OR c1 = ?
+");
+SELECT mle_session_state("stdout");
+mle_session_state("stdout")
+c1,c2,c3
+3,37,peach
+4,221,watermelon
+Number of warnings: 0
+c1,c2,c3
+2,139,apple
+3,37,peach
+Number of warnings: 0
+c1,c2,c3
+3,37,peach
+5,83,pear
+Number of warnings: 0
+
+#
+# Stored functions from JavaScript (27.3.6.12): procRect, getArea and
+# getDiag (a FLOAT result: 11.180339813232422, 25.079872131347656).
+#
+CREATE FUNCTION getArea(w INT, h INT) RETURNS INT DETERMINISTIC RETURN w * h;
+CREATE FUNCTION getDiag(w INT, h INT) RETURNS FLOAT DETERMINISTIC
+LANGUAGE JAVASCRIPT AS $$ return Math.sqrt(Math.pow(w, 2) + Math.pow(h, 2)) $$;
+CREATE PROCEDURE procRect(IN x INT, IN y INT) LANGUAGE JAVASCRIPT AS $mle$
+console.clear()
+let s = session.getDefaultSchema()
+let f = s.getFunction("getArea")
+let g = s.getFunction("getDiag")
+let a = x
+let b = y
+console.log(
+"Width: " + a + ", Height: " + b + "; Area: " +
+f(a,b) + "; Diagonal: " + g(a,b)
+)
+f.close()
+g.close()
+$mle$|
+CALL procRect(5, 10);
+SELECT mle_session_state("stdout");
+mle_session_state("stdout")
+Width: 5, Height: 10; Area: 50; Diagonal: 11.180339813232422
+
+CALL procRect(2, 25);
+SELECT mle_session_state("stdout");
+mle_session_state("stdout")
+Width: 2, Height: 25; Area: 50; Diagonal: 25.079872131347656
+
+#
+# OUT and INOUT through mysql.arg() (27.3.6.12): my_proc, use_my_proc.
+#
+CREATE PROCEDURE my_proc(IN x INT, OUT y VARCHAR(20), INOUT z TEXT)
+LANGUAGE JAVASCRIPT AS $$
+y = "Hello world " + x
+z += "Hello again JS"
+$$;
+CREATE PROCEDURE use_my_proc() LANGUAGE JAVASCRIPT AS $mle$
+console.clear()
+let s = session.getDefaultSchema()
+let p = s.getProcedure("my_proc")
+let a = mysql.arg()
+let b = mysql.arg("World ")
+p(42, a, b)
+console.log(a.val)
+console.log(b.val)
+p.close()
+$mle$|
+CALL use_my_proc();
+SELECT mle_session_state("stdout");
+mle_session_state("stdout")
+Hello world 42
+World Hello again JS
+
+#
+# SqlError (27.3.6.13): thrown and caught; SIGNAL through runSql.
+#
+CREATE PROCEDURE test_catch_throw_signal() LANGUAGE JAVASCRIPT AS $mle$
+console.clear()
+try {
+throw new mysql.SQLError(45000, 'Some error', 1001)
+} catch (e) {
+console.log(e)
+}
+$mle$|
+CALL test_catch_throw_signal();
+SELECT mle_session_state("stdout");
+mle_session_state("stdout")
+SqlError: Error code: 1001 Error state: 45000 Error message: Some error
+
+CREATE PROCEDURE test_signal_no_catch() LANGUAGE JAVASCRIPT AS $$
+console.clear()
+session.runSql("SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT= 'Some error', MYSQL_ERRNO = 1000")
+$$;
+CALL test_signal_no_catch();
+ERROR 45000: Some error
+# An uncaught statement error reaches the client unchanged (27.3.7.3).
+CREATE PROCEDURE jssp_simple_error(IN query VARCHAR(200)) LANGUAGE JAVASCRIPT
+AS $$ session.sql(query).execute() $$;
+CALL jssp_simple_error("SELECT * FROM bogus");
+ERROR 42S02: Table 'test.bogus' doesn't exist
+DROP PROCEDURE jssp_vsimple;
+DROP PROCEDURE jssp_meta;
+DROP PROCEDURE jssp_prep1;
+DROP PROCEDURE procRect;
+DROP FUNCTION getArea;
+DROP FUNCTION getDiag;
+DROP PROCEDURE my_proc;
+DROP PROCEDURE use_my_proc;
+DROP PROCEDURE test_catch_throw_signal;
+DROP PROCEDURE test_signal_no_catch;
+DROP PROCEDURE jssp_simple_error;
+DROP TABLE country, countrylanguage, city, t1;
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

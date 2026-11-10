@@ -390,6 +390,27 @@ void SqlRunner::execute_prepared(const mle::SqlMsg &request,
         now_us() - t0, result);
 }
 
+namespace {
+
+/** The statement's warnings into result. */
+void read_warnings(my_h_statement h, SqlResultMsg *result) {
+  uint32_t n = 0;
+  (void)mysql_service_mysql_stmt_diagnostics->num_warnings(h, &n);
+  for (uint32_t i = 0; i < n; i++) {
+    my_h_warning w = nullptr;
+    if (mysql_service_mysql_stmt_diagnostics->get_warning(h, i, &w)) break;
+    mle::Warning warning;
+    mysql_cstring_with_length msg{"", 0};
+    (void)mysql_service_mysql_stmt_diagnostics->warning_level(w, &warning.level);
+    (void)mysql_service_mysql_stmt_diagnostics->warning_code(w, &warning.code);
+    (void)mysql_service_mysql_stmt_diagnostics->warning_message(w, &msg);
+    warning.message.assign(msg.str, msg.length);
+    result->warnings.push_back(std::move(warning));
+  }
+}
+
+}  // namespace
+
 void SqlRunner::fetch(const mle::SqlMsg &request, SqlResultMsg *result) {
   const auto it = m_statements.find(request.stmt_id);
   if (it == m_statements.end() || !it->second->rows_open)
@@ -405,7 +426,8 @@ void SqlRunner::fetch(const mle::SqlMsg &request, SqlResultMsg *result) {
   result->columns = s.columns;
   if (read_rows(s, max_rows, result)) return statement_error(s, result);
   if (!s.rows_open) {
-    // Drained: is there another result set?
+    // Drained: its warnings; is there another result set?
+    read_warnings(s.h, result);
     bool more = false;
     if (!mysql_service_mysql_stmt_result->next_result(s.h, &more) && more)
       s.next_pending = true;
@@ -460,19 +482,7 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
         s.h, &result->affected_rows);
     (void)mysql_service_mysql_stmt_diagnostics->insert_id(s.h,
                                                           &result->insert_id);
-    uint32_t n = 0;
-    (void)mysql_service_mysql_stmt_diagnostics->num_warnings(s.h, &n);
-    for (uint32_t i = 0; i < n; i++) {
-      my_h_warning w = nullptr;
-      if (mysql_service_mysql_stmt_diagnostics->get_warning(s.h, i, &w)) break;
-      mle::Warning warning;
-      mysql_cstring_with_length msg{"", 0};
-      (void)mysql_service_mysql_stmt_diagnostics->warning_level(w, &warning.level);
-      (void)mysql_service_mysql_stmt_diagnostics->warning_code(w, &warning.code);
-      (void)mysql_service_mysql_stmt_diagnostics->warning_message(w, &msg);
-      warning.message.assign(msg.str, msg.length);
-      result->warnings.push_back(std::move(warning));
-    }
+    read_warnings(s.h, result);
     bool more = false;
     if (!s.to_client &&
         !mysql_service_mysql_stmt_result->next_result(s.h, &more) && more)
@@ -579,6 +589,8 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
   result->columns = s.columns;
   if (read_rows(s, max_rows, result)) return statement_error(s, result);
   if (!s.rows_open) {
+    // The result set is complete: its warnings are known.
+    read_warnings(s.h, result);
     bool more = false;
     if (!mysql_service_mysql_stmt_result->next_result(s.h, &more) && more)
       s.next_pending = true;

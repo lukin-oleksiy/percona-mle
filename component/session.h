@@ -123,6 +123,9 @@ class Session {
   static constexpr size_t kMaxNesting = 64;
   std::array<std::atomic<mle::Worker *>, kMaxNesting> m_running{};
   std::atomic<size_t> m_running_n{0};
+  /** KILLs seen by the kill handler (a call killed meanwhile is interrupted
+      even if the KILL was consumed by an inner statement). */
+  std::atomic<uint64_t> m_kills{0};
   bool m_kill_installed = false;
 
   MYSQL_THD m_thd;

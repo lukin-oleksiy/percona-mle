@@ -1,0 +1,479 @@
+#
+# component_mle (P5-W3): the JavaScript SQL API beyond Oracle's examples:
+# values and options, parameters, rows, results, session variables,
+# schemas and tables, transactions, mysql.*, errors.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t1 (id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(20), n INT);
+INSERT INTO t1 (v, n) VALUES ('one', 1), ('two', 2), ('three', 3);
+CREATE VIEW v1 AS SELECT v FROM t1;
+SET SESSION cte_max_recursion_depth = 100000;
+#
+# 1. Values of all types, with their JavaScript types (defaults:
+#    integers as numbers when safe, else strings; DECIMAL as strings).
+#
+CREATE PROCEDURE types(IN opts JSON) LANGUAGE JAVASCRIPT AS $mle$
+console.clear()
+const show = (v) => v === null ? 'null'
+      : v instanceof Date ? 'Date ' + v.toISOString()
+: v instanceof Uint8Array ? 'Uint8Array ' + Array.from(v).join(' ')
+: v instanceof Float32Array ? 'Float32Array ' + Array.from(v).join(' ')
+: typeof v === 'object' ? 'object ' + JSON.stringify(v)
+: typeof v + ' ' + String(v)
+const r = session.sql(`SELECT -5 AS i, 9007199254740993 AS big,
+      CAST(18446744073709551615 AS UNSIGNED) AS ubig, 2.5e0 AS d, CAST(1.25 AS FLOAT) AS f,
+      CAST(1.25 AS DECIMAL(6,3)) AS decm, 'héllo' AS s, x'00ff' AS b, CAST('{"a": [1, 2]}' AS JSON) AS j,
+      DATE'2024-01-02' AS dt, TIME'12:34:56.5' AS tm, TIMESTAMP'2024-01-02 03:04:05.678' AS ts,
+      STRING_TO_VECTOR('[1,2.5]') AS vec, b'101' AS bits, CAST(2024 AS YEAR) AS yr, NULL AS nul`,
+opts).execute()
+const row = r.fetchOne()
+for (const c of r.getColumns())
+console.log(c.getColumnLabel() + ': ' + c.getType() + ': ' + show(row[c.getColumnLabel()]))
+$mle$|
+CALL types(NULL);
+SELECT mle_session_state('stdout');
+mle_session_state('stdout')
+i: BIGINT: number -5
+big: BIGINT: string 9007199254740993
+ubig: BIGINT: string 18446744073709551615
+d: DOUBLE: number 2.5
+f: FLOAT: number 1.25
+decm: DECIMAL: string 1.250
+s: STRING: string héllo
+b: BYTES: Uint8Array 0 255
+j: JSON: object {"a":[1,2]}
+dt: DATE: Date 2024-01-01T21:00:00.000Z
+tm: TIME: string 12:34:56.500000
+ts: DATETIME: Date 2024-01-02T00:04:05.678Z
+vec: VECTOR: Float32Array 1 2.5
+bits: BYTES: Uint8Array 5
+yr: INT: number 2024
+nul: BYTES: null
+
+# integerType BIGINT and decimalType NUMBER for one statement.
+CALL types('{"integerType": "BIGINT", "decimalType": "NUMBER"}');
+SELECT mle_session_state('stdout');
+mle_session_state('stdout')
+i: BIGINT: bigint -5
+big: BIGINT: bigint 9007199254740993
+ubig: BIGINT: bigint 18446744073709551615
+d: DOUBLE: number 2.5
+f: FLOAT: number 1.25
+decm: DECIMAL: number 1.25
+s: STRING: string héllo
+b: BYTES: Uint8Array 0 255
+j: JSON: object {"a":[1,2]}
+dt: DATE: Date 2024-01-01T21:00:00.000Z
+tm: TIME: string 12:34:56.500000
+ts: DATETIME: Date 2024-01-02T00:04:05.678Z
+vec: VECTOR: Float32Array 1 2.5
+bits: BYTES: Uint8Array 5
+yr: INT: number 2024
+nul: BYTES: null
+
+# integerType STRING; and UNSAFE_BIGINT (only unsafe values are BigInts).
+CREATE PROCEDURE int_types(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+const q = 'SELECT 5 AS a, 9007199254740993 AS b'
+  const out = []
+for (const t of [mysql.IntegerType.STRING, mysql.IntegerType.UNSAFE_BIGINT, mysql.IntegerType.UNSAFE_STRING]) {
+const row = session.sql(q, { integerType: t }).execute().fetchOne()
+out.push(t + ': ' + typeof row.a + ' ' + typeof row.b + ' ' + row.b)
+}
+// Session defaults for the rest of the call; options of a statement win.
+session.setOptions({ integerType: 'BIGINT', decimalType: mysql.DecimalType.NUMBER })
+out.push('setOptions: ' + typeof session.sql(q).execute().fetchOne().a + ' '
+      + session.getOption('integerType') + ' ' + session.getOption('decimalType') + ' '
+      + session.getOption('passResultToClient') + ' ' + session.getOption('charsetName'))
+const x = session.sql(q, { integerType: 'STRING' })
+out.push('statement: ' + typeof x.execute().fetchOne().a + ' ' + x.getOption('integerType'))
+r = out.join('\n')
+$mle$|
+CALL int_types(@r);
+SELECT @r;
+@r
+STRING: string string 9007199254740993
+UNSAFE_BIGINT: number bigint 9007199254740993
+UNSAFE_STRING: number string 9007199254740993
+setOptions: bigint BIGINT NUMBER false utf8mb4
+statement: string STRING
+# setOptions holds only for the call that set it.
+CREATE PROCEDURE int_default(OUT r TEXT) LANGUAGE JAVASCRIPT
+AS $$ r = typeof session.sql('SELECT 5 AS a').execute().fetchOne().a $$;
+CALL int_default(@r);
+SELECT @r;
+@r
+number
+# The session state's integer_type is the default (Oracle's; set
+# after a reset).
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+SELECT mle_set_session_state('{"integer_type": "STRING"}');
+mle_set_session_state('{"integer_type": "STRING"}')
+1
+CALL int_default(@r);
+SELECT @r;
+@r
+string
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+#
+# 2. Parameters: runSql with values of all kinds; round trips.
+#
+CREATE TABLE tp (i BIGINT, d DOUBLE, s VARCHAR(20), b BLOB, j JSON, dt DATETIME(3),
+vec VECTOR(2), st SET('a', 'b', 'c'), u BIGINT UNSIGNED, bo TINYINT);
+CREATE PROCEDURE params(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+session.runSql('INSERT INTO tp VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+[42, 2.5, 'text', new Uint8Array([0, 255, 7]), { k: [1, 'x'] },
+new Date(Date.UTC(2024, 0, 2, 3, 4, 5, 678)), new Float32Array([1, 2.5]),
+new Set(['a', 'c']), 18446744073709551615n, true])
+session.runSql('INSERT INTO tp (i, s) VALUES (?, ?)', [null, undefined])
+const res = session.runSql('SELECT i, d, s, HEX(b) AS b, j, dt, VECTOR_TO_STRING(vec) AS vec, st, u, bo ' +
+'FROM tp ORDER BY i IS NULL, i', [], { integerType: 'STRING' })
+r = res.fetchAll().map((row) => row.toArray().map((v) =>
+v instanceof Date ? v.toISOString() : typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v))
+.join(' | ')).join('\n')
+$mle$|
+SET time_zone = '+00:00';
+CALL params(@r);
+SELECT @r;
+@r
+42 | 2.5 | text | 00FF07 | {"k":[1,"x"]} | 2024-01-02T03:04:05.678Z | [1.00000e+00,2.50000e+00] | a,c | 18446744073709551615 | 1
+null | null | null | null | null | null | null | null | null | null
+SELECT i, d, s, HEX(b), j, dt, VECTOR_TO_STRING(vec), st, u, bo FROM tp;
+i	d	s	HEX(b)	j	dt	VECTOR_TO_STRING(vec)	st	u	bo
+42	2.5	text	00FF07	{"k": [1, "x"]}	2024-01-02 06:04:05.678	[1.00000e+00,2.50000e+00]	a,c	18446744073709551615	1
+NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+SET time_zone = DEFAULT;
+# Values that cannot be bound: TypeErrors.
+CREATE PROCEDURE bad_params(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+const out = []
+for (const v of [NaN, Infinity, Symbol('s'), () => 1, new Date(NaN), mysql.arg(1)]) {
+try { session.runSql('SELECT ?', [v]); out.push('bound') }
+catch (e) { out.push(e.name + ': ' + e.message) }
+}
+r = out.join('\n')
+$mle$|
+CALL bad_params(@r);
+SELECT @r;
+@r
+TypeError: cannot bind NaN
+TypeError: cannot bind Infinity
+TypeError: cannot bind a symbol
+TypeError: cannot bind a function
+TypeError: cannot bind an invalid Date
+TypeError: mysql.arg() values are for OUT and INOUT parameters of procedures
+#
+# 3. Rows and results: access forms, fetchAll, OKs, warnings, execution
+#    time, several result sets, passResultToClient, many rows.
+#
+CREATE PROCEDURE rows_api(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+const out = []
+const res = session.runSql('SELECT id, v AS name, n, n AS n FROM t1 ORDER BY id')
+const row = res.fetchOne()
+out.push([row.id, row['name'], row[2], row.getField('n'), row.getLength(), row.toArray().length,
+Object.keys(row).join('|'), JSON.stringify(row), row.nope, row[9]].join(' '))
+out.push('rest: ' + res.fetchAll().map((x) => x.name).join(',') + ' then ' + res.fetchOne())
+out.push('hasData ' + res.hasData() + ', next ' + res.nextResult() + ', count ' + res.getColumnCount())
+const ins = session.runSql("INSERT INTO t1 (v, n) VALUES ('four', 4), ('five', 5)")
+out.push('insert: hasData ' + ins.hasData() + ', affected ' + ins.getAffectedItemsCount() + ', id '
+      + ins.getAutoIncrementValue() + ', columns ' + ins.getColumnCount() + ', row ' + ins.fetchOne())
+const w = session.runSql("SELECT CAST('12abc' AS SIGNED) AS x")
+out.push('warnings ' + w.getWarningsCount() + ': ' + w.getWarnings().map((x) =>
+x.level + ' ' + x.code + ' ' + x.message).join('; '))
+out.push('time: ' + /^\d+\.\d{4} sec$/.test(w.getExecutionTime()))
+try { row.getField('nope') } catch (e) { out.push(e.name + ': ' + e.message) }
+r = out.join('\n')
+$mle$|
+CREATE PROCEDURE two_sets() BEGIN SELECT 1 AS a; SELECT 'x' AS b, 'y' AS c; END|
+CREATE PROCEDURE sets(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+const out = []
+const res = session.runSql('CALL two_sets()')
+do {
+out.push(res.hasData() ? res.getColumnNames() + ': ' + res.fetchAll().map((x) => x.toArray()).join(';')
+: 'OK ' + res.getAffectedItemsCount())
+} while (res.nextResult() ? true : res.hasData())
+// Rows left unread are skipped by nextResult.
+const res2 = session.runSql('CALL two_sets()')
+out.push('skip: ' + res2.nextResult() + ' ' + res2.fetchOne().c)
+res2.close()
+r = out.join('\n')
+$mle$|
+CREATE PROCEDURE to_client() LANGUAGE JAVASCRIPT AS $mle$
+const r1 = session.sql('SELECT v, n FROM t1 WHERE n < 3 ORDER BY n', { passResultToClient: true }).execute()
+const p = session.prepare('SELECT ? AS prepared', { passResultToClient: true })
+const r2 = p.bind('to the client').execute()
+const r3 = session.runSql('CALL two_sets()', [], { passResultToClient: true })
+console.clear()
+console.log(String(r1) + ' ' + String(r2) + ' ' + String(r3) + ' ' + p.getOption('passResultToClient'))
+$mle$|
+CREATE PROCEDURE many(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+const q = 'WITH RECURSIVE c(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM c WHERE k < ?) SELECT k FROM c'
+  let n = 0, sum = 0
+const res = session.runSql(q, [5000])
+for (let row = res.fetchOne(); row; row = res.fetchOne()) { n++; sum += row.k }
+const all = session.sql(q.replace('?', '5000')).execute().fetchAll()
+r = n + ' ' + sum + ' ' + all.length + ' ' + all[4999].k
+$mle$|
+CALL rows_api(@r);
+Warnings:
+Warning	1292	Truncated incorrect INTEGER value: '12abc'
+SELECT @r;
+@r
+1 one 1 1 4 4 0|1|2|3|id|name|n [1,"one",1,1]  
+rest: two,three then null
+hasData true, next false, count 4
+insert: hasData false, affected 2, id 4, columns 0, row null
+warnings 1: 2 1292 Truncated incorrect INTEGER value: '12abc'
+time: true
+TypeError: no column 'nope' in the row
+CALL sets(@r);
+SELECT @r;
+@r
+a: 1
+b,c: x,y
+skip: true y
+CALL to_client();
+v	n
+one	1
+two	2
+prepared
+to the client
+a
+1
+b	c
+x	y
+SELECT mle_session_state('stdout');
+mle_session_state('stdout')
+null null null true
+
+CALL many(@r);
+SELECT @r;
+@r
+5000 12502500 5000 5000
+#
+# 4. Prepared statements: binding rules and errors.
+#
+CREATE PROCEDURE prep(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+const out = []
+const try_ = (what, f) => { try { out.push(what + ': ' + f()) } catch (e) { out.push(what + ': ' + e.name
++ (e.code ? ' ' + e.code + ' ' + e.sqlState : '') + ': ' + e.message) } }
+const p = session.prepare('SELECT ? + ? AS s')
+try_('too few', () => p.bind(1).execute())
+try_('accumulated', () => p.bind(2).execute().fetchOne().s)
+try_('partial', () => p.bind(10).execute().fetchOne().s)
+try_('too many', () => p.bind(1, 2, 3))
+const old = p.execute()
+p.execute()
+try_('replaced', () => old.fetchOne())
+p.deallocate()
+try_('deallocated', () => p.bind(1))
+try_('syntax', () => session.prepare('SELEC 1'))
+r = out.join('\n')
+$mle$|
+CALL prep(@r);
+SELECT @r;
+@r
+too few: SqlError 1210 HY000: Incorrect arguments to EXECUTE: 1 of 2 parameter markers bound
+accumulated: 3
+partial: 12
+too many: SqlError 1210 HY000: Incorrect arguments to bind: 3 values for 2 parameter markers
+replaced: Error: the result was replaced by a new execution of its prepared statement
+deallocated: Error: the prepared statement was deallocated
+syntax: SqlError 1064 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'SELEC 1' at line 1
+#
+# 5. Session variables as properties (Oracle's set_any_var).
+#
+CREATE PROCEDURE set_any_var(IN name VARCHAR(20), IN val INT) LANGUAGE JAVASCRIPT
+AS $$ session[name] = val $$;
+CALL set_any_var("yourvar", 100);
+SELECT @yourvar;
+@yourvar
+100
+SET @myvar = 27, @s = 'Something that is not 27', @dec = 1.5, @big = 9007199254740993;
+CREATE PROCEDURE vars(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+const out = []
+for (const n of ['myvar', 's', 'dec', 'big', 'unset'])
+out.push(n + ': ' + typeof session[n] + ' ' + session[n])
+session.flag = true
+session.when = new Date(Date.UTC(2024, 0, 2))
+session.bin = new Uint8Array([65, 66])
+session.obj = { a: 1 }
+session['odd name`'] = 'quoted'
+  try { session.sql = 1 } catch (e) { out.push(e.name + ': ' + e.message) }
+r = out.join('\n')
+$mle$|
+SET time_zone = '+00:00';
+CALL vars(@r);
+SELECT @r;
+@r
+myvar: number 27
+s: string Something that is not 27
+dec: string 1.5
+big: string 9007199254740993
+unset: object null
+TypeError: cannot set sql
+SELECT @flag, @when, HEX(@bin), @obj, @`odd name```;
+@flag	@when	HEX(@bin)	@obj	@`odd name```
+1	2024-01-02 03:00:00.000000	4142	{"a":1}	quoted
+SET time_zone = DEFAULT;
+#
+# 6. Schemas and tables.
+#
+CREATE PROCEDURE schema_api(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+const out = []
+const s = session.getDefaultSchema()
+out.push(s.getName() + ' ' + s.existsInDatabase() + ' ' + (s.getSession() === session))
+out.push(session.getSchemas().map((x) => x.getName()).filter((n) => ['test', 'mysql'].includes(n)).join(','))
+out.push(s.getTables().map((t) => t.getName() + (t.isView() ? '(view)' : '')).join(','))
+const t = s.getTable('t1')
+out.push(t.getName() + ' ' + t.existsInDatabase() + ' ' + t.count() + ' ' + t.getSchema().getName())
+const none = s.getTable('none')
+out.push('none ' + none.existsInDatabase())
+try { none.count() } catch (e) { out.push(e.code + ' ' + e.message) }
+try { session.getSchema('nope') } catch (e) { out.push(e.code + ' ' + e.sqlState + ' ' + e.message) }
+const n = session.createSchema('mle js`db')
+out.push(n.getName() + ' ' + session.getSchema('mle js`db').existsInDatabase() + ' ' + session.quoteName('mle js`db'))
+session.dropSchema('mle js`db')
+out.push('dropped ' + n.existsInDatabase())
+try { s.getFunction('nope') } catch (e) { out.push(e.code + ' ' + e.message) }
+r = out.join('\n')
+$mle$|
+CALL schema_api(@r);
+SELECT @r;
+@r
+test true true
+mysql,test
+t1,tp,v1(view)
+t1 true 5 test
+none false
+1146 Table 'test.none' doesn't exist
+1049 42000 Unknown database 'nope'
+mle js`db true `mle js``db`
+dropped false
+1305 FUNCTION test.nope does not exist
+#
+# 7. Transactions: the caller's; savepoints; autocommit.
+#
+CREATE TABLE tx (k INT) ENGINE=InnoDB;
+CREATE PROCEDURE tx(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+const out = []
+session.startTransaction()
+session.runSql('INSERT INTO tx VALUES (1)')
+const sp = session.setSavepoint()
+session.runSql('INSERT INTO tx VALUES (2)')
+const named = session.setSavepoint('mine')
+session.runSql('INSERT INTO tx VALUES (3)')
+session.rollbackTo(sp)
+out.push(sp + ' ' + named + ' ' + session.runSql('SELECT GROUP_CONCAT(k) AS k FROM tx').fetchOne().k)
+try { session.releaseSavepoint('') } catch (e) { out.push(e.name + ': ' + e.message) }
+try { session.releaseSavepoint('mine') } catch (e) { out.push(e.code + ' ' + e.message) }
+session.commit()
+session.runSql('INSERT INTO tx VALUES (4)')
+session.rollback()
+const before = session.autocommit()
+session.autocommit(false)
+const off = session.autocommit()
+session.autocommit(true)
+out.push('autocommit ' + before + ' ' + off + ' ' + session.autocommit())
+r = out.join('\n')
+$mle$|
+CALL tx(@r);
+SELECT @r;
+@r
+TxSp1 mine 1
+TypeError: the savepoint name must not be empty
+1305 SAVEPOINT mine does not exist
+autocommit 1 0 1
+SELECT * FROM tx;
+k
+1
+4
+#
+# 8. mysql.*: rand, uuid (version 1), isUUID, sleep; they also work in
+#    functions, where SQL is not allowed (6120).
+#
+CREATE FUNCTION fns() RETURNS TEXT LANGUAGE JAVASCRIPT AS $mle$
+const out = []
+const x = mysql.rand()
+out.push(typeof x + ' ' + (x >= 0 && x < 1))
+const u = mysql.uuid(), v = mysql.uuid()
+out.push(/^[0-9a-f]{8}-[0-9a-f]{4}-1[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(u) + ' ' + (u !== v))
+out.push([u, u.replaceAll('-', ''), '{' + u + '}', 'nope', null].map((y) => mysql.isUUID(y)).join(','))
+out.push(mysql.sleep(0.01) + ' ' + Object.keys(mysql.IntegerType).join(',') + ' ' + mysql.Type.VECTOR)
+try { session.runSql('SELECT 1') } catch (e) { out.push(e.code + ' ' + (e instanceof SqlError)) }
+return out.join('\n')
+$mle$|
+SELECT fns();
+fns()
+number true
+true true
+1,1,1,0,
+0 BIGINT,STRING,UNSAFE_BIGINT,UNSAFE_STRING VECTOR
+6120 true
+SELECT IS_UUID(fns()) IS NOT NULL;
+IS_UUID(fns()) IS NOT NULL
+1
+#
+# 9. Errors: SqlError objects of statements; thrown SqlErrors; a thrown
+#    SqlError without an error number is SIGNAL's default (1644).
+#
+CREATE PROCEDURE errs(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
+const out = []
+try { session.runSql('SELECT * FROM bogus') }
+catch (e) { out.push([e instanceof SqlError, e instanceof Error, e.name, e.code, e.sqlState, e.message].join(' | ')) }
+out.push(String(new SqlError('HY000', 'text', 1234)))
+try { new SqlError(NaN, 'x', 1) } catch (e) { out.push(e.name + ': ' + e.message) }
+r = out.join('\n')
+$mle$|
+CALL errs(@r);
+SELECT @r;
+@r
+true | true | SqlError | 1146 | 42S02 | Table 'test.bogus' doesn't exist
+SqlError: Error code: 1234 Error state: HY000 Error message: text
+TypeError: SqlError: sql_state must be a finite number
+CREATE PROCEDURE throw_default() LANGUAGE JAVASCRIPT AS $$ throw new SqlError(45000, 'mine') $$;
+CALL throw_default();
+ERROR 45000: mine
+CREATE PROCEDURE throw_state() LANGUAGE JAVASCRIPT AS $$ throw new SqlError('HY000', 'with state', 1234) $$;
+CALL throw_state();
+ERROR HY000: with state
+# A caught error leaves no trace; the call ends normally.
+CREATE PROCEDURE caught() LANGUAGE JAVASCRIPT
+AS $$ try { session.runSql('SELECT * FROM bogus') } catch (e) {} $$;
+CALL caught();
+SHOW WARNINGS;
+Level	Code	Message
+#
+# 10. KILL QUERY during mysql.sleep.
+#
+CREATE PROCEDURE sleeper() LANGUAGE JAVASCRIPT AS $$ mysql.sleep(60); while (true) {} $$;
+CALL sleeper();
+ERROR 70100: Query execution was interrupted
+DROP PROCEDURE types;
+DROP PROCEDURE int_types;
+DROP PROCEDURE int_default;
+DROP PROCEDURE params;
+DROP PROCEDURE bad_params;
+DROP PROCEDURE rows_api;
+DROP PROCEDURE two_sets;
+DROP PROCEDURE sets;
+DROP PROCEDURE to_client;
+DROP PROCEDURE many;
+DROP PROCEDURE prep;
+DROP PROCEDURE set_any_var;
+DROP PROCEDURE vars;
+DROP PROCEDURE schema_api;
+DROP PROCEDURE tx;
+DROP FUNCTION fns;
+DROP PROCEDURE errs;
+DROP PROCEDURE throw_default;
+DROP PROCEDURE throw_state;
+DROP PROCEDURE caught;
+DROP PROCEDURE sleeper;
+DROP VIEW v1;
+DROP TABLE t1, tp, tx;
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

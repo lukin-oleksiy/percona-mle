@@ -103,6 +103,11 @@ final class Control implements Runnable {
     return t;
   }
 
+  /** Whether the running call was interrupted (polled by long host waits, e.g. mysql.sleep). */
+  synchronized boolean isInterrupted() {
+    return interrupted;
+  }
+
   /** A top-level call starts (on the main thread); guest: a JS or Python routine. */
   synchronized void begin(long seq, boolean guest) {
     running = seq;

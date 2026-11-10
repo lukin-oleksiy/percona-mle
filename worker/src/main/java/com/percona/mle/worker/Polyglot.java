@@ -146,6 +146,8 @@ final class Polyglot {
       js = jsHelpers(c);
       python = pythonHelpers(c);
       jsOracle = JsOracle.helpers(c);
+      // The SQL API (Phase 5): the globals session, mysql and SqlError.
+      new JsSql(c, options);
       // Oracle: console.clear() clears the session's stdout and stderr.
       if (console != null) {
         Value clear = c.asValue((org.graalvm.polyglot.proxy.ProxyExecutable) a -> {

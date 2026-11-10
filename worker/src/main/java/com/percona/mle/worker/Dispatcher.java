@@ -288,7 +288,32 @@ final class Dispatcher {
       result(Wire.INTERRUPTED, null, null, new ErrorInfo(language, "interrupted", frames, 0, ""));
       return;
     }
+    ErrorInfo sql = e.isGuestException() ? sqlError(language, e.getGuestObject(), frames) : null;
+    if (sql != null) {
+      result(Wire.GUEST_ERROR, null, null, sql);
+      return;
+    }
     result(Wire.GUEST_ERROR, null, null, new ErrorInfo(language, Polyglot.describe(e, false), frames, 0, ""));
+  }
+
+  /**
+   * A guest SqlError (the SQL API's error class of JS and Python: marked with $mle$sql, with code
+   * and sqlState): an inner statement's error, or one the routine throws (raised like SIGNAL).
+   */
+  private static ErrorInfo sqlError(String language, org.graalvm.polyglot.Value g, List<Frame> frames) {
+    try {
+      if (g == null || !g.hasMembers()) return null;
+      org.graalvm.polyglot.Value mark = g.getMember("$mle$sql");
+      if (mark == null || !mark.isBoolean() || !mark.asBoolean()) return null;
+      org.graalvm.polyglot.Value code = g.getMember("code");
+      org.graalvm.polyglot.Value state = g.getMember("sqlState");
+      org.graalvm.polyglot.Value message = g.getMember("message");
+      return new ErrorInfo(language, message == null || message.isNull() ? "" : message.toString(), frames,
+          code != null && code.fitsInInt() ? code.asInt() : 0,
+          state != null && state.isString() ? state.asString() : "");
+    } catch (RuntimeException e) {
+      return null;
+    }
   }
 
   private static String describe(Throwable t) {
@@ -400,6 +425,15 @@ final class Dispatcher {
    * flags); throws MleSqlException for an SQL error.
    */
   MleSql.Reply sqlRequest(int action, long id, String text, Object[] params, int flags, int maxRows) {
+    return sqlRequest(action, id, text, params, flags, maxRows, false);
+  }
+
+  /**
+   * raw: row values stay as read (DATE/TIME/DATETIME/TIMESTAMP as Values.Temporal, VECTOR as
+   * float[]) for the language mappers of com.percona.mle.sql.
+   */
+  MleSql.Reply sqlRequest(int action, long id, String text, Object[] params, int flags, int maxRows,
+      boolean raw) {
     if (Thread.currentThread() != thread)
       throw new IllegalStateException("SQL must be run on the routine's thread");
     w.reset();
@@ -413,7 +447,7 @@ final class Dispatcher {
     mb.send(Wire.SQL, Wire.OK, depth, seq, w);
     while (true) {
       Mailbox.Message m = mb.receive();
-      if (m.op() == Wire.SQL_RESULT && m.depth() == depth) return sqlReply(id, new MessageReader(m.body()));
+      if (m.op() == Wire.SQL_RESULT && m.depth() == depth) return sqlReply(id, new MessageReader(m.body()), raw);
       boolean nested = m.op() == Wire.CALL || m.op() == Wire.PREPARE || m.op() == Wire.DROP;
       if (nested && m.depth() == depth + 1 && m.depth() <= maxDepth) {
         handle(m);
@@ -444,7 +478,17 @@ final class Dispatcher {
     return r.warnings().stream().map(x -> x.level() + " " + x.code() + " " + x.message()).toList();
   }
 
-  private static MleSql.Reply sqlReply(long id, MessageReader r) {
+  /** The top-level call's sequence number (per-call state of the SQL API). */
+  long callSeq() {
+    return seq;
+  }
+
+  /** Whether the running top-level call was killed (mysql.sleep). */
+  boolean interrupted() {
+    return control.isInterrupted();
+  }
+
+  private static MleSql.Reply sqlReply(long id, MessageReader r, boolean raw) {
     int kind = r.u8();
     switch (kind) {
       case Wire.SQL_ERROR -> {
@@ -478,7 +522,10 @@ final class Dispatcher {
         List<Object[]> rows = new ArrayList<>((int) Math.min(nrows, 1 << 16));
         for (long i = 0; i < nrows; i++) {
           Object[] row = new Object[ncols];
-          for (int c = 0; c < ncols; c++) row[c] = Values.toJava(Values.read(r));
+          for (int c = 0; c < ncols; c++) {
+            Object v = Values.read(r);
+            row[c] = !raw ? Values.toJava(v) : v instanceof Values.VectorRef ref ? ref.toArray() : v;
+          }
           rows.add(row);
         }
         boolean more = r.flag();

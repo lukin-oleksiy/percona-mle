@@ -42,6 +42,28 @@ public final class SqlBridge {
     return d.sqlRequest(action, id, text, params, flags, maxRows);
   }
 
+  /** com.percona.mle.sql: a request whose rows keep raw values (see Dispatcher#sqlRequest). */
+  public static com.percona.mle.api.MleSql.Reply requestRaw(int action, long id, String text, Object[] params,
+      int flags, int maxRows) {
+    return dispatcher().sqlRequest(action, id, text, params, flags, maxRows, true);
+  }
+
+  /** The running top-level call's sequence number. */
+  public static long callSeq() {
+    return dispatcher().callSeq();
+  }
+
+  /** Whether the running call was killed. */
+  public static boolean interrupted() {
+    return dispatcher().interrupted();
+  }
+
+  private static Dispatcher dispatcher() {
+    Dispatcher d = dispatcher;
+    if (d == null) throw new IllegalStateException("MLE worker not running");
+    return d;
+  }
+
   public static long newStatementId() {
     Dispatcher d = dispatcher;
     if (d == null) throw new IllegalStateException("MLE worker not running");

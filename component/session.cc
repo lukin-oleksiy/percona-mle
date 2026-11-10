@@ -126,6 +126,7 @@ class Session::KillGuard {
           s->m_thd,
           [](MYSQL_THD, uint16_t, void *data) {
             auto *session = static_cast<Session *>(data);
+            session->m_kills.fetch_add(1);
             const size_t count = session->m_running_n.load();
             for (size_t i = 0; i < count && i < kMaxNesting; i++)
               if (mle::Worker *w = session->m_running[i].load()) w->interrupt();
@@ -337,12 +338,18 @@ bool Session::execute(Routine &routine) {
   std::string error;
   raise_max(g_counters.threads_max, ++g_counters.threads);
   Status s;
+  const uint64_t kills = m_kills.load();
   {
     const KillGuard kill(this, slot->worker.get());
     s = slot->worker->call(routine.id, 0, args, hooks, &result, &error);
   }
   --g_counters.threads;
   keep_console(result);
+  // A call killed meanwhile reports the KILL even if the routine then ended
+  // normally (e.g. an inner SLEEP returned early and the worker finished
+  // before the interrupt reached it).
+  if (s == Status::kOk && (hooks.killed() || m_kills.load() != kills))
+    s = Status::kInterrupted;
   const bool ok = s == Status::kOk;
   if (ok) sql.call_succeeded();
   else report(who, s, result, error, routine, &args, &sql);
