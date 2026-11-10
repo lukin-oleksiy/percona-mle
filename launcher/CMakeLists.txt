@@ -14,11 +14,12 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 # mle_launcher: starts and isolates MLE worker processes (see main.cc).
-# Installation is decided with the rest of the packaging (Phase 3, W7).
+# Installed into <plugin dir>/mle with the rest of MLE (defaults.h).
 MYSQL_ADD_EXECUTABLE(mle_launcher
   main.cc
   child.cc
   cgroup.cc
   LINK_LIBRARIES mle_host
-  SKIP_INSTALL
+  DESTINATION ${INSTALL_PLUGINDIR}/mle
+  COMPONENT MleWorker
   )

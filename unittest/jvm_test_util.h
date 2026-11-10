@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "mle/codec.h"
+#include "mle/defaults.h"
 #include "mle/launcher.h"
 #include "mle/worker.h"
 
@@ -51,37 +52,35 @@ inline const char *python_venv() {
   return v.empty() ? nullptr : v.c_str();
 }
 
-/** A JVM worker class (D-10) under the full lockdown. prewarm: a comma list
-    of java, js, python, numpy (see Main). */
+/** The build tree's MLE files (as the installed layout, see defaults.h).
+    MLE_TEST_NO_AOT=1 runs workers without the AOT cache. */
+inline Layout build_layout() {
+  Layout l;
+  l.launcher_exe = MLE_LAUNCHER_EXE;
+  l.worker_exe = MLE_WORKER_EXE;
+  l.worker_jar = MLE_WORKER_JAR;
+  l.resource_cache = MLE_RESOURCE_CACHE;
+  l.python_venv = python_venv() ? python_venv() : "";
+  if (getenv("MLE_TEST_NO_AOT") == nullptr) l.aot_cache = MLE_AOT_CACHE;
+  l.java_home = MLE_JAVA_HOME;
+  return l;
+}
+
+/** The default JVM worker class (defaults.h) for the tests. prewarm: a comma
+    list of java, js, python, numpy (see Main). */
 inline ClassConfig jvm_class(const std::string &name,
                              const std::string &prewarm = "java",
-                             const std::string &xmx = "512m") {
-  ClassConfig c;
-  c.name = name;
-  c.executable = MLE_WORKER_EXE;
-  c.args = {
-      std::string("--jvm=") + MLE_JAVA_HOME + "/lib/server/libjvm.so",
-      std::string("-Djava.class.path=") + MLE_WORKER_JAR,
-      std::string("-Dpolyglot.engine.userResourceCache=") + MLE_RESOURCE_CACHE,
-      "-XX:+UseSerialGC",
-      "-Xmx" + xmx,
-      "-Xss2m",
-      "-XX:CICompilerCount=2",
-      "-XX:-UsePerfData",
-      "--enable-native-access=ALL-UNNAMED",
-      "--add-modules=jdk.incubator.vector",
-      "-Dmle.class=" + name};
-  if (!prewarm.empty()) c.args.push_back("-Dmle.prewarm=" + prewarm);
-  if (python_venv() != nullptr)
-    c.args.push_back(std::string("-Dmle.python.venv=") + python_venv());
-  if (const char *extra = getenv("MLE_TEST_JVM_OPT")) c.args.push_back(extra);
+                             const std::string &heap = "512m") {
+  JvmClassOptions o;
+  o.name = name;
+  o.prewarm = prewarm;
+  o.heap = heap;
+  o.inherit_stderr = getenv("MLE_TEST_STDERR") != nullptr;
+  if (const char *extra = getenv("MLE_TEST_JVM_OPT"))
+    o.extra_jvm_options.push_back(extra);
   if (const char *spin = getenv("MLE_TEST_SPIN"))
-    c.args.push_back(std::string("-Dmle.spin=") + spin);
-  c.exec_paths = {dir_of(MLE_WORKER_EXE), MLE_JAVA_HOME};
-  c.read_paths = {dir_of(MLE_WORKER_JAR), MLE_RESOURCE_CACHE};
-  if (python_venv() != nullptr) c.read_paths.push_back(python_venv());
-  c.inherit_stderr = getenv("MLE_TEST_STDERR") != nullptr;
-  return c;
+    o.extra_jvm_options.push_back(std::string("-Dmle.spin=") + spin);
+  return jvm_worker_class(build_layout(), o);
 }
 
 // ---------------------------------------------------------------- test host

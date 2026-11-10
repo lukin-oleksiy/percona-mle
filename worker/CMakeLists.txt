@@ -35,7 +35,8 @@ MYSQL_ADD_EXECUTABLE(mle_worker
   bootstrap/main.cc
   bootstrap/seccomp.cc
   LINK_LIBRARIES ${CMAKE_DL_LIBS}
-  SKIP_INSTALL
+  DESTINATION ${INSTALL_PLUGINDIR}/mle
+  COMPONENT MleWorker
   )
 TARGET_INCLUDE_DIRECTORIES(mle_worker SYSTEM PRIVATE
   ${MLE_JAVA_HOME}/include ${MLE_JAVA_HOME}/include/linux)
@@ -69,6 +70,61 @@ ADD_CUSTOM_COMMAND(OUTPUT ${MLE_RESOURCE_STAMP}
   COMMENT "Extracting GraalJS/GraalPy resources for MLE workers"
   VERBATIM
   )
-ADD_CUSTOM_TARGET(mle_worker_jar ALL DEPENDS ${MLE_WORKER_JAR} ${MLE_RESOURCE_STAMP})
+
+# The GraalPy venv with numpy (D-6). The first build downloads the packages.
+SET(MLE_PYTHON_VENV ${CMAKE_CURRENT_BINARY_DIR}/python-venv/venv)
+SET(MLE_PYTHON_VENV_STAMP ${CMAKE_CURRENT_BINARY_DIR}/python-venv/.mle-venv-done)
+ADD_CUSTOM_COMMAND(OUTPUT ${MLE_PYTHON_VENV_STAMP}
+  COMMAND ${CMAKE_COMMAND} -E env JAVA_HOME=${MLE_JAVA_HOME}
+    ${MLE_MAVEN} -q -B -f ${CMAKE_CURRENT_SOURCE_DIR}/python/pom.xml
+    -Dmle.build.dir=${CMAKE_CURRENT_BINARY_DIR}/maven-python
+    -Dmle.venv.dir=${CMAKE_CURRENT_BINARY_DIR}/python-venv
+    generate-resources
+  COMMAND ${CMAKE_COMMAND} -E touch ${MLE_PYTHON_VENV_STAMP}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/python/pom.xml
+  COMMENT "Building the GraalPy venv for MLE workers (numpy)"
+  VERBATIM
+  )
+
+# JDK AOT cache (JEP 483/515): a training run loads, links and profiles what
+# a worker runs; workers then start from the cache. The JVM options that
+# matter for the cache must match the worker's (defaults.cc).
+SET(MLE_AOT_CACHE ${CMAKE_CURRENT_BINARY_DIR}/mle.aot)
+SET(MLE_AOT_JVM_OPTIONS
+  -XX:+UseSerialGC --enable-native-access=ALL-UNNAMED
+  --add-modules=jdk.incubator.vector
+  -Dpolyglot.engine.userResourceCache=${MLE_RESOURCE_CACHE}
+  -Dmle.python.venv=${MLE_PYTHON_VENV}
+  -cp ${MLE_WORKER_JAR})
+ADD_CUSTOM_COMMAND(OUTPUT ${MLE_AOT_CACHE}
+  COMMAND ${MLE_JAVA_HOME}/bin/java -XX:AOTMode=record
+    -XX:AOTConfiguration=${CMAKE_CURRENT_BINARY_DIR}/mle.aotconf
+    ${MLE_AOT_JVM_OPTIONS} com.percona.mle.worker.Train
+  COMMAND ${MLE_JAVA_HOME}/bin/java -XX:AOTMode=create
+    -XX:AOTConfiguration=${CMAKE_CURRENT_BINARY_DIR}/mle.aotconf
+    -XX:AOTCache=${MLE_AOT_CACHE} ${MLE_AOT_JVM_OPTIONS}
+  DEPENDS ${MLE_WORKER_JAR} ${MLE_RESOURCE_STAMP} ${MLE_PYTHON_VENV_STAMP}
+  COMMENT "Training and creating the JDK AOT cache for MLE workers"
+  VERBATIM
+  )
+
+ADD_CUSTOM_TARGET(mle_worker_jar ALL
+  DEPENDS ${MLE_WORKER_JAR} ${MLE_RESOURCE_STAMP} ${MLE_PYTHON_VENV_STAMP}
+          ${MLE_AOT_CACHE})
 SET_PROPERTY(GLOBAL PROPERTY MLE_WORKER_JAR ${MLE_WORKER_JAR})
 SET_PROPERTY(GLOBAL PROPERTY MLE_RESOURCE_CACHE ${MLE_RESOURCE_CACHE})
+SET_PROPERTY(GLOBAL PROPERTY MLE_PYTHON_VENV ${MLE_PYTHON_VENV})
+SET_PROPERTY(GLOBAL PROPERTY MLE_AOT_CACHE ${MLE_AOT_CACHE})
+
+# Installed layout: <plugin dir>/mle (see include/mle/defaults.h). The
+# component MleWorker is separate from Server for now (POC; packaging later).
+# The AOT cache checks the jars' paths, sizes and modification times: CMake
+# keeps the times when it installs, and the cache is installed with the jars.
+# The venv is used only through its site-packages, so it can be moved.
+SET(MLE_INSTALL_DIR ${INSTALL_PLUGINDIR}/mle)
+INSTALL(FILES ${MLE_WORKER_JAR} ${MLE_AOT_CACHE}
+  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleWorker)
+INSTALL(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/maven/deps
+                  ${MLE_RESOURCE_CACHE}
+                  ${CMAKE_CURRENT_BINARY_DIR}/python-venv
+  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleWorker USE_SOURCE_PERMISSIONS)

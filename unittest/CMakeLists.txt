@@ -52,11 +52,17 @@ TARGET_COMPILE_DEFINITIONS(mle_worker_protocol-t PRIVATE
   )
 ADD_DEPENDENCIES(mle_worker_protocol-t mle_launcher mle_test_worker)
 
-# A GraalPy venv with numpy for the Python tests (optional; numpy tests are
-# skipped without it).
-SET(MLE_TEST_PYTHON_VENV "" CACHE PATH "GraalPy venv with numpy for the MLE tests")
+# The GraalPy venv for the Python tests: the one built here, unless set.
+SET(MLE_TEST_PYTHON_VENV "" CACHE PATH "GraalPy venv with numpy for the MLE tests (default: the built one)")
 GET_PROPERTY(MLE_WORKER_JAR GLOBAL PROPERTY MLE_WORKER_JAR)
 GET_PROPERTY(MLE_RESOURCE_CACHE GLOBAL PROPERTY MLE_RESOURCE_CACHE)
+GET_PROPERTY(MLE_AOT_CACHE GLOBAL PROPERTY MLE_AOT_CACHE)
+GET_PROPERTY(MLE_BUILT_PYTHON_VENV GLOBAL PROPERTY MLE_PYTHON_VENV)
+IF(MLE_TEST_PYTHON_VENV)
+  SET(MLE_TESTS_VENV ${MLE_TEST_PYTHON_VENV})
+ELSE()
+  SET(MLE_TESTS_VENV ${MLE_BUILT_PYTHON_VENV})
+ENDIF()
 FOREACH(test java_worker polyglot_worker worker_failures)
   TARGET_COMPILE_DEFINITIONS(mle_${test}-t PRIVATE
     MLE_LAUNCHER_EXE="$<TARGET_FILE:mle_launcher>"
@@ -64,7 +70,8 @@ FOREACH(test java_worker polyglot_worker worker_failures)
     MLE_WORKER_JAR="${MLE_WORKER_JAR}"
     MLE_RESOURCE_CACHE="${MLE_RESOURCE_CACHE}"
     MLE_JAVA_HOME="${MLE_JAVA_HOME}"
-    MLE_TEST_PYTHON_VENV="${MLE_TEST_PYTHON_VENV}"
+    MLE_TEST_PYTHON_VENV="${MLE_TESTS_VENV}"
+    MLE_AOT_CACHE="${MLE_AOT_CACHE}"
     )
   ADD_DEPENDENCIES(mle_${test}-t mle_launcher mle_worker mle_worker_jar)
 ENDFOREACH()

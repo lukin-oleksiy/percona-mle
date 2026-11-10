@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright (c) 2026 Percona LLC and/or its affiliates. All rights reserved.
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; version 2 of the License.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+  The GraalPy virtual environment of the MLE JVM worker, with the Python
+  packages routines may import (numpy: D-6). Built by CMake into
+  mle.venv.dir; the worker reads it (-Dmle.python.venv).
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.percona.mle</groupId>
+  <artifactId>mle-python-venv</artifactId>
+  <version>1.0</version>
+  <packaging>pom</packaging>
+
+  <properties>
+    <graalvm.version>25.5.5.0.3</graalvm.version>
+    <mle.build.dir>${project.basedir}/target</mle.build.dir>
+    <mle.venv.dir>${mle.build.dir}/python-venv</mle.venv.dir>
+  </properties>
+
+  <!-- The plugin creates the venv with this GraalPy (the worker's version). -->
+  <dependencies>
+    <dependency>
+      <groupId>org.graalvm.polyglot</groupId>
+      <artifactId>python-community</artifactId>
+      <version>${graalvm.version}</version>
+      <type>pom</type>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <directory>${mle.build.dir}</directory>
+    <plugins>
+      <plugin>
+        <groupId>org.graalvm.python</groupId>
+        <artifactId>graalpy-maven-plugin</artifactId>
+        <version>${graalvm.version}</version>
+        <configuration>
+          <packages>
+            <package>numpy</package>
+          </packages>
+          <externalDirectory>${mle.venv.dir}</externalDirectory>
+        </configuration>
+        <executions>
+          <execution>
+            <phase>generate-resources</phase>
+            <goals><goal>process-graalpy-resources</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

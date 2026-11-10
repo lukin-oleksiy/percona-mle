@@ -200,7 +200,7 @@ final class Polyglot {
         import array as _array, datetime as _dt, decimal as _decimal, json as _json
 
         def _vector(b):
-            data = bytes(b)
+            data = b.encode('latin-1') if isinstance(b, str) else bytes(b)
             try:
                 import numpy
                 return numpy.frombuffer(data, dtype=numpy.float32).copy()
@@ -342,6 +342,12 @@ final class Polyglot {
       case MleJson j -> j.text();
       case byte[] b -> ByteBuffer.wrap(b);
       case Values.VectorRef ref -> {
+        if (!js) {
+          // Python: a Latin-1 string (one byte per char, stored compactly by Truffle) turns into
+          // bytes natively in GraalPy; bytes() of a foreign buffer goes element by element.
+          byte[] raw = ref.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
+          yield new String(raw, java.nio.charset.StandardCharsets.ISO_8859_1);
+        }
         ByteBuffer bb = ByteBuffer.allocate(ref.dims() * 4).order(ByteOrder.LITTLE_ENDIAN);
         java.lang.foreign.MemorySegment.ofBuffer(bb).copyFrom(ref.data());
         yield bb;
