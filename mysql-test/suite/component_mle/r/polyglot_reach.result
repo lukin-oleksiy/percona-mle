@@ -1,0 +1,88 @@
+#
+# component_mle: every language reaches the others' ecosystems (the point
+# of the polyglot engine): Java classes from JavaScript and Python, numpy
+# from JavaScript and Java, npm packages from Python and Java, database
+# Java libraries from JavaScript and Python. The package fixture in
+# std_data stands for the DBA's npm, PyPI and Maven packages.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+# 1. A Java jar (Maven) from JavaScript and Python.
+CREATE FUNCTION js_java_jar() RETURNS DOUBLE LANGUAGE JAVASCRIPT
+AS $$ return Java.type('demo.Stats').median(4, 1, 3, 10) $$;
+CREATE FUNCTION py_java_jar() RETURNS DOUBLE LANGUAGE PYTHON AS $$
+import java
+return java.type('demo.Stats').median(4.0, 1.0, 3.0, 10.0)
+$$;
+SELECT js_java_jar(), py_java_jar();
+js_java_jar()	py_java_jar()
+3.5	3.5
+# 2. numpy from JavaScript and Java (JavaScript arrays go to numpy as
+#    Python lists: builtins.list(...); numpy scalars become numbers with
+#    item(), as in Python).
+CREATE FUNCTION js_numpy() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+const np = importPython('numpy'), py = importPython('builtins')
+const v = np.array(py.list([3, 4]))
+return 'norm ' + np.linalg.norm(v).item() + ', dot ' + np.dot(np.arange(4), np.arange(4)).item() + ', numpy ' + np.__version__
+$$;
+CREATE FUNCTION java_numpy() RETURNS TEXT LANGUAGE JAVA AS $$
+org.graalvm.polyglot.Value np = Mle.importPython("numpy");
+org.graalvm.polyglot.Value v = np.invokeMember("array", Mle.context().eval("python", "[3.0, 4.0]"));
+// numpy scalars become plain numbers with item(), as in Python.
+return "norm " + np.getMember("linalg").invokeMember("norm", v).invokeMember("item").asDouble()
++ ", sum " + np.invokeMember("arange", 5).invokeMember("sum").invokeMember("item").asLong();
+$$;
+SELECT REGEXP_REPLACE(js_numpy(), 'numpy [0-9.]+', 'numpy <version>') AS js_numpy, java_numpy();
+js_numpy	java_numpy()
+norm 5, dot 14, numpy <version>	norm 5.0, sum 10
+# 3. npm packages (CommonJS and an ES module) from Python and Java.
+CREATE FUNCTION py_npm() RETURNS TEXT LANGUAGE PYTHON AS $$
+return import_js('mle-demo-cjs').slugify('Hello, Polyglot World') + ' / ' + import_js('mle-demo-esm').greet('Python')
+$$;
+CREATE FUNCTION java_npm() RETURNS TEXT LANGUAGE JAVA
+AS $$ return Mle.importJs("mle-demo-cjs").getMember("slugify").execute("From Java!").asString(); $$;
+SELECT py_npm(), java_npm();
+py_npm()	java_npm()
+hello-polyglot-world / Hello, Python!	from-java
+# 4. A database Java library from JavaScript and Python (USING binds
+#    its classes), and from Java.
+CREATE LIBRARY geo LANGUAGE JAVA AS $$
+package geo;
+public final class Shapes {
+private Shapes() {}
+public static double diagonal(double w, double h) { return Math.sqrt(w * w + h * h); }
+}
+$$;
+CREATE FUNCTION js_geo(w DOUBLE, h DOUBLE) RETURNS DOUBLE LANGUAGE JAVASCRIPT USING (geo)
+AS $$ return geo.Shapes.diagonal(w, h) $$;
+CREATE FUNCTION py_geo(w DOUBLE, h DOUBLE) RETURNS DOUBLE LANGUAGE PYTHON USING (geo)
+AS $$ return geo.Shapes.diagonal(w, h) $$;
+CREATE FUNCTION java_geo(w DOUBLE, h DOUBLE) RETURNS DOUBLE LANGUAGE JAVA USING (geo)
+AS $$ return geo.Shapes.diagonal(w, h); $$;
+SELECT js_geo(5, 10), py_geo(5, 10), java_geo(5, 10);
+js_geo(5, 10)	py_geo(5, 10)	java_geo(5, 10)
+11.180339887498949	11.180339887498949	11.180339887498949
+# A changed Java library is used from the next statement on.
+DROP LIBRARY geo;
+CREATE LIBRARY geo LANGUAGE JAVA AS $$
+package geo;
+public final class Shapes {
+private Shapes() {}
+public static double diagonal(double w, double h) { return Math.round(Math.sqrt(w * w + h * h)); }
+}
+$$;
+SELECT js_geo(5, 10), py_geo(5, 10);
+js_geo(5, 10)	py_geo(5, 10)
+11	11
+DROP FUNCTION js_java_jar;
+DROP FUNCTION py_java_jar;
+DROP FUNCTION js_numpy;
+DROP FUNCTION java_numpy;
+DROP FUNCTION py_npm;
+DROP FUNCTION java_npm;
+DROP FUNCTION js_geo;
+DROP FUNCTION py_geo;
+DROP FUNCTION java_geo;
+DROP LIBRARY geo;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

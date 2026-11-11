@@ -127,6 +127,42 @@ final class JavaRoutines {
     return cp.toString();
   }
 
+  /** The polyglot Context's host class loader: the worker's classes and the DBA's jars. */
+  static ClassLoader hostLoader() {
+    return packageLoader(JavaRoutines.class.getClassLoader());
+  }
+
+  /** The routines' parent loader, shared by Java libraries loaded for other languages. */
+  private static final ClassLoader LIBRARY_PARENT = packageLoader(new ApiLoader(JavaRoutines.class.getClassLoader()));
+  private static JavaRoutines libraryCompiler;
+
+  /**
+   * A Java library for JavaScript and Python (Phase 6): compiled alone into a class loader of its
+   * own; returns its top-level classes by simple name.
+   */
+  static synchronized Map<String, Class<?>> loadLibrary(String name, String source) throws CompileException {
+    if (libraryCompiler == null) libraryCompiler = new JavaRoutines();
+    Map<String, byte[]> bytes = libraryCompiler.compile(source, 0, name, List.of());
+    ClassLoader loader = new ClassLoader("mle-library-" + name, LIBRARY_PARENT) {
+      @Override
+      protected Class<?> findClass(String n) throws ClassNotFoundException {
+        byte[] b = bytes.get(n);
+        if (b == null) throw new ClassNotFoundException(n);
+        return defineClass(n, b, 0, b.length);
+      }
+    };
+    Map<String, Class<?>> classes = new HashMap<>();
+    for (String n : bytes.keySet()) {
+      if (n.contains("$")) continue;
+      try {
+        classes.put(n.substring(n.lastIndexOf('.') + 1), loader.loadClass(n));
+      } catch (ClassNotFoundException | LinkageError e) {
+        throw new CompileException("class " + n + " cannot be loaded: " + e);
+      }
+    }
+    return classes;
+  }
+
   private static ClassLoader packageLoader(ClassLoader api) {
     List<java.nio.file.Path> jars = packageJars();
     if (jars.isEmpty()) return api;

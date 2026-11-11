@@ -42,10 +42,12 @@ java_diag(5, 10)
 # A Java routine uses Java libraries only (checked when it is compiled).
 CREATE FUNCTION java_uses_js() RETURNS INT LANGUAGE JAVA USING (jsmath) AS $$ return 1; $$;
 ERROR HY000: Java> library test.jsmath is a JavaScript library: Java routines use Java libraries (other languages through Mle.context())
-# Other languages use Java through the polyglot API, not Java libraries.
-CREATE FUNCTION js_uses_java() RETURNS INT LANGUAGE JAVASCRIPT USING (geo) AS $$ return 1 $$;
+# JavaScript uses a Java library too (its classes; see polyglot_reach).
+CREATE FUNCTION js_uses_java() RETURNS DOUBLE LANGUAGE JAVASCRIPT USING (geo)
+AS $$ return geo.Shapes.diagonal(3, 4) $$;
 SELECT js_uses_java();
-ERROR HY000: JavaScript> library test.geo is a Java library: Java routines use it with USING
+js_uses_java()
+5
 # 5. Syntax errors at CREATE LIBRARY, by language.
 CREATE LIBRARY bad_py LANGUAGE PYTHON AS $$ def f(:
 pass $$;

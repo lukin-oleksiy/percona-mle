@@ -72,6 +72,14 @@ public final class SqlBridge {
     return d.newStatementId();
   }
 
+  public static org.graalvm.polyglot.Value importPython(String module) {
+    return dispatcher().polyglot().importPython(module);
+  }
+
+  public static org.graalvm.polyglot.Value importJs(String name) {
+    return dispatcher().polyglot().importJs(name);
+  }
+
   public static org.graalvm.polyglot.Context context() {
     Dispatcher d = dispatcher;
     if (d == null) throw new IllegalStateException("MLE worker not running");

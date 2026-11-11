@@ -165,6 +165,9 @@ final class Polyglot {
       jsOracle.putMember("libBridge",
           (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString(), true));
       jsImport = c.eval("js", "(p) => import(p)");
+      // importPython('numpy'): Python modules from JavaScript.
+      c.getBindings("js").putMember("importPython",
+          (org.graalvm.polyglot.proxy.ProxyExecutable) a -> importPython(a[0].asString()));
       // The SQL API (Phase 5): the globals session, mysql and SqlError. Python's are made
       // with Python's helpers, on first use (GraalPy costs ~150 MB: JS-only workers skip it).
       new JsSql(c, options);
@@ -193,6 +196,8 @@ final class Polyglot {
         .allowHostAccess(HostAccess.ALL)
         // The process is the sandbox; only the worker's own classes are hidden.
         .allowHostClassLookup(name -> !name.startsWith("com.percona.mle.worker."))
+        // The DBA's jars (Phase 6) for Java.type() in JavaScript and java.type() in Python.
+        .hostClassLoader(JavaRoutines.hostLoader())
         .allowPolyglotAccess(PolyglotAccess.ALL)
         .allowCreateThread(true)  // GraalPy's C API helper thread
         .allowCreateProcess(false)
@@ -393,9 +398,52 @@ final class Polyglot {
         return pySql.loadLibrary.execute(schema + "." + name, l.hash(),
             new String(l.body(), java.nio.charset.StandardCharsets.UTF_8));
       }
-      default -> throw new IllegalArgumentException("library " + schema + "." + name
-          + " is a Java library: Java routines use it with USING");
+      default -> {
+        // A Java library: compiled once per version into its own class loader; the namespace's
+        // members are its classes (static side: static methods, constructors with new).
+        return javaLibrary(schema + "." + name, l);
+      }
     }
+  }
+
+  private final Map<String, Object[]> javaLibraries = new HashMap<>();
+
+  private Object javaLibrary(String key, LibraryFileSystem.Library l) {
+    Object[] hit = javaLibraries.get(key);
+    if (hit != null && (long) hit[0] == l.hash()) return hit[1];
+    Map<String, Class<?>> classes;
+    try {
+      classes = JavaRoutines.loadLibrary(key, new String(l.body(), java.nio.charset.StandardCharsets.UTF_8));
+    } catch (JavaRoutines.CompileException e) {
+      throw new IllegalArgumentException("Java library " + key + ": " + e.getMessage());
+    }
+    Context c = context();
+    Map<String, Object> members = new HashMap<>();
+    classes.forEach((simple, cls) -> members.put(simple, c.asValue(cls).getMember("static")));
+    Object ns = org.graalvm.polyglot.proxy.ProxyObject.fromMap(members);
+    javaLibraries.put(key, new Object[] {l.hash(), ns});
+    return ns;
+  }
+
+  /** importPython(name) / Mle.importPython: a Python module (numpy ...) for any language. */
+  Value importPython(String module) {
+    Context c = context();
+    return c.eval("python", "import importlib\nlambda n: importlib.import_module(n)").execute(module);
+  }
+
+  /**
+   * import_js(name) / Mle.importJs: an npm package (Phase 6) for any language: require() for
+   * CommonJS, else import() of an ES module.
+   */
+  Value importJs(String name) {
+    Context c = context();
+    Value required = c.eval("js", "(n) => { try { return require(n) } catch (e) { return null } }").execute(name);
+    if (!required.isNull()) return required;
+    Value settled = jsOracle.getMember("settle").execute(jsImport.execute(name));
+    if (!settled.getMember("done").asBoolean())
+      throw new IllegalStateException("module " + name + " did not load");
+    if (!settled.getMember("ok").asBoolean()) jsOracle.getMember("rethrow").execute(settled.getMember("v"));
+    return settled.getMember("v");
   }
 
   /** Python's helpers and SQL API, made when the first Python routine is loaded. */
@@ -404,7 +452,8 @@ final class Polyglot {
     Context c = context();
     // All or nothing: an interrupt (KILL) in between leaves Python to be set up again.
     Helpers h = pythonHelpers(c);
-    pySql = new PySql(c, options, a -> libraryModule(a[0].asString(), a[1].asString(), false));
+    pySql = new PySql(c, options, a -> libraryModule(a[0].asString(), a[1].asString(), false),
+        a -> importJs(a[0].asString()));
     python = h;
   }
 

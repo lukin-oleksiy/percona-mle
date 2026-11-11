@@ -71,9 +71,9 @@ SELECT java_diag(5, 10);
 --echo # A Java routine uses Java libraries only (checked when it is compiled).
 --error ER_LANGUAGE_COMPONENT_RUNTIME
 CREATE FUNCTION java_uses_js() RETURNS INT LANGUAGE JAVA USING (jsmath) AS $$ return 1; $$;
---echo # Other languages use Java through the polyglot API, not Java libraries.
-CREATE FUNCTION js_uses_java() RETURNS INT LANGUAGE JAVASCRIPT USING (geo) AS $$ return 1 $$;
---error ER_LANGUAGE_COMPONENT_RUNTIME
+--echo # JavaScript uses a Java library too (its classes; see polyglot_reach).
+CREATE FUNCTION js_uses_java() RETURNS DOUBLE LANGUAGE JAVASCRIPT USING (geo)
+  AS $$ return geo.Shapes.diagonal(3, 4) $$;
 SELECT js_uses_java();
 
 --echo # 5. Syntax errors at CREATE LIBRARY, by language.

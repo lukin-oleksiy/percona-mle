@@ -71,7 +71,7 @@ final class PySql implements GuestSql.Lang {
   final Value loadLibrary;
   final Value bind;
 
-  PySql(Context c, Options options, ProxyExecutable library) {
+  PySql(Context c, Options options, ProxyExecutable library, ProxyExecutable importJs) {
     this.options = options;
     GuestSql.GSession session = new GuestSql.GSession(this);
     Map<String, Object> bridge = Map.of(
@@ -81,7 +81,8 @@ final class PySql implements GuestSql.Lang {
         "uuid", (ProxyExecutable) a -> Functions.uuid(),
         "isUUID", (ProxyExecutable) a -> Functions.isUUID(a[0].isNull() ? null : a[0].asString()),
         "arg", (ProxyExecutable) a -> new GuestSql.GArgument(this, a.length == 0 ? null : a[0]),
-        "library", library);
+        "library", library,
+        "importJs", importJs);
     Value h = c.eval(Source.create("python", PRELUDE)).execute(ProxyObject.fromMap(bridge));
     list = h.getHashValue("list");
     bigint = h.getHashValue("bigint");
@@ -149,7 +150,12 @@ final class PySql implements GuestSql.Lang {
                   raise ValueError("a library is '/schema/name' or 'schema.name', not %r" % path)
               return B.library(schema, name)
 
-          _mle_globals.update(session=B.session, mysql=mysql, SqlError=SqlError, import_library=import_library)
+          # import_js('lodash'): npm packages (Phase 6) from Python.
+          def import_js(name):
+              return B.importJs(str(name))
+
+          _mle_globals.update(session=B.session, mysql=mysql, SqlError=SqlError, import_library=import_library,
+                              import_js=import_js)
 
           cache = {}
 

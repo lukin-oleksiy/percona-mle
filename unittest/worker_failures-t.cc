@@ -185,6 +185,18 @@ TEST_F(MleWorkerFailures, KillDuringPrepare) {
   const std::vector<std::pair<std::string, std::string>> loops = {
       {"python", "while True:\n    pass\ndef f():\n    return 1\n"},
       {"js", "for (;;) {}\nfunction f() { return 1; }"}};
+  // The runtimes start first (GraalPy starts lazily, at the first Python
+  // routine): the KILL must land in the routine's code, not in the start of
+  // a language runtime (which may not stop within the grace period on a
+  // loaded machine; the host then replaces the worker).
+  ASSERT_EQ(prepare_routine(*h, 90, "python", "f", "def f():\n    return 0\n", {},
+                            type_of(Tag::kI64), &res),
+            0u)
+      << error_of(res);
+  ASSERT_EQ(prepare_routine(*h, 91, "js", "f", "function f() { return 0; }", {},
+                            type_of(Tag::kI64), &res),
+            0u)
+      << error_of(res);
   uint64_t id = 1;
   for (const auto &[lang, src] : loops) {
     SCOPED_TRACE(lang);

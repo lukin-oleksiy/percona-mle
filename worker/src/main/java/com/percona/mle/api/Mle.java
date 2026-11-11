@@ -36,6 +36,16 @@ public final class Mle {
     return SqlBridge.javaSession();
   }
 
+  /** A Python module (e.g. numpy) for Java routines: {@code Mle.importPython("numpy")}. */
+  public static org.graalvm.polyglot.Value importPython(String module) {
+    return SqlBridge.importPython(module);
+  }
+
+  /** An npm package installed by the DBA (CommonJS or ES module): {@code Mle.importJs("lodash")}. */
+  public static org.graalvm.polyglot.Value importJs(String name) {
+    return SqlBridge.importJs(name);
+  }
+
   /**
    * The worker's polyglot Context (JS and Python), for calls from Java routines into the other
    * languages, e.g. {@code Mle.context().eval("python", "import numpy; numpy.dot")}. Must be used
