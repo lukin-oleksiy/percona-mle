@@ -47,8 +47,8 @@ public final class Main {
         String prewarm = System.getProperty("mle.prewarm", "");
         if (prewarm.contains("java")) java.prewarm();
         if (prewarm.contains("js")) polyglot.context().eval("js", "1");
-        if (prewarm.contains("python")) polyglot.context().eval("python", "1");
-        if (prewarm.contains("numpy")) polyglot.context().eval("python", "import numpy");
+        // mle.pool_prewarm (15 §2): python, or numpy (Python and numpy).
+        if (prewarm.contains("python") || prewarm.contains("numpy")) polyglot.prewarmPython(prewarm.contains("numpy"));
         // Starting leaves garbage and a grown heap; a worker often waits in the pool, so give
         // the memory back now (with the small-heap settings of the worker class).
         System.gc();

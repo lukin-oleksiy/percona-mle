@@ -1,0 +1,154 @@
+--echo #
+--echo # component_mle (Phase 7): LANGUAGE PYTHON semantics (15-phase7-python.md
+--echo # §1): fresh globals per call (state lives in libraries), no threads,
+--echo # VECTOR arguments as reused read-only numpy arrays, fetch_columns() for
+--echo # numpy work, mle.pool_prewarm.
+--echo #
+--source include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE docs (id INT PRIMARY KEY, title VARCHAR(20), score DOUBLE, note VARCHAR(10),
+  embedding VECTOR(3));
+INSERT INTO docs VALUES
+  (1, 'apples',  0.5, 'a',  STRING_TO_VECTOR('[1, 0, 0]')),
+  (2, 'pears',   1.5, NULL, STRING_TO_VECTOR('[0.9, 0.1, 0]')),
+  (3, 'cars',    2.5, 'c',  STRING_TO_VECTOR('[0, 0, 1]')),
+  (4, 'trucks',  3.5, 'd',  STRING_TO_VECTOR('[0, 0.2, 0.9]'));
+--connect (con1, localhost, root,,test)
+
+--write_file $MYSQLTEST_VARDIR/tmp/py7.sql
+CREATE FUNCTION py_counter() RETURNS INT LANGUAGE PYTHON AS $$
+    global n
+    n = globals().get('n', 0) + 1
+    return n
+$$;
+CREATE LIBRARY counters LANGUAGE PYTHON AS $$
+count = 0
+
+def next_value():
+    global count
+    count += 1
+    return count
+$$;
+CREATE FUNCTION py_lib_counter() RETURNS INT LANGUAGE PYTHON USING (counters) AS $$
+    return counters.next_value()
+$$;
+CREATE FUNCTION py_threads() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import threading, concurrent.futures
+    out = []
+    try:
+        threading.Thread(target=lambda: None).start()
+        out.append('thread started')
+    except RuntimeError as e:
+        out.append(str(e))
+    try:
+        concurrent.futures.ThreadPoolExecutor(2).submit(lambda: 1).result()
+        out.append('pool ran')
+    except RuntimeError as e:
+        out.append('pool: ' + str(e))
+    try:
+        import java
+        java.type('java.lang.Thread')
+        out.append('java thread class')
+    except Exception as e:
+        out.append('java: ' + type(e).__name__)
+    return ' | '.join(out)
+$$;
+CREATE FUNCTION py_vec(v VECTOR(3)) RETURNS TEXT LANGUAGE PYTHON AS $$
+    out = [type(v).__name__, str(v.dtype), str(v.flags.writeable), str((v * 2).tolist())]
+    try:
+        v[0] = 9
+    except ValueError as e:
+        out.append('read-only')
+    w = v.copy()
+    w[0] = 9
+    out.append(str(w.tolist()))
+    return ' '.join(out)
+$$;
+CREATE PROCEDURE py_nested(IN v VECTOR(3), OUT r TEXT) LANGUAGE PYTHON AS $$
+    before = v.tolist()
+    inner = session.run_sql("SELECT py_vec(STRING_TO_VECTOR('[7, 8, 9]')) AS x").fetch_one().x
+    r = '%s %s %s' % (before, v.tolist(), inner.split(' ')[3])
+$$;
+CREATE PROCEDURE py_columns(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import numpy as np
+    c = session.run_sql('SELECT id, title, score, note, embedding FROM docs ORDER BY id').fetch_columns()
+    m = c['embedding']
+    q = np.array([1, 0.05, 0], dtype=np.float32)
+    sims = m @ q / (np.linalg.norm(m, axis=1) * np.linalg.norm(q))
+    top = [int(c['id'][i]) for i in np.argsort(-sims)[:2]]
+    r = '%s %s %s | %s %s | %s %s | %s | top %s' % (type(m).__name__, m.shape, m.dtype,
+        c['id'].dtype, c['id'].tolist(), c['score'].dtype, c['score'].tolist(), c['note'], top)
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/py7.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/py7.sql
+
+--echo # 1. Fresh globals per call; state lives in libraries (per worker).
+SELECT py_counter(), py_counter(), py_counter();
+SELECT py_lib_counter(), py_lib_counter(), py_lib_counter();
+
+--echo # 2. No threads (Python's, nor Java's through the polyglot API).
+SELECT py_threads();
+CREATE FUNCTION js_thread() RETURNS TEXT LANGUAGE JAVASCRIPT
+  AS $$ try { Java.type('java.lang.Thread'); return 'loaded' } catch (e) { return e.name } $$;
+SELECT js_thread();
+
+--echo # 3. VECTOR arguments: numpy float32, read-only, valid during the call;
+--echo #    nested calls have their own arrays.
+SELECT py_vec(STRING_TO_VECTOR('[1, 2, 3]'));
+CALL py_nested(STRING_TO_VECTOR('[1, 2, 3]'), @r);
+SELECT @r;
+
+--echo # 4. fetch_columns(): VECTOR as one matrix, numbers as numpy arrays,
+--echo #    columns with NULLs as lists; a cosine top-k with one matrix product.
+CALL py_columns(@r);
+SELECT @r;
+--echo #    A result in several chunks (mle.sql_chunk_rows = 2): a statement
+--echo #    without parameters is fetched whole within run_sql, with its warnings.
+SET GLOBAL mle.sql_chunk_rows = 2;
+CALL py_columns(@r);
+SELECT @r;
+CREATE PROCEDURE js_chunks(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  let res = session.runSql("SELECT id, CAST(CONCAT(id, 'x') AS UNSIGNED) AS n FROM docs ORDER BY id")
+  let w = res.getWarningsCount()
+  let ids = res.fetchAll().map(x => x.toArray()[0])
+  r = w + ' warnings, ids ' + ids
+$$;
+CALL js_chunks(@r);
+SELECT @r;
+SET GLOBAL mle.sql_chunk_rows = DEFAULT;
+
+--echo # 5. mle.pool_prewarm: none, python or numpy (a DBA choice).
+SELECT @@mle.pool_prewarm;
+--error ER_WRONG_VALUE_FOR_VAR,ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
+SET GLOBAL mle.pool_prewarm = 'ruby';
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.worker_cache_size = 0;
+SET GLOBAL mle.worker_cache_size = DEFAULT;
+SET GLOBAL mle.pool_prewarm = 'python';
+SELECT @@mle.pool_prewarm;
+--let $mle_pool = 2
+--source ../include/wait_for_pool.inc
+SET GLOBAL mle.pool_prewarm = DEFAULT;
+
+--connect (con2, localhost, root,,test)
+DROP FUNCTION py_counter;
+DROP FUNCTION py_lib_counter;
+DROP LIBRARY counters;
+DROP FUNCTION py_threads;
+DROP FUNCTION js_thread;
+DROP FUNCTION py_vec;
+DROP PROCEDURE py_nested;
+DROP PROCEDURE py_columns;
+DROP PROCEDURE js_chunks;
+--disconnect con2
+--connection default
+DROP TABLE docs;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

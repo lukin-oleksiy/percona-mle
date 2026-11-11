@@ -71,8 +71,11 @@ final class PySql implements GuestSql.Lang {
   final Value loadLibrary;
   final Value bind;
 
+  private final Context context;
+
   PySql(Context c, Options options, ProxyExecutable library, ProxyExecutable importJs) {
     this.options = options;
+    this.context = c;
     GuestSql.GSession session = new GuestSql.GSession(this);
     Map<String, Object> bridge = Map.of(
         "session", session,
@@ -170,7 +173,8 @@ final class PySql implements GuestSql.Lang {
               return m
 
           def bind(fn, name, value):
-              fn.__globals__[name] = value
+              # Body-form routines get fresh globals per call from a prepared dict (Phase 7).
+              (fn.__mle_base__ if hasattr(fn, '__mle_base__') else fn.__globals__)[name] = value
 
           def throw_sql(code, state, message):
               raise SqlError(state, message, code)
@@ -302,6 +306,73 @@ final class PySql implements GuestSql.Lang {
   @Override
   public SqlOptions defaults() {
     return new SqlOptions().decimalType(SqlOptions.DECIMAL_TYPES.get(options.decimalType));
+  }
+
+  // ------------------------------------------------------------ columns (numpy)
+
+  private Value helper(String name) {
+    return context.getBindings("python").getMember("_mle_helpers").getHashValue(name);
+  }
+
+  /**
+   * fetch_columns (Phase 7, S-14): VECTOR columns as one n x d float32 numpy matrix, integer
+   * and floating-point columns as numpy int64/float64 arrays (one copy each), other columns (or
+   * columns with NULLs) as lists of Python values; a dict by column label.
+   */
+  @Override
+  public Object columns(com.percona.mle.sql.SqlResult r, List<String> names) {
+    List<Object[]> rows = r.fetchRemainingRaw();
+    int n = rows.size();
+    Value dict = helper("dict").execute();
+    for (String name : names) {
+      int i = GuestSql.columnIndex(r, name);
+      dict.putHashEntry(name, column(r, rows, i, n));
+    }
+    return dict;
+  }
+
+  @SuppressWarnings("restricted")  // the arrays' own memory, as numpy reports it
+  private Object column(com.percona.mle.sql.SqlResult r, List<Object[]> rows, int i, int n) {
+    boolean vectors = n > 0, longs = n > 0, doubles = n > 0;
+    int dims = -1;
+    for (Object[] row : rows) {
+      Object v = row[i];
+      vectors &= v instanceof float[] f && (dims < 0 || f.length == dims);
+      if (v instanceof float[] f && dims < 0) dims = f.length;
+      longs &= v instanceof Long;
+      doubles &= v instanceof Double || v instanceof Float || v instanceof Long;
+    }
+    try {
+      if (vectors) {
+        Value t = helper("numpy_matrix").execute(n, dims);
+        java.lang.foreign.MemorySegment m = java.lang.foreign.MemorySegment.ofAddress(t.getArrayElement(1).asLong())
+            .reinterpret((long) n * dims * 4);
+        long at = 0;
+        for (Object[] row : rows) {
+          java.lang.foreign.MemorySegment.copy(java.lang.foreign.MemorySegment.ofArray((float[]) row[i]), 0, m, at,
+              dims * 4L);
+          at += dims * 4L;
+        }
+        return t.getArrayElement(0);
+      }
+      if (longs || doubles) {
+        Value t = helper("numpy_numbers").execute(n, longs ? "i" : "f");
+        java.lang.foreign.MemorySegment m = java.lang.foreign.MemorySegment.ofAddress(t.getArrayElement(1).asLong())
+            .reinterpret(n * 8L);
+        for (int k = 0; k < n; k++) {
+          Object v = rows.get(k)[i];
+          if (longs) m.setAtIndex(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, k, (Long) v);
+          else m.setAtIndex(java.lang.foreign.ValueLayout.JAVA_DOUBLE_UNALIGNED, k, ((Number) v).doubleValue());
+        }
+        return t.getArrayElement(0);
+      }
+    } catch (PolyglotException e) {
+      if (!String.valueOf(e.getMessage()).contains("No module named")) throw e;  // no numpy: lists
+    }
+    List<Object> values = new java.util.ArrayList<>(n);
+    com.percona.mle.sql.Column c = r.getColumns().get(i);
+    for (Object[] row : rows) values.add(row[i] == null ? null : value(row[i], c, r.getOptions()));
+    return list(values);
   }
 
   // ------------------------------------------------------------ values

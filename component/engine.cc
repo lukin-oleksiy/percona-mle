@@ -245,6 +245,7 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   options.memory_max = s.memory_max;
   options.heap = std::to_string(s.heap_max >> 20) + "m";
   options.pool_size = s.pool_size;
+  if (s.pool_prewarm != "none") options.prewarm = s.pool_prewarm;
   // JavaScript's local time (Date.toString(), getHours()) follows mysqld's
   // system time zone; the worker cannot read the system's zone itself.
   const std::string zone = system_time_zone();

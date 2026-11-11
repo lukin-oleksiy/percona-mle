@@ -73,10 +73,22 @@ public final class SqlResult implements Iterable<Row> {
   private List<Warning> warnings = List.of();
   private boolean replaced;
 
+  /**
+   * A statement run from text without parameters: mysqld buffered its whole result and sends it
+   * in chunks; all of them are fetched at once, so mysqld closes the statement before runSql
+   * returns and holds at most one buffered result (12 §11).
+   */
+  private final boolean direct;
+
   SqlResult(Session session, long id, boolean owned, SqlOptions options, MleSql.Reply first) {
+    this(session, id, owned, false, options, first);
+  }
+
+  SqlResult(Session session, long id, boolean owned, boolean direct, SqlOptions options, MleSql.Reply first) {
     this.session = session;
     this.id = id;
     this.owned = owned;
+    this.direct = direct;
     this.options = options;
     load(first);
   }
@@ -92,6 +104,17 @@ public final class SqlResult implements Iterable<Row> {
     insertId = r.insertId();
     execUs = r.executionMicros();
     warnings = warnings(r);
+    if (direct && moreRows) {
+      List<Object[]> all = new ArrayList<>(rows);
+      while (moreRows) {
+        MleSql.Reply more = session.request(Session.FETCH, id, null, null, 0, 0);
+        all.addAll(more.rows());
+        moreRows = more.moreRows();
+        moreResults = more.moreResults();
+        if (!more.warnings().isEmpty()) warnings = warnings(more);
+      }
+      rows = all;
+    }
   }
 
   private static List<Warning> warnings(MleSql.Reply r) {
@@ -128,6 +151,30 @@ public final class SqlResult implements Iterable<Row> {
       if (!r.warnings().isEmpty()) warnings = warnings(r);
     }
     return new Row(set, rows.get(pos++));
+  }
+
+  /**
+   * The remaining rows of the current result set as read from mysqld (values before any language
+   * mapping), for column-wise conversions such as numpy arrays (Phase 7).
+   */
+  public List<Object[]> fetchRemainingRaw() {
+    live();
+    List<Object[]> out = new ArrayList<>();
+    while (true) {
+      while (pos < rows.size()) out.add(rows.get(pos++));
+      if (!moreRows) return out;
+      MleSql.Reply r = session.request(Session.FETCH, id, null, null, 0, 0);
+      rows = r.rows();
+      pos = 0;
+      moreRows = r.moreRows();
+      moreResults = r.moreResults();
+      if (!r.warnings().isEmpty()) warnings = warnings(r);
+    }
+  }
+
+  /** The statement's options (language mappers convert values with them). */
+  public SqlOptions getOptions() {
+    return options;
   }
 
   /** The remaining rows of the current result set. */

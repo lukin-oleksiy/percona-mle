@@ -103,8 +103,10 @@ public final class Session {
 
   SqlResult run(String sql, Object[] params, SqlOptions o) {
     long id = SqlBridge.newStatementId();
-    MleSql.Reply r = request(EXECUTE, id, sql, params(params), o.passResultToClient() ? TO_CLIENT : 0, 0);
-    return o.passResultToClient() ? null : new SqlResult(this, id, true, o, r);
+    Object[] values = params(params);
+    MleSql.Reply r = request(EXECUTE, id, sql, values, o.passResultToClient() ? TO_CLIENT : 0, 0);
+    return o.passResultToClient() ? null
+        : new SqlResult(this, id, true, values == null || values.length == 0, o, r);
   }
 
   /** Runs a statement for its effect; its results are dropped. */

@@ -183,11 +183,20 @@ SELECT 'session fine' AS after_errors;
 --echo #
 --echo # 7. Limits.
 --echo #
+--echo # A direct statement: mysqld buffers the whole result (mle.sql_result_max)
+--echo # and sends it in chunks (mle.sql_chunk_rows rows or about 3/4 of the arena).
 CREATE PROCEDURE big(OUT r TEXT) LANGUAGE JAVA AS $$
-MleSql.Reply x = MleSql.execute(MleSql.newStatementId(),
+long id = MleSql.newStatementId();
+MleSql.Reply x = MleSql.execute(id,
     "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 50000) " +
     "SELECT n, REPEAT('x', 100) FROM c", null, false, 0);
-r[0] = "rows=" + x.rows().size() + " more=" + x.moreRows();
+int rows = x.rows().size(), chunks = 1;
+while (x.moreRows()) {
+  x = MleSql.fetch(id, 0);
+  rows += x.rows().size();
+  chunks++;
+}
+r[0] = "rows=" + rows + " chunks=" + chunks;
 $$;
 CALL big(@r);
 SELECT @r;

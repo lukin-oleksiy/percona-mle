@@ -30,6 +30,7 @@
   - languages, max_workers, spin_us, interrupt_grace_ms: dynamic.
 */
 
+#include <cctype>
 #include <strings.h>
 
 #include <atomic>
@@ -76,6 +77,7 @@ char *g_cgroup_base = nullptr;
 char *g_dir = nullptr;
 char *g_java_home = nullptr;
 char *g_package_dir = nullptr;
+char *g_pool_prewarm = nullptr;
 
 std::atomic<unsigned> g_language_bits{kAllLanguages};
 
@@ -152,6 +154,28 @@ int check_languages(MYSQL_THD, SYS_VAR *, void *save,
   return 0;
 }
 
+/** mle.pool_prewarm: none, python or numpy; shapes workers (refused while a
+    session holds one). */
+int check_prewarm(MYSQL_THD, SYS_VAR *, void *save, struct st_mysql_value *value) {
+  if (engine_workers_in_use() > 0) {
+    my_error(ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE, MYF(0), "mle.pool_prewarm");
+    return 1;
+  }
+  int length = 0;
+  const char *s = value->val_str(value, nullptr, &length);
+  if (s == nullptr) return 1;
+  std::string v(s, static_cast<size_t>(length));
+  for (char &c : v) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+  if (v != "none" && v != "python" && v != "numpy") return 1;
+  *static_cast<const char **>(save) = s;
+  return 0;
+}
+
+void update_prewarm(MYSQL_THD thd, SYS_VAR *, void *val_ptr, const void *save) {
+  *static_cast<char **>(val_ptr) = *static_cast<char *const *>(save);
+  restart_engine(thd, "pool_prewarm");
+}
+
 void update_languages(MYSQL_THD, SYS_VAR *, void *val_ptr, const void *save) {
   char *s = *static_cast<char *const *>(save);
   *static_cast<char **>(val_ptr) = s;
@@ -171,7 +195,7 @@ Registered g_registered[] = {
     {"java_home", false},  {"sql_result_max", false}, {"sql_row_max", false},
     {"sql_statements_max", false}, {"sql_chunk_rows", false},
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
-    {"package_dir", false}};
+    {"package_dir", false}, {"pool_prewarm", false}};
 
 void mark(const char *name) {
   for (auto &r : g_registered)
@@ -243,6 +267,16 @@ bool register_settings() {
           "holds a worker; restarts the engine.",
           check_shaping<uint, kPoolSize, 0, kPoolSizeMax>,
           update_shaping<uint, kPoolSize>, &pool_size, &g_pool_size))
+    return true;
+
+  STR_CHECK_ARG(pool_prewarm) pool_prewarm;
+  pool_prewarm.def_val = const_cast<char *>("none");
+  if (reg("pool_prewarm", PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC,
+          "What pool workers start before a session needs them: none, python "
+          "(GraalPy, ~1-5 s and ~195 MB per idle worker) or numpy (Python and "
+          "numpy). Can be changed while no session holds a worker; restarts the "
+          "engine.",
+          check_prewarm, update_prewarm, &pool_prewarm, &g_pool_prewarm))
     return true;
 
   uint_check_arg_s max_workers;
@@ -406,7 +440,7 @@ void unregister_settings() {
             kName, r.name))
       r.done = false;
   }
-  g_languages = g_cgroup_base = g_dir = g_java_home = g_package_dir = nullptr;
+  g_languages = g_cgroup_base = g_dir = g_java_home = g_package_dir = g_pool_prewarm = nullptr;
 }
 
 Settings current_settings() {
@@ -418,6 +452,9 @@ Settings current_settings() {
   s.dir = text(g_dir);
   s.java_home = text(g_java_home);
   s.package_dir = text(g_package_dir);
+  s.pool_prewarm = text(g_pool_prewarm);
+  for (char &c : s.pool_prewarm) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+  if (s.pool_prewarm.empty()) s.pool_prewarm = "none";
   if (s.package_dir.empty()) s.package_dir = s.dir + "/packages";
   return s;
 }

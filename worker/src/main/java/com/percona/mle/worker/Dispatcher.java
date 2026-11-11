@@ -66,6 +66,11 @@ final class Dispatcher {
     return polyglot;
   }
 
+  /** The current nesting depth (0: a top-level request). */
+  int depth() {
+    return depth;
+  }
+
   void ready(int status, String info) {
     w.reset();
     w.u32(Wire.VERSION);

@@ -50,6 +50,9 @@ struct Settings {
   std::string cgroup_base = "AUTO";
   std::string dir;
   std::string java_home;
+  /** What pool workers start before they are needed (15 §2): none, python,
+      numpy. */
+  std::string pool_prewarm = "none";
   /** Third-party packages installed by the DBA (14 §3); "": <dir>/packages. */
   std::string package_dir;
 };

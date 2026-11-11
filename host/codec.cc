@@ -283,6 +283,32 @@ bool is_valid_temporal(Tag tag, const Temporal &t) {
 
 // ---------------------------------------------------------------- Writer
 
+namespace {
+
+/** An upper bound of the encoded size of values (Writer::value). */
+size_t encoded_size(const std::vector<Value> &values) {
+  size_t n = 0;
+  for (const Value &v : values) {
+    switch (v.tag()) {
+      case Tag::kDecimal:
+      case Tag::kString:
+      case Tag::kBytes:
+      case Tag::kJson:
+        n += 5 + v.as_text().size();
+        break;
+      case Tag::kVector:
+        n += 5 + wire::kVectorAlignment + v.as_vector().size() * sizeof(float);
+        break;
+      default:
+        n += 1 + 16;  // numbers and temporals
+    }
+  }
+  return n;
+}
+
+}  // namespace
+
+
 void Writer::str(std::string_view s) {
   u32(static_cast<uint32_t>(s.size()));
   raw(s.data(), s.size());
@@ -743,6 +769,9 @@ void encode(const SqlResultMsg &m, std::string *out) {
       }
       const size_t ncols = m.columns.size();
       w.u32(static_cast<uint32_t>(ncols == 0 ? 0 : m.rows.size() / ncols));
+      // Rows with VECTORs or long text make bodies of many MB: one
+      // allocation instead of a growing string's copies and page faults.
+      out->reserve(out->size() + encoded_size(m.rows) + 64);
       for (const Value &v : m.rows) w.value(v);
       w.u8(m.more ? 1 : 0);
       w.u8(m.more_results ? 1 : 0);

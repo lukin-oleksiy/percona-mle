@@ -62,6 +62,12 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
 final class Polyglot {
   static final List<String> LANGUAGES = List.of("js", "python");
 
+  /** Phase 7: guest code cannot start threads through Java either. */
+  private static final java.util.Set<String> THREAD_CLASSES = java.util.Set.of("java.lang.Thread",
+      "java.lang.ThreadGroup", "java.lang.Thread$Builder", "java.util.concurrent.Executors",
+      "java.util.concurrent.ThreadPoolExecutor", "java.util.concurrent.ScheduledThreadPoolExecutor",
+      "java.util.concurrent.ForkJoinPool", "java.util.concurrent.CompletableFuture", "java.util.Timer");
+
   /**
    * A prepared routine. Body form (entry ""): js is set for JavaScript; Python routines with OUT
    * parameters return (result, out1, ...), outs gives the parameters' indexes.
@@ -195,7 +201,7 @@ final class Polyglot {
     Context.Builder b = Context.newBuilder("js", "python")
         .allowHostAccess(HostAccess.ALL)
         // The process is the sandbox; only the worker's own classes are hidden.
-        .allowHostClassLookup(name -> !name.startsWith("com.percona.mle.worker."))
+        .allowHostClassLookup(name -> !name.startsWith("com.percona.mle.worker.") && !THREAD_CLASSES.contains(name))
         // The DBA's jars (Phase 6) for Java.type() in JavaScript and java.type() in Python.
         .hostClassLoader(JavaRoutines.hostLoader())
         .allowPolyglotAccess(PolyglotAccess.ALL)
@@ -279,6 +285,39 @@ final class Polyglot {
     Value ns = c.eval(Source.create("python", """
         import array as _array, datetime as _dt, decimal as _decimal, json as _json
 
+        # Phase 7: routines cannot start threads (deterministic KILL and memory accounting).
+        import _thread as _mle_thread_mod, threading as _mle_threading, types as _mle_types_mod
+        def _mle_no_threads(*args, **kwargs):
+            raise RuntimeError('threads are not available in MLE routines')
+        _mle_thread_mod.start_new_thread = _mle_no_threads
+        if hasattr(_mle_thread_mod, 'start_new'):
+            _mle_thread_mod.start_new = _mle_no_threads
+        if hasattr(_mle_thread_mod, 'start_joinable_thread'):
+            _mle_thread_mod.start_joinable_thread = _mle_no_threads
+        _mle_threading.Thread.start = lambda self: _mle_no_threads()
+
+        # Phase 7 (S-14): numpy arrays the host fills with one memcpy; creating numpy arrays is
+        # the expensive part, so argument arrays are reused (read-only, valid during the call).
+        def _numpy_buffer(shape, readonly):
+            try:
+                import numpy
+            except ImportError:
+                return None
+            a = numpy.empty(shape, dtype=numpy.float32)
+            if readonly:
+                a.setflags(write=False)
+            return (a, a.__array_interface__['data'][0])
+
+        def _numpy_matrix(n, d):
+            import numpy
+            a = numpy.empty((n, d), dtype=numpy.float32)
+            return (a, a.__array_interface__['data'][0])
+
+        def _numpy_numbers(shape, kind):
+            import numpy
+            a = numpy.empty(shape, dtype=numpy.int64 if kind == 'i' else numpy.float64)
+            return (a, a.__array_interface__['data'][0])
+
         def _vector(b):
             data = b.encode('latin-1') if isinstance(b, str) else bytes(b)
             try:
@@ -339,7 +378,13 @@ final class Polyglot {
             ns = {'__name__': name, 'Mle': mle}
             ns.update(_mle_globals)
             exec(compile(mod, name, 'exec'), ns)
-            return ns['__mle_routine']
+            # Phase 7: fresh globals per call; state belongs in libraries (15 §1). Each call runs
+            # the routine's code with a copy of the prepared globals.
+            code, base, make = ns['__mle_routine'].__code__, ns, _mle_types_mod.FunctionType
+            def fresh(*args):
+                return make(code, base.copy())(*args)
+            fresh.__mle_base__ = base
+            return fresh
 
         _mle_helpers = {
             'bytes': lambda b: bytes(b),
@@ -357,6 +402,10 @@ final class Polyglot {
             'toNumber': lambda v: float(v),
             'loader': _load,
             'body_loader': _load_body,
+            'numpy_buffer': _numpy_buffer,
+            'numpy_numbers': _numpy_numbers,
+            'numpy_matrix': _numpy_matrix,
+            'dict': lambda: {},
         }
         _mle_helpers
         """));
@@ -561,6 +610,13 @@ final class Polyglot {
     Object[] args = new Object[neutral.length];
     boolean js = r.language().equals("js");
     for (int i = 0; i < args.length; i++) {
+      if (!js && neutral[i] instanceof Values.VectorRef ref) {
+        Object a = vectorArgument(i, ref);
+        if (a != null) {
+          args[i] = a;
+          continue;
+        }
+      }
       Object v = hostForm(neutral[i], js);
       args[i] = v == null || r.converters()[i] == null ? v : r.converters()[i].execute(v);
     }
@@ -598,6 +654,41 @@ final class Polyglot {
       result = result.getArrayElement(0);
     }
     return j.ret() == null ? null : JsOracle.toJava(result, j.ret(), options, jsOracle);
+  }
+
+  /** Reused read-only numpy arrays for VECTOR arguments, by nesting depth, parameter and dims. */
+  private final Map<String, Object[]> vectorBuffers = new HashMap<>();
+
+  /**
+   * A VECTOR argument for Python (Phase 7, S-14): a numpy array reused per parameter, dims and
+   * nesting depth, filled with one copy; read-only and valid during the call (copy() keeps it).
+   * Null without numpy (then array.array, as before).
+   */
+  @SuppressWarnings("restricted")  // the array's own memory, as numpy reports it
+  private Object vectorArgument(int index, Values.VectorRef ref) {
+    int depth = SqlBridge.dispatcher == null ? 0 : SqlBridge.dispatcher.depth();
+    String key = depth + ":" + index + ":" + ref.dims();
+    Object[] buf = vectorBuffers.get(key);
+    if (buf == null) {
+      Value t = pythonHelper("numpy_buffer").execute(ref.dims(), true);
+      if (t.isNull()) return null;
+      buf = new Object[] {t.getArrayElement(0),
+          java.lang.foreign.MemorySegment.ofAddress(t.getArrayElement(1).asLong()).reinterpret(ref.dims() * 4L)};
+      vectorBuffers.put(key, buf);
+    }
+    ((java.lang.foreign.MemorySegment) buf[1]).copyFrom(ref.data());
+    return buf[0];
+  }
+
+  Value pythonHelper(String name) {
+    pythonReady();
+    return context.getBindings("python").getMember("_mle_helpers").getHashValue(name);
+  }
+
+  /** Pre-warming (mle.pool_prewarm): Python, and numpy too. */
+  void prewarmPython(boolean numpy) {
+    pythonReady();
+    if (numpy) context().eval("python", "import numpy");
   }
 
   /** The neutral value in the form the language's converter takes. */

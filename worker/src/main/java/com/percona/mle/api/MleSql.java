@@ -66,8 +66,9 @@ public final class MleSql {
 
   /**
    * Runs statement text: without parameters directly (the whole result is buffered by mysqld,
-   * at most mle.sql_result_max bytes), with parameters as a one-shot prepared statement (rows
-   * streamed). toClient: the result sets go to the client (Oracle's passResultToClient).
+   * at most mle.sql_result_max bytes, and sent in chunks: fetch the rest while moreRows, or
+   * close), with parameters as a one-shot prepared statement (rows streamed). toClient: the
+   * result sets go to the client (Oracle's passResultToClient).
    */
   public static Reply execute(long id, String sql, Object[] params, boolean toClient, int maxRows) {
     return SqlBridge.request(EXECUTE, id, sql, params, toClient ? TO_CLIENT : 0, maxRows);

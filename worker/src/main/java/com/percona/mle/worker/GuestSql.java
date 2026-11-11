@@ -69,6 +69,23 @@ final class GuestSql {
     /** A guest options object as SqlOptions; null for null/undefined. */
     SqlOptions options(Value v);
 
+    /**
+     * fetchColumns(names...): the remaining rows column-wise, by column label. By default a map of
+     * lists of the language's values; Python returns numpy arrays (Phase 7).
+     */
+    default Object columns(SqlResult r, List<String> names) {
+      List<Object[]> rows = r.fetchRemainingRaw();
+      java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+      for (String name : names) {
+        int i = columnIndex(r, name);
+        List<Object> values = new ArrayList<>(rows.size());
+        for (Object[] row : rows)
+          values.add(row[i] == null ? none() : value(row[i], r.getColumns().get(i), r.getOptions()));
+        m.put(name, list(values));
+      }
+      return ProxyObject.fromMap(m);
+    }
+
     /** The guest's null (JS null; Python None, not a foreign null). */
     default Object none() {
       return null;
@@ -133,6 +150,13 @@ final class GuestSql {
     } catch (RuntimeException e) {
       throw lang.error(e);
     }
+  }
+
+  static int columnIndex(SqlResult r, String name) {
+    List<Column> cols = r.getColumns();
+    for (int i = 0; i < cols.size(); i++)
+      if (cols.get(i).getColumnLabel().equals(name)) return i;
+    throw new IllegalArgumentException("no column '" + name + "' in the result");
   }
 
   static Value arg(Value[] a, int i) {
@@ -311,7 +335,7 @@ final class GuestSql {
   static final class GResult extends Methods implements org.graalvm.polyglot.proxy.ProxyIterable {
     private static final Set<String> NAMES = Set.of("fetchOne", "fetchAll", "hasData", "nextResult", "getColumns",
         "getColumnNames", "getColumnCount", "getAffectedItemsCount", "getAutoIncrementValue", "getWarnings",
-        "getWarningsCount", "getExecutionTime", "close");
+        "getWarningsCount", "getExecutionTime", "close", "fetchColumns");
     private final SqlResult r;
 
     GResult(GSession session, SqlResult r) {
@@ -378,6 +402,19 @@ final class GuestSql {
         case "close" -> {
           r.close();
           yield null;
+        }
+        case "fetchColumns" -> {
+          List<String> names = new ArrayList<>();
+          if (a.length == 0) {
+            for (Column c : r.getColumns()) names.add(c.getColumnLabel());
+          } else {
+            for (Value v : a) {
+              if (v.hasArrayElements() && !v.isString())
+                for (Object o : elements(v)) names.add(((Value) o).asString());
+              else names.add(v.asString());
+            }
+          }
+          yield lang.columns(r, names);
         }
         default -> throw new IllegalStateException(name);
       };

@@ -352,9 +352,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
   Statement &st = *s;
   m_statements[request.stmt_id] = std::move(s);
   reply(request.stmt_id, st,
-        request.max_rows != 0 ? request.max_rows
-        : with_params         ? sql_chunk_rows()
-                              : UINT32_MAX,
+        request.max_rows != 0 ? request.max_rows : sql_chunk_rows(),
         now_us() - t0, result);
 }
 
@@ -436,9 +434,7 @@ void SqlRunner::fetch(const mle::SqlMsg &request, SqlResultMsg *result) {
                      "no rows to fetch for this statement id");
   Statement &s = *it->second;
   const uint32_t max_rows =
-      request.max_rows != 0 ? request.max_rows
-      : s.prepared          ? sql_chunk_rows()
-                            : UINT32_MAX;
+      request.max_rows != 0 ? request.max_rows : sql_chunk_rows();
   *result = SqlResultMsg();
   result->kind = SqlResultKind::kRows;
   result->columns = s.columns;
@@ -479,10 +475,8 @@ void SqlRunner::next_result(const mle::SqlMsg &request, SqlResultMsg *result) {
   }
   s.next_pending = false;
   reply(request.stmt_id, s,
-        request.max_rows != 0 ? request.max_rows
-        : s.prepared          ? sql_chunk_rows()
-                              : UINT32_MAX,
-        0, result);
+        request.max_rows != 0 ? request.max_rows : sql_chunk_rows(), 0,
+        result);
 }
 
 // ------------------------------------------------------------- results
@@ -621,7 +615,7 @@ namespace {
 
 /** One row's values by the column readers; false on a getter failure. */
 bool read_row(my_h_row row, const std::vector<Reader> &readers,
-              std::vector<Value> *out) {
+              std::vector<Value> *out, size_t *bytes) {
   for (uint32_t i = 0; i < readers.size(); i++) {
     bool is_null = false;
     bool failed = false;
@@ -674,6 +668,13 @@ bool read_row(my_h_row row, const std::vector<Reader> &readers,
         mysql_cstring_with_length s{nullptr, 0};
         failed = mysql_service_mysql_stmt_get_string->get(row, i, &s, &is_null);
         if (failed || is_null) break;
+        *bytes += s.length;
+        if (readers[i] == Reader::kVector) {
+          std::vector<float> f(s.length / sizeof(float));
+          memcpy(f.data(), s.str, f.size() * sizeof(float));
+          v = Value::vector(std::move(f));
+          break;
+        }
         std::string text(s.str, s.length);
         switch (readers[i]) {
           case Reader::kDecimal:
@@ -691,12 +692,6 @@ bool read_row(my_h_row row, const std::vector<Reader> &readers,
             v = Value::u64(x);
             break;
           }
-          case Reader::kVector: {
-            std::vector<float> f(text.size() / sizeof(float));
-            memcpy(f.data(), text.data(), f.size() * sizeof(float));
-            v = Value::vector(std::move(f));
-            break;
-          }
           default:
             v = Value::string(std::move(text));
         }
@@ -712,20 +707,25 @@ bool read_row(my_h_row row, const std::vector<Reader> &readers,
 
 bool SqlRunner::read_rows(Statement &s, uint32_t max_rows,
                           SqlResultMsg *result) {
+  // A chunk ends after max_rows rows or about one mailbox arena of data:
+  // larger messages are split and reassembled, and rows of VECTORs or BLOBs
+  // would otherwise be held several times in fresh memory (Phase 7 bench).
+  constexpr size_t kChunkBytes = mle::wire::kDefaultArenaSize * 3 / 4;
+  size_t bytes = 0;
   uint32_t rows = 0;
   if (!s.lookahead.empty()) {
     for (Value &v : s.lookahead) result->rows.push_back(std::move(v));
     s.lookahead.clear();
     rows++;
   }
-  while (rows < max_rows) {
+  while (rows < max_rows && bytes < kChunkBytes) {
     my_h_row row = nullptr;
     if (mysql_service_mysql_stmt_result->fetch(s.h, &row)) return true;
     if (row == nullptr) {
       s.rows_open = false;
       return false;
     }
-    if (!read_row(row, s.readers, &result->rows)) return true;
+    if (!read_row(row, s.readers, &result->rows, &bytes)) return true;
     rows++;
   }
   // The chunk is full: is there one more row?
@@ -735,7 +735,7 @@ bool SqlRunner::read_rows(Statement &s, uint32_t max_rows,
     s.rows_open = false;
     return false;
   }
-  if (!read_row(row, s.readers, &s.lookahead)) return true;
+  if (!read_row(row, s.readers, &s.lookahead, &bytes)) return true;
   result->more = true;
   return false;
 }

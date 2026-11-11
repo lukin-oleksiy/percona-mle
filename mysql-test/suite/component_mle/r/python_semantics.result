@@ -1,0 +1,94 @@
+#
+# component_mle (Phase 7): LANGUAGE PYTHON semantics (15-phase7-python.md
+# §1): fresh globals per call (state lives in libraries), no threads,
+# VECTOR arguments as reused read-only numpy arrays, fetch_columns() for
+# numpy work, mle.pool_prewarm.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE docs (id INT PRIMARY KEY, title VARCHAR(20), score DOUBLE, note VARCHAR(10),
+embedding VECTOR(3));
+INSERT INTO docs VALUES
+(1, 'apples',  0.5, 'a',  STRING_TO_VECTOR('[1, 0, 0]')),
+(2, 'pears',   1.5, NULL, STRING_TO_VECTOR('[0.9, 0.1, 0]')),
+(3, 'cars',    2.5, 'c',  STRING_TO_VECTOR('[0, 0, 1]')),
+(4, 'trucks',  3.5, 'd',  STRING_TO_VECTOR('[0, 0.2, 0.9]'));
+# 1. Fresh globals per call; state lives in libraries (per worker).
+SELECT py_counter(), py_counter(), py_counter();
+py_counter()	py_counter()	py_counter()
+1	1	1
+SELECT py_lib_counter(), py_lib_counter(), py_lib_counter();
+py_lib_counter()	py_lib_counter()	py_lib_counter()
+1	2	3
+# 2. No threads (Python's, nor Java's through the polyglot API).
+SELECT py_threads();
+py_threads()
+threads are not available in MLE routines | pool: threads are not available in MLE routines | java: KeyError
+CREATE FUNCTION js_thread() RETURNS TEXT LANGUAGE JAVASCRIPT
+AS $$ try { Java.type('java.lang.Thread'); return 'loaded' } catch (e) { return e.name } $$;
+SELECT js_thread();
+js_thread()
+TypeError
+# 3. VECTOR arguments: numpy float32, read-only, valid during the call;
+#    nested calls have their own arrays.
+SELECT py_vec(STRING_TO_VECTOR('[1, 2, 3]'));
+py_vec(STRING_TO_VECTOR('[1, 2, 3]'))
+ndarray float32 False [2.0, 4.0, 6.0] read-only [9.0, 2.0, 3.0]
+CALL py_nested(STRING_TO_VECTOR('[1, 2, 3]'), @r);
+SELECT @r;
+@r
+[1.0, 2.0, 3.0] [1.0, 2.0, 3.0] [14.0,
+# 4. fetch_columns(): VECTOR as one matrix, numbers as numpy arrays,
+#    columns with NULLs as lists; a cosine top-k with one matrix product.
+CALL py_columns(@r);
+SELECT @r;
+@r
+ndarray (4, 3) float32 | int64 [1, 2, 3, 4] | float64 [0.5, 1.5, 2.5, 3.5] | ['a', None, 'c', 'd'] | top [1, 2]
+#    A result in several chunks (mle.sql_chunk_rows = 2): a statement
+#    without parameters is fetched whole within run_sql, with its warnings.
+SET GLOBAL mle.sql_chunk_rows = 2;
+CALL py_columns(@r);
+SELECT @r;
+@r
+ndarray (4, 3) float32 | int64 [1, 2, 3, 4] | float64 [0.5, 1.5, 2.5, 3.5] | ['a', None, 'c', 'd'] | top [1, 2]
+CREATE PROCEDURE js_chunks(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+let res = session.runSql("SELECT id, CAST(CONCAT(id, 'x') AS UNSIGNED) AS n FROM docs ORDER BY id")
+let w = res.getWarningsCount()
+let ids = res.fetchAll().map(x => x.toArray()[0])
+r = w + ' warnings, ids ' + ids
+$$;
+CALL js_chunks(@r);
+Warnings:
+Warning	1292	Truncated incorrect INTEGER value: '1x'
+Warning	1292	Truncated incorrect INTEGER value: '2x'
+Warning	1292	Truncated incorrect INTEGER value: '3x'
+Warning	1292	Truncated incorrect INTEGER value: '4x'
+SELECT @r;
+@r
+4 warnings, ids 1,2,3,4
+SET GLOBAL mle.sql_chunk_rows = DEFAULT;
+# 5. mle.pool_prewarm: none, python or numpy (a DBA choice).
+SELECT @@mle.pool_prewarm;
+@@mle.pool_prewarm
+none
+SET GLOBAL mle.pool_prewarm = 'ruby';
+Got one of the listed errors
+SET GLOBAL mle.worker_cache_size = 0;
+SET GLOBAL mle.worker_cache_size = DEFAULT;
+SET GLOBAL mle.pool_prewarm = 'python';
+SELECT @@mle.pool_prewarm;
+@@mle.pool_prewarm
+python
+SET GLOBAL mle.pool_prewarm = DEFAULT;
+DROP FUNCTION py_counter;
+DROP FUNCTION py_lib_counter;
+DROP LIBRARY counters;
+DROP FUNCTION py_threads;
+DROP FUNCTION js_thread;
+DROP FUNCTION py_vec;
+DROP PROCEDURE py_nested;
+DROP PROCEDURE py_columns;
+DROP PROCEDURE js_chunks;
+DROP TABLE docs;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
