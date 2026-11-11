@@ -66,8 +66,25 @@ final class LibraryFileSystem implements FileSystem {
   /** mysqld's answer to a LIBRARY request. */
   record Reply(int status, String language, String body, long hash, String message) {}
 
-  /** A library body the worker has. */
-  record Library(String language, byte[] body, long hash) {}
+  /** A library body the worker has; checked: the validation epoch it was last confirmed in. */
+  record Library(String language, byte[] body, long hash, long checked) {
+    Library confirmed(long epoch) {
+      return checked == epoch ? this : new Library(language, body, hash, epoch);
+    }
+  }
+
+  /**
+   * Library DDL (CREATE/DROP LIBRARY) invalidates the server's stored-program caches, so every
+   * routine used after it is set up again and the worker gets a new PREPARE. Each PREPARE starts
+   * a new epoch; within an epoch a library confirmed once is used without asking mysqld again. In
+   * effect libraries are validated once per statement (and per routine load), not per call.
+   */
+  private static long epoch = 1;
+
+  /** A routine was (re)loaded: confirm libraries with mysqld again at their next import. */
+  static void revalidate() {
+    epoch++;
+  }
 
   static final String ROOT = "/.mle-libraries";
   private static final Pattern ORACLE_PATH = Pattern.compile("/([^/.]+)/([^/.]+)");
@@ -91,18 +108,24 @@ final class LibraryFileSystem implements FileSystem {
     Dispatcher d = SqlBridge.dispatcher;
     String key = schema + "/" + name;
     Library known = libraries.get(key);
+    if (known != null && known.checked() == epoch) return known;
     if (d == null) throw new NoSuchFileException("/" + key, null, "no database libraries here");
     Reply r = d.libraryRequest(schema, name, known == null ? 0 : known.hash());
     switch (r.status()) {
       case Wire.LIBRARY_UNCHANGED -> {
-        return known;
-      }
-      case Wire.LIBRARY_BODY -> {
-        Library l = new Library(r.language(), r.body().getBytes(StandardCharsets.UTF_8), r.hash());
+        Library l = known.confirmed(epoch);
         libraries.put(key, l);
         return l;
       }
-      default -> throw new NoSuchFileException("/" + key, null, r.message());
+      case Wire.LIBRARY_BODY -> {
+        Library l = new Library(r.language(), r.body().getBytes(StandardCharsets.UTF_8), r.hash(), epoch);
+        libraries.put(key, l);
+        return l;
+      }
+      default -> {
+        libraries.remove(key);
+        throw new NoSuchFileException("/" + key, null, r.message());
+      }
     }
   }
 
@@ -138,8 +161,9 @@ final class LibraryFileSystem implements FileSystem {
     Matcher m = virtualOf(p);
     if (m == null) return null;
     Library l = libraries.get(m.group(1) + "/" + m.group(2));
-    // A versioned path names a body the worker has; an import (unversioned) asks mysqld, which
-    // answers "unchanged" (no body) or with the new body, or refuses (dropped, not importable).
+    // A versioned path names a body the worker has; an import (unversioned) is confirmed with
+    // mysqld once per epoch ("unchanged" without the body, a new body, or refused: dropped or not
+    // importable).
     if (l == null || m.group(3) == null || !Long.toHexString(l.hash()).equals(m.group(3)))
       l = fetch(m.group(1), m.group(2));
     return l;

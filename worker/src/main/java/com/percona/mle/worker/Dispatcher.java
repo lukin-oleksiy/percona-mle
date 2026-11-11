@@ -204,6 +204,8 @@ final class Dispatcher {
       return;
     }
     mb.stats(Wire.STATE_COMPILING, tainted);
+    // A routine is (re)loaded: library DDL may have happened (see LibraryFileSystem).
+    LibraryFileSystem.revalidate();
     // Loading runs routine code too (Python module level, JS top level), so PREPARE can be
     // interrupted like a call.
     boolean top = depth == 0;
