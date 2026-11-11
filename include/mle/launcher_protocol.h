@@ -60,13 +60,14 @@
 
 namespace mle::launcher {
 
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 
-/** Below this Landlock ABI, truncate(2) is not restricted, so a worker
-    running as the mysqld OS user could truncate data files. Network and
-    signal restrictions of later ABIs are also enforced by the worker's
-    seccomp filter. */
-constexpr int kMinLandlockAbi = 3;
+/** Landlock ABI 6 (Linux 6.12; the POC's minimum is Linux 7.0) scopes
+    signals and abstract unix sockets to the worker: below it a worker
+    running as the mysqld OS user could signal mysqld (fcntl F_SETOWN +
+    O_ASYNC is not a kill-family call the seccomp filter sees), and below 3
+    truncate data files. */
+constexpr int kMinLandlockAbi = 6;
 
 /** After this many workers in a row died while idle in the pool, the
     launcher stops refilling that class's pool until a worker is handed out
@@ -90,6 +91,9 @@ struct ClassConfig {
   std::vector<std::string> env;
   std::vector<std::string> read_paths;
   std::vector<std::string> exec_paths;
+  /** Never readable, even below an allowed path (mysqld's plugin_dir with
+      the keyring components' configuration, its datadir). */
+  std::vector<std::string> hidden_paths;
   uint64_t memory_max = 0;
   uint32_t pids_max = 0;
   uint32_t nofile = 4096;

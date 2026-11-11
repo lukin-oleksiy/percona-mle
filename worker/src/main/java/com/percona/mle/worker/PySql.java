@@ -168,8 +168,14 @@ final class PySql implements GuestSql.Lang {
                   return hit[1]
               m = _mle_types.ModuleType(key)
               m.__dict__.update(_mle_globals)
-              exec(compile(src, key, 'exec'), m.__dict__)
+              # Cached before it runs (as sys.modules): libraries that import each other get the
+              # partly initialised module instead of recursing.
               cache[key] = (h, m)
+              try:
+                  exec(compile(src, key, 'exec'), m.__dict__)
+              except BaseException:
+                  del cache[key]
+                  raise
               return m
 
           def bind(fn, name, value):
@@ -213,7 +219,7 @@ final class PySql implements GuestSql.Lang {
                   if not v.is_finite(): raise TypeError('cannot bind ' + str(v))
                   return (10, str(v))
               if isinstance(v, _mle_dt.datetime):
-                  if v.tzinfo is not None: v = v.astimezone().replace(tzinfo=None)
+                  # An aware datetime keeps its offset: Java converts it to the session's zone.
                   return (11, v.isoformat())
               if isinstance(v, _mle_dt.date): return (12, v.isoformat())
               if isinstance(v, _mle_dt.timedelta): return (13, (v.days * 86400 + v.seconds) * 1000000 + v.microseconds)
@@ -439,7 +445,13 @@ final class PySql implements GuestSql.Lang {
       case 8 -> p.asString().getBytes(StandardCharsets.ISO_8859_1);
       case 9 -> new MleJson(p.asString());
       case 10 -> new BigDecimal(p.asString());
-      case 11 -> LocalDateTime.parse(p.asString());
+      case 11 -> {
+        String text = p.asString();
+        java.time.temporal.TemporalAccessor parsed = java.time.format.DateTimeFormatter.ISO_DATE_TIME.parse(text);
+        yield parsed.isSupported(java.time.temporal.ChronoField.OFFSET_SECONDS)
+            ? java.time.OffsetDateTime.from(parsed).atZoneSameInstant(options.zone).toLocalDateTime()
+            : LocalDateTime.parse(text);
+      }
       case 12 -> LocalDate.parse(p.asString());
       case 13 -> Duration.ofNanos(Math.multiplyExact(p.asLong(), 1000L));
       case 14 -> LocalTime.parse(p.asString());

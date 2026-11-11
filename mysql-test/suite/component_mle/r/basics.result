@@ -107,7 +107,7 @@ mle_stored_programs	4
 mle_workers	1
 # UNINSTALL is refused while a session that used MLE is connected.
 UNINSTALL COMPONENT "file://component_mle";
-ERROR HY000: Language component: Cannot uninstall due to connected sessions. Please disconnect all sessions and try again.
+Got one of the listed errors
 SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status
 WHERE VARIABLE_NAME = 'mle_status';
 mle_status

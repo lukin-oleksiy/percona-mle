@@ -85,9 +85,13 @@ class Session {
                                           const std::string &key);
   /** mle_session_reset('stdout' | 'stderr' | 'output'). */
   void reset_output(bool out, bool err);
-  /** mle_session_reset(): workers closed, programs, stack trace, options
-      and time-zone binding forgotten. */
-  void reset();
+  /** mle_session_reset(): workers closed (the next call gets a new one),
+      programs, stack trace, options and time-zone binding forgotten. False
+      while a routine of this session runs (it would destroy its worker). */
+  bool reset();
+  /** COM_CHANGE_USER: the session's state belongs to the old account; its
+      workers go back to the engine for that account's later sessions. */
+  void account_changed();
   /** Programs prepared in this session's workers (Oracle: "active"). */
   bool has_programs() const { return !m_programs.empty(); }
   /** The pid of the current principal's worker, or -1 (debug UDF). */
@@ -104,7 +108,12 @@ class Session {
 
   explicit Session(MYSQL_THD thd) : m_thd(thd) {}
 
-  const std::string &principal() const;
+  /** The account the current request runs as ('user'@'host', from the
+      security context's contents on every call). */
+  std::string principal() const;
+  /** Releases the workers (kept for their principals if reuse) and forgets
+      programs, console, stack trace, options. */
+  void clear_state(bool reuse);
   /** The principal's worker, started (and given the options) if needed;
       nullptr after reporting the error. */
   Slot *worker_for(const std::string &principal, const Routine &routine);
@@ -139,11 +148,6 @@ class Session {
 
   MYSQL_THD m_thd;
   std::map<std::string, Slot> m_workers;
-  /** principal() of the last call, by the security context's identity. */
-  mutable const void *m_principal_sctx = nullptr;
-  mutable const char *m_principal_user = nullptr;
-  mutable const char *m_principal_host = nullptr;
-  mutable std::string m_principal;
   /** Argument buffer of the top-level call, reused. */
   std::vector<mle::Value> m_args;
   mle::OptionsMsg m_options;

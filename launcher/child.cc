@@ -18,6 +18,7 @@
 // The worker side of a spawn, between clone3 and exec, and the Landlock
 // rules. The launcher is single-threaded, so the child may allocate.
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/landlock.h>
 #include <signal.h>
@@ -28,7 +29,11 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <climits>
 #include <cstddef>
+#include <cstdlib>
+#include <functional>
+#include <string>
 #include <vector>
 
 #include "launcher_internal.h"
@@ -81,6 +86,18 @@ const char *const kSystemReadPaths[] = {
     "/sys/devices/system/cpu", "/proc/meminfo",  "/proc/stat",
     "/proc/cpuinfo",           "/dev/urandom",   "/dev/random"};
 
+std::string real_path(const std::string &path) {
+  char buffer[PATH_MAX];
+  return realpath(path.c_str(), buffer) != nullptr ? std::string(buffer) : "";
+}
+
+/** path is strictly inside dir. */
+bool below(const std::string &path, const std::string &dir) {
+  if (dir == "/") return path.size() > 1 && path[0] == '/';
+  return path.size() > dir.size() && path.compare(0, dir.size(), dir) == 0 &&
+         path[dir.size()] == '/';
+}
+
 int add_rule(int ruleset, const char *path, uint64_t access, uint64_t handled) {
   const int fd = open(path, O_PATH | O_CLOEXEC);
   if (fd < 0) return 0;  // a missing system path is simply not allowed
@@ -126,8 +143,33 @@ int apply_landlock(int abi, const ClassConfig &c, const std::string &leaf) {
   auto allow = [&](const std::string &path, uint64_t access) {
     if (err == 0) err = add_rule(rs, path.c_str(), access, handled);
   };
-  for (const char *p : kSystemExecPaths) allow(p, kReadExec);
-  for (const char *p : kSystemReadPaths) allow(p, kRead);
+  // Hidden paths (mysqld's plugin_dir, datadir) by their real path: a
+  // system directory that contains one is allowed entry by entry instead.
+  std::vector<std::string> hidden;
+  for (const std::string &h : c.hidden_paths)
+    if (const std::string r = real_path(h); !r.empty()) hidden.push_back(r);
+  std::function<void(const std::string &, uint64_t, int)> allow_hiding =
+      [&](const std::string &path, uint64_t access, int depth) {
+        const std::string r = real_path(path);
+        if (r.empty() || depth > 16) return allow(path, access);
+        for (const std::string &h : hidden)
+          if (r == h || below(r, h)) return;  // hidden itself
+        bool contains = false;
+        for (const std::string &h : hidden) contains = contains || below(h, r);
+        if (!contains) return allow(r, access);
+        DIR *d = opendir(r.c_str());
+        if (d == nullptr) return;
+        for (dirent *e = readdir(d); e != nullptr; e = readdir(d)) {
+          const std::string name = e->d_name;
+          if (name == "." || name == "..") continue;
+          allow_hiding(r == "/" ? "/" + name : r + "/" + name, access, depth + 1);
+        }
+        closedir(d);
+      };
+  for (const char *p : kSystemExecPaths) allow_hiding(p, kReadExec, 0);
+  for (const char *p : kSystemReadPaths) allow_hiding(p, kRead, 0);
+  // The class's own paths are allowed as they are (MLE's files may be
+  // installed below plugin_dir).
   for (const std::string &p : c.exec_paths) allow(p, kReadExec);
   for (const std::string &p : c.read_paths) allow(p, kRead);
   allow("/proc/" + std::to_string(getpid()), kRead);
@@ -209,6 +251,13 @@ const char *child_step_name(int32_t step) {
   if (!c.core_dumps) {
     rlimit zero{0, 0};
     if (setrlimit(RLIMIT_CORE, &zero) != 0) fail(err_pipe, kStepRlimit, errno);
+  }
+  // Out of memory (no cgroup, or the host is short): the kernel kills a
+  // worker before mysqld. Raising one's own score needs no privilege.
+  if (const int fd = open("/proc/self/oom_score_adj", O_WRONLY | O_CLOEXEC);
+      fd >= 0) {
+    [[maybe_unused]] ssize_t n = write(fd, "1000", 4);
+    close(fd);
   }
 
   if (r.landlock_abi >= kMinLandlockAbi) {

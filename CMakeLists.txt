@@ -25,6 +25,11 @@ IF(NOT LINUX)
 ENDIF()
 MESSAGE(STATUS "Building MLE")
 
+# Installed MLE directories are not writable by the group or others, whatever
+# the builder's umask: workers run what is in them.
+SET(CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
+  OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE
+  WORLD_READ WORLD_EXECUTE)
 ADD_SUBDIRECTORY(host)
 ADD_SUBDIRECTORY(launcher)
 ADD_SUBDIRECTORY(worker)

@@ -454,6 +454,18 @@ final class JavaRoutines {
     };
   }
 
+  private void discardCompiler() {
+    if (files != null) {
+      try {
+        files.close();
+      } catch (java.io.IOException | RuntimeException e) {
+        // closing a broken file manager: nothing to do
+      }
+    }
+    files = null;
+    javac = null;
+  }
+
   /**
    * Compiles a unit with the routine's Java libraries ({name, source}); prefix: wrapper text before
    * the routine body on line 1 (body form), display: the file name in error messages (null: the
@@ -501,7 +513,17 @@ final class JavaRoutines {
       units.add(u);
       libraryNames.put(u, lib[0]);
     }
-    boolean ok = javac.getTask(null, fm, diags, options, null, units).call();
+    boolean ok;
+    try {
+      ok = javac.getTask(null, fm, diags, options, null, units).call();
+    } catch (RuntimeException e) {
+      discardCompiler();
+      throw e;
+    } finally {
+      // A KILL during the compile interrupts this thread, which closes the file manager's jar
+      // channels (interruptible I/O): later compiles in this worker would fail. Start afresh.
+      if (Thread.currentThread().isInterrupted()) discardCompiler();
+    }
     if (!ok) {
       StringBuilder msg = new StringBuilder();
       for (Diagnostic<? extends JavaFileObject> d : diags.getDiagnostics()) {

@@ -33,8 +33,8 @@ java/*.jar (Maven, with dependencies). packages.json lists what is installed.
 """
 
 import argparse
+import csv
 import datetime
-import getpass
 import glob
 import json
 import os
@@ -43,6 +43,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from xml.sax.saxutils import escape
 
 # The MLE directory the tool is started from (the build layout links it).
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -67,17 +68,22 @@ def graalpy(args):
 
 # ---------------------------------------------------------------- install
 
-def install_js(d, specs):
+def install_js(d, specs, args):
     os.makedirs(os.path.join(d, "js"), exist_ok=True)
+    # Package lifecycle scripts would run third-party code as this OS user.
+    scripts = [] if args.allow_scripts else ["--ignore-scripts"]
     run(["npm", "install", "--prefix", os.path.join(d, "js"), "--no-audit",
-         "--no-fund", "--save-exact", *specs])
+         "--no-fund", "--save-exact", *scripts, *specs])
 
 
 def install_python(d, specs, args):
     site = os.path.join(d, "python", "site-packages")
     os.makedirs(site, exist_ok=True)
+    # Wheels only: building a source distribution runs its setup code as this
+    # OS user (--allow-source to permit it).
+    binary = ["--prefer-binary"] if args.allow_source else ["--only-binary=:all:"]
     run([graalpy(args), "-m", "pip", "install", "--disable-pip-version-check",
-         "--upgrade", "--prefer-binary", "--target", site,
+         "--upgrade", *binary, "--target", site,
          "--extra-index-url", GRAALPY_WHEELS,
          *specs])
 
@@ -88,10 +94,10 @@ def install_java(d, specs):
     deps = []
     for s in specs:
         parts = s.split(":")
-        if len(parts) != 3:
+        if len(parts) != 3 or not all(re.fullmatch(r"[A-Za-z0-9_.\-]+", p) for p in parts):
             sys.exit("mle_package: a Java package is group:artifact:version, not " + s)
         deps.append("<dependency><groupId>%s</groupId><artifactId>%s</artifactId>"
-                    "<version>%s</version></dependency>" % tuple(parts))
+                    "<version>%s</version></dependency>" % tuple(escape(p) for p in parts))
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, "pom.xml"), "w") as f:
             f.write('<project xmlns="http://maven.apache.org/POM/4.0.0">'
@@ -101,6 +107,19 @@ def install_java(d, specs):
         run(["mvn", "-q", "-B", "-f", os.path.join(tmp, "pom.xml"),
              "dependency:copy-dependencies", "-DincludeScope=runtime",
              "-DoutputDirectory=" + out])
+    # One version per artifact: the class path is sorted, an older jar would win.
+    newest = {}
+    for jar in glob.glob(os.path.join(out, "*.jar")):
+        m = JAR.match(os.path.basename(jar))
+        if not m:
+            continue
+        old = newest.get(m.group(1))
+        if old is None or os.path.getmtime(jar) > os.path.getmtime(old):
+            if old is not None:
+                os.remove(old)
+            newest[m.group(1)] = jar
+        else:
+            os.remove(jar)
 
 
 # ---------------------------------------------------------------- inventory
@@ -132,10 +151,13 @@ def python_packages(d):
     return out
 
 
+JAR = re.compile(r"(.+?)-(\d[^/]*)\.jar$")
+
+
 def java_packages(d):
     out = []
     for jar in sorted(glob.glob(os.path.join(d, "java", "*.jar"))):
-        m = re.match(r"(.+?)-(\d[^/]*)\.jar$", os.path.basename(jar))
+        m = JAR.match(os.path.basename(jar))
         out.append({"language": "java", "name": m.group(1) if m else os.path.basename(jar),
                     "version": m.group(2) if m else ""})
     return out
@@ -146,10 +168,11 @@ def inventory(d):
 
 
 def write_manifest(d):
+    # Every database user can read it (mle_packages()): no OS user names.
     data = {"updated": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-            "by": getpass.getuser(), "packages": inventory(d)}
-    tmp = os.path.join(d, ".packages.json.tmp")
-    with open(tmp, "w") as f:
+            "packages": inventory(d)}
+    fd, tmp = tempfile.mkstemp(prefix=".packages.", suffix=".json", dir=d)
+    with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=1)
     os.chmod(tmp, 0o644)
     os.replace(tmp, os.path.join(d, "packages.json"))
@@ -158,31 +181,48 @@ def write_manifest(d):
 # ---------------------------------------------------------------- remove
 
 def remove(d, language, names):
+    for n in names:
+        if not re.fullmatch(r"[A-Za-z0-9_.@/\-]+", n) or ".." in n or (language != "js" and "/" in n):
+            sys.exit("mle_package: not a package name: " + n)
     if language == "js":
         run(["npm", "uninstall", "--prefix", os.path.join(d, "js"), *names])
         return
     if language == "java":
         for n in names:
-            for jar in glob.glob(os.path.join(d, "java", n + "-*.jar")):
+            jars = [j for j in glob.glob(os.path.join(d, "java", "*.jar"))
+                    if (JAR.match(os.path.basename(j)) or [None, None])[1] == n]
+            if not jars:
+                sys.exit("mle_package: no Java package " + n)
+            for jar in jars:
                 os.remove(jar)
         return
-    site = os.path.join(d, "python", "site-packages")
+    site = os.path.realpath(os.path.join(d, "python", "site-packages"))
     for n in names:
         key = n.replace("-", "_").lower()
-        for info in glob.glob(os.path.join(site, "*.dist-info")):
-            if not os.path.basename(info).lower().startswith(key + "-"):
-                continue
+        infos = [i for i in glob.glob(os.path.join(site, "*.dist-info"))
+                 if os.path.basename(i).lower().startswith(key + "-")]
+        if not infos:
+            sys.exit("mle_package: no Python package " + n)
+        dirs = set()
+        for info in infos:
             record = os.path.join(info, "RECORD")
             if os.path.exists(record):
-                with open(record) as f:
-                    for line in f:
-                        path = os.path.normpath(os.path.join(site, line.split(",")[0]))
-                        if path.startswith(site) and os.path.isfile(path):
+                with open(record, newline="") as f:
+                    for row in csv.reader(f):
+                        if not row:
+                            continue
+                        path = os.path.realpath(os.path.join(site, row[0]))
+                        # Only files inside site-packages (RECORD comes with the package).
+                        if os.path.commonpath([path, site]) == site and path != site and os.path.isfile(path):
                             os.remove(path)
+                            dirs.add(os.path.dirname(path))
             shutil.rmtree(info, ignore_errors=True)
-        for left in (os.path.join(site, key),):
-            if os.path.isdir(left) and not os.listdir(left):
+        # Directories left empty (deepest first): no empty namespace packages.
+        for left in sorted(dirs | {os.path.join(site, key)}, key=len, reverse=True):
+            while (left != site and os.path.commonpath([left, site]) == site and
+                   os.path.isdir(left) and not os.listdir(left)):
                 os.rmdir(left)
+                left = os.path.dirname(left)
 
 
 def main():
@@ -190,6 +230,10 @@ def main():
     p.add_argument("--dir", default=os.environ.get("MLE_PACKAGE_DIR", os.path.join(HERE, "packages")),
                    help="the package directory (mle.package_dir)")
     p.add_argument("--graalpy", help="GraalPy for Python packages (default: the MLE venv's)")
+    p.add_argument("--allow-scripts", action="store_true",
+                   help="run npm packages' install scripts (they run as this OS user)")
+    p.add_argument("--allow-source", action="store_true",
+                   help="let pip build source distributions (their setup code runs as this OS user)")
     sub = p.add_subparsers(dest="cmd", required=True)
     for c in ("install", "remove"):
         s = sub.add_parser(c)
@@ -197,10 +241,15 @@ def main():
         s.add_argument("names", nargs="+")
     sub.add_parser("list")
     args = p.parse_args()
+    # Workers read these files: nobody but this OS user may change them.
+    os.umask(0o022)
     d = os.path.realpath(args.dir)
     os.makedirs(d, exist_ok=True)
+    if os.stat(d).st_mode & 0o022:
+        sys.exit("mle_package: %s is writable by its group or by others; MLE workers run what "
+                 "is installed there (chmod go-w)" % d)
     if args.cmd == "install":
-        {"js": lambda: install_js(d, args.names),
+        {"js": lambda: install_js(d, args.names, args),
          "python": lambda: install_python(d, args.names, args),
          "java": lambda: install_java(d, args.names)}[args.language]()
         write_manifest(d)

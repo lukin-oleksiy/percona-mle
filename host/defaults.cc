@@ -17,6 +17,7 @@
 
 #include "mle/defaults.h"
 
+#include <glob.h>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -53,8 +54,14 @@ Layout Layout::installed(const std::string &dir, const std::string &java_home) {
   l.worker_exe = resolve(dir + "/mle_worker");
   l.worker_jar = resolve(dir + "/mle-worker.jar");
   l.resource_cache = resolve(dir + "/resources");
-  if (exists(dir + "/python-venv/venv/bin/python"))
-    l.python_venv = resolve(dir + "/python-venv/venv");
+  // The venv is used only through its site-packages (numpy): its bin/python
+  // and pyvenv.cfg point to the GraalPy it was built with, which need not be
+  // there where MLE is installed.
+  if (glob_t g{}; glob((dir + "/python-venv/venv/lib/python*/site-packages").c_str(),
+                       GLOB_ONLYDIR, nullptr, &g) == 0) {
+    if (g.gl_pathc > 0) l.python_venv = resolve(dir + "/python-venv/venv");
+    globfree(&g);
+  }
   if (exists(dir + "/mle.aot")) l.aot_cache = resolve(dir + "/mle.aot");
   l.java_home = resolve(java_home);
   return l;
@@ -99,6 +106,7 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
   if (!layout.python_venv.empty()) c.read_paths.push_back(layout.python_venv);
   if (!layout.package_dir.empty()) c.read_paths.push_back(layout.package_dir);
   if (!layout.aot_cache.empty()) c.read_paths.push_back(layout.aot_cache);
+  c.hidden_paths = o.hidden_paths;
   c.memory_max = o.memory_max;
   c.pids_max = o.pids_max;
   c.nofile = 4096;

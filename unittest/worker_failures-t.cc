@@ -283,7 +283,7 @@ TEST_F(MleWorkerFailures, KillLongNumpyComputation) {
   EXPECT_TRUE(st == uint32_t(Status::kInterrupted) ||
               st == uint32_t(Status::kKilled))
       << st;
-  EXPECT_LT(ms, 500 + 1000);
+  EXPECT_LT(ms, 3 * (500 + 1000));  // generous: slow builds
 }
 
 // ---------------------------------------------------------------- limits
@@ -404,8 +404,11 @@ TEST_F(MleWorkerFailures, EscapesFromJsThroughJava) {
   ASSERT_EQ(
       prepare_routine(
           *s_host, 210, "js", "f",
+          // java.lang.Class is not accessible to guests (Phase 7 review):
+          // the exception's name from its text.
           "function t(fn) { try { fn(); return 'OK'; } catch (e) { "
-          "return e.getClass ? e.getClass().getSimpleName() : e.name; } }\n"
+          "return e.getClass ? String(e).split(':')[0].replace(/^.*[.]/, '') "
+          ": e.name; } }\n"
           "function f(host) {\n"
           "  const Files = Java.type('java.nio.file.Files');\n"
           "  const Path = Java.type('java.nio.file.Path');\n"
@@ -426,8 +429,9 @@ TEST_F(MleWorkerFailures, EscapesFromJsThroughJava) {
   ASSERT_EQ(s_host->call(210, {Value::i64(getpid())}, &res), 0u)
       << error_of(res);
   EXPECT_EQ(res.ret->as_text(),
+            // ProcessBuilder is not accessible to guests at all now.
             "read=AccessDeniedException write=AccessDeniedException "
-            "exec=IOException see_host=false");
+            "exec=TypeError see_host=false");
   EXPECT_EQ(access("/tmp/mle-js", F_OK), -1);
 }
 

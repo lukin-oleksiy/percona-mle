@@ -54,7 +54,7 @@ public final class Routine {
     if (!procedure) {
       StringBuilder q = new StringBuilder("SELECT ").append(qualified).append('(');
       for (int i = 0; i < args.length; i++) q.append(i == 0 ? "?" : ", ?");
-      SqlResult r = session.run(q.append(')').toString(), args, session.effective(null));
+      SqlResult r = session.run(q.append(')').toString(), args, session.internal());
       Object v = r.fetchOne().get(0);
       r.close();
       return v;
@@ -85,7 +85,7 @@ public final class Routine {
     SqlResult r = session.run(q.append(')').toString(), params.toArray(), session.effective(null));
     if (r != null) r.close();
     if (!outs.isEmpty()) {
-      Row row = session.run(get.toString(), null, session.effective(null)).fetchOne();
+      Row row = session.run(get.toString(), null, session.internal()).fetchOne();
       for (int i = 0; i < outs.size(); i++) outs.get(i).setVal(row.get(i));
     }
     return null;

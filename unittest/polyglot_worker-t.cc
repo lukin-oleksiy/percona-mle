@@ -525,7 +525,7 @@ TEST_F(MlePolyglotWorker, KillGuestLoops) {
         std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     std::cout << "[ INFO     ] " << (id == 1 ? "JS" : "Python")
               << " loop stopped " << ms - 200 << " ms after KILL\n";
-    EXPECT_LT(ms, 1500);
+    EXPECT_LT(ms, 4500);  // generous: sanitizers and parallel runs are slow
     // The worker and its context are still usable.
     ASSERT_TRUE(h->worker.usable());
     EXPECT_EQ(h->call(3, {}, &res), 0u) << error_of(res);

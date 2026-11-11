@@ -93,7 +93,10 @@ class Reader {
   /** A u32 element count that can be satisfied by the remaining bytes when
       each element takes at least min_size bytes. Protects against huge
       allocations from a hostile count. */
-  bool count(uint32_t *n, size_t min_size);
+  /** An element count: at most what the rest of the message can hold
+      (min_size bytes each) and at most max (decoded elements can be much
+      larger than their wire form). */
+  bool count(uint32_t *n, size_t min_size, uint32_t max = UINT32_MAX);
   bool value(Value *v);
   /** Fails unless every byte was consumed. */
   bool finish();

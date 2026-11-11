@@ -55,6 +55,13 @@ public final class SqlBridge {
     return dispatcher().callSeq();
   }
 
+  /** The running routine call: its top-level call and its nesting depth (a nested routine's
+      session options are its own). */
+  public static long callScope() {
+    Dispatcher d = dispatcher();
+    return d.callSeq() * 256 + d.depth();
+  }
+
   /** Whether the running call was killed. */
   public static boolean interrupted() {
     return dispatcher().interrupted();

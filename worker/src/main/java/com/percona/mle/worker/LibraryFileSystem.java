@@ -80,10 +80,17 @@ final class LibraryFileSystem implements FileSystem {
    * effect libraries are validated once per statement (and per routine load), not per call.
    */
   private static long epoch = 1;
+  /**
+   * "routine:schema/name" confirmed by mysqld in this epoch: mysqld decides per importing routine
+   * (its schema and USING), so a library one routine may import is not thereby importable by
+   * another (an INVOKER routine of another account, say).
+   */
+  private static final Set<String> confirmed = new java.util.HashSet<>();
 
   /** A routine was (re)loaded: confirm libraries with mysqld again at their next import. */
   static void revalidate() {
     epoch++;
+    confirmed.clear();
   }
 
   static final String ROOT = "/.mle-libraries";
@@ -108,18 +115,21 @@ final class LibraryFileSystem implements FileSystem {
     Dispatcher d = SqlBridge.dispatcher;
     String key = schema + "/" + name;
     Library known = libraries.get(key);
-    if (known != null && known.checked() == epoch) return known;
+    String confirmation = (d == null ? 0 : d.routine()) + ":" + key;
+    if (known != null && known.checked() == epoch && confirmed.contains(confirmation)) return known;
     if (d == null) throw new NoSuchFileException("/" + key, null, "no database libraries here");
     Reply r = d.libraryRequest(schema, name, known == null ? 0 : known.hash());
     switch (r.status()) {
       case Wire.LIBRARY_UNCHANGED -> {
         Library l = known.confirmed(epoch);
         libraries.put(key, l);
+        confirmed.add(confirmation);
         return l;
       }
       case Wire.LIBRARY_BODY -> {
         Library l = new Library(r.language(), r.body().getBytes(StandardCharsets.UTF_8), r.hash(), epoch);
         libraries.put(key, l);
+        confirmed.add(confirmation);
         return l;
       }
       default -> {
@@ -160,13 +170,9 @@ final class LibraryFileSystem implements FileSystem {
   private Library body(Path p) throws IOException {
     Matcher m = virtualOf(p);
     if (m == null) return null;
-    Library l = libraries.get(m.group(1) + "/" + m.group(2));
-    // A versioned path names a body the worker has; an import (unversioned) is confirmed with
-    // mysqld once per epoch ("unchanged" without the body, a new body, or refused: dropped or not
-    // importable).
-    if (l == null || m.group(3) == null || !Long.toHexString(l.hash()).equals(m.group(3)))
-      l = fetch(m.group(1), m.group(2));
-    return l;
+    // Every access, versioned path or not, is confirmed with mysqld once per epoch and importing
+    // routine ("unchanged" without the body, a new body, or refused: dropped or not importable).
+    return fetch(m.group(1), m.group(2));
   }
 
   @Override

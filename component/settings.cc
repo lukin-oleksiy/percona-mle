@@ -371,8 +371,8 @@ bool register_settings() {
   chunk_rows.max_val = 1000000;
   chunk_rows.blk_sz = 0;
   if (reg("sql_chunk_rows", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
-          "Rows of a prepared statement's result sent to the worker at a "
-          "time.",
+          "Rows of a statement's result sent to the worker at a time (a "
+          "chunk also ends at about 768 KB).",
           nullptr, nullptr, &chunk_rows, &g_sql_chunk_rows))
     return true;
 
@@ -394,8 +394,12 @@ bool register_settings() {
 
   STR_CHECK_ARG(cgroup_base) cgroup_base;
   cgroup_base.def_val = const_cast<char *>("AUTO");
+  // Paths (cgroup_base, dir, java_home, package_dir): READONLY and not
+  // persistable: what mysqld runs and what workers read is set where mysqld
+  // is started (my.cnf), not by SET PERSIST_ONLY from SQL.
   if (reg("cgroup_base",
-          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY,
+          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY |
+              PLUGIN_VAR_NOPERSIST,
           "cgroup v2 directory for the worker cgroups (memory and process "
           "limits): AUTO (the parent of mysqld's cgroup, if delegated), NONE "
           "or a path.",
@@ -405,7 +409,8 @@ bool register_settings() {
   g_default_dir = default_dir();
   STR_CHECK_ARG(dir) dir;
   dir.def_val = const_cast<char *>(g_default_dir.c_str());
-  if (reg("dir", PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY,
+  if (reg("dir", PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY |
+              PLUGIN_VAR_NOPERSIST,
           "Directory of the MLE files (mle_launcher, mle_worker, jars, Python "
           "venv); default <plugin_dir>/mle.",
           nullptr, nullptr, &dir, &g_dir))
@@ -414,7 +419,8 @@ bool register_settings() {
   STR_CHECK_ARG(java_home) java_home;
   java_home.def_val = const_cast<char *>(MLE_DEFAULT_JAVA_HOME);
   if (reg("java_home",
-          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY,
+          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY |
+              PLUGIN_VAR_NOPERSIST,
           "GraalVM JDK 25 that runs the MLE workers.", nullptr, nullptr,
           &java_home, &g_java_home))
     return true;
@@ -424,7 +430,8 @@ bool register_settings() {
   STR_CHECK_ARG(package_dir) package_dir;
   package_dir.def_val = const_cast<char *>("");
   if (reg("package_dir",
-          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY,
+          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY |
+              PLUGIN_VAR_NOPERSIST,
           "Directory of third-party packages for routines (js/node_modules, "
           "python/site-packages, java/*.jar), installed by the DBA with "
           "mle_package; empty: <mle.dir>/packages.",
@@ -441,6 +448,11 @@ void unregister_settings() {
       r.done = false;
   }
   g_languages = g_cgroup_base = g_dir = g_java_home = g_package_dir = g_pool_prewarm = nullptr;
+}
+
+std::string package_dir() {
+  const std::string dir = text(g_package_dir);  // READONLY: never replaced
+  return dir.empty() ? text(g_dir) + "/packages" : dir;
 }
 
 Settings current_settings() {

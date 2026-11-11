@@ -74,7 +74,7 @@ void put_values(Writer &w, const std::vector<Value> &values) {
 
 bool get_values(Reader &r, std::vector<Value> *values) {
   uint32_t n;
-  if (!r.count(&n, kMinValue)) return false;
+  if (!r.count(&n, kMinValue, wire::kMaxValues)) return false;
   values->clear();
   values->resize(n);
   for (Value &v : *values)
@@ -398,10 +398,11 @@ bool Reader::text(std::string *s, bool utf8) {
   return true;
 }
 
-bool Reader::count(uint32_t *n, size_t min_size) {
+bool Reader::count(uint32_t *n, size_t min_size, uint32_t max) {
   if (!u32(n)) return false;
   if (min_size > 0 && *n > remaining() / min_size)
     return fail("element count beyond the message");
+  if (*n > max) return fail("too many elements");
   return true;
 }
 
@@ -529,7 +530,7 @@ bool decode(std::string_view body, ReadyMsg *m, std::string *error) {
   return decode_with<ReadyMsg>(body, m, error, [](Reader &r, ReadyMsg *x) {
     uint32_t n;
     if (!r.u32(&x->version) || !r.str(&x->worker_class) ||
-        !r.count(&n, kMinStr))
+        !r.count(&n, kMinStr, wire::kMaxLanguages))
       return false;
     x->languages.clear();
     x->languages.resize(n);
@@ -694,7 +695,7 @@ bool decode(std::string_view body, ResultMsg *m, std::string *error) {
       if (!r.value(&*x->ret)) return false;
     }
     uint32_t n;
-    if (!r.count(&n, kMinOutParam)) return false;
+    if (!r.count(&n, kMinOutParam, wire::kMaxValues)) return false;
     x->out_params.clear();
     x->out_params.resize(n);
     for (auto &[index, v] : x->out_params)
@@ -912,7 +913,9 @@ Assembler::Step Assembler::add(const wire::MessageHeader &h,
   }
   if (h.len > m_first.total_len - m_body.size())
     return fail("chunks exceed the message length");
-  if (more && h.len == 0) return fail("empty chunk");
+  // Every chunk but the last fills the arena: a sender cannot stretch a
+  // message into many tiny round trips.
+  if (more && h.len != m_arena_size) return fail("a chunk before the last does not fill the arena");
   m_body.append(static_cast<const char *>(chunk), h.len);
   if (more) {
     if (m_body.size() == m_first.total_len)

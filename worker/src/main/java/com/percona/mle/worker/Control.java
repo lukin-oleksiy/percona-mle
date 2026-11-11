@@ -74,26 +74,50 @@ final class Control implements Runnable {
 
   /**
    * Java routines: Thread.interrupt. JS and Python routines: Context.interrupt, which stops guest
-   * code at its next safepoint (done on another thread: it waits for the guest to stop). Only one of
-   * the two: interrupting a guest's thread as well delays the guest interrupt (S-10).
+   * code at its next safepoint (done on another thread: it waits for the guest to stop). The
+   * routine's language decides the first; interrupting a guest's thread as well delays the guest
+   * interrupt (S-10), so the other comes only if the first did not stop the call: a Java routine
+   * looping in JavaScript or Python (Mle.context()), a guest routine looping in Java (a DBA jar).
    */
   private void stop() {
-    if (!guest) {
-      main.interrupt();
-      return;
-    }
+    final long seq = running;
+    final boolean guestFirst = guest;
     org.graalvm.polyglot.Context c = polyglot.contextIfCreated();
-    if (c == null) return;
     Thread t = new Thread(() -> {
-      try {
-        c.interrupt(java.time.Duration.ofSeconds(5));
-      } catch (Exception e) {
-        // timed out or the context is gone: the host's SIGKILL covers it
+      if (guestFirst) {
+        if (c == null || interruptContext(c, 500)) return;
+        main.interrupt();
+        interruptContext(c, 4500);
+      } else {
+        main.interrupt();
+        if (c != null && stillRunning(seq, 500)) interruptContext(c, 4500);
       }
     }, "mle-interrupt");
     t.setDaemon(true);
     interrupter = t;
     t.start();
+  }
+
+  private static boolean interruptContext(org.graalvm.polyglot.Context c, long ms) {
+    try {
+      c.interrupt(java.time.Duration.ofMillis(ms));
+      return true;
+    } catch (Exception e) {
+      return false;  // timed out or the context is gone: escalate, or the host's SIGKILL
+    }
+  }
+
+  /** Whether call seq is still running after up to ms (end() wakes the wait). */
+  private synchronized boolean stillRunning(long seq, long ms) {
+    long until = System.currentTimeMillis() + ms;
+    for (long left = ms; running == seq && left > 0; left = until - System.currentTimeMillis()) {
+      try {
+        wait(left);
+      } catch (InterruptedException e) {
+        return false;
+      }
+    }
+    return running == seq;
   }
 
   /** The thread running a Context.interrupt for the ended call, if any (see Polyglot). */
@@ -124,6 +148,7 @@ final class Control implements Runnable {
   synchronized boolean end() {
     last = Math.max(last, running);
     running = -1;
+    notifyAll();  // an interrupter waiting to escalate
     boolean r = interrupted;
     interrupted = false;
     Thread.interrupted();

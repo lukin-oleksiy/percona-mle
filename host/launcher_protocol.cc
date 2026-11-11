@@ -41,6 +41,7 @@ void put(Writer &w, const ClassConfig &c) {
   put(w, c.env);
   put(w, c.read_paths);
   put(w, c.exec_paths);
+  put(w, c.hidden_paths);
   w.u64(c.memory_max);
   w.u32(c.pids_max);
   w.u32(c.nofile);
@@ -53,6 +54,7 @@ void put(Writer &w, const ClassConfig &c) {
 bool get(Reader &r, ClassConfig *c) {
   return r.str(&c->name) && r.str(&c->executable) && get(r, &c->args) &&
          get(r, &c->env) && get(r, &c->read_paths) && get(r, &c->exec_paths) &&
+         get(r, &c->hidden_paths) &&
          r.u64(&c->memory_max) && r.u32(&c->pids_max) && r.u32(&c->nofile) &&
          r.flag(&c->core_dumps) && r.u32(&c->pool_size) &&
          r.flag(&c->inherit_stderr) && r.flag(&c->insecure_without_landlock);

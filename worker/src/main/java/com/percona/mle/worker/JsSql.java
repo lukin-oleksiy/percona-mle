@@ -221,7 +221,7 @@ final class JsSql implements GuestSql.Lang {
         String t = c.getSqlType();
         if (t.equals("YEAR")) yield l;
         if (t.equals("BIT")) yield l >= 0 && l <= MAX_SAFE ? (Object) l : bigint.execute(Long.toUnsignedString(l));
-        yield integer(l, o, Math.abs(l) <= MAX_SAFE);
+        yield integer(l, o, (l >= -MAX_SAFE && l <= MAX_SAFE));
       }
       case BigInteger b -> c.getSqlType().equals("BIT") ? bigint.execute(b.toString()) : integer(b, o, false);
       case Float f -> (double) f;

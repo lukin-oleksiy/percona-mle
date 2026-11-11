@@ -62,6 +62,29 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
 final class Polyglot {
   static final List<String> LANGUAGES = List.of("js", "python");
 
+  /**
+   * What JavaScript and Python may use of Java objects: everything (polyglot reach: DBA jars,
+   * java.util, ...) except reflection, class loading, threads and the process (15 §1; the OS
+   * lockdown stays the boundary, ThreadWatch the backstop for threads).
+   */
+  static final HostAccess HOST_ACCESS = HostAccess.newBuilder(HostAccess.ALL)
+      .denyAccess(Class.class)
+      .denyAccess(ClassLoader.class)
+      .denyAccess(java.lang.reflect.AccessibleObject.class)
+      .denyAccess(java.lang.invoke.MethodHandles.class)
+      .denyAccess(java.lang.invoke.MethodHandles.Lookup.class)
+      .denyAccess(Thread.class)
+      .denyAccess(ThreadGroup.class)
+      .denyAccess(Runtime.class)
+      .denyAccess(System.class)
+      .denyAccess(ProcessBuilder.class)
+      .denyAccess(java.util.concurrent.Executors.class)
+      .denyAccess(java.util.concurrent.ThreadPoolExecutor.class)
+      .denyAccess(java.util.concurrent.ForkJoinPool.class)
+      .denyAccess(java.util.concurrent.CompletableFuture.class)
+      .denyAccess(java.util.Timer.class)
+      .build();
+
   /** Phase 7: guest code cannot start threads through Java either. */
   private static final java.util.Set<String> THREAD_CLASSES = java.util.Set.of("java.lang.Thread",
       "java.lang.ThreadGroup", "java.lang.Thread$Builder", "java.util.concurrent.Executors",
@@ -105,7 +128,6 @@ final class Polyglot {
   static final Map<java.net.URI, Integer> prefixes = new java.util.concurrent.ConcurrentHashMap<>();
   private Value jsOracle;
   private PySql pySql;
-  private Value jsImport;
   private volatile Context context;
   private Helpers js;
   private Helpers python;
@@ -167,10 +189,9 @@ final class Polyglot {
       c.getPolyglotBindings().putMember("Mle", mleApi);
       js = jsHelpers(c);
       jsOracle = JsOracle.helpers(c);
-      // USING in JavaScript routines (Phase 6): $c.lib(...) asks for non-JavaScript libraries.
+      // USING in JavaScript routines (Phase 6): $c.lib(...) gets every library's module.
       jsOracle.putMember("libBridge",
           (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString(), true));
-      jsImport = c.eval("js", "(p) => import(p)");
       // importPython('numpy'): Python modules from JavaScript.
       c.getBindings("js").putMember("importPython",
           (org.graalvm.polyglot.proxy.ProxyExecutable) a -> importPython(a[0].asString()));
@@ -199,7 +220,7 @@ final class Polyglot {
   @SuppressWarnings("deprecation")
   static Context.Builder builder(Console console) {
     Context.Builder b = Context.newBuilder("js", "python")
-        .allowHostAccess(HostAccess.ALL)
+        .allowHostAccess(HOST_ACCESS)
         // The process is the sandbox; only the worker's own classes are hidden.
         .allowHostClassLookup(name -> !name.startsWith("com.percona.mle.worker.") && !THREAD_CLASSES.contains(name))
         // The DBA's jars (Phase 6) for Java.type() in JavaScript and java.type() in Python.
@@ -215,6 +236,11 @@ final class Polyglot {
                 FileSystem.newReadOnlyFileSystem(FileSystem.newDefaultFileSystem())))))
             .allowHostSocketAccess(false)
             .build())
+        // Evaluating a module returns its exports: database libraries and ES modules are
+        // loaded synchronously (an import() promise cannot settle while a JavaScript frame is
+        // on the stack, as in nested calls).
+        .allowExperimentalOptions(true)
+        .option("js.esm-eval-returns-exports", "true")
         .option("engine.WarnInterpreterOnly", "false")
         .option(FrameLimit.ID, "true")
         .option("python.PosixModuleBackend", "java")
@@ -225,6 +251,7 @@ final class Polyglot {
     // Third-party packages installed by the DBA (14 §3): npm packages for require() and
     // import of bare names (CommonJS support is an experimental GraalJS option), Python
     // packages on the module path.
+    List<String> pythonPath = new java.util.ArrayList<>();
     String packages = System.getProperty("mle.packages", "");
     if (!packages.isEmpty()) {
       Path js = Path.of(packages, "js");
@@ -234,8 +261,12 @@ final class Polyglot {
             .option("js.commonjs-require-cwd", js.toString())
             .option("js.esm-bare-specifier-relative-lookup", "true");
       Path site = Path.of(packages, "python", "site-packages");
-      if (java.nio.file.Files.isDirectory(site)) b.option("python.PythonPath", site.toString());
+      if (java.nio.file.Files.isDirectory(site)) pythonPath.add(site.toString());
     }
+    if (!pythonPath.isEmpty()) b.option("python.PythonPath", String.join(java.io.File.pathSeparator, pythonPath));
+    // The build's venv (numpy): GraalPy's site finds it from sys.executable's directory and its
+    // pyvenv.cfg. Only the path is used: bin/python need not exist (it points to the GraalPy that
+    // built the venv, which is not installed with MLE).
     String venv = System.getProperty("mle.python.venv", "");
     if (!venv.isEmpty())
       b.option("python.Executable", Path.of(venv).resolve("bin/python").toString())
@@ -295,6 +326,10 @@ final class Polyglot {
         if hasattr(_mle_thread_mod, 'start_joinable_thread'):
             _mle_thread_mod.start_joinable_thread = _mle_no_threads
         _mle_threading.Thread.start = lambda self: _mle_no_threads()
+        # threading keeps its own references to the _thread functions.
+        for _mle_name in ('_start_joinable_thread', '_start_new_thread', '_start_thread'):
+            if hasattr(_mle_threading, _mle_name):
+                setattr(_mle_threading, _mle_name, _mle_no_threads)
 
         # Phase 7 (S-14): numpy arrays the host fills with one memcpy; creating numpy arrays is
         # the expensive part, so argument arrays are reused (read-only, valid during the call).
@@ -357,7 +392,15 @@ final class Polyglot {
             # Bodies are usually indented inside $$ ... $$ (or start after
             # "$$ "): remove the common indentation (lines stay where they are).
             import ast, textwrap
-            tree = ast.parse(textwrap.dedent(src), filename=name)
+            try:
+                tree = ast.parse(textwrap.dedent(src), filename=name)
+            except (IndentationError, SyntaxError):
+                # The first statement on the $$ line, the rest indented below it: dedent the
+                # lines after the first one on their own.
+                first, _, rest = src.partition('\\n')
+                if not first.strip() or not rest.strip():
+                    raise
+                tree = ast.parse(first.strip() + '\\n' + textwrap.dedent(rest), filename=name)
             def fn(fname, args, body):
                 kw = dict(name=fname, args=ast.arguments(posonlyargs=[], args=[ast.arg(arg=a) for a in args],
                           vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
@@ -435,12 +478,7 @@ final class Polyglot {
     }
     switch (l.language()) {
       case "js" -> {
-        if (forJs) return null;
-        Value settled = jsOracle.getMember("settle").execute(jsImport.execute("/" + schema + "/" + name));
-        if (!settled.getMember("done").asBoolean())
-          throw new IllegalStateException("library " + schema + "." + name + " did not load");
-        if (!settled.getMember("ok").asBoolean()) jsOracle.getMember("rethrow").execute(settled.getMember("v"));
-        return settled.getMember("v");
+        return jsLibrary(schema, name, l.hash());
       }
       case "python" -> {
         pythonReady();
@@ -453,6 +491,30 @@ final class Polyglot {
         return javaLibrary(schema + "." + name, l);
       }
     }
+  }
+
+  /** JavaScript libraries' module namespaces, by "schema/name": {hash, namespace}. */
+  private final Map<String, Object[]> jsLibraries = new HashMap<>();
+
+  private Value jsLibrary(String schema, String name, long hash) {
+    String key = schema + "/" + name;
+    Object[] hit = jsLibraries.get(key);
+    if (hit != null && (long) hit[0] == hash) return (Value) hit[1];
+    // The virtual path, not Oracle's "/schema/name": a host directory of that name does not hide
+    // the library. The module map keeps one instance per version for every importer.
+    Value ns = jsModule(LibraryFileSystem.ROOT + "/" + schema + "/" + name + ".mjs");
+    jsLibraries.put(key, new Object[] {hash, ns});
+    return ns;
+  }
+
+  private long moduleWrappers;
+
+  /** An ES module's namespace, loaded and evaluated synchronously (no promise jobs). */
+  private Value jsModule(String specifier) {
+    Source s = Source.newBuilder("js", "import * as ns from " + JsOracle.jsString(specifier) + ";export default ns;",
+            "mle-import-" + (++moduleWrappers) + ".mjs")
+        .mimeType("application/javascript+module").buildLiteral();
+    return context().eval(s).getMember("default");
   }
 
   private final Map<String, Object[]> javaLibraries = new HashMap<>();
@@ -488,11 +550,7 @@ final class Polyglot {
     Context c = context();
     Value required = c.eval("js", "(n) => { try { return require(n) } catch (e) { return null } }").execute(name);
     if (!required.isNull()) return required;
-    Value settled = jsOracle.getMember("settle").execute(jsImport.execute(name));
-    if (!settled.getMember("done").asBoolean())
-      throw new IllegalStateException("module " + name + " did not load");
-    if (!settled.getMember("ok").asBoolean()) jsOracle.getMember("rethrow").execute(settled.getMember("v"));
-    return settled.getMember("v");
+    return jsModule(name);
   }
 
   /** Python's helpers and SQL API, made when the first Python routine is loaded. */
@@ -529,6 +587,7 @@ final class Polyglot {
     routines.clear();
     prefixes.clear();
     pythonSources.clear();
+    vectorBuffers.clear();
   }
 
   /**
@@ -596,7 +655,9 @@ final class Polyglot {
       case Wire.T_DATETIME, Wire.T_TIMESTAMP -> h.datetime();
       case Wire.T_TIME -> h.time();
       case Wire.T_DECIMAL -> h.decimal();
-      case Wire.T_I64, Wire.T_U64 -> null;  // big values come as strings: see hostForm
+      // BIGINT UNSIGNED beyond 2^63 comes as a string (hostForm): Python makes it an int.
+      case Wire.T_U64 -> language.equals("python") ? h.bigint() : null;
+      case Wire.T_I64 -> null;
       default -> null;
     };
   }
@@ -642,7 +703,10 @@ final class Polyglot {
     if (j.async()) {
       Value settled = jsOracle.getMember("settle").execute(result);
       if (!settled.getMember("done").asBoolean())
-        throw new Values.ConversionException("the routine's promise did not settle");
+        throw new Values.ConversionException(SqlBridge.dispatcher != null && SqlBridge.dispatcher.depth() > 0
+            ? "an async JavaScript routine (one that uses await) cannot run while another routine of "
+                + "this worker runs (a nested call); its promise did not settle"
+            : "the routine's promise did not settle");
       result = settled.getMember("v");
       if (!settled.getMember("ok").asBoolean()) jsOracle.getMember("rethrow").execute(result);
     }
@@ -670,6 +734,8 @@ final class Polyglot {
     String key = depth + ":" + index + ":" + ref.dims();
     Object[] buf = vectorBuffers.get(key);
     if (buf == null) {
+      // Bounded: many dimensions passed row by row would otherwise keep one array each.
+      if (vectorBuffers.size() >= 64) vectorBuffers.clear();
       Value t = pythonHelper("numpy_buffer").execute(ref.dims(), true);
       if (t.isNull()) return null;
       buf = new Object[] {t.getArrayElement(0),
@@ -698,7 +764,7 @@ final class Polyglot {
       // A JS number; beyond 2^53 a string (Oracle's UNSAFE_STRING default). Passed as a Long,
       // so that integers stay integers when a routine passes them back to SQL.
       case Long l -> js && Math.abs(l) > (1L << 53) - 1 ? l.toString() : (Object) l;
-      case BigInteger b -> js ? b.toString() : (Object) b;
+      case BigInteger b -> b.toString();
       case BigDecimal d -> d.toPlainString();
       case MleJson j -> j.text();
       case byte[] b -> ByteBuffer.wrap(b);
@@ -737,8 +803,20 @@ final class Polyglot {
   private static final Pattern TIME = Pattern.compile("(-)?(\\d+):(\\d{2}):(\\d{2})(?:\\.(\\d{1,6}))?");
 
   /** A guest result as a Java value of the declared SQL type. */
-  private static Object toJava(Value v, Values.ParamType t, Helpers h) {
+  private Object toJava(Value v, Values.ParamType t, Helpers h) {
     if (v == null || v.isNull()) return null;
+    // Python's True and False are numbers (1 and 0) for numeric types.
+    if (v.isBoolean()) {
+      switch (t.tag()) {
+        case Wire.T_I64, Wire.T_U64, Wire.T_DECIMAL -> {
+          return v.asBoolean() ? 1L : 0L;
+        }
+        case Wire.T_F64, Wire.T_F32 -> {
+          return v.asBoolean() ? 1.0 : 0.0;
+        }
+        default -> {}
+      }
+    }
     switch (t.tag()) {
       case Wire.T_I64, Wire.T_U64 -> {
         if (v.fitsInLong()) return v.asLong();
@@ -774,13 +852,14 @@ final class Polyglot {
       }
       case Wire.T_DATE -> {
         if (v.isDate() && !v.isTime()) return v.asDate();
-        if (v.isInstant()) return LocalDate.ofInstant(v.asInstant(), ZoneOffset.UTC);
+        if (v.isInstant()) return LocalDate.ofInstant(v.asInstant(), options.zone);
         if (v.isDate()) return v.asDate();
         throw new Values.ConversionException("cannot convert " + v + " to DATE");
       }
       case Wire.T_DATETIME, Wire.T_TIMESTAMP -> {
         if (v.isDate() && v.isTime() && !v.isTimeZone()) return LocalDateTime.of(v.asDate(), v.asTime());
-        if (v.isInstant()) return LocalDateTime.ofInstant(v.asInstant(), ZoneOffset.UTC);
+        // An aware datetime: in the session's time zone (as JavaScript Dates).
+        if (v.isInstant()) return LocalDateTime.ofInstant(v.asInstant(), options.zone);
         if (v.isDate()) return v.asDate();
         throw new Values.ConversionException("cannot convert " + v + " to " + t.sqlName());
       }

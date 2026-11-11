@@ -61,6 +61,9 @@ struct WorkerOptions {
   uint32_t max_depth = wire::kDefaultMaxDepth;
   /** Largest message accepted from the worker. */
   uint64_t max_message = 64ULL << 20;
+  /** DROP, OPTIONS and RESET run no routine code: a worker that does not
+      answer them in this time is killed (they are not KILLable). */
+  int control_timeout_ms = 10000;
 };
 
 /** Implemented by the caller (mysqld in the component, tests here). */
@@ -103,9 +106,18 @@ class Worker {
   Worker(const Worker &) = delete;
   Worker &operator=(const Worker &) = delete;
 
+  /** mle.spin_us and mle.interrupt_grace_ms are dynamic: a kept or long
+      used worker takes their values at each top-level call. */
+  void set_timing(int spin_us, int interrupt_grace_ms) {
+    if (m_depth != 0) return;  // not under a running call
+    m_options.spin_us = spin_us;
+    m_options.interrupt_grace_ms = interrupt_grace_ms;
+  }
+
   /** Waits for READY. kOk, or kInternal (the worker reported a start
       failure), kDied, kProtocolError, with *error. */
-  Status wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error);
+  Status wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error,
+                    CallHooks *hooks = nullptr);
 
   /** Compiles a routine. The RESULT goes to *result (with the compile
       error for kGuestError); host-side failures (kDied, kKilled,
@@ -159,12 +171,14 @@ class Worker {
     std::vector<uint32_t> outs;
   };
 
+  /** timeout_ms bounds each wait for the worker (-1: none, for requests
+      that run routine code and end on KILL instead). */
   Status request(wire::Op op, const std::string &body, CallHooks &hooks,
                  const RoutineInfo *routine, ResultMsg *result,
-                 std::string *error);
+                 std::string *error, int timeout_ms = -1);
   /** Sends body as one message (chunked if needed). */
   Wait send(wire::Op op, const std::string &body, CallHooks *hooks,
-            std::string *error);
+            std::string *error, int timeout_ms = -1);
   /** Waits for and reassembles the next message. */
   Wait receive(Message *m, CallHooks *hooks, int timeout_ms,
                std::string *error);

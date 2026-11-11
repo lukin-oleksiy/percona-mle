@@ -5,8 +5,8 @@
 #
 call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
 INSTALL COMPONENT "file://component_mle";
-# A small heap, so that exhausting it is quick; a short KILL grace.
-SET GLOBAL mle.heap_max = 128 * 1024 * 1024, GLOBAL mle.interrupt_grace_ms = 300;
+# A small heap, so that exhausting it is quick.
+SET GLOBAL mle.heap_max = 128 * 1024 * 1024;
 GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
 CREATE FUNCTION js_loop() RETURNS INT LANGUAGE JAVASCRIPT AS $$ for (;;) {} $$;
 CREATE FUNCTION java_loop() RETURNS INT LANGUAGE JAVA
@@ -39,8 +39,10 @@ js_ok()
 7
 #
 # 3. KILL QUERY of a Java loop that does not stop: the worker is killed
-#    after mle.interrupt_grace_ms; the next call gets a fresh one.
+#    after mle.interrupt_grace_ms (short here; it applies from the next
+#    call); the next call gets a fresh one.
 #
+SET GLOBAL mle.interrupt_grace_ms = 300;
 SELECT java_loop();
 KILL QUERY CON1;
 ERROR 70100: Query execution was interrupted
@@ -52,6 +54,7 @@ include/assert.inc [A new worker after the old one was killed]
 # 4. The worker killed from outside: the call fails (6111), the next one
 #    runs in a fresh worker.
 #
+# (wait until it is gone: kill is asynchronous)
 SELECT js_ok();
 ERROR HY000: Language component: Internal error.
 SELECT js_ok();

@@ -53,7 +53,7 @@
         <version>${graalvm.version}</version>
         <configuration>
           <packages>
-            <package>numpy</package>
+            <package>numpy==2.4.4</package>
           </packages>
           <externalDirectory>${mle.venv.dir}</externalDirectory>
         </configuration>

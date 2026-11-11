@@ -60,10 +60,18 @@ public final class Session {
 
   /** The options of a statement: o over this call's session options over the defaults. */
   SqlOptions effective(SqlOptions o) {
-    SqlOptions base = callOptionsSeq == SqlBridge.callSeq() ? callOptions : null;
+    SqlOptions base = callOptionsSeq == SqlBridge.callScope() ? callOptions : null;
     SqlOptions merged = base == null ? mapper instanceof Defaults d ? d.defaults() : new SqlOptions()
         : base;
     return o == null ? merged.over(null) : o.over(merged);
+  }
+
+  /**
+   * Options of a statement the API runs for itself (a user variable, a function call, OUT
+   * values): its rows are for the API, never for the client, whatever the session's options say.
+   */
+  SqlOptions internal() {
+    return effective(new SqlOptions().passResultToClient(false));
   }
 
   /** A mapper with default options (the session state's integer and decimal types). */
@@ -143,9 +151,9 @@ public final class Session {
 
   /** Sets defaults for the statements of the rest of this routine call (unset ones are kept). */
   public void setOptions(SqlOptions options) {
-    SqlOptions base = callOptionsSeq == SqlBridge.callSeq() ? callOptions : null;
+    SqlOptions base = callOptionsSeq == SqlBridge.callScope() ? callOptions : null;
     callOptions = options.over(base);
-    callOptionsSeq = SqlBridge.callSeq();
+    callOptionsSeq = SqlBridge.callScope();
   }
 
   public Object getOption(String name) {
@@ -250,7 +258,7 @@ public final class Session {
 
   /** The user variable @name (null if not set). */
   public Object getVariable(String name) {
-    SqlResult r = run("SELECT @" + quoteName(name), null, effective(null));
+    SqlResult r = run("SELECT @" + quoteName(name), null, internal());
     return r.fetchOne().get(0);
   }
 

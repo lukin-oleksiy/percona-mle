@@ -80,6 +80,8 @@ struct JvmClassOptions {
   int compiler_threads = 2;
   bool inherit_stderr = false;
   std::vector<std::string> extra_jvm_options;
+  /** Paths workers must never read (ClassConfig::hidden_paths). */
+  std::vector<std::string> hidden_paths;
 };
 
 /** The worker class for layout and options: executable, JVM options,

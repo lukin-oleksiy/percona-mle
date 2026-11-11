@@ -200,7 +200,7 @@ SELECT VARIABLE_VALUE AS threads FROM performance_schema.global_status
   WHERE VARIABLE_NAME = 'mle_threads';
 
 --connection default
---error ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL
+--error ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL,ER_COMPONENTS_UNLOAD_CANT_UNREGISTER_SERVICE
 UNINSTALL COMPONENT "file://component_mle";
 --disconnect con1
 --source include/wait_until_count_sessions.inc

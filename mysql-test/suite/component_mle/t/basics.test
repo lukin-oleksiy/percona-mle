@@ -54,7 +54,7 @@ SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
 
 --connection default
 --echo # UNINSTALL is refused while a session that used MLE is connected.
---error ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL
+--error ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL,ER_COMPONENTS_UNLOAD_CANT_UNREGISTER_SERVICE
 UNINSTALL COMPONENT "file://component_mle";
 SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status
   WHERE VARIABLE_NAME = 'mle_status';

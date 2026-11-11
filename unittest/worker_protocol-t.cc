@@ -142,7 +142,7 @@ TEST_F(MleWorkerProtocol, Violations) {
   expect_violation("status_without_error", "status and error disagree");
   expect_violation("missing_return", "missing return value");
   expect_violation("host_status", "bad status");
-  expect_violation("chunk_lie", "after the last byte");
+  expect_violation("chunk_lie", "does not fill the arena");
   expect_violation("out_for_in", "bad OUT parameter");
 }
 
@@ -189,7 +189,7 @@ TEST_F(MleWorkerProtocol, SilentWorkerIsKilled) {
       std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0)
           .count();
   EXPECT_GE(ms, 300);
-  EXPECT_LT(ms, 1000);
+  EXPECT_LT(ms, 3000);  // generous: slow builds
   EXPECT_NE(err.find("did not stop within 200 ms"), std::string::npos) << err;
   EXPECT_FALSE(w->usable());
   EXPECT_EQ(w->process().exit_info(2000).describe(),

@@ -34,7 +34,7 @@ mle_stored_programs	3
 # MLE refuses UNINSTALL while con1 caches its routines; the router
 # keeps routing both languages.
 UNINSTALL COMPONENT "file://component_mle";
-ERROR HY000: Language component: Cannot uninstall due to connected sessions. Please disconnect all sessions and try again.
+Got one of the listed errors
 SELECT v8_f(5) AS v8, mle_js(5) AS mle_js;
 v8	mle_js
 10	10

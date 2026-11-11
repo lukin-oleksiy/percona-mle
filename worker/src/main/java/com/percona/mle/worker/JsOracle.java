@@ -97,7 +97,7 @@ final class JsOracle {
             rethrow: (e) => { throw e; },
             // USING (Phase 6): a JavaScript library is imported; others come from the host
             // (libBridge: a Python library's module).
-            lib: function (s, n, p) { const m = this.libBridge(s, n); return m === null ? import(p) : m; },
+            lib: function (s, n) { return this.libBridge(s, n); },
             str: (v) => String(v),
             json_text: (v) => {
               if (typeof v === 'string') return JSON.stringify(JSON.parse(v));
@@ -141,9 +141,9 @@ final class JsOracle {
       Values.ParamType ret, java.net.URI uri, List<LibraryFileSystem.Import> imports) {
     int n = params.size();
     StringBuilder pre = new StringBuilder("(function($c){const $G=globalThis;return ");
-    // USING (Phase 6): each library is imported (once per worker, see LibraryFileSystem) and
-    // bound to its name or alias, so the routine is async.
-    boolean async = AWAIT.matcher(body).find() || !imports.isEmpty();
+    // USING (Phase 6): each library is bound to its name or alias, loaded synchronously (once per
+    // version and worker, see LibraryFileSystem); only a body with await is async.
+    boolean async = AWAIT.matcher(body).find();
     if (async) pre.append("async ");
     pre.append("function " + WRAPPER + "(");
     for (int i = 0; i < n; i++) pre.append(i == 0 ? "" : ",").append("$a").append(i);
@@ -164,9 +164,11 @@ final class JsOracle {
     // The body runs in an arrow function: it may return early, and its own
     // declarations (Oracle's myfunc: "var x") shadow the parameters.
     for (LibraryFileSystem.Import i : imports)
-      pre.append("const ").append(i.binding()).append("=await $c.lib(").append(jsString(i.schema())).append(',')
-          .append(jsString(i.name())).append(',').append(jsString(i.path())).append(");");
-    pre.append("const $r=").append(async ? "await(async()=>{" : "(()=>{");
+      pre.append("const ").append(i.binding()).append("=$c.lib(").append(jsString(i.schema())).append(',')
+          .append(jsString(i.name())).append(");");
+    // $c (the converters, the library bridge) and $G (the real global object) are shadowed in
+    // the body: it cannot change how other routines convert values, nor keep state in $G.
+    pre.append("const $r=").append(async ? "await(async($c,$G)=>{" : "(($c,$G)=>{");
     StringBuilder post = new StringBuilder("\n");
     if (outCount == 0) {
       post.append("})();return $r;}})");
@@ -185,7 +187,7 @@ final class JsOracle {
     return new Routine(factory.execute(helpers), types, outs, ret, async, pre.length(), name);
   }
 
-  private static String jsString(String s) {
+  static String jsString(String s) {
     return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
   }
 
@@ -199,9 +201,9 @@ final class JsOracle {
       case null -> null;
       case Long l -> {
         if (t.is("YEAR")) yield l;
-        if (t.is("BIT")) yield Math.abs(l) <= MAX_SAFE ? (Object) l : Long.toUnsignedString(l);
+        if (t.is("BIT")) yield (l >= -MAX_SAFE && l <= MAX_SAFE) ? (Object) l : Long.toUnsignedString(l);
         if (o.integerType == Wire.INT_STRING) yield l.toString();
-        yield Math.abs(l) <= MAX_SAFE ? (Object) l : l.toString();
+        yield (l >= -MAX_SAFE && l <= MAX_SAFE) ? (Object) l : l.toString();
       }
       case BigInteger b -> b.toString();
       case BigDecimal d -> d.toPlainString();

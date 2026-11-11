@@ -762,15 +762,18 @@ bool SqlRunner::raise(const mle::Error &e) {
   for (char c : state)
     valid = valid && ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z'));
   if (!valid) return false;
+  // The message as a hex literal: no quoting or escaping rules apply (also
+  // under NO_BACKSLASH_ESCAPES), any bytes are safe in the statement text.
+  static const char kHex[] = "0123456789ABCDEF";
   std::string message;
-  for (char c : e.message) {
-    if (c == '\'') message.push_back('\'');  // '' in a string literal
-    if (c == '\\') message.push_back('\\');
-    message.push_back(c);
+  for (unsigned char c : e.message) {
+    message.push_back(kHex[c >> 4]);
+    message.push_back(kHex[c & 15]);
   }
-  const std::string text = "SIGNAL SQLSTATE '" + state +
-                           "' SET MESSAGE_TEXT = '" + message +
-                           "', MYSQL_ERRNO = " + std::to_string(e.sql_errno);
+  const std::string text =
+      "SIGNAL SQLSTATE '" + state + "' SET MESSAGE_TEXT = " +
+      (message.empty() ? std::string("''") : "_utf8mb4 X'" + message + "'") +
+      ", MYSQL_ERRNO = " + std::to_string(e.sql_errno);
   Statement s;
   s.h = new_statement(false, 500);
   if (s.h == nullptr) return false;
@@ -779,8 +782,10 @@ bool SqlRunner::raise(const mle::Error &e) {
     return false;  // SIGNAL did not fail: should not happen
   uint64_t err_no = 0;
   (void)mysql_service_mysql_stmt_diagnostics->error_number(s.h, &err_no);
-  if (err_no == ER_STMT_EXECUTION_NOT_ALLOWED_WITHIN_SP_OR_TRG_OR_UDF) {
-    // In a function: SQL is not allowed, so SIGNAL is not either.
+  if (err_no != static_cast<uint64_t>(e.sql_errno)) {
+    // In a function SQL is not allowed, so SIGNAL is not either; or the
+    // SIGNAL itself failed (e.g. a message that is not UTF-8 or too long):
+    // the caller reports the error as a routine error instead.
     m_pending = true;
     clear_pending_error();
     return false;

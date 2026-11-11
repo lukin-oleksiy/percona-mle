@@ -115,7 +115,10 @@ class mle_session_reset_impl {
       const mysqlpp::udf_context &ctx) {
     Session *s = Session::current(false);
     if (ctx.get_number_of_args() == 0) {
-      if (s != nullptr) s->reset();
+      if (s != nullptr && !s->reset())
+        throw std::invalid_argument(
+            "mle_session_reset() cannot reset the session while one of its "
+            "MLE routines runs");
     } else {
       const std::string what = lower(ctx.get_arg<STRING_RESULT>(0));
       const bool out = what == "stdout" || what == "output";
@@ -153,8 +156,9 @@ class mle_packages_impl {
     utf8_result(ctx);
   }
   mysqlpp::udf_result_t<STRING_RESULT> calculate(const mysqlpp::udf_context &) {
-    std::ifstream in(mle_component::current_settings().package_dir +
-                     "/packages.json");
+    // Only READONLY settings here: other string sysvars may be freed by a
+    // concurrent SET GLOBAL.
+    std::ifstream in(mle_component::package_dir() + "/packages.json");
     if (!in) return std::string("[]");
     std::stringstream text;
     text << in.rdbuf();

@@ -1,0 +1,187 @@
+--echo #
+--echo # component_mle: regressions for the project review (17-project-review.md).
+--echo #
+--source include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE DATABASE tmp;
+CREATE DATABASE other;
+CREATE USER u2@localhost, u3@localhost;
+GRANT EXECUTE ON test.* TO u2@localhost, u3@localhost;
+--write_file $MYSQLTEST_VARDIR/tmp/review.sql
+CREATE FUNCTION py_mark(v TEXT) RETURNS TEXT SQL SECURITY INVOKER LANGUAGE PYTHON AS $$
+    import builtins
+    old = getattr(builtins, 'mle_mark', None)
+    builtins.mle_mark = v
+    print('marked', v)
+    return str(old)
+$$;
+CREATE FUNCTION py_escape(pid INT, datafile TEXT, pluginfile TEXT) RETURNS TEXT LANGUAGE PYTHON AS $$
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    def rc(name, r):
+        return '%s:%s' % (name, 'refused' if r != 0 else 'ALLOWED')
+    class RL(ctypes.Structure):
+        _fields_ = [('cur', ctypes.c_ulong), ('max', ctypes.c_ulong)]
+    old = RL()
+    out = [rc('prlimit(mysqld)', libc.prlimit(pid, 4, None, ctypes.byref(old)))]
+    out.append(rc('prlimit(self)', 0 if libc.prlimit(0, 4, None, ctypes.byref(old)) == 0 else 1).replace('ALLOWED', 'ok'))
+    out.append(rc('chmod(datadir_file)', libc.chmod(datafile.encode(), 0o644)))
+    fds = (ctypes.c_int * 2)()
+    out.append(rc('socketpair(dgram)', libc.socketpair(1, 2, 0, fds)))
+    out.append(rc('shmget', 0 if libc.shmget(0, 4096, 0o1600) >= 0 else 1))
+    out.append(rc('prctl(dumpable)', libc.prctl(4, 1, 0, 0, 0)))
+    for name, path in (('read_datadir', datafile), ('read_plugin_dir', pluginfile)):
+        try:
+            open(path, 'rb').read(1)
+            out.append(name + ':ALLOWED')
+        except OSError:
+            out.append(name + ':refused')
+    return ' '.join(out)
+$$;
+CREATE PROCEDURE js_reset() LANGUAGE JAVASCRIPT AS $$ session.runSql('SELECT mle_session_reset()') $$;
+CREATE LIBRARY tmp.tmplib LANGUAGE JAVASCRIPT AS $$ export function sq(n) { return n * n } $$;
+CREATE LIBRARY other.secret LANGUAGE JAVASCRIPT AS $$ export const value = 'secret' $$;
+CREATE FUNCTION js_using(n INT) RETURNS INT LANGUAGE JAVASCRIPT USING (tmp.tmplib AS lib) AS $$ return lib.sq(n) $$;
+CREATE PROCEDURE js_outer(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$ r = String(session.runSql('SELECT js_using(3)').fetchOne().toArray()[0]) $$;
+CREATE FUNCTION js_peek_using() RETURNS TEXT LANGUAGE JAVASCRIPT USING (other.secret) AS $$ return secret.value $$;
+CREATE FUNCTION js_peek() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  try { return (await import('/other/secret')).value } catch (e) { return 'refused' }
+$$;
+CREATE PROCEDURE js_opts(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$ session.setOptions({ passResultToClient: true }); r = String(session.foo) $$;
+CREATE FUNCTION py_bool(a INT, b INT) RETURNS INT LANGUAGE PYTHON AS $$ return a > b $$;
+CREATE FUNCTION py_big(v BIGINT UNSIGNED) RETURNS TEXT LANGUAGE PYTHON AS $$ return type(v).__name__ + ' ' + str(v + 1) $$;
+CREATE FUNCTION py_thread() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import threading
+    try:
+        threading._start_joinable_thread(lambda: None)
+        return 'started'
+    except RuntimeError as e:
+        return str(e)
+$$;
+CREATE FUNCTION java_thread() RETURNS TEXT LANGUAGE JAVA AS $$
+  Thread t = new Thread(() -> { try { Thread.sleep(600000); } catch (InterruptedException e) { } });
+  t.setDaemon(true);
+  t.start();
+  return "left a thread";
+$$;
+CREATE PROCEDURE js_throw() LANGUAGE JAVASCRIPT AS $$
+  throw new mysql.SQLError('45000', "it's a \\back\\slash 'quoted'", 1644)
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review.sql
+
+--echo # A1/D1: mle_session_reset() from inside a routine is refused (it would
+--echo # destroy the worker the routine runs in); the session goes on.
+--connect (con1, localhost, root,,test)
+--error ER_CANT_INITIALIZE_UDF,ER_UDF_ERROR
+CALL js_reset();
+SELECT py_mark('one') AS still_running;
+SELECT mle_session_reset();
+--echo # An explicit reset gives a fresh worker (no state from before).
+SELECT py_mark('two') AS after_reset;
+
+--echo # A2/D2/D10: COM_CHANGE_USER: the new account gets its own worker and
+--echo # none of the old account's session state.
+SELECT py_mark('root-secret') AS root_marks;
+--change_user u2,,test
+SELECT CURRENT_USER(), py_mark('u2') AS seen_by_u2;
+SELECT mle_session_state('stdout') AS console_after_change_user;
+--disconnect con1
+
+--echo # C12: a kept worker does not outlive its account (DROP USER).
+--connect (con3, localhost, u3,,test)
+SELECT py_mark('u3-secret') AS u3_marks;
+--disconnect con3
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE >= 1 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+--source include/wait_condition.inc
+DROP USER u3@localhost;
+CREATE USER u3@localhost;
+GRANT EXECUTE ON test.* TO u3@localhost;
+--connect (con3, localhost, u3,,test)
+SELECT py_mark('new u3') AS new_u3_sees;
+--disconnect con3
+--connection default
+
+--echo # D12: CREATE LIBRARY needs the language's CREATE_<LANGUAGE>_ROUTINE.
+CREATE USER lib_author@localhost;
+GRANT CREATE ROUTINE ON test.* TO lib_author@localhost;
+--connect (con4, localhost, lib_author,,test)
+--error ER_SPECIFIC_ACCESS_DENIED_ERROR
+CREATE LIBRARY nolib LANGUAGE JAVASCRIPT AS $$ export const x = 1 $$;
+--disconnect con4
+--connection default
+
+--echo # B1-B4, B9, B15, D4-D6: a worker cannot act on mysqld or its files.
+--let $pid_file = `SELECT @@pid_file`
+--let $datadir = `SELECT @@datadir`
+--let $plugin_dir = `SELECT @@plugin_dir`
+--exec echo "SET @mpid = `cat $pid_file`;" > $MYSQLTEST_VARDIR/tmp/pid.sql
+--connect (con6, localhost, root,,test)
+--disable_query_log
+--source $MYSQLTEST_VARDIR/tmp/pid.sql
+--enable_query_log
+--replace_result $datadir DATADIR $plugin_dir PLUGIN_DIR
+--eval SELECT REPLACE(py_escape(@mpid, '$datadir/auto.cnf', '$plugin_dir/component_mle.so'), ' ', '\n') AS probes
+--disconnect con6
+--connection default
+--remove_file $MYSQLTEST_VARDIR/tmp/pid.sql
+
+--echo # C1/C6: a JavaScript routine with USING runs nested under another
+--echo # JavaScript routine (synchronous libraries), from a schema named like a
+--echo # host directory (tmp).
+--connect (con7, localhost, root,,test)
+SELECT js_using(4) AS top_level;
+CALL js_outer(@r);
+SELECT @r AS nested;
+--echo # C5: an import allowed for one routine is not thereby allowed for another.
+SELECT js_peek_using() AS with_using;
+--error 0,ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_peek() AS without_using;
+--echo # C4: internal statements of the SQL API never go to the client.
+SET @foo = 42;
+CALL js_opts(@r);
+SELECT @r AS foo;
+--echo # C8, C16: Python bool results; BIGINT UNSIGNED beyond 2^63 is an int.
+SELECT py_bool(2, 1), py_bool(1, 2), py_big(18446744073709551614) AS big;
+--echo # C3: Python's internal thread start is refused too; a Java routine that
+--echo # leaves a thread gets its worker retired (not kept).
+SELECT py_thread() AS python_thread;
+let $failures0 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_workers_spawned', Value, 1);
+SELECT java_thread() AS java_thread;
+SELECT js_using(5) AS next_call_new_worker;
+--disconnect con7
+--connection default
+
+--echo # A12: an SqlError's message reaches the client exactly (quotes,
+--echo # backslashes), raised like SIGNAL.
+--connect (con5, localhost, root,,test)
+--error 1644
+CALL js_throw();
+SHOW WARNINGS;
+--disconnect con5
+--connection default
+
+DROP PROCEDURE js_reset;
+DROP PROCEDURE js_throw;
+DROP FUNCTION py_mark;
+DROP FUNCTION py_escape;
+DROP FUNCTION js_using;
+DROP PROCEDURE js_outer;
+DROP FUNCTION js_peek_using;
+DROP FUNCTION js_peek;
+DROP PROCEDURE js_opts;
+DROP FUNCTION py_bool;
+DROP FUNCTION py_big;
+DROP FUNCTION py_thread;
+DROP FUNCTION java_thread;
+DROP DATABASE tmp;
+DROP DATABASE other;
+DROP USER u2@localhost, u3@localhost, lib_author@localhost;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

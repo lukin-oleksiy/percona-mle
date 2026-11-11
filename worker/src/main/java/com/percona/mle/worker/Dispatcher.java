@@ -44,6 +44,7 @@ final class Dispatcher {
   private int depth;
   private long seq;
   private boolean tainted;
+  private final ThreadWatch threads = new ThreadWatch();
 
   record Frame(String function, String file, int line, int column, int endColumn) {}
 
@@ -64,6 +65,13 @@ final class Dispatcher {
 
   Polyglot polyglot() {
     return polyglot;
+  }
+
+  /** The routine whose PREPARE or call runs now (0: none). */
+  private long currentRoutine;
+
+  long routine() {
+    return currentRoutine;
   }
 
   /** The current nesting depth (0: a top-level request). */
@@ -217,6 +225,8 @@ final class Dispatcher {
     if (top) control.begin(seq, Polyglot.isGuest(language));
     String compileError = null;
     Throwable failure = null;
+    long outerRoutine = currentRoutine;
+    currentRoutine = id;
     try {
       // A routine id is prepared again after ALTER; it may change language.
       java.drop(id);
@@ -227,9 +237,12 @@ final class Dispatcher {
       compileError = e.getMessage();
     } catch (Throwable t) {
       failure = t;
+    } finally {
+      currentRoutine = outerRoutine;
     }
     boolean interrupted = top && control.end();
     if (top) polyglot.settleInterrupt(control.takeInterrupter());
+    if (top && !tainted && threads.strangers()) tainted = true;  // retired, not kept
     if (failure != null) failed(failure, interrupted);
     else if (compileError != null) result(Wire.GUEST_ERROR, null, null, guest(language, compileError));
     else result(Wire.OK, null, null, null);
@@ -261,13 +274,18 @@ final class Dispatcher {
       Object ret = null;
       Object[] outs = new Object[n];
       Throwable failure = null;
+      long outerRoutine = currentRoutine;
+      currentRoutine = id;
       try {
         ret = routine != null ? java.invoke(routine, args, callArena, outs) : polyglot.invoke(guestRoutine, args, outs);
       } catch (Throwable t) {
         failure = t;
+      } finally {
+        currentRoutine = outerRoutine;
       }
       boolean interrupted = top && control.end();
       if (top) polyglot.settleInterrupt(control.takeInterrupter());
+      if (top && !tainted && threads.strangers()) tainted = true;  // retired, not kept
       // A killed statement reports the KILL, even if the routine then ended normally.
       if (failure == null && interrupted) result(Wire.INTERRUPTED, null, null, guest("", "interrupted"));
       else if (failure == null) result(Wire.OK, ret, retType, null, outIndexes, outs, paramTypes(routine, guestRoutine));

@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <mutex>
 #include <climits>
 #include <cstring>
 #include <cstdlib>
@@ -60,7 +61,8 @@ using mle::Value;
 
 namespace {
 
-mysql_thd_store_slot g_slot = nullptr;
+/** Read by every session thread, set at INSTALL and UNINSTALL. */
+std::atomic<mysql_thd_store_slot> g_slot{nullptr};
 std::atomic<long> g_sessions{0};
 
 constexpr size_t kConsoleKeep = 64 * 1024;
@@ -162,6 +164,16 @@ std::string session_time_zone(MYSQL_THD thd) {
   return zone == "SYSTEM" ? system_time_zone() : zone;
 }
 
+/** Text from a worker or routine for the error log: one line, bounded (a
+    routine must not forge log lines or fill the log). */
+std::string log_safe(const std::string &text) {
+  std::string out;
+  for (unsigned char c : text.substr(0, 1000))
+    out += c < 0x20 || c == 0x7f ? ' ' : static_cast<char>(c);
+  if (text.size() > 1000) out += "...";
+  return out;
+}
+
 void append_capped(std::string *buffer, const std::string &more) {
   if (more.empty()) return;
   buffer->append(more);
@@ -230,21 +242,24 @@ bool Session::register_slot() {
     delete static_cast<Session *>(resource);
     return 0;
   };
-  return mysql_service_mysql_thd_store->register_slot("mle", free_session,
-                                                      &g_slot);
+  mysql_thd_store_slot slot = nullptr;
+  const bool failed =
+      mysql_service_mysql_thd_store->register_slot("mle", free_session, &slot);
+  if (!failed) g_slot = slot;
+  return failed;
 }
 
 void Session::unregister_slot() {
-  if (g_slot == nullptr) return;
-  (void)mysql_service_mysql_thd_store->unregister_slot(g_slot);
-  g_slot = nullptr;
+  mysql_thd_store_slot slot = g_slot.exchange(nullptr);
+  if (slot != nullptr) (void)mysql_service_mysql_thd_store->unregister_slot(slot);
 }
 
 long Session::count() { return g_sessions.load(); }
 
 Session *Session::of(MYSQL_THD thd) {
-  if (g_slot == nullptr || thd == nullptr) return nullptr;
-  return static_cast<Session *>(mysql_service_mysql_thd_store->get(thd, g_slot));
+  mysql_thd_store_slot slot = g_slot.load();
+  if (slot == nullptr || thd == nullptr) return nullptr;
+  return static_cast<Session *>(mysql_service_mysql_thd_store->get(thd, slot));
 }
 
 Session *Session::current(bool create) {
@@ -254,7 +269,7 @@ Session *Session::current(bool create) {
   Session *s = of(thd);
   if (s != nullptr || !create) return s;
   s = new Session(thd);
-  if (mysql_service_mysql_thd_store->set(thd, g_slot, s)) {
+  if (mysql_service_mysql_thd_store->set(thd, g_slot.load(), s)) {
     delete s;
     return nullptr;
   }
@@ -270,30 +285,29 @@ Session::~Session() {
   g_counters.sessions = --g_sessions;
 }
 
-const std::string &Session::principal() const {
+std::string account_key(std::string_view user, std::string_view host) {
+  // MySQL's quoting: unambiguous ('a@b'@'c' is not 'a'@'b@c').
+  std::string key = "'";
+  for (char c : user) key += c == '\'' ? std::string("''") : std::string(1, c);
+  key += "'@'";
+  for (char c : host) key += c == '\'' ? std::string("''") : std::string(1, c);
+  key += '\'';
+  return key;
+}
+
+std::string Session::principal() const {
+  // Read on every call: a security context's address says nothing (a
+  // COM_CHANGE_USER rewrites the session's context in place, a new routine
+  // may get a dropped one's address).
   Security_context_handle sctx = nullptr;
   MYSQL_LEX_CSTRING user{"", 0}, host{"", 0};
   if (mysql_service_mysql_thd_security_context->get(m_thd, &sctx) ||
       mysql_service_mysql_security_context_options->get(sctx, "priv_user",
                                                         &user) ||
       mysql_service_mysql_security_context_options->get(sctx, "priv_host",
-                                                        &host)) {
-    m_principal_sctx = nullptr;
-    m_principal = "?";
-    return m_principal;
-  }
-  // The same security context with the same account strings: the same
-  // principal (the strings are the context's own buffers).
-  if (sctx != m_principal_sctx || user.str != m_principal_user ||
-      host.str != m_principal_host) {
-    m_principal.assign(user.str, user.length);
-    m_principal += '@';
-    m_principal.append(host.str, host.length);
-    m_principal_sctx = sctx;
-    m_principal_user = user.str;
-    m_principal_host = host.str;
-  }
-  return m_principal;
+                                                        &host))
+    return "?";
+  return account_key({user.str, user.length}, {host.str, host.length});
 }
 
 // ------------------------------------------------------------- workers
@@ -333,12 +347,21 @@ Session::Slot *Session::worker_for(const std::string &principal,
   AcquireError why = AcquireError::kNone;
   std::string error;
   // A worker kept from an earlier session of this principal (warm), else a
-  // new one from the pool.
+  // new one from the pool. A kept worker that died meanwhile fails its
+  // OPTIONS: then a new one.
   std::unique_ptr<mle::Worker> worker =
       engine_reuse_worker(principal, max_workers());
+  if (worker && worker->options(m_options, &error) != Status::kOk) {
+    engine_release_worker(std::move(worker));
+    error.clear();
+  }
+  const bool reused = worker != nullptr;
+  Hooks hooks(m_thd);
   if (!worker)
     worker = engine_new_worker(max_workers(), spin_us(), interrupt_grace_ms(),
-                               &why, &error);
+                               &hooks, &why, &error);
+  if (why == AcquireError::kFailed && hooks.killed())
+    return nullptr;  // KILL while waiting for the worker: the server reports it
   switch (why) {
     case AcquireError::kNone:
       break;
@@ -351,18 +374,18 @@ Session::Slot *Session::worker_for(const std::string &principal,
                ("MLE> The MLE engine is not running: " + error).c_str());
       return nullptr;
     case AcquireError::kFailed:
-      log_error("No worker for " + principal + ": " + error);
+      log_error("No worker for " + principal + ": " + log_safe(error));
       my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
       return nullptr;
   }
 
-  if (worker->options(m_options, &error) != Status::kOk) {
+  if (!reused && worker->options(m_options, &error) != Status::kOk) {
     engine_release_worker(std::move(worker));
     if (error.find("unknown time zone") != std::string::npos) {
       my_error(ER_LANGUAGE_COMPONENT_TIMEZONE, MYF(0),
                routine.display_language(), zone.c_str());
     } else {
-      log_error("A new worker for " + principal + " failed: " + error);
+      log_error("A new worker for " + principal + " failed: " + log_safe(error));
       my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
     }
     return nullptr;
@@ -414,7 +437,7 @@ bool Session::execute(Routine &routine) {
   m_stack.clear();  // Oracle: the trace of the last call only
   std::vector<Value> args = std::move(m_args);  // reused; a nested call allocates
   if (!routine.read_args(&args)) return false;
-  const std::string &who = principal();
+  const std::string who = principal();  // a copy: nested calls change it
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr || !prepare_in(who, *slot, routine)) return false;
 
@@ -425,6 +448,7 @@ bool Session::execute(Routine &routine) {
   raise_max(g_counters.threads_max, ++g_counters.threads);
   Status s;
   const uint64_t kills = m_kills.load();
+  slot->worker->set_timing(spin_us(), interrupt_grace_ms());
   {
     const KillGuard kill(this, slot->worker.get());
     s = slot->worker->call(routine.id, 0, args, hooks, &result, &error);
@@ -499,7 +523,7 @@ void Session::report(const std::string &principal, Status status,
           (!it->second.worker || !it->second.worker->usable())) {
         // Retired after running out of heap or stack.
         log_warning("The worker of " + principal +
-                    " was retired: " + e->message);
+                    " was retired: " + log_safe(e->message));
         drop_worker(principal);
       }
       return;
@@ -519,12 +543,12 @@ void Session::report(const std::string &principal, Status status,
     ++g_counters.worker_failures;
     if (why.find("out-of-memory") != std::string::npos) ++g_counters.oom_errors;
     log_warning("The worker of " + principal + " was lost during " +
-                routine.qualified_name + ": " + why);
+                log_safe(routine.qualified_name) + ": " + log_safe(why));
     drop_worker(principal);
     if (status == Status::kKilled && Hooks(m_thd).killed()) return;
   } else {
     log_error("Internal error in the worker of " + principal + " during " +
-              routine.qualified_name + ": " + why);
+              log_safe(routine.qualified_name) + ": " + log_safe(why));
   }
   my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
 }
@@ -582,9 +606,9 @@ void Session::reset_output(bool out, bool err) {
   if (err) m_err.clear();
 }
 
-void Session::reset() {
+void Session::clear_state(bool reuse) {
   for (auto &[principal, slot] : m_workers)
-    engine_release_worker(std::move(slot.worker), principal);
+    engine_release_worker(std::move(slot.worker), reuse ? principal : "");
   m_workers.clear();
   m_programs.clear();
   m_stack.clear();
@@ -592,7 +616,21 @@ void Session::reset() {
   m_err.clear();
   m_options = mle::OptionsMsg();
   m_options_bound = false;
+}
+
+bool Session::reset() {
+  // A routine of this session runs (it called mle_session_reset() through
+  // SQL): its worker must not go away under it.
+  if (m_calls > 0) return false;
+  // Asked for a clean state: new workers, not this account's kept ones.
+  clear_state(false);
   ++g_counters.session_resets;
+  return true;
+}
+
+void Session::account_changed() {
+  if (m_calls > 0) return;  // between commands: never (defensive)
+  clear_state(true);
 }
 
 bool Session::set_options(mle::wire::IntegerType integer_type,
@@ -607,6 +645,36 @@ bool Session::set_options(mle::wire::IntegerType integer_type,
       log_warning("Options for the worker of " + principal + ": " + error);
   }
   return true;
+}
+
+// ------------------------------------------------------------- server paths
+
+std::vector<std::string> server_private_paths() {
+  // Read once (at INSTALL): they do not change while mysqld runs, and later
+  // engine restarts come from SET GLOBAL, which holds the system variables'
+  // lock the reader takes.
+  static std::mutex lock;
+  static std::vector<std::string> known;
+  static bool done = false;
+  std::lock_guard<std::mutex> guard(lock);
+  if (done) return known;
+  std::vector<std::string> out;
+  MYSQL_THD thd = nullptr;
+  // GLOBAL values are read through the current THD (none: skip).
+  if (mysql_service_mysql_current_thread_reader->get(&thd) || thd == nullptr)
+    return out;
+  for (const char *name : {"plugin_dir", "datadir"}) {
+    char buffer[PATH_MAX];
+    void *value = buffer;
+    size_t length = sizeof buffer - 1;
+    if (!mysql_service_mysql_system_variable_reader->get(
+            thd, "GLOBAL", "mysql_server", name, &value, &length) &&
+        length > 0)
+      out.emplace_back(static_cast<const char *>(value), length);
+  }
+  known = out;
+  done = true;
+  return out;
 }
 
 // ------------------------------------------------------------- privileges
@@ -643,7 +711,13 @@ bool Session::parse_library(unsigned language, const std::string &name,
   routine.language = language;
   routine.name = name;
   routine.qualified_name = name;
-  const std::string &who = principal();
+  // A library is code for the language's routines: the same privilege
+  // (D-3) as CREATE FUNCTION / PROCEDURE in that language.
+  if (!has_global_privilege(m_thd, privilege_of(routine))) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), privilege_of(routine));
+    return false;
+  }
+  const std::string who = principal();
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr) return false;
   mle::ParseLibraryMsg m;
@@ -673,14 +747,20 @@ bool has_global_privilege(MYSQL_THD thd, const char *privilege) {
 bool check_create_privilege(MYSQL_THD thd, const Routine &routine) {
   mysql_cstring_with_length command{nullptr, 0};
   if (mysql_service_mysql_thd_attributes->get(thd, "sql_command", &command) ||
-      command.str == nullptr)
-    return true;
+      command.str == nullptr) {
+    // Cannot tell whether this is a CREATE: refuse (fail closed).
+    my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+    return false;
+  }
   // sql_statement_names (mysqld.cc): SQLCOM_CREATE_SPFUNCTION is
   // "create_function" (a UDF is "create_udf").
   const std::string cmd(command.str, command.length);
   if (cmd != "create_procedure" && cmd != "create_function") return true;
   Security_context_handle sctx = nullptr;
-  if (mysql_service_mysql_thd_security_context->get(thd, &sctx)) return true;
+  if (mysql_service_mysql_thd_security_context->get(thd, &sctx)) {
+    my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+    return false;
+  }
   const char *privilege = privilege_of(routine);
   if (mysql_service_global_grants_check->has_global_grant(sctx, privilege,
                                                           strlen(privilege)))

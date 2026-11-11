@@ -151,7 +151,9 @@ Status Worker::died(std::string *error) {
 }
 
 WorkerStats Worker::stats() const {
-  const wire::WorkerStats &s = m_process->header()->stats;
+  // One copy: the worker may change shared memory between two reads.
+  wire::WorkerStats s;
+  memcpy(&s, &m_process->header()->stats, sizeof s);
   WorkerStats r;
   r.heap_max = s.heap_max;
   r.heap_used = std::min(s.heap_used, s.heap_max);
@@ -208,6 +210,9 @@ Worker::Wait Worker::wait_change(CallHooks *hooks, int timeout_ms,
     // A tick: is the worker alive, was the session killed, time is up?
     if (!m_process->alive()) return Wait::kDied;
     if (check_kill(hooks) == Wait::kKilled) return Wait::kKilled;
+    // Nothing runs yet (waiting for READY): a KILL ends the wait at once.
+    if (hooks != nullptr && m_running.load() == 0 && hooks->killed())
+      return Wait::kKilled;
     if (now_ns() > deadline) {
       if (error != nullptr) *error = "timed out waiting for the MLE worker";
       return Wait::kTimeout;
@@ -252,6 +257,8 @@ Worker::Wait Worker::receive(Message *m, CallHooks *hooks, int timeout_ms,
         *error = "the MLE worker broke the protocol: " + a.error();
         return Wait::kProtocol;
       case Assembler::Step::kNeedMore:
+        // A long message never lets the wait reach a tick: check KILL here.
+        if (check_kill(hooks) == Wait::kKilled) return Wait::kKilled;
         post(wire::Op::kContinue, 0, nullptr, 0, 0);
         break;
     }
@@ -259,7 +266,8 @@ Worker::Wait Worker::receive(Message *m, CallHooks *hooks, int timeout_ms,
 }
 
 Worker::Wait Worker::send(wire::Op op, const std::string &body,
-                          CallHooks *hooks, std::string *error) {
+                          CallHooks *hooks, std::string *error,
+                          int timeout_ms) {
   const uint32_t arena = m_process->arena_size();
   size_t sent = 0;
   while (true) {
@@ -269,7 +277,7 @@ Worker::Wait Worker::send(wire::Op op, const std::string &body,
          body.size());
     sent += len;
     if (!more) return Wait::kMessage;
-    const Wait w = wait_change(hooks, -1, error);
+    const Wait w = wait_change(hooks, timeout_ms, error);
     if (w != Wait::kMessage) return w;
     wire::MessageHeader h;
     memcpy(&h, &m_process->header()->msg, sizeof h);
@@ -283,15 +291,18 @@ Worker::Wait Worker::send(wire::Op op, const std::string &body,
 
 // ---------------------------------------------------------------- requests
 
-Status Worker::wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error) {
+Status Worker::wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error,
+                          CallHooks *hooks) {
   if (!m_usable) return died(error);
   Message m;
   std::string why;
-  switch (receive(&m, nullptr, timeout_ms, &why)) {
+  switch (receive(&m, hooks, timeout_ms, &why)) {
     case Wait::kMessage:
       break;
     case Wait::kDied:
       return died(error);
+    case Wait::kKilled:
+      return fail(Status::kInterrupted, "interrupted", error);
     case Wait::kProtocol:
       return fail(Status::kProtocolError, why, error);
     default:
@@ -311,7 +322,7 @@ Status Worker::wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error) {
 
 Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
                        const RoutineInfo *routine, ResultMsg *result,
-                       std::string *error) {
+                       std::string *error, int timeout_ms) {
   if (!m_usable) return died(error);
   if (!m_ready) {
     *error = "the MLE worker is not ready";
@@ -362,14 +373,20 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
                       std::to_string(m_options.interrupt_grace_ms) +
                       " ms after KILL and was terminated",
                   error);
+    if (w == Wait::kTimeout)
+      return fail(Status::kDied,
+                  std::string("the MLE worker did not answer ") +
+                      op_name(uint32_t(op)) + " within " +
+                      std::to_string(timeout_ms) + " ms and was terminated",
+                  error);
     return fail(Status::kProtocolError, why, error);
   };
 
-  Wait w = send(op, body, &hooks, &why);
+  Wait w = send(op, body, &hooks, &why, timeout_ms);
   if (w != Wait::kMessage) return lost(w);
   while (true) {
     Message m;
-    w = receive(&m, &hooks, -1, &why);
+    w = receive(&m, &hooks, timeout_ms, &why);
     if (w != Wait::kMessage) return lost(w);
     if (m.h.depth != depth || m.h.call_seq != m_seq)
       return broke(std::string(op_name(m.h.op)) + " for the wrong call");
@@ -396,7 +413,7 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
       if (guard.top() && m_process->header()->stats.tainted != 0)
         fail(Status::kDied,
              "the MLE worker was retired after running out of memory or "
-             "stack",
+             "stack, or leaving threads running",
              nullptr);
       return static_cast<Status>(m.h.status);
     }
@@ -423,6 +440,7 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
       LibraryResultMsg r;
       hooks.library(lib, &r);
       if (!m_usable) return died(error);
+      if (check_kill(&hooks) == Wait::kKilled) return lost(Wait::kKilled);
       std::string reply;
       encode(r, &reply);
       w = send(wire::Op::kLibraryResult, reply, &hooks, &why);
@@ -485,8 +503,8 @@ Status Worker::drop(uint64_t routine_id, std::string *error) {
   encode(DropMsg{routine_id}, &body);
   NoSql hooks;
   ResultMsg result;
-  const Status s =
-      request(wire::Op::kDrop, body, hooks, nullptr, &result, error);
+  const Status s = request(wire::Op::kDrop, body, hooks, nullptr, &result,
+                           error, m_options.control_timeout_ms);
   if (s == Status::kOk) m_routines.erase(routine_id);
   if (s != Status::kOk && result.error) *error = result.error->message;
   return s;
@@ -497,8 +515,8 @@ Status Worker::options(const OptionsMsg &options, std::string *error) {
   encode(options, &body);
   NoSql hooks;
   ResultMsg result;
-  const Status s =
-      request(wire::Op::kOptions, body, hooks, nullptr, &result, error);
+  const Status s = request(wire::Op::kOptions, body, hooks, nullptr, &result,
+                           error, m_options.control_timeout_ms);
   if (s != Status::kOk && result.error) *error = result.error->message;
   return s;
 }
@@ -506,8 +524,8 @@ Status Worker::options(const OptionsMsg &options, std::string *error) {
 Status Worker::reset(std::string *error) {
   NoSql hooks;
   ResultMsg result;
-  const Status s =
-      request(wire::Op::kReset, "", hooks, nullptr, &result, error);
+  const Status s = request(wire::Op::kReset, "", hooks, nullptr, &result,
+                           error, m_options.control_timeout_ms);
   if (s == Status::kOk) m_routines.clear();
   if (s != Status::kOk && result.error) *error = result.error->message;
   return s;

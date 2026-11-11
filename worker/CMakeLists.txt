@@ -81,7 +81,8 @@ ADD_CUSTOM_COMMAND(OUTPUT ${MLE_PYTHON_VENV_STAMP}
     -Dmle.venv.dir=${CMAKE_CURRENT_BINARY_DIR}/python-venv
     generate-resources
   COMMAND ${CMAKE_COMMAND} -E touch ${MLE_PYTHON_VENV_STAMP}
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/python/pom.xml
+  # After the jar: two Maven runs must not share ~/.m2 at the same time.
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/python/pom.xml ${MLE_WORKER_JAR}
   COMMENT "Building the GraalPy venv for MLE workers (numpy)"
   VERBATIM
   )
@@ -120,11 +121,27 @@ SET_PROPERTY(GLOBAL PROPERTY MLE_AOT_CACHE ${MLE_AOT_CACHE})
 # component MleWorker is separate from Server for now (POC; packaging later).
 # The AOT cache checks the jars' paths, sizes and modification times: CMake
 # keeps the times when it installs, and the cache is installed with the jars.
-# The venv is used only through its site-packages, so it can be moved.
+# The venv is used by GraalPy inside the workers: its site finds it from
+# sys.executable (venv/bin/python, which must exist) and pyvenv.cfg. Its bin/
+# points to the GraalPy that built it (build tree), so a placeholder python
+# is installed instead; nothing runs it. Files are installed read-only for
+# others whatever the builder's umask (workers run them), without build
+# stamps.
 SET(MLE_INSTALL_DIR ${INSTALL_PLUGINDIR}/mle)
+FILE(WRITE ${CMAKE_CURRENT_BINARY_DIR}/mle-venv-python
+  "#!/bin/sh\necho 'This venv is used by GraalPy inside MLE workers only.' >&2\nexit 1\n")
 INSTALL(FILES ${MLE_WORKER_JAR} ${MLE_AOT_CACHE}
-  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleWorker)
+  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleWorker
+  PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
 INSTALL(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/maven/deps
                   ${MLE_RESOURCE_CACHE}
                   ${CMAKE_CURRENT_BINARY_DIR}/python-venv
-  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleWorker USE_SOURCE_PERMISSIONS)
+  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleWorker
+  FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+  DIRECTORY_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                        GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+  PATTERN ".mle-*" EXCLUDE
+  REGEX "/venv/bin(/.*)?$" EXCLUDE)
+INSTALL(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/mle-venv-python
+  DESTINATION ${MLE_INSTALL_DIR}/python-venv/venv/bin RENAME python
+  COMPONENT MleWorker)

@@ -84,6 +84,11 @@ constexpr uint32_t kMaxVectorDimensions = 16383;
 constexpr uint32_t kMaxTimeHour = 838;
 /** Oracle MLE limit for stack traces. */
 constexpr uint32_t kMaxStackFrames = 1000;
+/** Values in one list (call arguments, SQL parameters, OUT parameters):
+    MySQL's limit of prepared-statement markers. */
+constexpr uint32_t kMaxValues = 65535;
+/** Languages a worker reports in READY. */
+constexpr uint32_t kMaxLanguages = 16;
 /** VECTOR data starts at this alignment, relative to the start of the
     message; that is the arena start when the message fits in one chunk. */
 constexpr size_t kVectorAlignment = 16;

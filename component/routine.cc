@@ -265,10 +265,14 @@ bool describe(const TypeQuery &q, const std::string &what, ParamInfo *info) {
       p.tag = Tag::kF64;
       info->kind = Kind::kDouble;
       return true;
-    case MYSQL_SP_ARG_TYPE_NEWDECIMAL:
+    case MYSQL_SP_ARG_TYPE_NEWDECIMAL: {
+      uint64_t decimals = 0;
+      (void)q.get("decimals", &decimals);
+      p.scale = static_cast<uint32_t>(decimals);
       p.tag = Tag::kDecimal;
       info->kind = Kind::kDecimal;
       return true;
+    }
     case MYSQL_SP_ARG_TYPE_NEWDATE:
       p.tag = Tag::kDate;
       info->kind = Kind::kDate;
@@ -291,7 +295,7 @@ bool describe(const TypeQuery &q, const std::string &what, ParamInfo *info) {
       return true;
     case MYSQL_SP_ARG_TYPE_VECTOR: {
       uint64_t bytes = 0;
-      (void)q.get("byte_length", &bytes);
+      (void)q.get("max_byte_length", &bytes);
       p.tag = Tag::kVector;
       p.length = static_cast<uint32_t>(bytes / 4);
       info->kind = Kind::kVector;
@@ -309,7 +313,7 @@ bool describe(const TypeQuery &q, const std::string &what, ParamInfo *info) {
       (void)q.get("charset", &charset);
       const std::string cs = charset == nullptr ? "" : charset;
       uint64_t chars = 0;
-      (void)q.get("char_length", &chars);
+      (void)q.get("max_display_length", &chars);
       p.length = static_cast<uint32_t>(chars);
       if (cs == "utf8mb4") {
         p.tag = Tag::kString;

@@ -58,6 +58,8 @@
 #include <mysql/components/services/udf_registration.h>
 #include <mysql/components/services/mysql_thd_store_service.h>
 #include <mysql/components/services/security_context.h>
+#include <mysql/components/util/event_tracking/event_tracking_authentication_consumer_helper.h>
+#include <mysql/components/util/event_tracking/event_tracking_connection_consumer_helper.h>
 #include <mysqld_error.h>
 
 #include "mle_component.h"
@@ -144,6 +146,23 @@ void report(const std::string &message) {
   my_error(ER_LANGUAGE_COMPONENT, MYF(0), message.c_str());
 }
 
+/** Exceptions must not cross the service boundary into the server (C
+    callers): a failure is an error of the statement. */
+template <typename F>
+bool guarded(F &&f) {
+  try {
+    return f();
+  } catch (const std::bad_alloc &) {
+    log_error("Out of memory in the mle component.");
+  } catch (const std::exception &e) {
+    log_error(std::string("Unexpected error in the mle component: ") + e.what());
+  } catch (...) {
+    log_error("Unexpected error in the mle component.");
+  }
+  my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+  return true;
+}
+
 Routine *routine_of(external_program_handle h) {
   return reinterpret_cast<Routine *>(h);
 }
@@ -169,49 +188,57 @@ class Services {
   static DEFINE_BOOL_METHOD(init, (stored_program_handle sp,
                                    stored_program_statement_handle,
                                    external_program_handle *lang_sp)) {
-    Routine *routine = Routine::create(sp);
-    if (routine == nullptr) return true;
-    (routine->is_function() ? g_counters.functions : g_counters.procedures)++;
-    raise_max(g_counters.program_bytes_max,
-              static_cast<long>(routine->prepare.source.size()));
-    *lang_sp = reinterpret_cast<external_program_handle>(routine);
-    return false;
+    return guarded([&]() -> bool {
+      Routine *routine = Routine::create(sp);
+      if (routine == nullptr) return true;
+      (routine->is_function() ? g_counters.functions : g_counters.procedures)++;
+      raise_max(g_counters.program_bytes_max,
+                static_cast<long>(routine->prepare.source.size()));
+      *lang_sp = reinterpret_cast<external_program_handle>(routine);
+      return false;
+    });
   }
 
   /** The routine leaves the cache: the session's workers drop it. thd is
       the session that cached it. */
   static DEFINE_BOOL_METHOD(deinit, (MYSQL_THD thd, external_program_handle lang_sp,
                                      stored_program_handle)) {
-    if (lang_sp == nullptr) return false;
-    Routine *routine = routine_of(lang_sp);
-    // The handle CREATE used may come without a THD: it is the current one.
-    Session *session = thd != nullptr ? Session::of(thd) : Session::current(false);
-    if (session != nullptr) session->forget(*routine);
-    (routine->is_function() ? g_counters.functions : g_counters.procedures)--;
-    Routine::destroy(routine);
-    return false;
+    return guarded([&]() -> bool {
+      if (lang_sp == nullptr) return false;
+      Routine *routine = routine_of(lang_sp);
+      // The handle CREATE used may come without a THD: it is the current one.
+      Session *session = thd != nullptr ? Session::of(thd) : Session::current(false);
+      if (session != nullptr) session->forget(*routine);
+      (routine->is_function() ? g_counters.functions : g_counters.procedures)--;
+      Routine::destroy(routine);
+      return false;
+    });
   }
 
   /** CREATE, and when a routine enters the cache: the worker of the
       current principal compiles it (syntax errors fail the CREATE). */
   static DEFINE_BOOL_METHOD(parse, (external_program_handle lang_sp,
                                     stored_program_statement_handle)) {
-    Session *session = Session::current(true);
-    if (session == nullptr) {
-      my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
-      return true;
-    }
-    return !session->parse(*routine_of(lang_sp));
+    return guarded([&]() -> bool {
+      Session *session = Session::current(true);
+      if (session == nullptr) {
+        my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+        return true;
+      }
+      return !session->parse(*routine_of(lang_sp));
+    });
   }
 
   static DEFINE_BOOL_METHOD(execute, (external_program_handle lang_sp,
                                       stored_program_statement_handle)) {
-    Session *session = Session::current(true);
-    if (session == nullptr) {
-      my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
-      return true;
-    }
-    return !session->execute(*routine_of(lang_sp));
+    return guarded([&]() -> bool {
+      Session *session = Session::current(true);
+      if (session == nullptr) {
+        my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+        return true;
+      }
+      return !session->execute(*routine_of(lang_sp));
+    });
   }
 };
 
@@ -252,12 +279,15 @@ mysql_service_status_t deinit() {
   /* Sessions that used MLE keep their state in a thd_store slot, which
      the server does not free once the slot is unregistered: refuse until
      they disconnect (as js_lang). */
-  if (g_counters.functions + g_counters.procedures > 0 || Session::count() > 0) {
+  /* The UDFs first (a running UDF keeps its registration: refuse, try
+     later): mle_set_session_state() creates sessions, so none can appear
+     between the check below and the slot's unregistration. */
+  if (unregister_udfs()) {
     my_error(ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL, MYF(0));
     return 1;
   }
-  /* A UDF that is running keeps its registration: refuse, try later. */
-  if (unregister_udfs()) {
+  if (g_counters.functions + g_counters.procedures > 0 || Session::count() > 0) {
+    (void)register_udfs();
     my_error(ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL, MYF(0));
     return 1;
   }
@@ -300,27 +330,69 @@ class Libraries {
                                         mysql_cstring_with_length language,
                                         mysql_cstring_with_length body,
                                         bool is_binary, bool *result)) {
-    *result = false;
-    const unsigned bit = mle_component::language_bit({language.str, language.length});
-    if ((bit & mle_component::enabled_languages()) == 0) {
-      my_error(ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE, MYF(0),
-               std::string(language.str, language.length).c_str());
-      return true;
-    }
-    if (is_binary) {
-      my_error(ER_LANGUAGE_COMPONENT, MYF(0),
-               "MLE> Libraries are source code (WebAssembly is not supported).");
-      return true;
-    }
-    mle_component::Session *s = mle_component::Session::current(true);
-    if (s == nullptr) return true;
-    if (!s->parse_library(bit, std::string(name.str, name.length),
-                          std::string(body.str == nullptr ? "" : body.str, body.length)))
-      return true;
-    *result = true;
-    return false;
+    return mle_component::guarded([&]() -> bool {
+      *result = false;
+      const unsigned bit = mle_component::language_bit({language.str, language.length});
+      if ((bit & mle_component::enabled_languages()) == 0) {
+        my_error(ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE, MYF(0),
+                 std::string(language.str, language.length).c_str());
+        return true;
+      }
+      if (is_binary) {
+        my_error(ER_LANGUAGE_COMPONENT, MYF(0),
+                 "MLE> Libraries are source code (WebAssembly is not supported).");
+        return true;
+      }
+      mle_component::Session *s = mle_component::Session::current(true);
+      if (s == nullptr) return true;
+      if (!s->parse_library(bit, std::string(name.str, name.length),
+                            std::string(body.str == nullptr ? "" : body.str, body.length)))
+        return true;
+      *result = true;
+      return false;
+    });
   }
 };
+
+/* COM_CHANGE_USER: the session's MLE state belonged to the old account.
+   DROP USER / RENAME USER: that account's kept workers go. */
+namespace Event_tracking_implementation {
+mysql_event_tracking_connection_subclass_t
+    Event_tracking_connection_implementation::filtered_sub_events =
+        (EVENT_TRACKING_CONNECTION_ALL) &  // the macro has no parentheses
+        ~EVENT_TRACKING_CONNECTION_CHANGE_USER;
+
+bool Event_tracking_connection_implementation::callback(
+    const mysql_event_tracking_connection_data *) {
+  try {  // no exception into the server, no error for the statement
+    if (mle_component::Session *s = mle_component::Session::current(false))
+      s->account_changed();
+  } catch (...) {
+  }
+  return false;
+}
+
+mysql_event_tracking_authentication_subclass_t
+    Event_tracking_authentication_implementation::filtered_sub_events =
+        (EVENT_TRACKING_AUTHENTICATION_ALL) &
+        ~(EVENT_TRACKING_AUTHENTICATION_AUTHID_DROP |
+          EVENT_TRACKING_AUTHENTICATION_AUTHID_RENAME);
+
+bool Event_tracking_authentication_implementation::callback(
+    const mysql_event_tracking_authentication_data *data) {
+  try {
+    if (data->status == 0)
+      mle_component::engine_forget_account(mle_component::account_key(
+          {data->user.str == nullptr ? "" : data->user.str, data->user.length},
+          {data->host.str == nullptr ? "" : data->host.str, data->host.length}));
+  } catch (...) {
+  }
+  return false;
+}
+}  // namespace Event_tracking_implementation
+
+IMPLEMENTS_SERVICE_EVENT_TRACKING_CONNECTION(mle);
+IMPLEMENTS_SERVICE_EVENT_TRACKING_AUTHENTICATION(mle);
 
 BEGIN_SERVICE_IMPLEMENTATION(mle, external_program_capability_query)
   Services::get,
@@ -347,6 +419,8 @@ BEGIN_COMPONENT_PROVIDES(mle)
   PROVIDES_SERVICE(mle, external_program_execution),
   PROVIDES_SERVICE(mle, external_library),
   PROVIDES_SERVICE(mle, external_library_ext),
+  PROVIDES_SERVICE_EVENT_TRACKING_CONNECTION(mle),
+  PROVIDES_SERVICE_EVENT_TRACKING_AUTHENTICATION(mle),
 END_COMPONENT_PROVIDES();
 
 BEGIN_COMPONENT_REQUIRES(mle)

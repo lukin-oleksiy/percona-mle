@@ -29,6 +29,7 @@
 #include <deque>
 #include <fstream>
 #include <thread>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -42,6 +43,8 @@
 namespace mle_component {
 
 void log_info(const std::string &message);  // component.cc
+void log_warning(const std::string &message);  // component.cc
+std::vector<std::string> server_private_paths();  // session.cc
 size_t worker_cache_size();       // settings.cc
 uint32_t worker_cache_timeout();  // settings.cc
 
@@ -53,11 +56,17 @@ void log_restart(const std::string &message) { log_info(message); }
 constexpr char kWorkerClass[] = "jvm";
 
 std::mutex g_mutex;
-std::unique_ptr<mle::Launcher> g_launcher;  // guarded by g_mutex
+std::shared_ptr<mle::Launcher> g_launcher;  // guarded by g_mutex
 std::string g_error;                        // guarded by g_mutex
 Settings g_settings;                        // guarded by g_mutex
-/** Workers held by sessions (for mle_memory_used). */
-std::set<const mle::Worker *> g_live;       // guarded by g_mutex
+/** Workers held by sessions (for mle_memory_used), with the engine
+    generation that started them. */
+std::map<const mle::Worker *, uint64_t> g_live;  // guarded by g_mutex
+/** Incremented at every engine (re)start: workers of an older one are never
+    kept for reuse (they have the old settings and package view). */
+uint64_t g_generation = 0;                  // guarded by g_mutex
+/** The last failed restart of a dead launcher (retried at most each second). */
+std::chrono::steady_clock::time_point g_last_failed_start;  // guarded by g_mutex
 std::atomic<long> g_workers_in_use{0};
 
 /** Reset workers kept for later sessions of the same principal (12 §17);
@@ -66,6 +75,7 @@ struct Cached {
   std::string principal;
   std::unique_ptr<mle::Worker> worker;
   std::chrono::steady_clock::time_point since;
+  uint64_t generation;
 };
 std::deque<Cached> g_cache;  // guarded by g_mutex
 std::atomic<uint64_t> g_cache_hits{0};
@@ -211,21 +221,16 @@ std::string auto_cgroup_base(std::string *why) {
   return parent;
 }
 
-/** Starts the launcher; caller holds g_mutex. */
+/** Starts a launcher with settings s and makes it the engine's; caller holds
+    g_mutex. On failure the running engine (if any) stays as it is. */
 bool start_locked(const Settings &s, std::string *error, std::string *info) {
-  // Kept workers have the old settings.
-  { auto old = take_cache_locked(); }
-  g_launcher.reset();
-  g_error.clear();
-  g_settings = s;
-
   mle::Layout layout = mle::Layout::installed(s.dir, s.java_home);
   if (char real[PATH_MAX]; !s.package_dir.empty() &&
                            realpath(s.package_dir.c_str(), real) != nullptr)
     layout.package_dir = real;  // a missing directory: no packages
   *error = check_layout(layout, s);
   if (!error->empty()) {
-    g_error = *error;
+    if (!g_launcher) g_error = *error;
     return false;
   }
 
@@ -246,6 +251,7 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   options.heap = std::to_string(s.heap_max >> 20) + "m";
   options.pool_size = s.pool_size;
   if (s.pool_prewarm != "none") options.prewarm = s.pool_prewarm;
+  options.hidden_paths = server_private_paths();
   // JavaScript's local time (Date.toString(), getHours()) follows mysqld's
   // system time zone; the worker cannot read the system's zone itself.
   const std::string zone = system_time_zone();
@@ -271,13 +277,13 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
       mle::Launcher::start(config, &launcher_error);
   if (!launcher) {
     *error = "cannot start mle_launcher: " + launcher_error;
-    g_error = *error;
+    if (!g_launcher || !g_launcher->alive()) g_error = *error;
     return false;
   }
   const mle::LauncherInfo &li = launcher->info();
   if (!li.class_errors.empty() && !li.class_errors[0].empty()) {
     *error = "workers cannot run here: " + li.class_errors[0];
-    g_error = *error;
+    if (!g_launcher || !g_launcher->alive()) g_error = *error;
     return false;  // destroying the launcher stops it
   }
 
@@ -285,9 +291,15 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   if (li.cgroup_enabled)
     cgroup = "worker cgroups below " + li.cgroup_info + ", memory.max " +
              mib(s.memory_max) + " each";
-  else
+  else {
     cgroup = "no worker cgroups, so mle.memory_max is not enforced (" +
              (cgroup_note.empty() ? li.cgroup_info : cgroup_note) + ")";
+    // Workers then have no memory or thread limit of their own (only the
+    // Java heap; their OOM score makes the kernel pick them before mysqld).
+    log_warning("MLE workers run without cgroups: " + cgroup +
+                ". Delegate a cgroup to mysqld (systemd: Delegate=yes) or set "
+                "mle.cgroup_base.");
+  }
   *info = "Engine started: mle_launcher pid " + std::to_string(li.pid) +
           ", Landlock ABI " + std::to_string(li.landlock_abi) + ", " + cgroup +
           ", Java heap " + mib(s.heap_max) + ", pool " +
@@ -297,7 +309,14 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
           (layout.python_venv.empty() ? ", no Python venv (no numpy)" : "") +
           (layout.package_dir.empty() ? "" : ", packages in " + layout.package_dir) +
           ".";
+  // The new engine: kept workers have the old settings; running sessions'
+  // workers keep the old launcher alive until they are released (and are
+  // not kept then: an older generation).
+  { auto old = take_cache_locked(); }
   g_launcher = std::move(launcher);
+  g_settings = s;
+  g_error.clear();
+  ++g_generation;
   return true;
 }
 
@@ -323,18 +342,24 @@ void engine_stop() {
 
 EngineState engine_state(bool with_stats) {
   EngineState st;
-  std::lock_guard<std::mutex> lock(g_mutex);
-  st.error = g_error;
-  if (!g_launcher) return st;
-  st.active = true;
-  st.launcher_pid = g_launcher->info().pid;
-  st.cgroup = g_launcher->info().cgroup_enabled;
-  st.cached = static_cast<uint32_t>(g_cache.size());
-  st.cache_hits = g_cache_hits.load();
+  std::shared_ptr<mle::Launcher> launcher;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    st.error = g_error;
+    if (!g_launcher) return st;
+    launcher = g_launcher;
+    st.active = true;
+    st.launcher_pid = g_launcher->info().pid;
+    st.cgroup = g_launcher->info().cgroup_enabled;
+    st.cached = static_cast<uint32_t>(g_cache.size());
+    st.cache_hits = g_cache_hits.load();
+  }
+  // The round trip to mle_launcher without the engine's mutex (SHOW STATUS
+  // must not hold up sessions taking workers).
   if (with_stats) {
     std::vector<mle::ClassStats> stats;
     std::string error;
-    if (g_launcher->stats(&stats, &error) && !stats.empty()) {
+    if (launcher->stats(&stats, &error) && !stats.empty()) {
       st.pool_idle = stats[0].idle;
       st.spawned = stats[0].spawned;
     }
@@ -351,7 +376,9 @@ bool engine_refresh(std::string *error) {
     *error = "the MLE engine is not running";
     return false;
   }
-  // Workers of running sessions die with the launcher: refuse then.
+  // A refresh is for new packages: refused while sessions use workers, so
+  // that they do not mix package versions (their workers would keep the old
+  // launcher alive and the old packages).
   if (g_workers_in_use.load() > 0) {
     *error = std::to_string(g_workers_in_use.load()) +
              " session workers are in use; try again when the sessions ended "
@@ -372,6 +399,7 @@ constexpr int kReadyTimeoutMs = 120000;
 
 std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us,
                                                int interrupt_grace_ms,
+                                               mle::CallHooks *hooks,
                                                AcquireError *why,
                                                std::string *error) {
   if (++g_workers_in_use > static_cast<long>(max_workers)) {
@@ -380,6 +408,7 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
     return nullptr;
   }
   std::unique_ptr<mle::WorkerProcess> process;
+  uint64_t generation = 0;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_launcher) {
@@ -389,17 +418,23 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
       return nullptr;
     }
     process = g_launcher->acquire(kWorkerClass, error);
-    if (!process && !g_launcher->alive()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!process && !g_launcher->alive() &&
+        now - g_last_failed_start >= std::chrono::seconds(1)) {
       // mle_launcher ended (killed, crashed); its workers died with it.
-      // Start a new one with the same settings and try once more.
+      // Start a new one with the same settings and try once more (a failed
+      // start is retried by a later session, at most once a second).
       log_restart("mle_launcher ended unexpectedly; starting it again.");
       std::string info;
       const Settings settings = g_settings;
       if (start_locked(settings, error, &info)) {
         log_restart(info);
         process = g_launcher->acquire(kWorkerClass, error);
+      } else {
+        g_last_failed_start = now;
       }
     }
+    generation = g_generation;
   }
   if (!process) {
     --g_workers_in_use;
@@ -411,7 +446,8 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
   options.interrupt_grace_ms = interrupt_grace_ms;
   auto worker = std::make_unique<mle::Worker>(std::move(process), options);
   mle::ReadyMsg ready;
-  if (worker->wait_ready(kReadyTimeoutMs, &ready, error) != mle::Status::kOk) {
+  if (worker->wait_ready(kReadyTimeoutMs, &ready, error, hooks) !=
+      mle::Status::kOk) {
     worker.reset();
     --g_workers_in_use;
     *why = AcquireError::kFailed;
@@ -420,7 +456,7 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
   *why = AcquireError::kNone;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_live.insert(worker.get());
+    g_live[worker.get()] = generation;
   }
   return worker;
 }
@@ -428,23 +464,31 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
 void engine_release_worker(std::unique_ptr<mle::Worker> worker,
                            const std::string &principal) {
   if (!worker) return;
+  uint64_t generation = 0;
+  bool current = false;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_live.erase(worker.get());
+    const auto it = g_live.find(worker.get());
+    if (it != g_live.end()) {
+      generation = it->second;
+      current = generation == g_generation;
+      g_live.erase(it);
+    }
   }
   --g_workers_in_use;
-  // Only a healthy worker that is not running anything is kept, after RESET
-  // (it forgets the session's routines and trims its heap).
-  if (!principal.empty() && worker_cache_size() > 0 && worker->usable() &&
+  // Only a healthy worker of the current engine that is not running
+  // anything is kept, after RESET (it forgets the session's routines and
+  // trims its heap).
+  if (current && !principal.empty() && worker_cache_size() > 0 && worker->usable() &&
       !worker->stats().tainted && worker->depth() == 0) {
     std::string error;
     if (worker->reset(&error) == mle::Status::kOk && worker->usable()) {
       std::vector<std::unique_ptr<mle::Worker>> evicted;
       {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_launcher) {
-          g_cache.push_back(
-              {principal, std::move(worker), std::chrono::steady_clock::now()});
+        if (g_launcher && generation == g_generation) {
+          g_cache.push_back({principal, std::move(worker),
+                             std::chrono::steady_clock::now(), generation});
           while (g_cache.size() > worker_cache_size()) {
             evicted.push_back(std::move(g_cache.front().worker));
             g_cache.pop_front();
@@ -461,34 +505,54 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
 std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
                                                  uint32_t max_workers) {
   std::unique_ptr<mle::Worker> worker;
+  uint64_t generation = 0;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     for (auto it = g_cache.end(); it != g_cache.begin();) {
       --it;
       if (it->principal != principal) continue;
       worker = std::move(it->worker);
+      generation = it->generation;
       g_cache.erase(it);
       break;
     }
   }
   if (!worker) return nullptr;
-  if (!worker->usable() || ++g_workers_in_use > static_cast<long>(max_workers)) {
-    if (worker->usable()) --g_workers_in_use;
+  // usable() is what the worker last did; alive() is the process now.
+  const bool healthy = worker->usable() && worker->process().alive();
+  if (!healthy || ++g_workers_in_use > static_cast<long>(max_workers)) {
+    if (healthy) --g_workers_in_use;
     return nullptr;  // destroyed: died while kept, or no room
   }
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_live.insert(worker.get());
+    g_live[worker.get()] = generation;
   }
   ++g_cache_hits;
   return worker;
+}
+
+void engine_forget_account(const std::string &principal) {
+  std::vector<std::unique_ptr<mle::Worker>> gone;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (auto it = g_cache.begin(); it != g_cache.end();) {
+      if (it->principal == principal) {
+        gone.push_back(std::move(it->worker));
+        it = g_cache.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  gone.clear();  // kills them, without the mutex
 }
 
 long engine_memory_used_percent() {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_live.empty() || g_settings.heap_max == 0) return 0;
   uint64_t used = 0;
-  for (const mle::Worker *w : g_live) used += w->stats().heap_used;
+  for (const auto &[w, generation] : g_live) used += w->stats().heap_used;
   return static_cast<long>(used * 100 / (g_settings.heap_max * g_live.size()));
 }
 

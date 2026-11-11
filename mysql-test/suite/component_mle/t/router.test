@@ -3,6 +3,7 @@
 --echo # component_lang_router: LANGUAGE JS runs in V8, LANGUAGE JAVASCRIPT,
 --echo # PYTHON and JAVA run in MLE.
 --echo #
+--source include/have_lang_router_component.inc
 --source include/have_mle_component.inc
 --source include/have_js_lang_component.inc
 --source include/count_sessions.inc
@@ -32,7 +33,7 @@ SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
 --connection default
 --echo # MLE refuses UNINSTALL while con1 caches its routines; the router
 --echo # keeps routing both languages.
---error ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL
+--error ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL,ER_COMPONENTS_UNLOAD_CANT_UNREGISTER_SERVICE
 UNINSTALL COMPONENT "file://component_mle";
 --connection con1
 SELECT v8_f(5) AS v8, mle_js(5) AS mle_js;

@@ -37,6 +37,7 @@
 
 namespace mle {
 class Worker;
+class CallHooks;
 }
 
 namespace mle_component {
@@ -105,6 +106,7 @@ enum class AcquireError { kNone, kInactive, kLimit, kFailed };
 */
 std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us,
                                                int interrupt_grace_ms,
+                                               mle::CallHooks *hooks,
                                                AcquireError *why,
                                                std::string *error);
 
@@ -123,6 +125,10 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
 */
 std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
                                                  uint32_t max_workers);
+
+/** DROP USER / RENAME USER: kept workers of that account are destroyed (a
+    new account of the same name must not get them). */
+void engine_forget_account(const std::string &principal);
 
 /** Java heap in use over all session workers, % of their summed limits
     (mle_memory_used). */

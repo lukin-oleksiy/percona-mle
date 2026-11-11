@@ -10,8 +10,8 @@
 call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
 
 INSTALL COMPONENT "file://component_mle";
---echo # A small heap, so that exhausting it is quick; a short KILL grace.
-SET GLOBAL mle.heap_max = 128 * 1024 * 1024, GLOBAL mle.interrupt_grace_ms = 300;
+--echo # A small heap, so that exhausting it is quick.
+SET GLOBAL mle.heap_max = 128 * 1024 * 1024;
 GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
 
 --connect (con1, localhost, root,,test)
@@ -55,8 +55,12 @@ SELECT js_ok();
 
 --echo #
 --echo # 3. KILL QUERY of a Java loop that does not stop: the worker is killed
---echo #    after mle.interrupt_grace_ms; the next call gets a fresh one.
+--echo #    after mle.interrupt_grace_ms (short here; it applies from the next
+--echo #    call); the next call gets a fresh one.
 --echo #
+--connection default
+SET GLOBAL mle.interrupt_grace_ms = 300;
+--connection con1
 --send SELECT java_loop()
 --connection default
 --let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE id = $con1_id AND info LIKE 'SELECT java_loop%'
@@ -78,6 +82,8 @@ SELECT js_ok();
 --echo #    runs in a fresh worker.
 --echo #
 --exec kill -9 $pid2
+--echo # (wait until it is gone: kill is asynchronous)
+--exec for i in `seq 200`; do grep -qs '^State:.[^Z]' /proc/$pid2/status || exit 0; sleep 0.05; done; exit 1
 --error ER_LANGUAGE_COMPONENT_INTERNAL
 SELECT js_ok();
 SELECT js_ok();
@@ -101,6 +107,7 @@ SELECT js_ok();
 --echo #
 --let $pid_file = `SELECT @@pid_file`
 --exec pkill -9 -x -P `cat $pid_file` mle_launcher
+--exec for i in `seq 200`; do ps -o stat=,comm= --ppid `cat $pid_file` | grep -v '^Z' | grep -q mle_launcher || exit 0; sleep 0.05; done; exit 1
 --error ER_LANGUAGE_COMPONENT_INTERNAL
 SELECT js_ok();
 SELECT js_ok();

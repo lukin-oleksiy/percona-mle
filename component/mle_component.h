@@ -28,6 +28,7 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
 #include <string_view>
 
 #include <mysql/components/services/mysql_current_thread_reader.h>
@@ -93,6 +94,13 @@ Settings current_settings();
 unsigned enabled_languages();
 /** mle.max_workers, mle.spin_us, mle.interrupt_grace_ms. */
 uint32_t max_workers();
+/** An account as 'user'@'host' (quotes doubled): the key of workers. */
+std::string account_key(std::string_view user, std::string_view host);
+/** mysqld's plugin_dir and datadir: never readable by workers (keyring
+    component configuration, data files). */
+std::vector<std::string> server_private_paths();
+/** mle.package_dir (or its default); safe without locks (READONLY). */
+std::string package_dir();
 /** Whether the session's account has a global (dynamic) privilege. */
 bool has_global_privilege(MYSQL_THD thd, const char *privilege);
 /** mle.worker_cache_size, mle.worker_cache_timeout (seconds). */

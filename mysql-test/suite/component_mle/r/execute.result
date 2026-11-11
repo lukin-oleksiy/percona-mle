@@ -242,7 +242,7 @@ WHERE VARIABLE_NAME = 'mle_threads';
 threads
 0
 UNINSTALL COMPONENT "file://component_mle";
-ERROR HY000: Language component: Cannot uninstall due to connected sessions. Please disconnect all sessions and try again.
+Got one of the listed errors
 DROP USER u1@localhost;
 DROP FUNCTION js_add;
 DROP FUNCTION js_types;

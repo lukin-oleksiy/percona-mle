@@ -36,6 +36,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <vector>
 
 namespace mle::worker {
@@ -54,6 +55,8 @@ constexpr uint32_t kNr = offsetof(seccomp_data, nr);
 constexpr uint32_t kArchOff = offsetof(seccomp_data, arch);
 constexpr uint32_t kArg0Lo = offsetof(seccomp_data, args[0]);
 constexpr uint32_t kArg0Hi = offsetof(seccomp_data, args[0]) + 4;
+constexpr uint32_t arg_lo(int i) { return offsetof(seccomp_data, args) + 8 * i; }
+constexpr uint32_t arg_hi(int i) { return arg_lo(i) + 4; }
 
 class Filter {
  public:
@@ -75,6 +78,47 @@ class Filter {
     jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(pid), 0, 3);
     stmt(BPF_LD | BPF_W | BPF_ABS, kArg0Hi);
     jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1);
+    stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
+  }
+  /** nr allowed only when argument arg is 0 (this process or thread) or
+      pid: a worker runs as mysqld's OS user, and these calls work on any
+      process of that user (rlimits, scheduling, I/O priority). */
+  void zero_or_self(long nr, int arg, pid_t pid) {
+    stmt(BPF_LD | BPF_W | BPF_ABS, kNr);
+    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(nr), 0, 7);
+    stmt(BPF_LD | BPF_W | BPF_ABS, arg_hi(arg));
+    jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3);  // high word set: refuse
+    stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(arg));
+    jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 2, 0);
+    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(pid), 1, 0);
+    stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
+    stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+  }
+  /** nr refused (EPERM) when argument arg is one of values. */
+  void deny_arg(long nr, int arg, std::initializer_list<uint32_t> values) {
+    stmt(BPF_LD | BPF_W | BPF_ABS, kNr);
+    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(nr), 0,
+         static_cast<uint8_t>(values.size() + 3));
+    stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(arg));
+    uint8_t left = static_cast<uint8_t>(values.size());
+    for (uint32_t v : values) {
+      --left;
+      jump(BPF_JMP | BPF_JEQ | BPF_K, v, static_cast<uint8_t>(left + 1), 0);
+    }
+    stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
+  }
+  /** socketpair: AF_UNIX stream pairs only (a datagram socket can send to
+      any pathname socket of the host without connect or bind). */
+  void unix_stream_pairs(long nr) {
+    stmt(BPF_LD | BPF_W | BPF_ABS, kNr);
+    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(nr), 0, 7);
+    stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(0));
+    jump(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 0, 4);
+    stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(1));
+    stmt(BPF_ALU | BPF_AND | BPF_K, 0xf);  // the type without SOCK_ flags
+    jump(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 0, 1);
     stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
     stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
   }
@@ -141,10 +185,10 @@ int install_seccomp() {
   // Network and local sockets (the worker talks to the host only through
   // descriptors it already has).
   f.deny(__NR_socket);
-  // AF_UNIX pairs only: two connected descriptors inside the process (the
-  // JDK's NIO dispatcher makes one when it starts; GraalPy's os.pipe() uses
-  // NIO). They reach no network and no other process.
-  f.only_arg0(__NR_socketpair, AF_UNIX);
+  // AF_UNIX stream pairs only: two connected descriptors inside the process
+  // (the JDK's NIO dispatcher makes one when it starts; GraalPy's os.pipe()
+  // uses NIO). They reach no network and no other process.
+  f.unix_stream_pairs(__NR_socketpair);
   f.deny(__NR_connect);
   f.deny(__NR_bind);
   f.deny(__NR_listen);
@@ -183,6 +227,91 @@ int install_seccomp() {
   f.deny(__NR_swapoff);
   f.deny(__NR_acct);
   f.deny(__NR_personality);
+  // Other processes of mysqld's OS user (the worker runs as that user):
+  // limits, scheduling, I/O priority, memory placement only for itself.
+  f.zero_or_self(__NR_prlimit64, 0, self);
+  f.zero_or_self(__NR_sched_setaffinity, 0, self);
+  f.zero_or_self(__NR_sched_setscheduler, 0, self);
+  f.zero_or_self(__NR_sched_setparam, 0, self);
+  f.zero_or_self(__NR_sched_setattr, 0, self);
+  f.zero_or_self(__NR_setpriority, 1, self);
+  f.zero_or_self(__NR_ioprio_set, 1, self);
+  f.deny(__NR_move_pages);
+  f.deny(__NR_migrate_pages);
+  // Files: Landlock does not cover mode, owner, times and extended
+  // attributes, and mysqld's files have the worker's owner.
+#ifdef __NR_chmod
+  f.deny(__NR_chmod);
+#endif
+  f.deny(__NR_fchmod);
+  f.deny(__NR_fchmodat);
+#ifdef __NR_fchmodat2
+  f.deny(__NR_fchmodat2);
+#endif
+#ifdef __NR_chown
+  f.deny(__NR_chown);
+#endif
+#ifdef __NR_lchown
+  f.deny(__NR_lchown);
+#endif
+  f.deny(__NR_fchown);
+  f.deny(__NR_fchownat);
+#ifdef __NR_utime
+  f.deny(__NR_utime);
+#endif
+#ifdef __NR_utimes
+  f.deny(__NR_utimes);
+#endif
+#ifdef __NR_futimesat
+  f.deny(__NR_futimesat);
+#endif
+  f.deny(__NR_utimensat);
+  f.deny(__NR_setxattr);
+  f.deny(__NR_lsetxattr);
+  f.deny(__NR_fsetxattr);
+  f.deny(__NR_removexattr);
+  f.deny(__NR_lremovexattr);
+  f.deny(__NR_fremovexattr);
+#ifdef __NR_setxattrat
+  f.deny(__NR_setxattrat);
+#endif
+#ifdef __NR_removexattrat
+  f.deny(__NR_removexattrat);
+#endif
+  // Watching the host's files, file handles, global syncs, the kernel log.
+  f.deny(__NR_inotify_add_watch);
+  f.deny(__NR_fanotify_init);
+  f.deny(__NR_fanotify_mark);
+  f.deny(__NR_name_to_handle_at);
+  f.deny(__NR_open_by_handle_at);
+  f.deny(__NR_sync);
+  f.deny(__NR_syncfs);
+  f.deny(__NR_syslog);
+#ifdef __NR_modify_ldt
+  f.deny(__NR_modify_ldt);
+#endif
+  // SysV IPC and POSIX message queues: objects that outlive the worker and
+  // its cgroup, shared with every process of the OS user.
+  f.deny(__NR_shmget);
+  f.deny(__NR_shmat);
+  f.deny(__NR_shmctl);
+  f.deny(__NR_msgget);
+  f.deny(__NR_msgsnd);
+  f.deny(__NR_msgrcv);
+  f.deny(__NR_msgctl);
+  f.deny(__NR_semget);
+  f.deny(__NR_semop);
+  f.deny(__NR_semctl);
+  f.deny(__NR_semtimedop);
+  f.deny(__NR_mq_open);
+  f.deny(__NR_mq_unlink);
+  f.deny(__NR_mq_timedsend);
+  f.deny(__NR_mq_timedreceive);
+  f.deny(__NR_mq_notify);
+  f.deny(__NR_mq_getsetattr);
+  // prctl: the bootstrap's settings stay (not dumpable, dies with the
+  // launcher, no ptracer exception).
+  f.deny_arg(__NR_prctl, 0, {PR_SET_DUMPABLE, PR_SET_PDEATHSIG, PR_SET_PTRACER});
   f.stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
 
   sock_fprog prog{static_cast<unsigned short>(f.code().size()),

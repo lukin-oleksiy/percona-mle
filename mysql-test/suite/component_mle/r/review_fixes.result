@@ -1,0 +1,124 @@
+#
+# component_mle: regressions for the project review (17-project-review.md).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE DATABASE tmp;
+CREATE DATABASE other;
+CREATE USER u2@localhost, u3@localhost;
+GRANT EXECUTE ON test.* TO u2@localhost, u3@localhost;
+# A1/D1: mle_session_reset() from inside a routine is refused (it would
+# destroy the worker the routine runs in); the session goes on.
+CALL js_reset();
+Got one of the listed errors
+SELECT py_mark('one') AS still_running;
+still_running
+None
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+# An explicit reset gives a fresh worker (no state from before).
+SELECT py_mark('two') AS after_reset;
+after_reset
+None
+# A2/D2/D10: COM_CHANGE_USER: the new account gets its own worker and
+# none of the old account's session state.
+SELECT py_mark('root-secret') AS root_marks;
+root_marks
+two
+SELECT CURRENT_USER(), py_mark('u2') AS seen_by_u2;
+CURRENT_USER()	seen_by_u2
+u2@localhost	None
+SELECT mle_session_state('stdout') AS console_after_change_user;
+console_after_change_user
+marked u2
+
+# C12: a kept worker does not outlive its account (DROP USER).
+SELECT py_mark('u3-secret') AS u3_marks;
+u3_marks
+None
+DROP USER u3@localhost;
+CREATE USER u3@localhost;
+GRANT EXECUTE ON test.* TO u3@localhost;
+SELECT py_mark('new u3') AS new_u3_sees;
+new_u3_sees
+None
+# D12: CREATE LIBRARY needs the language's CREATE_<LANGUAGE>_ROUTINE.
+CREATE USER lib_author@localhost;
+GRANT CREATE ROUTINE ON test.* TO lib_author@localhost;
+CREATE LIBRARY nolib LANGUAGE JAVASCRIPT AS $$ export const x = 1 $$;
+ERROR 42000: Access denied; you need (at least one of) the CREATE_JAVASCRIPT_ROUTINE privilege(s) for this operation
+# B1-B4, B9, B15, D4-D6: a worker cannot act on mysqld or its files.
+SELECT REPLACE(py_escape(@mpid, 'DATADIR/auto.cnf', 'PLUGIN_DIR/component_mle.so'), ' ', '\n') AS probes;
+probes
+prlimit(mysqld):refused
+prlimit(self):ok
+chmod(datadir_file):refused
+socketpair(dgram):refused
+shmget:refused
+prctl(dumpable):refused
+read_datadir:refused
+read_plugin_dir:refused
+# C1/C6: a JavaScript routine with USING runs nested under another
+# JavaScript routine (synchronous libraries), from a schema named like a
+# host directory (tmp).
+SELECT js_using(4) AS top_level;
+top_level
+16
+CALL js_outer(@r);
+SELECT @r AS nested;
+nested
+9
+# C5: an import allowed for one routine is not thereby allowed for another.
+SELECT js_peek_using() AS with_using;
+with_using
+secret
+SELECT js_peek() AS without_using;
+without_using
+refused
+# C4: internal statements of the SQL API never go to the client.
+SET @foo = 42;
+CALL js_opts(@r);
+SELECT @r AS foo;
+foo
+42
+# C8, C16: Python bool results; BIGINT UNSIGNED beyond 2^63 is an int.
+SELECT py_bool(2, 1), py_bool(1, 2), py_big(18446744073709551614) AS big;
+py_bool(2, 1)	py_bool(1, 2)	big
+1	0	int 18446744073709551615
+# C3: Python's internal thread start is refused too; a Java routine that
+# leaves a thread gets its worker retired (not kept).
+SELECT py_thread() AS python_thread;
+python_thread
+threads are not available in MLE routines
+SELECT java_thread() AS java_thread;
+java_thread
+left a thread
+SELECT js_using(5) AS next_call_new_worker;
+next_call_new_worker
+25
+# A12: an SqlError's message reaches the client exactly (quotes,
+# backslashes), raised like SIGNAL.
+CALL js_throw();
+ERROR 45000: it's a \back\slash 'quoted'
+SHOW WARNINGS;
+Level	Code	Message
+Error	1644	it's a \back\slash 'quoted'
+DROP PROCEDURE js_reset;
+DROP PROCEDURE js_throw;
+DROP FUNCTION py_mark;
+DROP FUNCTION py_escape;
+DROP FUNCTION js_using;
+DROP PROCEDURE js_outer;
+DROP FUNCTION js_peek_using;
+DROP FUNCTION js_peek;
+DROP PROCEDURE js_opts;
+DROP FUNCTION py_bool;
+DROP FUNCTION py_big;
+DROP FUNCTION py_thread;
+DROP FUNCTION java_thread;
+DROP DATABASE tmp;
+DROP DATABASE other;
+DROP USER u2@localhost, u3@localhost, lib_author@localhost;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

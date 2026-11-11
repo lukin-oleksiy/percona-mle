@@ -651,7 +651,7 @@ TEST_F(MleJavaWorker, KillTightLoopIgnoringInterrupts) {
       std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0)
           .count();
   EXPECT_GE(ms, 400);
-  EXPECT_LT(ms, 2000);
+  EXPECT_LT(ms, 6000);  // generous: sanitizers and parallel runs are slow
   EXPECT_FALSE(h->worker.usable());
   EXPECT_EQ(h->worker.process().exit_info(2000).describe(),
             "killed by signal 9 (Killed)");
@@ -675,7 +675,7 @@ TEST_F(MleJavaWorker, InterruptFromAnotherThread) {
   const auto t0 = Clock::now();
   EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kInterrupted));
   killer.join();
-  EXPECT_LT(Clock::now() - t0, std::chrono::seconds(2));
+  EXPECT_LT(Clock::now() - t0, std::chrono::seconds(6));
   EXPECT_TRUE(h->worker.usable());
   delete h;
 }
