@@ -25,7 +25,8 @@
   (launcher_protocol.h). Single-threaded: a poll loop over the host socket
   and the pidfds of all workers.
 
-  A worker is started with clone3(CLONE_PIDFD | CLONE_INTO_CGROUP), so it
+  A worker is started with clone3(CLONE_PIDFD | CLONE_INTO_CGROUP) (or, where
+  clone3 is refused, clone(CLONE_PIDFD) and the child joins its cgroup), so it
   is in its cgroup leaf from its first instruction and we hold a pidfd. The
   child sets up its descriptors, limits and Landlock and execs the worker
   executable (child.cc). An exec-error pipe makes the spawn synchronous up
@@ -324,7 +325,17 @@ Worker *Launcher::spawn(size_t cls, std::string *error) {
   args.pidfd = reinterpret_cast<uint64_t>(&w.pidfd);
   args.exit_signal = SIGCHLD;
   args.cgroup = cgroup_fd >= 0 ? static_cast<uint64_t>(cgroup_fd) : 0;
-  const long pid = syscall(SYS_clone3, &args, sizeof args);
+  long pid = syscall(SYS_clone3, &args, sizeof args);
+  if (pid < 0 && (errno == ENOSYS || errno == EPERM)) {
+    // clone3 refused (container runtimes' default seccomp profiles, e.g.
+    // Docker's): clone() with CLONE_PIDFD (the pidfd goes to the parent tid
+    // argument, the third on x86-64 and arm64); the child joins its cgroup
+    // leaf itself.
+    req.join_cgroup = cgroup_fd >= 0;
+    pid = syscall(SYS_clone, CLONE_PIDFD | SIGCHLD, nullptr, &w.pidfd, nullptr,
+                  nullptr);
+    if (pid < 0) return cleanup(std::string("clone: ") + strerror(errno));
+  }
   if (pid < 0) return cleanup(std::string("clone3: ") + strerror(errno));
   if (pid == 0) child_main(req);
 

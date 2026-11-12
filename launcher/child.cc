@@ -196,6 +196,8 @@ const char *child_step_name(int32_t step) {
       return "Landlock";
     case kStepExec:
       return "exec";
+    case kStepCgroup:
+      return "cgroup";
   }
   return "?";
 }
@@ -215,6 +217,16 @@ const char *child_step_name(int32_t step) {
   if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0)
     fail(err_pipe, kStepPdeathsig, errno);
   if (getppid() != r.launcher_pid) fail(err_pipe, kStepPdeathsig, ESRCH);
+
+  // Started with clone() (clone3 refused): join the cgroup leaf now, before
+  // the worker allocates anything ("0" moves the writing process).
+  if (r.join_cgroup) {
+    const std::string procs = r.leaf + "/cgroup.procs";
+    const int fd = open(procs.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) fail(err_pipe, kStepCgroup, errno);
+    if (write(fd, "0", 1) != 1) fail(err_pipe, kStepCgroup, errno);
+    close(fd);
+  }
 
   // Signals: dispositions set to SIG_IGN survive exec (the launcher ignores
   // SIGPIPE); reset everything and unblock everything.

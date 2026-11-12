@@ -1,0 +1,26 @@
+# The DBA's tools image (19-docker.md): mle_package with npm, Maven and a
+# GraalPy of the workers' GraalVM version, writing into the package volume
+# that the server container reads (mle.package_dir). Built by
+# build-image.sh --tools on top of the server image.
+ARG BASE=percona-mle:dev
+FROM ${BASE}
+ARG GRAALVM_VERSION
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      nodejs npm maven python3 \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME=/opt/graalvm
+
+# GraalPy as the workers run it (same version): its jars from Maven Central,
+# a launcher script, and a venv with pip for mle_package.
+RUN test -n "$GRAALVM_VERSION" && mkdir -p /opt/graalpy/build && cd /opt/graalpy/build \
+ && printf '%s' "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>mle</groupId><artifactId>graalpy</artifactId><version>1</version><dependencies><dependency><groupId>org.graalvm.python</groupId><artifactId>python-community</artifactId><version>${GRAALVM_VERSION}</version><type>pom</type></dependency><dependency><groupId>org.graalvm.python</groupId><artifactId>python-launcher</artifactId><version>${GRAALVM_VERSION}</version></dependency></dependencies></project>" > pom.xml \
+ && mvn -q -B dependency:copy-dependencies -DoutputDirectory=/opt/graalpy/lib \
+ && cd / && rm -rf /opt/graalpy/build /root/.m2
+COPY graalpy /usr/local/bin/graalpy
+RUN graalpy -m venv /opt/graalpy/venv && /opt/graalpy/venv/bin/graalpy -m pip --version
+
+ENTRYPOINT ["/usr/local/mysql/lib/plugin/mle/mle_package", "--dir", "/var/lib/mysql-mle-packages", \
+            "--graalpy", "/opt/graalpy/venv/bin/graalpy"]
+CMD ["list"]

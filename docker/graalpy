@@ -1,0 +1,5 @@
+#!/bin/sh
+# GraalPy from the jars in /opt/graalpy/lib, on the image's GraalVM JDK.
+exec /opt/graalvm/bin/java --enable-native-access=ALL-UNNAMED \
+  --sun-misc-unsafe-memory-access=allow -cp "/opt/graalpy/lib/*" \
+  com.oracle.graal.python.shell.GraalPythonMain --python.Executable="$0" "$@"

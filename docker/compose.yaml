@@ -1,0 +1,28 @@
+# Percona Server + MLE for development (19-docker.md).
+#   docker compose up -d                      # the server
+#   docker compose run --rm tools install python networkx
+#   docker compose exec mysql mysql -uroot -p -e "SELECT mle_packages_refresh()"
+services:
+  mysql:
+    image: ${MLE_IMAGE:-percona-mle:dev}
+    init: false            # tini is the image's PID 1
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mle}
+      MLE_APP_USER: ${MLE_APP_USER:-app}
+      MLE_APP_PASSWORD: ${MLE_APP_PASSWORD:-app}
+    ports:
+      - "${MLE_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - mle-packages:/var/lib/mysql-mle-packages:ro
+    mem_limit: ${MLE_MEMORY:-8g}
+    # Per-worker cgroups (mle.memory_max) need a writable cgroup filesystem:
+    # privileged: true
+  tools:
+    image: ${MLE_TOOLS_IMAGE:-percona-mle-tools:dev}
+    profiles: ["tools"]
+    volumes:
+      - mle-packages:/var/lib/mysql-mle-packages
+volumes:
+  mysql-data:
+  mle-packages:

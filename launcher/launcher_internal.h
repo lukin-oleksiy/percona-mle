@@ -75,6 +75,7 @@ enum ChildStep : int32_t {
   kStepRlimit,
   kStepLandlock,
   kStepExec,
+  kStepCgroup,
 };
 
 const char *child_step_name(int32_t step);
@@ -87,9 +88,12 @@ struct SpawnRequest {
   int err_pipe;  // write end, O_CLOEXEC
   pid_t launcher_pid;
   std::string leaf;
+  /** Started without CLONE_INTO_CGROUP (clone3 not allowed): the child moves
+      itself into leaf before anything else. */
+  bool join_cgroup = false;
 };
 
-/** Runs in the child after clone3; never returns. */
+/** Runs in the child after clone3 (or clone); never returns. */
 [[noreturn]] void child_main(const SpawnRequest &r);
 
 }  // namespace mle::launcher
