@@ -73,3 +73,42 @@ INSTALL(PROGRAMS tools/mle_aot_cache DESTINATION ${INSTALL_PLUGINDIR}/mle
   COMPONENT MleCore)
 
 ADD_SUBDIRECTORY(component)
+
+# The debug server (mysqld-debug, plugin_dir <plugin>/debug) gets MLE too: a
+# release build installs the debug variants from the sibling debug build
+# (INSTALL_DEBUG_TARGET, as for plugins) when that build has MLE:
+# component_mle in <plugin>/debug, the debug launcher and worker in
+# <plugin>/debug/mle, and there symlinks to the release runtime (jars,
+# resources, Python, JDK, AOT cache), which is the same for both. The
+# component resolves the symlinks (Landlock rules and the AOT cache see the
+# real paths). Each symlink goes with the package of what it points to.
+IF(NOT CMAKE_BUILD_TYPE_UPPER STREQUAL "DEBUG" AND
+    EXISTS ${DEBUGBUILDDIR}/CMakeCache.txt)
+  FILE(STRINGS ${DEBUGBUILDDIR}/CMakeCache.txt MLE_DEBUG_BUILD
+    REGEX "^WITH_MLE:BOOL=ON$")
+ENDIF()
+IF(MLE_DEBUG_BUILD)
+  MESSAGE(STATUS "MLE: installing the debug variants from ${DEBUGBUILDDIR}")
+  SET(MLE_DEBUG_DIR ${INSTALL_PLUGINDIR}/debug/mle)
+  INSTALL_DEBUG_TARGET(component_mle
+    DESTINATION ${INSTALL_PLUGINDIR}/debug COMPONENT MleCore)
+  INSTALL_DEBUG_TARGET(mle_launcher DESTINATION ${MLE_DEBUG_DIR}
+    COMPONENT MleCore)
+  INSTALL_DEBUG_TARGET(mle_worker DESTINATION ${MLE_DEBUG_DIR}
+    COMPONENT MleCore)
+  SET(MLE_DEBUG_LINKS mle-worker.jar:MleCore deps:MleCore resources:MleCore
+    mle.aot:MleCore python-venv:MlePython)
+  IF(MLE_BUILD_JDK)
+    LIST(APPEND MLE_DEBUG_LINKS jdk:MleJdk)
+  ENDIF()
+  SET(links_dir ${CMAKE_CURRENT_BINARY_DIR}/debug-links)
+  FILE(MAKE_DIRECTORY ${links_dir})
+  FOREACH(entry ${MLE_DEBUG_LINKS})
+    STRING(REPLACE ":" ";" entry ${entry})
+    LIST(GET entry 0 name)
+    LIST(GET entry 1 install_component)
+    FILE(CREATE_LINK ../../mle/${name} ${links_dir}/${name} SYMBOLIC)
+    INSTALL(FILES ${links_dir}/${name} DESTINATION ${MLE_DEBUG_DIR}
+      COMPONENT ${install_component})
+  ENDFOREACH()
+ENDIF()
