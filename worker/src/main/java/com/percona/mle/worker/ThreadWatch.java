@@ -17,36 +17,48 @@
 
 package com.percona.mle.worker;
 
-import java.lang.management.ManagementFactory;
-import java.lang.management.ThreadMXBean;
-
 /**
  * Routines must not leave threads behind (15 §1, Q4): a thread that outlives its call keeps running
  * while the worker waits, is cached for the account's next session, or serves another session, and
- * KILL does not reach it. Python's and Java's thread APIs are refused, but Java routines and
- * reflection can still start threads; after each top-level request the worker looks for threads
- * that are not the runtime's own and, if one is alive, is retired (tainted) instead of kept.
+ * KILL does not reach it. Python's thread API is refused and JavaScript/Python cannot reach Java's
+ * thread classes; Java code (Java routines, DBA jars) still can. The worker looks for threads that
+ * are not the runtime's own at RESET (which decides whether it is kept for reuse) and, during a
+ * session, after a top-level request at most every few seconds; with one, it is retired (tainted).
  *
- * <p>The live-thread count is cheap; names are looked at only when it grew (the runtime starts
- * compiler and helper threads lazily).
+ * <p>Plain thread enumeration, no java.lang.management (JMX is slow to start in every worker and
+ * not in the AOT cache).
  */
 final class ThreadWatch {
-  private static final ThreadMXBean MX = ManagementFactory.getThreadMXBean();
   /** The JVM's, Truffle's, GraalPy's and the worker's own threads. */
   private static final String[] SYSTEM = {"main", "mle-", "Reference Handler", "Finalizer",
       "Signal Dispatcher", "Common-Cleaner", "Notification Thread", "Attach Listener",
       "VirtualThread-unblocker", "TruffleCompilerThread", "Truffle", "python-actions-pool",
       "C API reference queue watcher", "process reaper", "JFR "};
-  private int known = -1;
+  private static final long PERIOD_NS = 5_000_000_000L;
+  private static final ThreadGroup ROOT = root();
+  private long next;
+
+  /** After a top-level request: strangers(), at most once per period. */
+  boolean strangersNow() {
+    long now = System.nanoTime();
+    if (now - next < 0) return false;
+    next = now + PERIOD_NS;
+    return strangers();
+  }
 
   /** True if a thread not belonging to the runtime is alive. */
   boolean strangers() {
-    int n = MX.getThreadCount();
-    if (n <= known) return false;
-    for (Thread t : Thread.getAllStackTraces().keySet())
-      if (t.isAlive() && !system(t.getName())) return true;
-    known = n;  // only the runtime's threads: remember the count
+    Thread[] all = new Thread[ROOT.activeCount() + 16];
+    int n = ROOT.enumerate(all, true);
+    for (int i = 0; i < n; i++)
+      if (all[i].isAlive() && !system(all[i].getName())) return true;
     return false;
+  }
+
+  private static ThreadGroup root() {
+    ThreadGroup g = Thread.currentThread().getThreadGroup();
+    while (g.getParent() != null) g = g.getParent();
+    return g;
   }
 
   private static boolean system(String name) {

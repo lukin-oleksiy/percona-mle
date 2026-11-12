@@ -124,6 +124,8 @@ final class Dispatcher {
         case Wire.RESET -> {
           java.reset();
           polyglot.reset();
+          // A worker with a thread a routine left is not kept for reuse (the host retires it).
+          if (!tainted && threads.strangers()) tainted = true;
           // A reset worker is usually parked for reuse: give its memory back (12 §17).
           System.gc();
           result(Wire.OK, null, null, null);
@@ -242,7 +244,7 @@ final class Dispatcher {
     }
     boolean interrupted = top && control.end();
     if (top) polyglot.settleInterrupt(control.takeInterrupter());
-    if (top && !tainted && threads.strangers()) tainted = true;  // retired, not kept
+    if (top && !tainted && threads.strangersNow()) tainted = true;  // retired, not kept
     if (failure != null) failed(failure, interrupted);
     else if (compileError != null) result(Wire.GUEST_ERROR, null, null, guest(language, compileError));
     else result(Wire.OK, null, null, null);
@@ -285,7 +287,7 @@ final class Dispatcher {
       }
       boolean interrupted = top && control.end();
       if (top) polyglot.settleInterrupt(control.takeInterrupter());
-      if (top && !tainted && threads.strangers()) tainted = true;  // retired, not kept
+      if (top && !tainted && threads.strangersNow()) tainted = true;  // retired, not kept
       // A killed statement reports the KILL, even if the routine then ended normally.
       if (failure == null && interrupted) result(Wire.INTERRUPTED, null, null, guest("", "interrupted"));
       else if (failure == null) result(Wire.OK, ret, retType, null, outIndexes, outs, paramTypes(routine, guestRoutine));

@@ -482,7 +482,9 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
   if (current && !principal.empty() && worker_cache_size() > 0 && worker->usable() &&
       !worker->stats().tainted && worker->depth() == 0) {
     std::string error;
-    if (worker->reset(&error) == mle::Status::kOk && worker->usable()) {
+    // RESET also tells whether a routine left a thread running (tainted).
+    if (worker->reset(&error) == mle::Status::kOk && worker->usable() &&
+        !worker->stats().tainted) {
       std::vector<std::unique_ptr<mle::Worker>> evicted;
       {
         std::lock_guard<std::mutex> lock(g_mutex);
