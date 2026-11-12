@@ -90,7 +90,9 @@ bool register_settings();
 void unregister_settings();
 /** The engine settings from the sysvars. */
 Settings current_settings();
-/** Bits of mle.languages. */
+/** Languages installed (engine start: Python is an optional package). */
+void set_installed_languages(unsigned bits);
+/** Bits of mle.languages that are installed. */
 unsigned enabled_languages();
 /** mle.max_workers, mle.spin_us, mle.interrupt_grace_ms. */
 uint32_t max_workers();

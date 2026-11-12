@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+# The JDK AOT cache MLE workers start from (21-packaging.md §3). It must match
+# the installed JDK, jars and languages, so it is made here, and again when the
+# JDK or Python package changes (triggers). Without it workers start slower.
+aot_cache() {
+	if [ -x /usr/lib/mysql/plugin/mle/mle_aot_cache ]; then
+		echo "Creating the MLE AOT cache (up to a minute)..."
+		/usr/lib/mysql/plugin/mle/mle_aot_cache ||
+			echo "Warning: no MLE AOT cache; workers start slower. Run /usr/lib/mysql/plugin/mle/mle_aot_cache to retry." >&2
+	fi
+}
+
+case "$1" in
+	configure|triggered)
+		aot_cache
+		;;
+esac
+
+#DEBHELPER#
+exit 0

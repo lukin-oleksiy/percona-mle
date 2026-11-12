@@ -1,0 +1,63 @@
+#!/bin/sh
+# Copyright (c) 2026 Percona LLC and/or its affiliates. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+# mle_aot_cache: makes the JDK AOT cache MLE workers start from
+# (<mle dir>/mle.aot; 21-packaging.md §3). The cache must match the installed
+# JDK, jars and languages, so it is made where MLE is installed: the packages'
+# install scripts run this after every install or upgrade of MLE, its Python
+# or its JDK. Without a cache workers start slower but work.
+#
+#   mle_aot_cache [JAVA_HOME]     # default: <mle dir>/jdk
+#   mle_aot_cache --remove
+#
+# The JVM options that matter for the cache match the workers'
+# (host/defaults.cc) and the build's (worker/CMakeLists.txt).
+set -eu
+DIR=$(dirname "$(readlink -f "$0")")
+CACHE="$DIR/mle.aot"
+
+if [ "${1:-}" = "--remove" ]; then
+  rm -f "$CACHE" "$CACHE.new"
+  exit 0
+fi
+JAVA_HOME=${1:-$DIR/jdk}
+if [ ! -x "$JAVA_HOME/bin/java" ]; then
+  echo "mle_aot_cache: no JDK at $JAVA_HOME (package percona-server-mle-jdk); no AOT cache" >&2
+  rm -f "$CACHE" "$CACHE.new"
+  exit 0
+fi
+
+set -- -XX:+UseSerialGC --enable-native-access=ALL-UNNAMED \
+  --add-modules=jdk.incubator.vector \
+  -Dpolyglot.engine.userResourceCache="$DIR/resources" \
+  -cp "$DIR/mle-worker.jar"
+if [ -d "$DIR/python-venv/venv" ] && ls "$DIR"/deps/python-language-*.jar >/dev/null 2>&1; then
+  set -- "$@" -Dmle.python.venv="$DIR/python-venv/venv"
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+# A training run (loads, links and profiles what workers run), then the cache.
+HOME="$TMP" "$JAVA_HOME/bin/java" -XX:AOTMode=record \
+  -XX:AOTConfiguration="$TMP/mle.aotconf" "$@" com.percona.mle.worker.Train \
+  > "$TMP/train.log" 2>&1 || { cat "$TMP/train.log" >&2; exit 1; }
+HOME="$TMP" "$JAVA_HOME/bin/java" -XX:AOTMode=create \
+  -XX:AOTConfiguration="$TMP/mle.aotconf" -XX:AOTCache="$TMP/mle.aot" "$@" \
+  > "$TMP/create.log" 2>&1 || { cat "$TMP/create.log" >&2; exit 1; }
+# Running workers map the old cache: replace it by a rename.
+install -m 0644 "$TMP/mle.aot" "$CACHE.new"
+mv -f "$CACHE.new" "$CACHE"
+echo "mle_aot_cache: $CACHE ($(du -h "$CACHE" | cut -f1))"

@@ -1,7 +1,8 @@
 # Percona Server with component_mle (JavaScript, Python + numpy, Java) on
 # Ubuntu 26.04. Built by build-image.sh from a release build installed into
-# stage/ (cmake --install) and a GraalVM JDK 25 in graalvm/ (POC: the image is
-# made from a local build; a reproducible multi-stage build comes later).
+# stage/ (cmake --install), with the GraalVM runtime in lib/plugin/mle/jdk
+# (POC: the image is made from a local build; a reproducible multi-stage build
+# comes later).
 FROM ubuntu:26.04
 
 # The libraries mysqld, its plugins and the MLE binaries need (from ldd of the
@@ -18,7 +19,6 @@ RUN groupadd --system mysql && useradd --system --gid mysql --home /var/lib/mysq
       --shell /usr/sbin/nologin mysql
 
 COPY stage/ /usr/local/mysql/
-COPY graalvm/ /opt/graalvm/
 COPY my.cnf /etc/mysql/my.cnf
 COPY mle-entrypoint.sh /usr/local/bin/mle-entrypoint.sh
 
@@ -26,7 +26,8 @@ ENV PATH=/usr/local/mysql/bin:$PATH
 RUN mkdir -p /var/lib/mysql /var/run/mysqld /var/lib/mysql-mle-packages \
  && chown mysql:mysql /var/lib/mysql /var/run/mysqld \
  && chmod 0755 /var/lib/mysql-mle-packages \
- && mysqld --version
+ && mysqld --version \
+ && /usr/local/mysql/lib/plugin/mle/mle_aot_cache
 
 VOLUME ["/var/lib/mysql", "/var/lib/mysql-mle-packages"]
 EXPOSE 3306

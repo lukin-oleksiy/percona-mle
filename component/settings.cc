@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <unistd.h>
 #include <string>
 
 #include <my_inttypes.h>
@@ -80,6 +81,8 @@ char *g_package_dir = nullptr;
 char *g_pool_prewarm = nullptr;
 
 std::atomic<unsigned> g_language_bits{kAllLanguages};
+/** What is installed (Python is an optional package): set at engine start. */
+std::atomic<unsigned> g_installed_bits{kAllLanguages};
 
 /** Default of mle.dir; must outlive the registration. */
 std::string g_default_dir;
@@ -417,11 +420,13 @@ bool register_settings() {
     return true;
 
   STR_CHECK_ARG(java_home) java_home;
-  java_home.def_val = const_cast<char *>(MLE_DEFAULT_JAVA_HOME);
+  java_home.def_val = const_cast<char *>("");
   if (reg("java_home",
           PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY |
               PLUGIN_VAR_NOPERSIST,
-          "GraalVM JDK 25 that runs the MLE workers.", nullptr, nullptr,
+          "GraalVM JDK 25 that runs the MLE workers; empty: <mle.dir>/jdk "
+          "(package percona-server-mle-jdk), else the build's JDK.",
+          nullptr, nullptr,
           &java_home, &g_java_home))
     return true;
 
@@ -463,6 +468,13 @@ Settings current_settings() {
   s.cgroup_base = text(g_cgroup_base);
   s.dir = text(g_dir);
   s.java_home = text(g_java_home);
+  if (s.java_home.empty()) {
+    // The packaged runtime (21-packaging.md), else the JDK of the build.
+    const std::string packaged = s.dir + "/jdk";
+    s.java_home = access((packaged + "/lib/server/libjvm.so").c_str(), R_OK) == 0
+                      ? packaged
+                      : MLE_DEFAULT_JAVA_HOME;
+  }
   s.package_dir = text(g_package_dir);
   s.pool_prewarm = text(g_pool_prewarm);
   for (char &c : s.pool_prewarm) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
@@ -471,7 +483,11 @@ Settings current_settings() {
   return s;
 }
 
-unsigned enabled_languages() { return g_language_bits.load(); }
+unsigned enabled_languages() {
+  return g_language_bits.load() & g_installed_bits.load();
+}
+
+void set_installed_languages(unsigned bits) { g_installed_bits = bits; }
 
 uint32_t max_workers() { return g_max_workers; }
 size_t worker_cache_size() { return g_worker_cache_size; }

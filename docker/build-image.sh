@@ -1,7 +1,10 @@
 #!/bin/bash
 # Builds the percona-mle image from a release build tree configured with
-# -DWITH_MLE=ON (19-docker.md): installs it into a staging directory, adds
-# the GraalVM JDK the build used (MLE_JAVA_HOME), and runs docker build.
+# -DWITH_MLE=ON (19-docker.md): installs the server and the MLE install
+# components (the packages' split, 21-packaging.md) into a staging directory,
+# with the JDK as <mle dir>/jdk: the trimmed runtime of a build with
+# -DMLE_BUILD_JDK=ON, else a copy of the GraalVM JDK the build used
+# (MLE_JAVA_HOME). Then runs docker build.
 #
 #   components/mle/docker/build-image.sh [--tools] <build dir> [image tag]
 #
@@ -18,21 +21,26 @@ trap 'rm -rf "$CTX"' EXIT
 grep -q '^WITH_MLE:BOOL=ON' "$BUILD/CMakeCache.txt" ||
   { echo "build-image.sh: $BUILD is not configured with -DWITH_MLE=ON" >&2; exit 1; }
 JAVA_HOME_BUILD=$(sed -n 's/^MLE_JAVA_HOME:PATH=//p' "$BUILD/CMakeCache.txt")
+MLE_DIR="$CTX/stage/lib/plugin/mle"
 
 echo "Installing $BUILD into the image context"
-for c in Server Client SharedLibraries MleWorker; do
+for c in Server Client SharedLibraries MleCore MlePython MleTools; do
   cmake --install "$BUILD" --prefix "$CTX/stage" --component "$c" >> "$CTX/install.log"
 done
+if grep -q '^MLE_BUILD_JDK:BOOL=ON' "$BUILD/CMakeCache.txt"; then
+  cmake --install "$BUILD" --prefix "$CTX/stage" --component MleJdk >> "$CTX/install.log"
+else
+  echo "Adding the GraalVM JDK from $JAVA_HOME_BUILD (no -DMLE_BUILD_JDK=ON)"
+  cp -a "$(realpath "$JAVA_HOME_BUILD")/." "$MLE_DIR/jdk/"
+  rm -rf "$MLE_DIR/jdk/lib/src.zip" "$MLE_DIR/jdk/jmods"
+fi
 # Not needed in a server image.
 rm -rf "$CTX/stage/mysql-test" "$CTX/stage/man" "$CTX/stage/docs" \
        "$CTX/stage/include" "$CTX/stage/lib/mysqlrouter" 2>/dev/null || true
 
-echo "Adding the GraalVM JDK from $JAVA_HOME_BUILD"
-cp -a "$(realpath "$JAVA_HOME_BUILD")/." "$CTX/graalvm/"
-rm -rf "$CTX/graalvm/lib/src.zip" "$CTX/graalvm/jmods"
 
 cp "$HERE/Dockerfile" "$HERE/my.cnf" "$HERE/mle-entrypoint.sh" "$CTX/"
-du -sh "$CTX/stage" "$CTX/graalvm"
+du -sh "$CTX/stage" "$MLE_DIR/jdk"
 docker build -t "$TAG" "$CTX"
 
 if [ "$TOOLS" = yes ]; then

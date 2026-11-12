@@ -4,13 +4,15 @@ Design and measured container constraints: `19-docker.md` (MLE design notes).
 
 ## Build
 
-From a release build tree configured with `-DWITH_MLE=ON` and fully built:
+From a release build tree configured with `-DWITH_MLE=ON` (best with `-DMLE_BUILD_JDK=ON`) and fully built:
 
     components/mle/docker/build-image.sh [--tools] ../BUILD-release [percona-mle:dev]
 
-The image (Ubuntu 26.04) holds the server, component_mle with its runtime (`<plugin_dir>/mle`) and the GraalVM JDK
-the build used (`/opt/graalvm`). `--tools` also builds `percona-mle-tools:dev` (mle_package with npm, Maven and a
-GraalPy of the workers' version).
+The image (Ubuntu 26.04) holds the server and component_mle with its runtime in `<plugin_dir>/mle`, as the packages
+install them (`21-packaging.md`): JavaScript, Java, Python + numpy, and the GraalVM runtime in `<plugin_dir>/mle/jdk`
+(the trimmed runtime of `-DMLE_BUILD_JDK=ON`, else a copy of the JDK the build used). The JDK AOT cache for worker
+start is made in the image (`mle_aot_cache`). `--tools` also builds `percona-mle-tools:dev` (mle_package with npm,
+Maven and a GraalPy of the workers' version).
 
 ## Run
 

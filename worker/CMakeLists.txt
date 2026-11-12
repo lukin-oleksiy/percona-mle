@@ -36,7 +36,7 @@ MYSQL_ADD_EXECUTABLE(mle_worker
   bootstrap/seccomp.cc
   LINK_LIBRARIES ${CMAKE_DL_LIBS}
   DESTINATION ${INSTALL_PLUGINDIR}/mle
-  COMPONENT MleWorker
+  COMPONENT MleCore
   )
 TARGET_INCLUDE_DIRECTORIES(mle_worker SYSTEM PRIVATE
   ${MLE_JAVA_HOME}/include ${MLE_JAVA_HOME}/include/linux)
@@ -117,10 +117,13 @@ SET_PROPERTY(GLOBAL PROPERTY MLE_RESOURCE_CACHE ${MLE_RESOURCE_CACHE})
 SET_PROPERTY(GLOBAL PROPERTY MLE_PYTHON_VENV ${MLE_PYTHON_VENV})
 SET_PROPERTY(GLOBAL PROPERTY MLE_AOT_CACHE ${MLE_AOT_CACHE})
 
-# Installed layout: <plugin dir>/mle (see include/mle/defaults.h). The
-# component MleWorker is separate from Server for now (POC; packaging later).
-# The AOT cache checks the jars' paths, sizes and modification times: CMake
-# keeps the times when it installs, and the cache is installed with the jars.
+# Installed layout: <plugin dir>/mle (see include/mle/defaults.h), in the
+# install components of the packages (21-packaging.md): MleCore (launcher,
+# worker, jars, the JavaScript/Java runtime), MlePython (GraalPy, numpy),
+# MleJdk (a trimmed GraalVM runtime, -DMLE_BUILD_JDK=ON), MleTools.
+# The JDK AOT cache is not installed: it must match the installed JDK, jars
+# and languages, so mle_aot_cache makes it where MLE is installed (the
+# packages' install scripts run it).
 # The venv is used by GraalPy inside the workers: its site finds it from
 # sys.executable (venv/bin/python, which must exist) and pyvenv.cfg. Its bin/
 # points to the GraalPy that built it (build tree), so a placeholder python
@@ -128,20 +131,65 @@ SET_PROPERTY(GLOBAL PROPERTY MLE_AOT_CACHE ${MLE_AOT_CACHE})
 # others whatever the builder's umask (workers run them), without build
 # stamps.
 SET(MLE_INSTALL_DIR ${INSTALL_PLUGINDIR}/mle)
+SET(MLE_FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+SET(MLE_DIRECTORY_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+  GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 FILE(WRITE ${CMAKE_CURRENT_BINARY_DIR}/mle-venv-python
   "#!/bin/sh\necho 'This venv is used by GraalPy inside MLE workers only.' >&2\nexit 1\n")
-INSTALL(FILES ${MLE_WORKER_JAR} ${MLE_AOT_CACHE}
-  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleWorker
-  PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+INSTALL(FILES ${MLE_WORKER_JAR}
+  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleCore
+  PERMISSIONS ${MLE_FILE_PERMISSIONS})
+# The runtime jars: GraalPy's go with Python.
 INSTALL(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/maven/deps
-                  ${MLE_RESOURCE_CACHE}
-                  ${CMAKE_CURRENT_BINARY_DIR}/python-venv
-  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleWorker
-  FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
-  DIRECTORY_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
-                        GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleCore
+  FILE_PERMISSIONS ${MLE_FILE_PERMISSIONS}
+  DIRECTORY_PERMISSIONS ${MLE_DIRECTORY_PERMISSIONS}
+  PATTERN "python-*.jar" EXCLUDE)
+INSTALL(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/maven/deps
+  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MlePython
+  FILE_PERMISSIONS ${MLE_FILE_PERMISSIONS}
+  DIRECTORY_PERMISSIONS ${MLE_DIRECTORY_PERMISSIONS}
+  FILES_MATCHING PATTERN "python-*.jar")
+# The languages' extracted resources: the Python standard library goes with
+# Python.
+INSTALL(DIRECTORY ${MLE_RESOURCE_CACHE}
+  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleCore
+  FILE_PERMISSIONS ${MLE_FILE_PERMISSIONS}
+  DIRECTORY_PERMISSIONS ${MLE_DIRECTORY_PERMISSIONS}
+  PATTERN ".mle-*" EXCLUDE
+  REGEX "/resources/python(/.*)?$" EXCLUDE)
+INSTALL(DIRECTORY ${MLE_RESOURCE_CACHE}/python
+  DESTINATION ${MLE_INSTALL_DIR}/resources COMPONENT MlePython
+  FILE_PERMISSIONS ${MLE_FILE_PERMISSIONS}
+  DIRECTORY_PERMISSIONS ${MLE_DIRECTORY_PERMISSIONS})
+INSTALL(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/python-venv
+  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MlePython
+  FILE_PERMISSIONS ${MLE_FILE_PERMISSIONS}
+  DIRECTORY_PERMISSIONS ${MLE_DIRECTORY_PERMISSIONS}
   PATTERN ".mle-*" EXCLUDE
   REGEX "/venv/bin(/.*)?$" EXCLUDE)
 INSTALL(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/mle-venv-python
   DESTINATION ${MLE_INSTALL_DIR}/python-venv/venv/bin RENAME python
-  COMPONENT MleWorker)
+  COMPONENT MlePython)
+
+# A trimmed GraalVM runtime for the packages (percona-server-mle-jdk): what
+# the workers use of the JDK (the Graal compiler with libgraal for Truffle,
+# javac for Java routines, the vector incubator module). ~160 MB instead of
+# ~730 MB; installed as <mle.dir>/jdk, the default of mle.java_home.
+OPTION(MLE_BUILD_JDK "Build a trimmed GraalVM runtime (jlink) for MLE packages" OFF)
+IF(MLE_BUILD_JDK)
+  SET(MLE_JDK_DIR ${CMAKE_CURRENT_BINARY_DIR}/jdk)
+  SET(MLE_JDK_MODULES
+    java.base,java.logging,java.xml,java.sql,java.naming,java.compiler,jdk.compiler,jdk.zipfs,jdk.unsupported,jdk.incubator.vector,jdk.internal.vm.ci,jdk.graal.compiler,java.management,jdk.management,jdk.crypto.ec)
+  ADD_CUSTOM_COMMAND(OUTPUT ${MLE_JDK_DIR}/release
+    COMMAND ${CMAKE_COMMAND} -E rm -rf ${MLE_JDK_DIR}
+    COMMAND ${MLE_JAVA_HOME}/bin/jlink --add-modules ${MLE_JDK_MODULES}
+      --strip-debug --no-man-pages --no-header-files --output ${MLE_JDK_DIR}
+    COMMENT "Linking a trimmed GraalVM runtime for MLE"
+    VERBATIM
+    )
+  ADD_CUSTOM_TARGET(mle_jdk ALL DEPENDS ${MLE_JDK_DIR}/release)
+  INSTALL(DIRECTORY ${MLE_JDK_DIR}/
+    DESTINATION ${MLE_INSTALL_DIR}/jdk COMPONENT MleJdk
+    USE_SOURCE_PERMISSIONS)
+ENDIF()

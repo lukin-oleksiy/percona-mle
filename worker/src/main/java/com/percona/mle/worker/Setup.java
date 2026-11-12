@@ -31,7 +31,7 @@ public final class Setup {
     int status = 0;
     try (Context c = Polyglot.builder(null).build()) {
       c.eval("js", "1");
-      c.eval("python", "import json, decimal, datetime, array");
+      if (Polyglot.PYTHON) c.eval("python", "import json, decimal, datetime, array");
     } catch (Throwable t) {
       t.printStackTrace();
       status = 1;

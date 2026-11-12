@@ -70,15 +70,19 @@ public final class Train {
     // JS and Python routines, numpy when the venv is there.
     Polyglot polyglot = new Polyglot(new Console(), new Options());
     polyglot.prepare(2, "js", "", "f", "function f(a, b, c) { return a + b.length + c; }", threeArgs, i64, List.of());
-    polyglot.prepare(3, "python", "", "f", "def f(a, b, c):\n    return a + len(b) + int(c)\n", threeArgs, i64, List.of());
     // The body forms (CREATE ... AS $$ body $$).
     polyglot.prepare(6, "js", "jf", "", "return a + b.length + c;", threeArgs, i64, List.of());
-    polyglot.prepare(7, "python", "pf", "", "return a + len(b) + int(c)", threeArgs, i64, List.of());
+    // Python only where it is installed (the AOT cache is made for the installed languages).
+    if (Polyglot.PYTHON) {
+      polyglot.prepare(3, "python", "", "f", "def f(a, b, c):\n    return a + len(b) + int(c)\n", threeArgs, i64, List.of());
+      polyglot.prepare(7, "python", "pf", "", "return a + len(b) + int(c)", threeArgs, i64, List.of());
+    }
     Object[] outs = new Object[3];
     for (int i = 0; i < rounds; i++) {
-      for (int id : new int[] {2, 3, 6, 7}) polyglot.invoke(polyglot.get(id), new Object[] {1L, "hello", 2.0}, outs);
+      for (int id : Polyglot.PYTHON ? new int[] {2, 3, 6, 7} : new int[] {2, 6})
+        polyglot.invoke(polyglot.get(id), new Object[] {1L, "hello", 2.0}, outs);
     }
-    if (!System.getProperty("mle.python.venv", "").isEmpty()) {
+    if (Polyglot.PYTHON && !System.getProperty("mle.python.venv", "").isEmpty()) {
       polyglot.prepare(4, "python", "", "f", "import numpy as np\ndef f(v):\n    return float(np.dot(v, v))\n",
           List.of(new JavaRoutines.Param("v", 0, vec)), f64, List.of());
       polyglot.context().eval("python", "import numpy; numpy.ones(768) @ numpy.ones(768)");

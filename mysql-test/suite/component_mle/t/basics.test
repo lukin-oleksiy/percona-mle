@@ -17,10 +17,12 @@ SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status
 --source ../include/wait_for_pool.inc
 
 --echo # System variables (paths differ per build).
---replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR
---replace_regex /(mle\.dir\s+).*/\1<plugin_dir>\/mle/ /(mle\.java_home\s+).*/\1<java_home>/
-SHOW GLOBAL VARIABLES LIKE 'mle.%';
-SELECT @@mle.dir = CONCAT(TRIM(TRAILING '/' FROM @@plugin_dir), '/mle') AS default_dir;
+SHOW GLOBAL VARIABLES WHERE Variable_name LIKE 'mle.%'
+  AND Variable_name NOT IN ('mle.dir', 'mle.java_home');
+# Defaults: <plugin dir>/mle; empty, i.e. <mle.dir>/jdk if installed (package
+# percona-server-mle-jdk), else the JDK of the build.
+SELECT @@mle.dir = CONCAT(TRIM(TRAILING '/' FROM @@plugin_dir), '/mle') AS default_dir,
+       @@mle.java_home = '' AS default_java_home;
 
 --echo # Status variables.
 --replace_column 2 #

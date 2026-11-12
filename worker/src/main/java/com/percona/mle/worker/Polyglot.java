@@ -60,7 +60,18 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
  * <p>System properties: mle.python.venv (a GraalPy venv, e.g. with numpy).
  */
 final class Polyglot {
-  static final List<String> LANGUAGES = List.of("js", "python");
+  /** GraalPy is optional (package percona-server-mle-python, 21-packaging.md §2). */
+  static final boolean PYTHON = installed("com.oracle.graal.python.PythonLanguage");
+  static final List<String> LANGUAGES = PYTHON ? List.of("js", "python") : List.of("js");
+
+  private static boolean installed(String languageClass) {
+    try {
+      Class.forName(languageClass, false, Polyglot.class.getClassLoader());
+      return true;
+    } catch (ClassNotFoundException | LinkageError e) {
+      return false;
+    }
+  }
 
   /**
    * What JavaScript and Python may use of Java objects: everything (polyglot reach: DBA jars,
@@ -219,7 +230,7 @@ final class Polyglot {
    */
   @SuppressWarnings("deprecation")
   static Context.Builder builder(Console console) {
-    Context.Builder b = Context.newBuilder("js", "python")
+    Context.Builder b = Context.newBuilder(LANGUAGES.toArray(new String[0]))
         .allowHostAccess(HOST_ACCESS)
         // The process is the sandbox; only the worker's own classes are hidden.
         .allowHostClassLookup(name -> !name.startsWith("com.percona.mle.worker.") && !THREAD_CLASSES.contains(name))
@@ -243,11 +254,13 @@ final class Polyglot {
         .option("js.esm-eval-returns-exports", "true")
         .option("engine.WarnInterpreterOnly", "false")
         .option(FrameLimit.ID, "true")
-        .option("python.PosixModuleBackend", "java")
-        .option("python.DontWriteBytecodeFlag", "true")
-        .option("python.NoUserSiteFlag", "true")
-        .option("python.WarnExperimentalFeatures", "false")
         .environment("HOME", "/nonexistent");  // GraalPy looks up the home directory (U-1)
+    // Python is an optional package: its options exist only when GraalPy is installed.
+    if (PYTHON)
+      b.option("python.PosixModuleBackend", "java")
+          .option("python.DontWriteBytecodeFlag", "true")
+          .option("python.NoUserSiteFlag", "true")
+          .option("python.WarnExperimentalFeatures", "false");
     // Third-party packages installed by the DBA (14 §3): npm packages for require() and
     // import of bare names (CommonJS support is an experimental GraalJS option), Python
     // packages on the module path.
@@ -263,12 +276,12 @@ final class Polyglot {
       Path site = Path.of(packages, "python", "site-packages");
       if (java.nio.file.Files.isDirectory(site)) pythonPath.add(site.toString());
     }
-    if (!pythonPath.isEmpty()) b.option("python.PythonPath", String.join(java.io.File.pathSeparator, pythonPath));
+    if (PYTHON && !pythonPath.isEmpty()) b.option("python.PythonPath", String.join(java.io.File.pathSeparator, pythonPath));
     // The build's venv (numpy): GraalPy's site finds it from sys.executable's directory and its
-    // pyvenv.cfg. Only the path is used: bin/python need not exist (it points to the GraalPy that
-    // built the venv, which is not installed with MLE).
+    // pyvenv.cfg. Only the path is used: the installed bin/python is a placeholder (the venv's own
+    // points to the GraalPy that built it, which is not installed with MLE).
     String venv = System.getProperty("mle.python.venv", "");
-    if (!venv.isEmpty())
+    if (PYTHON && !venv.isEmpty())
       b.option("python.Executable", Path.of(venv).resolve("bin/python").toString())
           .option("python.ForceImportSite", "true");
     if (console != null) b.out(console.outStream()).err(console.errStream());
@@ -539,6 +552,8 @@ final class Polyglot {
   /** importPython(name) / Mle.importPython: a Python module (numpy ...) for any language. */
   Value importPython(String module) {
     Context c = context();
+    if (!PYTHON)
+      throw new IllegalStateException("Python is not installed in this MLE (package percona-server-mle-python)");
     return c.eval("python", "import importlib\nlambda n: importlib.import_module(n)").execute(module);
   }
 
@@ -556,6 +571,8 @@ final class Polyglot {
   /** Python's helpers and SQL API, made when the first Python routine is loaded. */
   private void pythonReady() {
     if (python != null) return;
+    if (!PYTHON)
+      throw new IllegalStateException("Python is not installed in this MLE (package percona-server-mle-python)");
     Context c = context();
     // All or nothing: an interrupt (KILL) in between leaves Python to be set up again.
     Helpers h = pythonHelpers(c);
@@ -753,6 +770,7 @@ final class Polyglot {
 
   /** Pre-warming (mle.pool_prewarm): Python, and numpy too. */
   void prewarmPython(boolean numpy) {
+    if (!PYTHON) return;
     pythonReady();
     if (numpy) context().eval("python", "import numpy");
   }

@@ -65,8 +65,11 @@ ADD_CUSTOM_TARGET(mle_build_layout ALL
   )
 ADD_DEPENDENCIES(mle_build_layout mle_launcher mle_worker mle_worker_jar)
 
-# The DBA's tool for third-party packages (14-phase6-libraries.md §3).
+# The DBA's tool for third-party packages (14-phase6-libraries.md §3), and
+# the AOT cache maker the packages' install scripts run (21-packaging.md §3).
 INSTALL(PROGRAMS tools/mle_package DESTINATION ${INSTALL_PLUGINDIR}/mle
-  COMPONENT MleWorker)
+  COMPONENT MleTools)
+INSTALL(PROGRAMS tools/mle_aot_cache DESTINATION ${INSTALL_PLUGINDIR}/mle
+  COMPONENT MleCore)
 
 ADD_SUBDIRECTORY(component)

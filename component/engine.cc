@@ -16,6 +16,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 #include "engine.h"
+#include "mle_component.h"
 
 #include <unistd.h>
 
@@ -228,6 +229,10 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   if (char real[PATH_MAX]; !s.package_dir.empty() &&
                            realpath(s.package_dir.c_str(), real) != nullptr)
     layout.package_dir = real;  // a missing directory: no packages
+  // Python is an optional package: without GraalPy, PYTHON routines are an
+  // unsupported language.
+  set_installed_languages(layout.python ? kAllLanguages
+                                        : kAllLanguages & ~kPython);
   *error = check_layout(layout, s);
   if (!error->empty()) {
     if (!g_launcher) g_error = *error;
@@ -306,7 +311,8 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
           std::to_string(s.pool_size) + ", files in " + s.dir +
           ", JDK " + layout.java_home +
           (layout.aot_cache.empty() ? ", no AOT cache" : "") +
-          (layout.python_venv.empty() ? ", no Python venv (no numpy)" : "") +
+          (!layout.python ? ", no Python (package percona-server-mle-python)"
+           : layout.python_venv.empty() ? ", no Python venv (no numpy)" : "") +
           (layout.package_dir.empty() ? "" : ", packages in " + layout.package_dir) +
           ".";
   // The new engine: kept workers have the old settings; running sessions'

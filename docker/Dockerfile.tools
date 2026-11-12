@@ -10,7 +10,7 @@ RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       nodejs npm maven python3 \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
-ENV JAVA_HOME=/opt/graalvm
+# Maven runs on the JRE it brings; GraalPy on the workers' runtime (graalpy).
 
 # GraalPy as the workers run it (same version): its jars from Maven Central,
 # a launcher script, and a venv with pip for mle_package.

@@ -26,7 +26,12 @@ MYSQL_ADD_COMPONENT(mle
   udfs.cc
   LINK_LIBRARIES mle_host
   MODULE_ONLY
+  SKIP_INSTALL
   )
+# In the package percona-server-mle (install component MleCore), not in the
+# server's.
+MYSQL_INSTALL_TARGET(component_mle DESTINATION ${INSTALL_PLUGINDIR}
+  COMPONENT MleCore)
 # Default of mle.java_home: the GraalVM JDK the worker was built with.
 TARGET_COMPILE_DEFINITIONS(component_mle PRIVATE
   MLE_DEFAULT_JAVA_HOME="${MLE_JAVA_HOME}")

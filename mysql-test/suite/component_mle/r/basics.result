@@ -13,13 +13,12 @@ mle_status
 Active
 # The pool fills: one JVM worker with Java, JavaScript and Python.
 # System variables (paths differ per build).
-SHOW GLOBAL VARIABLES LIKE 'mle.%';
+SHOW GLOBAL VARIABLES WHERE Variable_name LIKE 'mle.%'
+  AND Variable_name NOT IN ('mle.dir', 'mle.java_home');
 Variable_name	Value
 mle.cgroup_base	AUTO
-mle.dir	/home/al/projects-m/BUILD-percona-server-my/plugin_output_directory/mle
 mle.heap_max	536870912
 mle.interrupt_grace_ms	1000
-mle.java_home	/home/al/.sdkman/candidates/java/current
 mle.languages	JAVASCRIPT,PYTHON,JAVA
 mle.max_workers	64
 mle.memory_max	2147483648
@@ -33,9 +32,10 @@ mle.sql_row_max	16777216
 mle.sql_statements_max	1024
 mle.worker_cache_size	4
 mle.worker_cache_timeout	60
-SELECT @@mle.dir = CONCAT(TRIM(TRAILING '/' FROM @@plugin_dir), '/mle') AS default_dir;
-default_dir
-1
+SELECT @@mle.dir = CONCAT(TRIM(TRAILING '/' FROM @@plugin_dir), '/mle') AS default_dir,
+@@mle.java_home = '' AS default_java_home;
+default_dir	default_java_home
+1	1
 # Status variables.
 SHOW GLOBAL STATUS LIKE 'mle%';
 Variable_name	Value

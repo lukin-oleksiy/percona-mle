@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# The AOT cache is not a file of the package: remove it with the package (an
+# upgrade makes a new one).
+case "$1" in
+	remove|upgrade|deconfigure)
+		rm -f /usr/lib/mysql/plugin/mle/mle.aot /usr/lib/mysql/plugin/mle/mle.aot.new
+		;;
+esac
+
+#DEBHELPER#
+exit 0

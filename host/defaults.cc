@@ -63,6 +63,11 @@ Layout Layout::installed(const std::string &dir, const std::string &java_home) {
     globfree(&g);
   }
   if (exists(dir + "/mle.aot")) l.aot_cache = resolve(dir + "/mle.aot");
+  if (glob_t g{}; glob((dir_of(l.worker_jar) + "/deps/python-language-*.jar").c_str(), 0,
+                       nullptr, &g) == 0) {
+    l.python = g.gl_pathc > 0;
+    globfree(&g);
+  }
   l.java_home = resolve(java_home);
   return l;
 }

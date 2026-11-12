@@ -54,6 +54,8 @@ struct Layout {
   std::string java_home;
   /** Third-party packages (read-only for workers); empty: none. */
   std::string package_dir;
+  /** GraalPy is installed (deps/python-language-*.jar; an optional package). */
+  bool python = false;
 
   /** The installed layout below dir; optional parts that do not exist are
       left empty. Symlinks are resolved (the build tree has a layout of
