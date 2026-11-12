@@ -35,7 +35,7 @@ if [ "${1:-}" = "--remove" ]; then
 fi
 JAVA_HOME=${1:-$DIR/jdk}
 if [ ! -x "$JAVA_HOME/bin/java" ]; then
-  echo "mle_aot_cache: no JDK at $JAVA_HOME (package percona-server-mle-jdk); no AOT cache" >&2
+  echo "mle_aot_cache: no JDK at $JAVA_HOME (package percona-mle-jdk); no AOT cache" >&2
   rm -f "$CACHE" "$CACHE.new"
   exit 0
 fi

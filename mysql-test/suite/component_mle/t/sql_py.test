@@ -3,7 +3,7 @@
 --echo # the Java core, with snake_case names and Python values; the globals
 --echo # session, mysql and SqlError.
 --echo #
---source include/have_mle_component.inc
+--source ../include/have_mle_component.inc
 --source include/count_sessions.inc
 
 INSTALL COMPONENT "file://component_mle";

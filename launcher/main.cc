@@ -16,7 +16,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 /**
-  @file components/mle/launcher/main.cc
+  @file launcher/main.cc
 
   mle_launcher: starts MLE worker processes for the host (mysqld).
 

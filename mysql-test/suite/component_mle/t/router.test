@@ -4,7 +4,7 @@
 --echo # PYTHON and JAVA run in MLE.
 --echo #
 --source include/have_lang_router_component.inc
---source include/have_mle_component.inc
+--source ../include/have_mle_component.inc
 --source include/have_js_lang_component.inc
 --source include/count_sessions.inc
 

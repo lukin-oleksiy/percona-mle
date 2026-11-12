@@ -16,7 +16,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 /**
-  @file components/mle/component/status.cc
+  @file component/status.cc
 
   The mle_* status variables: Oracle's names (05 §7), with our meaning
   where the engine differs (11-phase4-component.md §6a), and ours.

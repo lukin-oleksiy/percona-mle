@@ -1,7 +1,7 @@
 --echo #
 --echo # component_mle: regressions for the project review (17-project-review.md).
 --echo #
---source include/have_mle_component.inc
+--source ../include/have_mle_component.inc
 --source include/count_sessions.inc
 
 INSTALL COMPONENT "file://component_mle";

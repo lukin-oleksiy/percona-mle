@@ -19,7 +19,7 @@
 #define COMPONENTS_MLE_COMPONENT_ENGINE_H
 
 /**
-  @file components/mle/component/engine.h
+  @file component/engine.h
 
   The MLE engine of the server: one mle_launcher process with the worker
   class of the current settings and its warm pool (11-phase4-component.md

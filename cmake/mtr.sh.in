@@ -1,0 +1,8 @@
+#!/bin/sh
+# The MLE MTR suite on the server build @MYSQL_BUILD_DIR@ (generated from
+# cmake/mtr.sh.in): what the server's plugin.defs gives its own components,
+# and the suite's directory for its data.
+export MLE_COMPONENT=component_mle.so
+export MLE_COMPONENT_OPT=--plugin-dir=@MYSQL_BUILD_DIR@/plugin_output_directory
+export MLE_SUITE_DIR=@CMAKE_SOURCE_DIR@/mysql-test/suite/component_mle
+cd @MYSQL_BUILD_DIR@/mysql-test && exec ./mysql-test-run.pl --suite="$MLE_SUITE_DIR" "$@"

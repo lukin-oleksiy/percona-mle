@@ -28,7 +28,7 @@ MYSQL_ADD_COMPONENT(mle
   MODULE_ONLY
   SKIP_INSTALL
   )
-# In the package percona-server-mle (install component MleCore), not in the
+# In the package percona-mle (install component MleCore), not in the
 # server's.
 MYSQL_INSTALL_TARGET(component_mle DESTINATION ${INSTALL_PLUGINDIR}
   COMPONENT MleCore)

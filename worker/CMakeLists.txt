@@ -21,12 +21,12 @@ SET(MLE_JAVA_HOME "$ENV{JAVA_HOME}" CACHE PATH
 IF(NOT EXISTS "${MLE_JAVA_HOME}/include/jni.h" OR
    NOT EXISTS "${MLE_JAVA_HOME}/lib/server/libjvm.so")
   MESSAGE(FATAL_ERROR
-    "WITH_MLE: MLE_JAVA_HOME (${MLE_JAVA_HOME}) must be a GraalVM JDK 25 "
+    "MLE: MLE_JAVA_HOME (${MLE_JAVA_HOME}) must be a GraalVM JDK 25 "
     "with include/jni.h and lib/server/libjvm.so")
 ENDIF()
 FIND_PROGRAM(MLE_MAVEN mvn)
 IF(NOT MLE_MAVEN)
-  MESSAGE(FATAL_ERROR "WITH_MLE: Maven (mvn) is needed to build mle-worker.jar")
+  MESSAGE(FATAL_ERROR "MLE: Maven (mvn) is needed to build mle-worker.jar")
 ENDIF()
 
 # libjvm is loaded with dlopen (path given at run time), so mle_worker does
@@ -172,7 +172,7 @@ INSTALL(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/mle-venv-python
   DESTINATION ${MLE_INSTALL_DIR}/python-venv/venv/bin RENAME python
   COMPONENT MlePython)
 
-# A trimmed GraalVM runtime for the packages (percona-server-mle-jdk): what
+# A trimmed GraalVM runtime for the packages (percona-mle-jdk): what
 # the workers use of the JDK (the Graal compiler with libgraal for Truffle,
 # javac for Java routines, the vector incubator module). ~160 MB instead of
 # ~730 MB; installed as <mle.dir>/jdk, the default of mle.java_home.

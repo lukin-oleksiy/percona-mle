@@ -19,7 +19,7 @@
 #define COMPONENTS_MLE_COMPONENT_SQL_H
 
 /**
-  @file components/mle/component/sql.h
+  @file component/sql.h
 
   SQL from routines (Phase 5, 12-phase5-sql-api.md): the statements one
   routine call runs through the server's mysql_stmt_* services, on the

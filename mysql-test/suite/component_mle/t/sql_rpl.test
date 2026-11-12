@@ -5,7 +5,7 @@
 --echo # (as for SQL procedures, the CALL itself is not logged); the routine
 --echo # definitions replicate and the replica needs no MLE.
 --echo #
---source include/have_mle_component.inc
+--source ../include/have_mle_component.inc
 --source include/have_binlog_format_row_or_statement.inc
 --source include/rpl/init_source_replica.inc
 

@@ -19,7 +19,7 @@
 #define MLE_WORKER_H
 
 /**
-  @file components/mle/include/mle/worker.h
+  @file include/mle/worker.h
 
   The host's handle on one worker process (libmle_host): runs the mailbox
   protocol (protocol.h) for READY, PREPARE, CALL, DROP and RESET, serves

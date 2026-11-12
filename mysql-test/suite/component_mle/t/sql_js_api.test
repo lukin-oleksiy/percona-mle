@@ -3,7 +3,7 @@
 --echo # values and options, parameters, rows, results, session variables,
 --echo # schemas and tables, transactions, mysql.*, errors.
 --echo #
---source include/have_mle_component.inc
+--source ../include/have_mle_component.inc
 --source include/count_sessions.inc
 
 INSTALL COMPONENT "file://component_mle";

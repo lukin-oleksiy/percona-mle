@@ -16,7 +16,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 /**
-  @file components/mle/component/component.cc
+  @file component/component.cc
 
   component_mle: stored programs in LANGUAGE JAVASCRIPT (Oracle MySQL MLE
   compatible), PYTHON and JAVA, run in MLE worker processes (Phase 3) that

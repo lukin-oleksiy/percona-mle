@@ -4,9 +4,10 @@ Design and measured container constraints: `19-docker.md` (MLE design notes).
 
 ## Build
 
-From a release build tree configured with `-DWITH_MLE=ON` (best with `-DMLE_BUILD_JDK=ON`) and fully built:
+From a release build of Percona Server with the language router (`-DWITH_LANG_ROUTER=ON`, the default with js_lang)
+and a release build of percona-mle against it (best with `-DMLE_BUILD_JDK=ON`), both fully built:
 
-    components/mle/docker/build-image.sh [--tools] ../BUILD-release [percona-mle:dev]
+    docker/build-image.sh [--tools] ../BUILD-server-release ../BUILD-mle-release [percona-mle:dev]
 
 The image (Ubuntu 26.04) holds the server and component_mle with its runtime in `<plugin_dir>/mle`, as the packages
 install them (`21-packaging.md`): JavaScript, Java, Python + numpy, and the GraalVM runtime in `<plugin_dir>/mle/jdk`

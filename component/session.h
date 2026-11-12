@@ -19,7 +19,7 @@
 #define COMPONENTS_MLE_COMPONENT_SESSION_H
 
 /**
-  @file components/mle/component/session.h
+  @file component/session.h
 
   The MLE state of a client session (thd_store slot): one worker per
   principal (D-8: the definer for SQL SECURITY DEFINER routines, else the

@@ -19,7 +19,7 @@
 #define MLE_DEFAULTS_H
 
 /**
-  @file components/mle/include/mle/defaults.h
+  @file include/mle/defaults.h
 
   Where the MLE files are and how a JVM worker class (D-10) is configured
   by default. Used by the component (Phase 4), the benchmark harness and the

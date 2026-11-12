@@ -19,7 +19,7 @@
 #define COMPONENTS_MLE_COMPONENT_MLE_COMPONENT_H
 
 /**
-  @file components/mle/component/mle_component.h
+  @file component/mle_component.h
 
   What the parts of component_mle share: languages, counters, settings
   (sysvars, settings.cc), status variables (status.cc) and the error log.

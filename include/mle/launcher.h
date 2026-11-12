@@ -19,7 +19,7 @@
 #define MLE_LAUNCHER_H
 
 /**
-  @file components/mle/include/mle/launcher.h
+  @file include/mle/launcher.h
 
   Host side of the MLE launcher (libmle_host): starts mle_launcher, asks it
   for worker processes and owns what it hands over (the mapped mailbox, the

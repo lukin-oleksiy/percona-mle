@@ -16,7 +16,7 @@
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
   mle-worker.jar: the Java side of the MLE JVM worker (D-10). Built by CMake
-  (components/mle/worker/CMakeLists.txt), which passes mle.build.dir so that
+  (worker/CMakeLists.txt), which passes mle.build.dir so that
   nothing is written into the source tree.
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"

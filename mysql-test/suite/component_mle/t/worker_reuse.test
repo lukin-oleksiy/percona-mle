@@ -3,7 +3,7 @@
 --echo # (mle.worker_cache_size, mle.worker_cache_timeout; 12 §17). A kept worker
 --echo # was reset: no routines; its runtime stays warm.
 --echo #
---source include/have_mle_component.inc
+--source ../include/have_mle_component.inc
 --source include/have_debug.inc
 --source include/count_sessions.inc
 

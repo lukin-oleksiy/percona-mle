@@ -16,7 +16,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 /**
-  @file components/mle/component/settings.cc
+  @file component/settings.cc
 
   The mle.* system variables (11-phase4-component.md §6).
 
@@ -425,7 +425,7 @@ bool register_settings() {
           PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY |
               PLUGIN_VAR_NOPERSIST,
           "GraalVM JDK 25 that runs the MLE workers; empty: <mle.dir>/jdk "
-          "(package percona-server-mle-jdk), else the build's JDK.",
+          "(package percona-mle-jdk), else the build's JDK.",
           nullptr, nullptr,
           &java_home, &g_java_home))
     return true;

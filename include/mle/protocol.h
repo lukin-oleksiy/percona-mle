@@ -19,7 +19,7 @@
 #define MLE_PROTOCOL_H
 
 /**
-  @file components/mle/include/mle/protocol.h
+  @file include/mle/protocol.h
 
   Wire protocol v1 between the MLE host (mysqld) and an MLE worker process.
 

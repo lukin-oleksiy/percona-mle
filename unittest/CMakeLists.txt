@@ -13,11 +13,17 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
-IF(NOT WITH_MLE)
+# GoogleTest from the server build (cmake/server.cmake).
+OPTION(MLE_WITH_UNIT_TESTS "Build the MLE unit tests (GoogleTest of the server build)" ON)
+IF(NOT MLE_WITH_UNIT_TESTS)
   RETURN()
 ENDIF()
-
-INCLUDE_DIRECTORIES(SYSTEM ${GMOCK_INCLUDE_DIRS})
+IF(NOT MLE_GTEST_LIB OR NOT MLE_GTEST_MAIN_LIB OR NOT MLE_GMOCK_LIB)
+  MESSAGE(FATAL_ERROR "No GoogleTest libraries in ${MYSQL_BUILD_DIR}; build the server "
+    "with its unit tests, or configure with -DMLE_WITH_UNIT_TESTS=OFF")
+ENDIF()
+INCLUDE_DIRECTORIES(SYSTEM ${MLE_GTEST_INCLUDE_DIRS})
+FIND_PACKAGE(Threads REQUIRED)
 
 SET(MLE_TESTS
   codec
@@ -33,7 +39,7 @@ SET(MLE_TESTS
 FOREACH(test ${MLE_TESTS})
   MYSQL_ADD_EXECUTABLE(mle_${test}-t ${test}-t.cc
     ADD_TEST mle_${test}
-    LINK_LIBRARIES mle_host gunit_small
+    LINK_LIBRARIES mle_host ${MLE_GMOCK_LIB} ${MLE_GTEST_MAIN_LIB} ${MLE_GTEST_LIB} Threads::Threads
     )
 ENDFOREACH()
 

@@ -16,7 +16,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 /**
-  @file components/mle/component/udfs.cc
+  @file component/udfs.cc
 
   Oracle MLE's session UDFs (MySQL manual 26.10, 05 §7):
     mle_session_state(key)  is_active, stdout, stderr, stack_trace,

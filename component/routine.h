@@ -19,7 +19,7 @@
 #define COMPONENTS_MLE_COMPONENT_ROUTINE_H
 
 /**
-  @file components/mle/component/routine.h
+  @file component/routine.h
 
   A stored program as the component keeps it (the SQL layer's
   external_program_handle): its PREPARE message for the workers, and how

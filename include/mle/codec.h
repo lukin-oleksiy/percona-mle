@@ -19,7 +19,7 @@
 #define MLE_CODEC_H
 
 /**
-  @file components/mle/include/mle/codec.h
+  @file include/mle/codec.h
 
   Encoding and decoding of MLE wire protocol v1 message bodies (protocol.h),
   and reassembly of chunked messages.

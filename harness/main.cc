@@ -16,7 +16,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 /**
-  @file components/mle/harness/main.cc
+  @file harness/main.cc
 
   mle_harness: benchmarks of the MLE worker runtime without mysqld, through
   the same libmle_host the component uses, from an MLE directory (installed

@@ -16,7 +16,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 /**
-  @file components/mle/worker/bootstrap/main.cc
+  @file worker/bootstrap/main.cc
 
   mle_worker: the MLE worker process (JVM worker, D-10).
 

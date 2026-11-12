@@ -19,7 +19,7 @@
 #define MLE_LAUNCHER_PROTOCOL_H
 
 /**
-  @file components/mle/include/mle/launcher_protocol.h
+  @file include/mle/launcher_protocol.h
 
   Messages between the MLE host (libmle_host) and mle_launcher over the
   SOCK_SEQPACKET socket that is the launcher's fd 3. One message per

@@ -1,30 +1,38 @@
 #!/bin/bash
-# Builds the percona-mle image from a release build tree configured with
-# -DWITH_MLE=ON (19-docker.md): installs the server and the MLE install
-# components (the packages' split, 21-packaging.md) into a staging directory,
-# with the JDK as <mle dir>/jdk: the trimmed runtime of a build with
-# -DMLE_BUILD_JDK=ON, else a copy of the GraalVM JDK the build used
-# (MLE_JAVA_HOME). Then runs docker build.
+# Builds the percona-mle image (19-docker.md) from a release build of Percona
+# Server (with the language router) and a release build of percona-mle
+# against it: installs the server and the MLE install components (the
+# packages' split, 21-packaging.md) into a staging directory, with the JDK as
+# <mle dir>/jdk: the trimmed runtime of an MLE build with -DMLE_BUILD_JDK=ON,
+# else a copy of the GraalVM JDK the build used (MLE_JAVA_HOME). Then runs
+# docker build.
 #
-#   components/mle/docker/build-image.sh [--tools] <build dir> [image tag]
+#   docker/build-image.sh [--tools] <server build> <mle build> [image tag]
 #
 # --tools also builds <image>-tools (mle_package with npm, Maven, GraalPy).
 set -euo pipefail
 TOOLS=no
 if [ "${1:-}" = "--tools" ]; then TOOLS=yes; shift; fi
-BUILD=$(realpath "${1:?usage: build-image.sh [--tools] <build dir> [image tag]}")
-TAG=${2:-percona-mle:dev}
+USAGE="usage: build-image.sh [--tools] <server build> <mle build> [image tag]"
+SERVER=$(realpath "${1:?$USAGE}")
+BUILD=$(realpath "${2:?$USAGE}")
+TAG=${3:-percona-mle:dev}
 HERE=$(dirname "$(realpath "$0")")
 CTX=$(mktemp -d "${TMPDIR:-/tmp}/percona-mle.XXXXXX")
 trap 'rm -rf "$CTX"' EXIT
 
-grep -q '^WITH_MLE:BOOL=ON' "$BUILD/CMakeCache.txt" ||
-  { echo "build-image.sh: $BUILD is not configured with -DWITH_MLE=ON" >&2; exit 1; }
+grep -q '^CMAKE_PROJECT_NAME:STATIC=percona-mle$' "$BUILD/CMakeCache.txt" ||
+  { echo "build-image.sh: $BUILD is not a build of percona-mle" >&2; exit 1; }
+grep -q '^WITH_LANG_ROUTER:BOOL=ON' "$SERVER/CMakeCache.txt" ||
+  { echo "build-image.sh: $SERVER is not a server build with the language router" >&2; exit 1; }
 JAVA_HOME_BUILD=$(sed -n 's/^MLE_JAVA_HOME:PATH=//p' "$BUILD/CMakeCache.txt")
 MLE_DIR="$CTX/stage/lib/plugin/mle"
 
-echo "Installing $BUILD into the image context"
-for c in Server Client SharedLibraries MleCore MlePython MleTools; do
+echo "Installing $SERVER and $BUILD into the image context"
+for c in Server Client SharedLibraries; do
+  cmake --install "$SERVER" --prefix "$CTX/stage" --component "$c" >> "$CTX/install.log"
+done
+for c in MleCore MlePython MleTools; do
   cmake --install "$BUILD" --prefix "$CTX/stage" --component "$c" >> "$CTX/install.log"
 done
 if grep -q '^MLE_BUILD_JDK:BOOL=ON' "$BUILD/CMakeCache.txt"; then

@@ -60,7 +60,7 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
  * <p>System properties: mle.python.venv (a GraalPy venv, e.g. with numpy).
  */
 final class Polyglot {
-  /** GraalPy is optional (package percona-server-mle-python, 21-packaging.md §2). */
+  /** GraalPy is optional (package percona-mle-python, 21-packaging.md §2). */
   static final boolean PYTHON = installed("com.oracle.graal.python.PythonLanguage");
   static final List<String> LANGUAGES = PYTHON ? List.of("js", "python") : List.of("js");
 
@@ -553,7 +553,7 @@ final class Polyglot {
   Value importPython(String module) {
     Context c = context();
     if (!PYTHON)
-      throw new IllegalStateException("Python is not installed in this MLE (package percona-server-mle-python)");
+      throw new IllegalStateException("Python is not installed in this MLE (package percona-mle-python)");
     return c.eval("python", "import importlib\nlambda n: importlib.import_module(n)").execute(module);
   }
 
@@ -572,7 +572,7 @@ final class Polyglot {
   private void pythonReady() {
     if (python != null) return;
     if (!PYTHON)
-      throw new IllegalStateException("Python is not installed in this MLE (package percona-server-mle-python)");
+      throw new IllegalStateException("Python is not installed in this MLE (package percona-mle-python)");
     Context c = context();
     // All or nothing: an interrupt (KILL) in between leaves Python to be set up again.
     Helpers h = pythonHelpers(c);

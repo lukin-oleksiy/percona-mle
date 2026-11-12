@@ -1,1 +1,1 @@
-$MLE_COMPONENT_OPT --loose-mle.package_dir=$MYSQL_TEST_DIR/suite/component_mle/std_data/mle_packages
+$MLE_COMPONENT_OPT --loose-mle.package_dir=$MLE_SUITE_DIR/std_data/mle_packages

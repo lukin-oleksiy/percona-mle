@@ -19,7 +19,7 @@
 #define MLE_VALUE_H
 
 /**
-  @file components/mle/include/mle/value.h
+  @file include/mle/value.h
 
   A typed SQL value as carried by the MLE wire protocol (protocol.h, Tag).
   Owns its bytes. No MySQL types: the conversion from and to MySQL values is

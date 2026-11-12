@@ -311,7 +311,7 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
           std::to_string(s.pool_size) + ", files in " + s.dir +
           ", JDK " + layout.java_home +
           (layout.aot_cache.empty() ? ", no AOT cache" : "") +
-          (!layout.python ? ", no Python (package percona-server-mle-python)"
+          (!layout.python ? ", no Python (package percona-mle-python)"
            : layout.python_venv.empty() ? ", no Python venv (no numpy)" : "") +
           (layout.package_dir.empty() ? "" : ", packages in " + layout.package_dir) +
           ".";

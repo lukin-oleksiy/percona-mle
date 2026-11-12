@@ -3,7 +3,7 @@
 --echo # (no half-working component), and a server whose installed component
 --echo # cannot start comes up without it.
 --echo #
---source include/have_mle_component.inc
+--source ../include/have_mle_component.inc
 --source include/not_valgrind.inc
 
 call mtr.add_suppression("Component mle reported: 'Cannot install: ");

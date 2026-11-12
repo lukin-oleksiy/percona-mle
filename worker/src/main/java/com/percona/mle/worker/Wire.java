@@ -18,7 +18,7 @@
 package com.percona.mle.worker;
 
 /**
- * Wire protocol v1 constants. Mirrors components/mle/include/mle/protocol.h,
+ * Wire protocol v1 constants. Mirrors include/mle/protocol.h,
  * which is the definition; keep both in sync.
  */
 final class Wire {
