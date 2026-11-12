@@ -84,7 +84,7 @@ std::string errno_text(const char *what) {
 }  // namespace
 
 std::string ExitInfo::describe() const {
-  if (!known) return "unknown";
+  if (!known) return "exit status unknown";
   if (WIFEXITED(status))
     return "exited with status " + std::to_string(WEXITSTATUS(status));
   if (WIFSIGNALED(status)) {

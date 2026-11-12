@@ -546,10 +546,13 @@ void Session::report(const std::string &principal, Status status,
                 log_safe(routine.qualified_name) + ": " + log_safe(why));
     drop_worker(principal);
     if (status == Status::kKilled && Hooks(m_thd).killed()) return;
-  } else {
-    log_error("Internal error in the worker of " + principal + " during " +
-              log_safe(routine.qualified_name) + ": " + log_safe(why));
+    // The caller learns why (the worker died: signal ..., did not stop after
+    // KILL ...); the next call of the session gets a new worker.
+    my_error(ER_LANGUAGE_COMPONENT_RUNTIME, MYF(0), "MLE", why.c_str());
+    return;
   }
+  log_error("Internal error in the worker of " + principal + " during " +
+            log_safe(routine.qualified_name) + ": " + log_safe(why));
   my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
 }
 

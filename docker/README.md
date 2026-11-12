@@ -30,8 +30,9 @@ to root (and to `MLE_APP_USER`, optional, on its database).
 
 Docker's default seccomp profile refuses `clone3`; the launcher then starts workers with `clone(CLONE_PIDFD)`.
 
-Binary logging is on (server default): functions need `DETERMINISTIC`, `NO SQL` or `READS SQL DATA` (or
-`log_bin_trust_function_creators`).
+Binary logging is on (server default): functions need `DETERMINISTIC`, `NO SQL` or `READS SQL DATA`; the image sets
+`log_bin_trust_function_creators = ON` so that application accounts (without SUPER) can create them, as in a
+development setup. The clients in the container use UTF-8 (`LANG=C.UTF-8`).
 
 ## Packages (DBA)
 

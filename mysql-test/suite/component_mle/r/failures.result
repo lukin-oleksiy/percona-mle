@@ -56,7 +56,7 @@ include/assert.inc [A new worker after the old one was killed]
 #
 # (wait until it is gone: kill is asynchronous)
 SELECT js_ok();
-ERROR HY000: Language component: Internal error.
+ERROR HY000: MLE> the MLE worker died: killed by signal 9 (Killed)
 SELECT js_ok();
 js_ok()
 7
@@ -74,7 +74,7 @@ include/assert.inc [A new worker after heap exhaustion]
 #    new launcher when the next worker is needed.
 #
 SELECT js_ok();
-ERROR HY000: Language component: Internal error.
+ERROR HY000: MLE> the MLE worker died: exit status unknown
 SELECT js_ok();
 js_ok()
 7

@@ -84,7 +84,7 @@ SELECT js_ok();
 --exec kill -9 $pid2
 --echo # (wait until it is gone: kill is asynchronous)
 --exec for i in `seq 200`; do grep -qs '^State:.[^Z]' /proc/$pid2/status || exit 0; sleep 0.05; done; exit 1
---error ER_LANGUAGE_COMPONENT_INTERNAL
+--error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT js_ok();
 SELECT js_ok();
 
@@ -108,7 +108,7 @@ SELECT js_ok();
 --let $pid_file = `SELECT @@pid_file`
 --exec pkill -9 -x -P `cat $pid_file` mle_launcher
 --exec for i in `seq 200`; do ps -o stat=,comm= --ppid `cat $pid_file` | grep -v '^Z' | grep -q mle_launcher || exit 0; sleep 0.05; done; exit 1
---error ER_LANGUAGE_COMPONENT_INTERNAL
+--error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT js_ok();
 SELECT js_ok();
 SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status

@@ -23,6 +23,8 @@ COPY my.cnf /etc/mysql/my.cnf
 COPY mle-entrypoint.sh /usr/local/bin/mle-entrypoint.sh
 
 ENV PATH=/usr/local/mysql/bin:$PATH
+# UTF-8 for the clients in the container (no locale: they fall back to latin1).
+ENV LANG=C.UTF-8
 RUN mkdir -p /var/lib/mysql /var/run/mysqld /var/lib/mysql-mle-packages \
  && chown mysql:mysql /var/lib/mysql /var/run/mysqld \
  && chmod 0755 /var/lib/mysql-mle-packages \
