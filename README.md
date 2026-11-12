@@ -14,7 +14,8 @@ A separate product: it builds against Percona Server and installs into it as a c
 server needs only its generic language router (`component_lang_router`, built with js_lang or
 `-DWITH_LANG_ROUTER=ON`). Supported server lines: trunk-based releases (26.x), then 9.7.
 
-*Proof of concept, confidential.*
+*A proof of concept.* Licensed under the GNU General Public License version 2 (`LICENSE`), as Percona Server. Code
+comments cite the project's design notes by name (e.g. `14-phase6-libraries.md`); those notes are not published.
 
 ## Layout
 
