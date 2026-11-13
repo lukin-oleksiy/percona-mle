@@ -396,14 +396,46 @@ final class PySql implements GuestSql.Lang {
       case String s -> s;
       case byte[] b -> bytes.execute(new String(b, StandardCharsets.ISO_8859_1));
       case MleJson j -> json.execute(j.text());
-      case float[] f -> {
-        ByteBuffer bb = ByteBuffer.allocate(f.length * 4).order(ByteOrder.LITTLE_ENDIAN);
-        bb.asFloatBuffer().put(f);
-        yield vector.execute(new String(bb.array(), StandardCharsets.ISO_8859_1));
-      }
+      case float[] f -> vectorValue(f);
       case Values.Temporal t -> temporal(t);
       default -> raw;
     };
+  }
+
+  /** Reused numpy staging arrays for VECTOR values of rows, by dimensions (24 P1). */
+  private final Map<Integer, Object[]> vectorStaging = new java.util.HashMap<>();
+  private boolean noNumpy;
+
+  /**
+   * A VECTOR value of a row (24 P1): one memcpy into a staging array reused per dimensions, then
+   * numpy's own copy() makes the row's array. Creating numpy arrays is the cost in GraalPy (copy()
+   * is cheaper than numpy.empty()); nothing is retained, and the row's array is its own and
+   * writable, as before. Without numpy: array.array('f') through the bytes, as before.
+   */
+  @SuppressWarnings("restricted")  // the staging array's own memory, as numpy reports it
+  private Object vectorValue(float[] f) {
+    if (!noNumpy) {
+      Object[] s = vectorStaging.get(f.length);
+      if (s == null) {
+        if (vectorStaging.size() >= 64) vectorStaging.clear();  // many different dimensions
+        Value t = helper("numpy_buffer").execute(f.length, false);
+        if (t.isNull()) {
+          noNumpy = true;
+        } else {
+          s = new Object[] {t.getArrayElement(0), java.lang.foreign.MemorySegment.ofAddress(
+              t.getArrayElement(1).asLong()).reinterpret(f.length * 4L)};
+          vectorStaging.put(f.length, s);
+        }
+      }
+      if (s != null) {
+        java.lang.foreign.MemorySegment.copy(java.lang.foreign.MemorySegment.ofArray(f), 0,
+            (java.lang.foreign.MemorySegment) s[1], 0, f.length * 4L);
+        return ((Value) s[0]).invokeMember("copy");
+      }
+    }
+    ByteBuffer bb = ByteBuffer.allocate(f.length * 4).order(ByteOrder.LITTLE_ENDIAN);
+    bb.asFloatBuffer().put(f);
+    return vector.execute(new String(bb.array(), StandardCharsets.ISO_8859_1));
   }
 
   private Object temporal(Values.Temporal t) {

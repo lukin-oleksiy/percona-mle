@@ -66,6 +66,20 @@ Warning	1292	Truncated incorrect INTEGER value: '4x'
 SELECT @r;
 @r
 4 warnings, ids 1,2,3,4
+#    Rows one by one (24 P1, P2), over several chunks: each row's VECTOR
+#    is its own writable numpy array (a staging array is copied per
+#    row); kept rows keep their values; a direct statement and a
+#    prepared one (streamed chunk by chunk).
+CALL py_row_vecs(@r);
+SELECT @r;
+@r
+1: ndarray float32 True [42.0, 0.0, 0.0]
+2: ndarray float32 True [0.9, 0.1, 0.0]
+3: ndarray float32 True [0.0, 0.0, 1.0]
+4: ndarray float32 True [0.0, 0.2, 0.9]
+row 1 again: ndarray float32 True [42.0, 0.0, 0.0]
+prepared: [0.9, 0.1, 0.0] / [0.0, 0.0, 1.0] / [0.0, 0.2, 0.9]
+DROP PROCEDURE py_row_vecs;
 SET GLOBAL mle.sql_chunk_rows = DEFAULT;
 # 5. mle.pool_prewarm: none, python or numpy (a DBA choice).
 SELECT @@mle.pool_prewarm;

@@ -138,6 +138,18 @@ public final class SqlResult implements Iterable<Row> {
       throw new IllegalStateException("the result was replaced by a new execution of its prepared statement");
   }
 
+  /**
+   * The next row's values. Results are forward-only, so the slot is cleared (24 P2): a large
+   * result read row by row does not stay in memory as a whole. Lists from the decoder are
+   * mutable; immutable ones (empty results) are left as they are.
+   */
+  private Object[] take() {
+    Object[] v = rows.get(pos);
+    if (rows instanceof ArrayList<Object[]>) rows.set(pos, null);
+    pos++;
+    return v;
+  }
+
   /** The next row of the current result set, or null at its end (or for an OK). */
   public Row fetchOne() {
     live();
@@ -150,7 +162,7 @@ public final class SqlResult implements Iterable<Row> {
       moreResults = r.moreResults();
       if (!r.warnings().isEmpty()) warnings = warnings(r);
     }
-    return new Row(set, rows.get(pos++));
+    return new Row(set, take());
   }
 
   /**
@@ -161,7 +173,7 @@ public final class SqlResult implements Iterable<Row> {
     live();
     List<Object[]> out = new ArrayList<>();
     while (true) {
-      while (pos < rows.size()) out.add(rows.get(pos++));
+      while (pos < rows.size()) out.add(take());
       if (!moreRows) return out;
       MleSql.Reply r = session.request(Session.FETCH, id, null, null, 0, 0);
       rows = r.rows();

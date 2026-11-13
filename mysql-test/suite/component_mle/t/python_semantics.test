@@ -119,6 +119,31 @@ CREATE PROCEDURE js_chunks(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
 $$;
 CALL js_chunks(@r);
 SELECT @r;
+--echo #    Rows one by one (24 P1, P2), over several chunks: each row's VECTOR
+--echo #    is its own writable numpy array (a staging array is copied per
+--echo #    row); kept rows keep their values; a direct statement and a
+--echo #    prepared one (streamed chunk by chunk).
+--write_file $MYSQLTEST_VARDIR/tmp/py7rows.sql
+CREATE PROCEDURE py_row_vecs(OUT r TEXT) LANGUAGE PYTHON AS $$
+    def show(v):
+        return f'{type(v).__name__} {v.dtype} {v.flags.writeable} {[round(x, 3) for x in v.tolist()]}'
+    rows = list(session.run_sql('SELECT id, embedding FROM docs ORDER BY id'))
+    vs = [row.embedding for row in rows]
+    vs[0][0] = 42
+    out = [f'{row.id}: {show(v)}' for row, v in zip(rows, vs)]
+    out.append('row 1 again: ' + show(rows[0].embedding))
+    res = session.prepare('SELECT id, embedding FROM docs WHERE id > ? ORDER BY id').bind(1).execute()
+    first = res.fetch_one().embedding
+    rest = [row.embedding for row in res]
+    out.append('prepared: ' + ' / '.join(str([round(x, 3) for x in v.tolist()]) for v in [first] + rest))
+    r = '\n'.join(out)
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/py7rows.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/py7rows.sql
+CALL py_row_vecs(@r);
+SELECT @r;
+DROP PROCEDURE py_row_vecs;
 SET GLOBAL mle.sql_chunk_rows = DEFAULT;
 
 --echo # 5. mle.pool_prewarm: none, python or numpy (a DBA choice).
