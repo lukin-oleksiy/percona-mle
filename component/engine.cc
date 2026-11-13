@@ -285,7 +285,10 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   options.memory_max = s.memory_max;
   options.heap = std::to_string(s.heap_max >> 20) + "m";
   options.pool_size = s.pool_size;
-  if (s.pool_prewarm != "none") options.prewarm = s.pool_prewarm;
+  // Pool workers start Java (javac) and JavaScript, which are cheap; GraalPy
+  // (and numpy) only when mle.pool_prewarm asks (15 §1: Python starts lazily
+  // by default, for memory). The native build skips what it does not have.
+  options.prewarm = s.pool_prewarm == "none" ? "java,js" : "java,js," + s.pool_prewarm;
   options.hidden_paths = server_private_paths();
   // JavaScript's local time (Date.toString(), getHours()) follows mysqld's
   // system time zone; the worker cannot read the system's zone itself.
