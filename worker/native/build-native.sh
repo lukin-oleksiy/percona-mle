@@ -27,8 +27,13 @@ mkdir -p "$OUT"
 exec "$JAVA_HOME/bin/native-image" \
   --shared -o "$OUT/libmleworker" -cp "$CP" \
   --no-fallback \
+  `# -O3: the host side of a call (arguments, VECTOR, numpy through the C API) about 30 % faster than -O2,` \
+  `# for ≈ 30 MB more per worker and 70 MB more library (measured, exp 23)` \
+  -O3 \
   -J-Xmx${MLE_NATIVE_BUILD_HEAP:-14g} \
   --enable-native-access=ALL-UNNAMED \
   -H:+UnlockExperimentalVMOptions -H:+JNIExportSymbols -H:+ForeignAPISupport -H:-UnlockExperimentalVMOptions \
+  `# GraalPy's home comes from the extracted resources (mle.python.home): no second copy in the image` \
+  -H:-IncludeLanguageResources \
   -Dpolyglot.engine.WarnInterpreterOnly=false \
   ${MLE_NATIVE_IMAGE_OPTIONS:-}
