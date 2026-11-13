@@ -85,6 +85,9 @@ SET(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 SET(CPACK_RPM_PACKAGE_LICENSE "GPLv2")
 SET(CPACK_RPM_PACKAGE_ARCHITECTURE x86_64)
 SET(CPACK_RPM_PACKAGE_AUTOREQPROV OFF)
+# The server's directories belong to the server's package, not to ours.
+SET(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
+  /usr/lib64/mysql /usr/lib64/mysql/plugin /usr/lib/mysql /usr/lib/mysql/plugin)
 # Prebuilt runtime: no stripping, debuginfo or Python byte-compiling of the venv by rpmbuild.
 SET(CPACK_RPM_SPEC_MORE_DEFINE "%define __strip /bin/true
 %define __os_install_post %{nil}
