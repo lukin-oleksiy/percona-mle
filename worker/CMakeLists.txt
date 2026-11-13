@@ -42,7 +42,9 @@ TARGET_INCLUDE_DIRECTORIES(mle_worker SYSTEM PRIVATE
   ${MLE_JAVA_HOME}/include ${MLE_JAVA_HOME}/include/linux)
 
 FILE(GLOB_RECURSE MLE_WORKER_JAVA_SOURCES CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/main/java/*.java)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/main/java/*.java
+  # Native Image metadata (Python-only native build) is packaged in the jar.
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/main/resources/*)
 SET(MLE_WORKER_JAR ${CMAKE_CURRENT_BINARY_DIR}/maven/mle-worker.jar)
 ADD_CUSTOM_COMMAND(OUTPUT ${MLE_WORKER_JAR}
   COMMAND ${CMAKE_COMMAND} -E env JAVA_HOME=${MLE_JAVA_HOME}
@@ -116,6 +118,27 @@ SET_PROPERTY(GLOBAL PROPERTY MLE_WORKER_JAR ${MLE_WORKER_JAR})
 SET_PROPERTY(GLOBAL PROPERTY MLE_RESOURCE_CACHE ${MLE_RESOURCE_CACHE})
 SET_PROPERTY(GLOBAL PROPERTY MLE_PYTHON_VENV ${MLE_PYTHON_VENV})
 SET_PROPERTY(GLOBAL PROPERTY MLE_AOT_CACHE ${MLE_AOT_CACHE})
+
+# The Python-only native build (exp design note 23): the worker as a Native
+# Image shared library that mle_worker loads instead of libjvm.so; Python only
+# (no GraalJS, no Java routines), selected with mle.worker. Off by default:
+# each build needs 13-16 GB RAM and a few minutes.
+OPTION(MLE_PYTHON_NATIVE "Build the Python-only native worker (Native Image)" OFF)
+IF(MLE_PYTHON_NATIVE)
+  SET(MLE_NATIVE_DIR ${CMAKE_CURRENT_BINARY_DIR}/native)
+  SET(MLE_NATIVE_LIB ${MLE_NATIVE_DIR}/libmleworker.so)
+  ADD_CUSTOM_COMMAND(OUTPUT ${MLE_NATIVE_LIB}
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/native/build-native.sh
+      ${MLE_JAVA_HOME} ${MLE_WORKER_JAR} ${CMAKE_CURRENT_BINARY_DIR}/maven/deps
+      ${MLE_NATIVE_DIR}
+    DEPENDS ${MLE_WORKER_JAR} ${CMAKE_CURRENT_SOURCE_DIR}/native/build-native.sh
+    COMMENT "Building the Python-only native worker (Native Image: minutes, 13-16 GB RAM)"
+    USES_TERMINAL
+    VERBATIM
+    )
+  ADD_CUSTOM_TARGET(mle_native_worker ALL DEPENDS ${MLE_NATIVE_LIB})
+  SET_PROPERTY(GLOBAL PROPERTY MLE_NATIVE_DIR ${MLE_NATIVE_DIR})
+ENDIF()
 
 # Installed layout: <plugin dir>/mle (see include/mle/defaults.h), in the
 # install components of the packages (21-packaging.md): MleCore (launcher,

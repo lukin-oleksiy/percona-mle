@@ -56,6 +56,10 @@ struct Layout {
   std::string package_dir;
   /** GraalPy is installed (deps/python-language-*.jar; an optional package). */
   bool python = false;
+  /** The Python-only native build of the worker (exp design note 23):
+      <dir>/native/libmleworker.so, with its language resources beside it;
+      empty: not installed. */
+  std::string native_lib;
 
   /** The installed layout below dir; optional parts that do not exist are
       left empty. Symlinks are resolved (the build tree has a layout of
@@ -90,6 +94,13 @@ struct JvmClassOptions {
     Landlock paths, environment and limits. */
 ClassConfig jvm_worker_class(const Layout &layout,
                              const JvmClassOptions &options = {});
+
+/** The Python-only native worker class (exp design note 23): the same
+    bootstrap loads layout.native_lib instead of libjvm.so; system properties
+    and the heap size as for the JVM class, no JVM-only options; no JDK in
+    the Landlock paths. */
+ClassConfig native_worker_class(const Layout &layout,
+                                const JvmClassOptions &options = {});
 
 }  // namespace mle
 

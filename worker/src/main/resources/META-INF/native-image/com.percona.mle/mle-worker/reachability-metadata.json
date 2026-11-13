@@ -1,0 +1,19 @@
+{
+  "comment": "Python-only native build (exp design note 23): the worker bootstrap finds Main.run through JNI; Native.java's libc downcalls (mmap, munmap, syscall(SYS_futex, ...) variadic from the 2nd argument, read). Keep in sync with Native.java.",
+  "reflection": [
+    {
+      "type": "com.percona.mle.worker.Main",
+      "jniAccessible": true,
+      "methods": [ { "name": "run", "parameterTypes": [] } ]
+    }
+  ],
+  "foreign": {
+    "downcalls": [
+      { "returnType": "void*", "parameterTypes": ["void*", "jlong", "jint", "jint", "jint", "jlong"] },
+      { "returnType": "jint", "parameterTypes": ["void*", "jlong"] },
+      { "returnType": "jlong", "parameterTypes": ["jlong", "void*", "jint", "jint", "void*", "void*", "jint"],
+        "options": { "firstVariadicArg": 1 } },
+      { "returnType": "jlong", "parameterTypes": ["jint", "void*", "jlong"] }
+    ]
+  }
+}

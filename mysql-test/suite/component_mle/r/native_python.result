@@ -1,0 +1,94 @@
+#
+# component_mle: the Python-only native build (exp design note 23;
+# mle.worker = NATIVE, a Native Image the worker bootstrap loads instead
+# of the JVM). Python routines, numpy, the SQL API, VECTOR values, Python
+# libraries; JavaScript and Java refused; the sandbox, KILL and a native
+# crash as with the JVM build.
+#
+call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+#
+# 1. The native build runs Python only.
+#
+SELECT @@mle.worker;
+@@mle.worker
+NATIVE
+SELECT VARIABLE_VALUE AS languages FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_languages_supported';
+languages
+Python
+CREATE FUNCTION js_f() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+ERROR HY000: Language component: Unsupported language 'JAVASCRIPT'
+CREATE FUNCTION java_f() RETURNS INT LANGUAGE JAVA AS $$ return 1; $$;
+ERROR HY000: Language component: Unsupported language 'JAVA'
+CREATE LIBRARY jslib LANGUAGE JAVASCRIPT AS $$ export function f() { return 1 } $$;
+ERROR HY000: Libraries are not supported for JAVASCRIPT.
+#
+# 2. Python routines, numpy, the SQL API, VECTOR values, libraries.
+#
+CREATE TABLE items (id INT PRIMARY KEY, name VARCHAR(20), price DECIMAL(8,2), v VECTOR(3));
+INSERT INTO items VALUES (1, 'apple', 0.50, STRING_TO_VECTOR('[1, 0, 0]')),
+(2, 'pear', 0.75, STRING_TO_VECTOR('[0.9, 0.1, 0]')), (3, 'car', 9000, STRING_TO_VECTOR('[0, 0, 1]'));
+SELECT py_add(2, 3), py_np();
+py_add(2, 3)	py_np()
+5	[[5.0, 14.0], [14.0, 50.0]] 5.0
+SELECT id, py_cosine(v, STRING_TO_VECTOR('[1, 0.05, 0]')) AS cosine FROM items ORDER BY id;
+id	cosine
+1	0.9988
+2	0.9982
+3	0
+CALL py_sql(@r);
+SELECT @r;
+@r
+1 apple 0.50 [1.0, 0.0, 0.0]
+2 pear 0.75 [0.9, 0.1, 0.0]
+3 car 9000.00 [0.0, 0.0, 1.0]
+cheap: apple,pear
+columns: (3, 3) float32 [1, 2, 3]
+after rollback: 3
+SELECT py_vat(price) FROM items ORDER BY id;
+py_vat(price)
+0.6
+0.91
+10890
+SELECT py_probe();
+py_probe()
+read /etc/passwd: refused, socket: refused
+# Process creation is refused (a host SecurityException, not a Python OSError).
+SELECT py_spawn();
+ERROR HY000: Python> (process creation refused)
+#
+# 3. max_execution_time and KILL QUERY stop a Python loop; the worker stays.
+#
+SELECT /*+ MAX_EXECUTION_TIME(500) */ py_loop();
+ERROR HY000: Query execution was interrupted, maximum statement execution time exceeded
+SELECT py_loop();
+KILL QUERY CON1;
+ERROR 70100: Query execution was interrupted
+SELECT py_add(1, 1);
+py_add(1, 1)
+2
+include/assert.inc [The same worker after the timeout and KILL QUERY]
+#
+# 4. A native crash ends the worker, not mysqld; the next call gets a new one.
+#
+SELECT py_crash();
+Got one of the listed errors
+SELECT py_add(20, 22);
+py_add(20, 22)
+42
+include/assert.inc [A new worker after the crash]
+DROP FUNCTION py_add;
+DROP FUNCTION py_np;
+DROP FUNCTION py_cosine;
+DROP PROCEDURE py_sql;
+DROP FUNCTION py_vat;
+DROP LIBRARY pyprices;
+DROP FUNCTION py_loop;
+DROP FUNCTION py_probe;
+DROP FUNCTION py_spawn;
+DROP FUNCTION py_crash;
+DROP TABLE items;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

@@ -45,8 +45,9 @@ public final class Main {
       String info;
       try {
         String prewarm = System.getProperty("mle.prewarm", "");
-        if (prewarm.contains("java")) java.prewarm();
-        if (prewarm.contains("js")) polyglot.context().eval("js", "1");
+        // Only what this build has (23): no Java routines or GraalJS in the native build.
+        if (prewarm.contains("java") && !Polyglot.nativeImage()) java.prewarm();
+        if (prewarm.contains("js") && Polyglot.JS) polyglot.context().eval("js", "1");
         // mle.pool_prewarm (15 §2): python, or numpy (Python and numpy).
         if (prewarm.contains("python") || prewarm.contains("numpy")) polyglot.prewarmPython(prewarm.contains("numpy"));
         // Starting leaves garbage and a grown heap; a worker often waits in the pool, so give
@@ -55,7 +56,13 @@ public final class Main {
         info = "ready in " + (System.nanoTime() - t0) / 1_000_000 + " ms";
       } catch (Throwable t) {
         status = Wire.INTERNAL;
-        info = "start failed: " + t;
+        // The causes too (an ExceptionInInitializerError says little by itself); the stack
+        // goes to stderr (mysqld's error log with MLE_WORKER_STDERR=1).
+        StringBuilder why = new StringBuilder("start failed: ").append(t);
+        for (Throwable c = t.getCause(); c != null && c != c.getCause(); c = c.getCause())
+          why.append("; caused by ").append(c);
+        info = why.toString();
+        t.printStackTrace();
       }
       d.ready(status, info);
       d.loop();

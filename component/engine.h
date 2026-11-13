@@ -56,6 +56,9 @@ struct Settings {
   std::string pool_prewarm = "none";
   /** Third-party packages installed by the DBA (14 §3); "": <dir>/packages. */
   std::string package_dir;
+  /** Which worker build runs routines (23): AUTO, JVM or NATIVE (the
+      Python-only native build); upper case. */
+  std::string worker = "AUTO";
 };
 
 struct EngineState {

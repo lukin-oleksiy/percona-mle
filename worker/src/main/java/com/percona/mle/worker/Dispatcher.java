@@ -83,8 +83,11 @@ final class Dispatcher {
     w.reset();
     w.u32(Wire.VERSION);
     w.str(System.getProperty("mle.class", "jvm"));
-    w.u32(1 + Polyglot.LANGUAGES.size());
-    w.str("java");
+    // Java only on the JVM (23): the Python-only native build reports "python" alone, and
+    // mysqld then refuses routines and libraries in the other languages.
+    boolean jvm = !Polyglot.nativeImage();
+    w.u32((jvm ? 1 : 0) + Polyglot.LANGUAGES.size());
+    if (jvm) w.str("java");
     for (String l : Polyglot.LANGUAGES) w.str(l);
     w.str("Java " + Runtime.version() + " (" + System.getProperty("java.vm.name") + ")");
     w.str(info);
@@ -167,7 +170,8 @@ final class Dispatcher {
     r.finish();
     String error;
     try {
-      error = language.equals("java") ? java.checkLibrary(name, body) : polyglot.parseLibrary(language, name, body);
+      error = !language.equals("java") ? polyglot.parseLibrary(language, name, body)
+          : Polyglot.nativeImage() ? "Java needs the JVM build of MLE" : java.checkLibrary(name, body);
     } catch (Throwable t) {
       failed(t, false);
       return;
@@ -214,7 +218,9 @@ final class Dispatcher {
     for (int i = 0; i < ni; i++) imports.add(new LibraryFileSystem.Import(r.str(), r.str(), r.str()));
     r.finish();
 
-    if (!language.equals("java") && !Polyglot.isGuest(language)) {
+    // Java routines need the JVM build (23); mysqld refuses them earlier (the worker's READY).
+    boolean javaRoutine = language.equals("java") && !Polyglot.nativeImage();
+    if (!javaRoutine && !Polyglot.isGuest(language)) {
       result(Wire.GUEST_ERROR, null, null, guest(language, "the language " + language + " is not available in this worker"));
       return;
     }
@@ -233,7 +239,7 @@ final class Dispatcher {
       // A routine id is prepared again after ALTER; it may change language.
       java.drop(id);
       polyglot.drop(id);
-      if (language.equals("java")) java.prepare(id, name, entry, source, params, ret, imports);
+      if (javaRoutine) java.prepare(id, name, entry, source, params, ret, imports);
       else polyglot.prepare(id, language, name, entry, source, params, ret, imports);
     } catch (JavaRoutines.CompileException e) {
       compileError = e.getMessage();

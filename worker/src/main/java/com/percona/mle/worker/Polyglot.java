@@ -62,7 +62,19 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
 final class Polyglot {
   /** GraalPy is optional (package percona-mle-python, 21-packaging.md §2). */
   static final boolean PYTHON = installed("com.oracle.graal.python.PythonLanguage");
-  static final List<String> LANGUAGES = PYTHON ? List.of("js", "python") : List.of("js");
+  /** GraalJS is absent in the Python-only native build (23). */
+  static final boolean JS = installed("com.oracle.truffle.js.lang.JavaScriptLanguage");
+  static final List<String> LANGUAGES = JS && PYTHON ? List.of("js", "python")
+      : JS ? List.of("js") : PYTHON ? List.of("python") : List.of();
+
+  /**
+   * The Python-only native build (23): a Native Image cannot compile and load classes at run time,
+   * so Java routines, Java libraries, the DBA's jars and host class lookup are JVM-only. Native
+   * Image folds this call at build time, which leaves javac out of the image.
+   */
+  static boolean nativeImage() {
+    return org.graalvm.nativeimage.ImageInfo.inImageCode();
+  }
 
   private static boolean installed(String languageClass) {
     try {
@@ -194,28 +206,33 @@ final class Polyglot {
       // The worker's main thread stays entered: entering and leaving on every call costs about
       // 1 us (measured, W5). Everything that runs guest code runs on this thread.
       c.enter();
-      // The static side of com.percona.mle.api.Mle (Mle.context(), Mle.session()) in JS and Python.
-      mleApi = c.asValue(com.percona.mle.api.Mle.class).getMember("static");
-      c.getBindings("js").putMember("Mle", mleApi);
-      c.getPolyglotBindings().putMember("Mle", mleApi);
-      js = jsHelpers(c);
-      jsOracle = JsOracle.helpers(c);
-      // USING in JavaScript routines (Phase 6): $c.lib(...) gets every library's module.
-      jsOracle.putMember("libBridge",
-          (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString(), true));
-      // importPython('numpy'): Python modules from JavaScript.
-      c.getBindings("js").putMember("importPython",
-          (org.graalvm.polyglot.proxy.ProxyExecutable) a -> importPython(a[0].asString()));
-      // The SQL API (Phase 5): the globals session, mysql and SqlError. Python's are made
-      // with Python's helpers, on first use (GraalPy costs ~150 MB: JS-only workers skip it).
-      new JsSql(c, options);
-      // Oracle: console.clear() clears the session's stdout and stderr.
-      if (console != null) {
-        Value clear = c.asValue((org.graalvm.polyglot.proxy.ProxyExecutable) a -> {
-          console.clear();
-          return null;
-        });
-        c.eval("js", "(f) => { console.clear = () => { f(); }; }").execute(clear);
+      // The static side of com.percona.mle.api.Mle (Mle.context(), Mle.session()) in JS and Python
+      // (host class access: JVM workers only, 23).
+      if (!nativeImage()) {
+        mleApi = c.asValue(com.percona.mle.api.Mle.class).getMember("static");
+        if (JS) c.getBindings("js").putMember("Mle", mleApi);
+        c.getPolyglotBindings().putMember("Mle", mleApi);
+      }
+      if (JS) {
+        js = jsHelpers(c);
+        jsOracle = JsOracle.helpers(c);
+        // USING in JavaScript routines (Phase 6): $c.lib(...) gets every library's module.
+        jsOracle.putMember("libBridge",
+            (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString(), true));
+        // importPython('numpy'): Python modules from JavaScript.
+        c.getBindings("js").putMember("importPython",
+            (org.graalvm.polyglot.proxy.ProxyExecutable) a -> importPython(a[0].asString()));
+        // The SQL API (Phase 5): the globals session, mysql and SqlError. Python's are made
+        // with Python's helpers, on first use (GraalPy costs ~150 MB: JS-only workers skip it).
+        new JsSql(c, options);
+        // Oracle: console.clear() clears the session's stdout and stderr.
+        if (console != null) {
+          Value clear = c.asValue((org.graalvm.polyglot.proxy.ProxyExecutable) a -> {
+            console.clear();
+            return null;
+          });
+          c.eval("js", "(f) => { console.clear = () => { f(); }; }").execute(clear);
+        }
       }
       context = c;
       applyOptions();
@@ -232,10 +249,10 @@ final class Polyglot {
   static Context.Builder builder(Console console) {
     Context.Builder b = Context.newBuilder(LANGUAGES.toArray(new String[0]))
         .allowHostAccess(HOST_ACCESS)
-        // The process is the sandbox; only the worker's own classes are hidden.
-        .allowHostClassLookup(name -> !name.startsWith("com.percona.mle.worker.") && !THREAD_CLASSES.contains(name))
-        // The DBA's jars (Phase 6) for Java.type() in JavaScript and java.type() in Python.
-        .hostClassLoader(JavaRoutines.hostLoader())
+        // The process is the sandbox; only the worker's own classes are hidden. In the native
+        // build no class can be looked up (classes need reflection metadata there; 23).
+        .allowHostClassLookup(nativeImage() ? name -> false
+            : name -> !name.startsWith("com.percona.mle.worker.") && !THREAD_CLASSES.contains(name))
         .allowPolyglotAccess(PolyglotAccess.ALL)
         .allowCreateThread(true)  // GraalPy's C API helper thread
         .allowCreateProcess(false)
@@ -247,20 +264,26 @@ final class Polyglot {
                 FileSystem.newReadOnlyFileSystem(FileSystem.newDefaultFileSystem())))))
             .allowHostSocketAccess(false)
             .build())
-        // Evaluating a module returns its exports: database libraries and ES modules are
-        // loaded synchronously (an import() promise cannot settle while a JavaScript frame is
-        // on the stack, as in nested calls).
         .allowExperimentalOptions(true)
-        .option("js.esm-eval-returns-exports", "true")
         .option("engine.WarnInterpreterOnly", "false")
         .option(FrameLimit.ID, "true")
         .environment("HOME", "/nonexistent");  // GraalPy looks up the home directory (U-1)
+    // Evaluating a module returns its exports: database libraries and ES modules are loaded
+    // synchronously (an import() promise cannot settle while a JavaScript frame is on the
+    // stack, as in nested calls). GraalJS options exist only when GraalJS is there (23).
+    if (JS) b.option("js.esm-eval-returns-exports", "true");
+    // The DBA's jars (Phase 6) for Java.type() in JavaScript and java.type() in Python (JVM only).
+    if (!nativeImage()) b.hostClassLoader(JavaRoutines.hostLoader());
     // Python is an optional package: its options exist only when GraalPy is installed.
     if (PYTHON)
       b.option("python.PosixModuleBackend", "java")
           .option("python.DontWriteBytecodeFlag", "true")
           .option("python.NoUserSiteFlag", "true")
           .option("python.WarnExperimentalFeatures", "false");
+    // The native build (23): GraalPy's home in the extracted resources (the JVM finds it
+    // through the resource cache).
+    String pythonHome = System.getProperty("mle.python.home", "");
+    if (PYTHON && !pythonHome.isEmpty()) b.option("python.PythonHome", pythonHome);
     // Third-party packages installed by the DBA (14 §3): npm packages for require() and
     // import of bare names (CommonJS support is an experimental GraalJS option), Python
     // packages on the module path.
@@ -268,7 +291,7 @@ final class Polyglot {
     String packages = System.getProperty("mle.packages", "");
     if (!packages.isEmpty()) {
       Path js = Path.of(packages, "js");
-      if (java.nio.file.Files.isDirectory(js.resolve("node_modules")))
+      if (JS && java.nio.file.Files.isDirectory(js.resolve("node_modules")))
         b.allowExperimentalOptions(true)
             .option("js.commonjs-require", "true")
             .option("js.commonjs-require-cwd", js.toString())
@@ -535,6 +558,8 @@ final class Polyglot {
   private Object javaLibrary(String key, LibraryFileSystem.Library l) {
     Object[] hit = javaLibraries.get(key);
     if (hit != null && (long) hit[0] == l.hash()) return hit[1];
+    if (nativeImage())
+      throw new IllegalArgumentException("Java library " + key + ": Java needs the JVM build of MLE");
     Map<String, Class<?>> classes;
     try {
       classes = JavaRoutines.loadLibrary(key, new String(l.body(), java.nio.charset.StandardCharsets.UTF_8));

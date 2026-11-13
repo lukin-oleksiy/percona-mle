@@ -140,12 +140,26 @@ std::string mib(uint64_t bytes) {
 }
 
 /** The files the engine needs; "" if all are there, else what is missing. */
-std::string check_layout(const mle::Layout &l, const Settings &s) {
+std::string check_layout(const mle::Layout &l, const Settings &s, bool native) {
   struct Need {
     const std::string &path;
     int mode;
     const char *what;
   };
+  if (native) {
+    // The Python-only native build (23): no jar, no JDK.
+    const Need needs[] = {{l.launcher_exe, X_OK, "mle_launcher"},
+                          {l.worker_exe, X_OK, "mle_worker"}};
+    for (const Need &n : needs)
+      if (access(n.path.c_str(), n.mode) != 0)
+        return std::string("the MLE files are not installed in mle.dir '") +
+               s.dir + "': " + n.what + " (" + n.path +
+               ") is missing or not accessible";
+    if (l.native_lib.empty())
+      return "mle.worker is NATIVE but the native build is not installed (" +
+             s.dir + "/native/libmleworker.so)";
+    return "";
+  }
   const std::string libjvm = l.java_home + "/lib/server/libjvm.so";
   const Need needs[] = {
       {l.launcher_exe, X_OK, "mle_launcher"},
@@ -229,11 +243,27 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   if (char real[PATH_MAX]; !s.package_dir.empty() &&
                            realpath(s.package_dir.c_str(), real) != nullptr)
     layout.package_dir = real;  // a missing directory: no packages
+  // mle.worker (23): the JVM build (Java, JavaScript, Python) or the
+  // Python-only native build; AUTO takes the JVM build when it is installed
+  // (its jar is there: a wrong mle.java_home is still an error, not a reason
+  // to run the native build instead).
+  const bool jvm_installed = access(layout.worker_jar.c_str(), R_OK) == 0;
+  bool native = false;
+  if (s.worker == "NATIVE") {
+    native = true;
+  } else if (s.worker == "AUTO") {
+    native = !jvm_installed && !layout.native_lib.empty();
+  } else if (s.worker != "JVM") {
+    *error = "mle.worker must be AUTO, JVM or NATIVE, not '" + s.worker + "'";
+    if (!g_launcher) g_error = *error;
+    return false;
+  }
   // Python is an optional package: without GraalPy, PYTHON routines are an
-  // unsupported language.
-  set_installed_languages(layout.python ? kAllLanguages
-                                        : kAllLanguages & ~kPython);
-  *error = check_layout(layout, s);
+  // unsupported language; the native build runs Python only.
+  set_installed_languages(native         ? kPython
+                          : layout.python ? kAllLanguages
+                                          : kAllLanguages & ~kPython);
+  *error = check_layout(layout, s, native);
   if (!error->empty()) {
     if (!g_launcher) g_error = *error;
     return false;
@@ -262,6 +292,10 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   const std::string zone = system_time_zone();
   options.extra_jvm_options.push_back(
       "-Duser.timezone=" + (zone[0] == '+' || zone[0] == '-' ? "GMT" + zone : zone));
+  // Undocumented, for diagnosing worker starts: workers write to mysqld's
+  // stderr (the error log) instead of nowhere.
+  if (const char *e = getenv("MLE_WORKER_STDERR"); e != nullptr && *e == '1')
+    options.inherit_stderr = true;
   // Undocumented, for measurements: more JVM options for the workers.
   if (const char *extra = getenv("MLE_JVM_OPTIONS"); extra != nullptr) {
     std::string word;
@@ -275,7 +309,8 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
       }
     }
   }
-  config.classes = {mle::jvm_worker_class(layout, options)};
+  config.classes = {native ? mle::native_worker_class(layout, options)
+                           : mle::jvm_worker_class(layout, options)};
 
   std::string launcher_error;
   std::unique_ptr<mle::Launcher> launcher =
@@ -309,9 +344,10 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
           ", Landlock ABI " + std::to_string(li.landlock_abi) + ", " + cgroup +
           ", Java heap " + mib(s.heap_max) + ", pool " +
           std::to_string(s.pool_size) + ", files in " + s.dir +
-          ", JDK " + layout.java_home +
-          (layout.aot_cache.empty() ? ", no AOT cache" : "") +
-          (!layout.python ? ", no Python (package percona-mle-python)"
+          (native ? ", Python-only native build " + layout.native_lib
+                  : ", JDK " + layout.java_home +
+                        (layout.aot_cache.empty() ? ", no AOT cache" : "")) +
+          (!native && !layout.python ? ", no Python (package percona-mle-python)"
            : layout.python_venv.empty() ? ", no Python venv (no numpy)" : "") +
           (layout.package_dir.empty() ? "" : ", packages in " + layout.package_dir) +
           ".";

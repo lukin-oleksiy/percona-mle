@@ -1,0 +1,162 @@
+--echo #
+--echo # component_mle: the Python-only native build (exp design note 23;
+--echo # mle.worker = NATIVE, a Native Image the worker bootstrap loads instead
+--echo # of the JVM). Python routines, numpy, the SQL API, VECTOR values, Python
+--echo # libraries; JavaScript and Java refused; the sandbox, KILL and a native
+--echo # crash as with the JVM build.
+--echo #
+--source ../include/have_mle_component.inc
+--source ../include/have_mle_native.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+
+call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+
+--echo #
+--echo # 1. The native build runs Python only.
+--echo #
+SELECT @@mle.worker;
+SELECT VARIABLE_VALUE AS languages FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_languages_supported';
+--error ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE
+CREATE FUNCTION js_f() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+--error ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE
+CREATE FUNCTION java_f() RETURNS INT LANGUAGE JAVA AS $$ return 1; $$;
+--error ER_LIBRARIES_NOT_SUPPORTED
+CREATE LIBRARY jslib LANGUAGE JAVASCRIPT AS $$ export function f() { return 1 } $$;
+
+--echo #
+--echo # 2. Python routines, numpy, the SQL API, VECTOR values, libraries.
+--echo #
+CREATE TABLE items (id INT PRIMARY KEY, name VARCHAR(20), price DECIMAL(8,2), v VECTOR(3));
+INSERT INTO items VALUES (1, 'apple', 0.50, STRING_TO_VECTOR('[1, 0, 0]')),
+  (2, 'pear', 0.75, STRING_TO_VECTOR('[0.9, 0.1, 0]')), (3, 'car', 9000, STRING_TO_VECTOR('[0, 0, 1]'));
+--write_file $MYSQLTEST_VARDIR/tmp/native_python.sql
+CREATE FUNCTION py_add(a INT, b INT) RETURNS INT LANGUAGE PYTHON AS $$ return a + b $$;
+CREATE FUNCTION py_np() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import numpy as np
+    a = np.arange(6, dtype=np.float32).reshape(2, 3)
+    return f'{(a @ a.T).tolist()} {np.linalg.norm(np.array([3.0, 4.0]))}'
+$$;
+CREATE FUNCTION py_cosine(a VECTOR(3), b VECTOR(3)) RETURNS DOUBLE DETERMINISTIC LANGUAGE PYTHON AS $$
+    import numpy as np
+    return round(float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b))), 4)
+$$;
+CREATE PROCEDURE py_sql(OUT r TEXT) LANGUAGE PYTHON AS $$
+    out = []
+    for row in session.run_sql('SELECT id, name, price, v FROM items ORDER BY id'):
+        out.append(f'{row.id} {row.name} {row.price} {[round(x, 2) for x in row.v.tolist()]}')
+    ps = session.prepare('SELECT name FROM items WHERE price < ? ORDER BY id')
+    out.append('cheap: ' + ','.join(row.name for row in ps.bind(1).execute()))
+    c = session.run_sql('SELECT id, v FROM items ORDER BY id').fetch_columns()
+    out.append(f"columns: {c['v'].shape} {c['v'].dtype} {c['id'].tolist()}")
+    session.start_transaction()
+    session.run_sql("INSERT INTO items VALUES (4, 'plum', 1.10, STRING_TO_VECTOR('[1, 1, 0]'))")
+    session.rollback()
+    out.append('after rollback: ' + str(session.run_sql('SELECT COUNT(*) AS n FROM items').fetch_one().n))
+    r = '\n'.join(out)
+$$;
+CREATE LIBRARY pyprices LANGUAGE PYTHON AS $$
+def with_vat(price, rate=0.21):
+    return round(float(price) * (1 + rate), 2)
+$$;
+CREATE FUNCTION py_vat(p DECIMAL(8,2)) RETURNS DOUBLE LANGUAGE PYTHON USING (pyprices) AS $$
+    return pyprices.with_vat(p)
+$$;
+CREATE FUNCTION py_loop() RETURNS INT LANGUAGE PYTHON AS $$
+    while True:
+        pass
+$$;
+CREATE FUNCTION py_probe() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import os, socket
+    out = []
+    try:
+        open('/etc/passwd').read(1)
+        out.append('read /etc/passwd: ALLOWED')
+    except OSError:
+        out.append('read /etc/passwd: refused')
+    try:
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        out.append('socket: ALLOWED')
+    except Exception:
+        out.append('socket: refused')
+    return ', '.join(out)
+$$;
+CREATE FUNCTION py_spawn() RETURNS INT LANGUAGE PYTHON AS $$
+    import os
+    return os.system('true')
+$$;
+CREATE FUNCTION py_crash() RETURNS INT LANGUAGE PYTHON AS $$
+    import ctypes
+    return ctypes.string_at(0)[0]
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/native_python.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/native_python.sql
+
+--connect (con1, localhost, root,,test)
+SELECT py_add(2, 3), py_np();
+SELECT id, py_cosine(v, STRING_TO_VECTOR('[1, 0.05, 0]')) AS cosine FROM items ORDER BY id;
+CALL py_sql(@r);
+SELECT @r;
+SELECT py_vat(price) FROM items ORDER BY id;
+SELECT py_probe();
+--echo # Process creation is refused (a host SecurityException, not a Python OSError).
+--replace_regex /Python> .*/Python> (process creation refused)/
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_spawn();
+--let $con1_id = `SELECT CONNECTION_ID()`
+--let $pid0 = `SELECT mle_debug_worker_pid()`
+
+--echo #
+--echo # 3. max_execution_time and KILL QUERY stop a Python loop; the worker stays.
+--echo #
+--error ER_QUERY_TIMEOUT
+SELECT /*+ MAX_EXECUTION_TIME(500) */ py_loop();
+--send SELECT py_loop()
+--connection default
+--let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE id = $con1_id AND info LIKE 'SELECT py_loop%'
+--source include/wait_condition.inc
+--sleep 0.5
+--replace_result $con1_id CON1
+--eval KILL QUERY $con1_id
+--connection con1
+--error ER_QUERY_INTERRUPTED
+--reap
+SELECT py_add(1, 1);
+--let $pid1 = `SELECT mle_debug_worker_pid()`
+--let $assert_text = The same worker after the timeout and KILL QUERY
+--let $assert_cond = $pid1 = $pid0
+--source include/assert.inc
+
+--echo #
+--echo # 4. A native crash ends the worker, not mysqld; the next call gets a new one.
+--echo #
+--replace_regex /signal [0-9]+/signal N/
+--error ER_LANGUAGE_COMPONENT_INTERNAL,ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_crash();
+SELECT py_add(20, 22);
+--let $pid2 = `SELECT mle_debug_worker_pid()`
+--let $assert_text = A new worker after the crash
+--let $assert_cond = $pid2 != $pid0
+--source include/assert.inc
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION py_add;
+DROP FUNCTION py_np;
+DROP FUNCTION py_cosine;
+DROP PROCEDURE py_sql;
+DROP FUNCTION py_vat;
+DROP LIBRARY pyprices;
+DROP FUNCTION py_loop;
+DROP FUNCTION py_probe;
+DROP FUNCTION py_spawn;
+DROP FUNCTION py_crash;
+DROP TABLE items;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

@@ -63,6 +63,8 @@ Layout Layout::installed(const std::string &dir, const std::string &java_home) {
     globfree(&g);
   }
   if (exists(dir + "/mle.aot")) l.aot_cache = resolve(dir + "/mle.aot");
+  if (exists(dir + "/native/libmleworker.so"))
+    l.native_lib = resolve(dir + "/native/libmleworker.so");
   if (glob_t g{}; glob((dir_of(l.worker_jar) + "/deps/python-language-*.jar").c_str(), 0,
                        nullptr, &g) == 0) {
     l.python = g.gl_pathc > 0;
@@ -117,6 +119,39 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
   c.nofile = 4096;
   c.pool_size = o.pool_size;
   c.inherit_stderr = o.inherit_stderr;
+  return c;
+}
+
+ClassConfig native_worker_class(const Layout &layout, const JvmClassOptions &o) {
+  ClassConfig c = jvm_worker_class(layout, o);
+  // The same bootstrap and Main.run; the library is a Native Image with its
+  // own language resources beside it (no class path, no AOT cache, no JDK).
+  const std::string lib_dir = dir_of(layout.native_lib);
+  // Language resources (Python's standard library) as for the JVM class: extracted at build
+  // time, since workers cannot write a resource cache (same GraalVM release, same resources).
+  c.args = {"--jvm=" + layout.native_lib,
+            "-Dpolyglot.engine.userResourceCache=" + layout.resource_cache,
+            "-Xmx" + o.heap, "-Dmle.class=" + o.name};
+  if (!o.prewarm.empty()) c.args.push_back("-Dmle.prewarm=" + o.prewarm);
+  if (!layout.python_venv.empty())
+    c.args.push_back("-Dmle.python.venv=" + layout.python_venv);
+  if (!layout.package_dir.empty())
+    c.args.push_back("-Dmle.packages=" + layout.package_dir);
+  // GraalPy's home (its standard library) in the extracted resources: the
+  // native image does not find it through the resource cache by itself.
+  if (glob_t g{}; glob((layout.resource_cache + "/python/python-home/*").c_str(),
+                       GLOB_ONLYDIR, nullptr, &g) == 0) {
+    if (g.gl_pathc > 0) c.args.push_back(std::string("-Dmle.python.home=") + g.gl_pathv[0]);
+    globfree(&g);
+  }
+  // System properties only (-D...): the -XX options of the JVM class do not
+  // apply to a Native Image.
+  for (const std::string &x : o.extra_jvm_options)
+    if (x.rfind("-D", 0) == 0) c.args.push_back(x);
+  c.exec_paths = {dir_of(layout.worker_exe), lib_dir};
+  c.read_paths = {lib_dir, layout.resource_cache};
+  if (!layout.python_venv.empty()) c.read_paths.push_back(layout.python_venv);
+  if (!layout.package_dir.empty()) c.read_paths.push_back(layout.package_dir);
   return c;
 }
 

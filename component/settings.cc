@@ -79,6 +79,7 @@ char *g_dir = nullptr;
 char *g_java_home = nullptr;
 char *g_package_dir = nullptr;
 char *g_pool_prewarm = nullptr;
+char *g_worker = nullptr;
 
 std::atomic<unsigned> g_language_bits{kAllLanguages};
 /** What is installed (Python is an optional package): set at engine start. */
@@ -198,7 +199,7 @@ Registered g_registered[] = {
     {"java_home", false},  {"sql_result_max", false}, {"sql_row_max", false},
     {"sql_statements_max", false}, {"sql_chunk_rows", false},
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
-    {"package_dir", false}, {"pool_prewarm", false}};
+    {"package_dir", false}, {"pool_prewarm", false}, {"worker", false}};
 
 void mark(const char *name) {
   for (auto &r : g_registered)
@@ -442,6 +443,19 @@ bool register_settings() {
           "mle_package; empty: <mle.dir>/packages.",
           nullptr, nullptr, &package_dir, &g_package_dir))
     return true;
+
+  // The worker build (23): READONLY and not persistable, like the paths.
+  STR_CHECK_ARG(worker) worker;
+  worker.def_val = const_cast<char *>("AUTO");
+  if (reg("worker",
+          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY |
+              PLUGIN_VAR_NOPERSIST,
+          "Which worker build runs routines: JVM (Java, JavaScript and "
+          "Python), NATIVE (the Python-only native build in "
+          "<mle.dir>/native, highly optimised for Python) or AUTO (the JVM "
+          "build when it is installed, else the native one).",
+          nullptr, nullptr, &worker, &g_worker))
+    return true;
   return false;
 }
 
@@ -452,7 +466,7 @@ void unregister_settings() {
             kName, r.name))
       r.done = false;
   }
-  g_languages = g_cgroup_base = g_dir = g_java_home = g_package_dir = g_pool_prewarm = nullptr;
+  g_languages = g_cgroup_base = g_dir = g_java_home = g_package_dir = g_pool_prewarm = g_worker = nullptr;
 }
 
 std::string package_dir() {
@@ -479,6 +493,9 @@ Settings current_settings() {
   s.pool_prewarm = text(g_pool_prewarm);
   for (char &c : s.pool_prewarm) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
   if (s.pool_prewarm.empty()) s.pool_prewarm = "none";
+  s.worker = text(g_worker);
+  for (char &c : s.worker) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+  if (s.worker.empty()) s.worker = "AUTO";
   if (s.package_dir.empty()) s.package_dir = s.dir + "/packages";
   return s;
 }

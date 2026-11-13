@@ -30,6 +30,7 @@ mle.sql_chunk_rows	1000
 mle.sql_result_max	67108864
 mle.sql_row_max	16777216
 mle.sql_statements_max	1024
+mle.worker	AUTO
 mle.worker_cache_size	4
 mle.worker_cache_timeout	60
 SELECT @@mle.dir = CONCAT(TRIM(TRAILING '/' FROM @@plugin_dir), '/mle') AS default_dir,
