@@ -104,13 +104,18 @@ IF(MLE_DEBUG_BUILD)
   MESSAGE(STATUS "MLE: installing the debug variants from ${MLE_DEBUG_BUILD_DIR}")
   SET(MLE_DEBUG_DIR ${INSTALL_PLUGINDIR}/debug/mle)
   INSTALL_DEBUG_TARGET(component_mle
-    DESTINATION ${INSTALL_PLUGINDIR}/debug COMPONENT MleCore)
+    DESTINATION ${INSTALL_PLUGINDIR}/debug COMPONENT MleCommon)
   INSTALL_DEBUG_TARGET(mle_launcher DESTINATION ${MLE_DEBUG_DIR}
-    COMPONENT MleCore)
+    COMPONENT MleCommon)
   INSTALL_DEBUG_TARGET(mle_worker DESTINATION ${MLE_DEBUG_DIR}
-    COMPONENT MleCore)
-  SET(MLE_DEBUG_LINKS mle-worker.jar:MleCore deps:MleCore resources:MleCore
-    mle.aot:MleCore python-venv:MlePython)
+    COMPONENT MleCommon)
+  # resources: both builds read it (engine/ from the JVM build, python/ from
+  # Python); native: the Python-only native build.
+  SET(MLE_DEBUG_LINKS mle-worker.jar:MleCore deps:MleCore resources:MleCommon
+    mle.aot:MleCore python-venv:MlePythonRuntime)
+  IF(MLE_NATIVE_DIR)
+    LIST(APPEND MLE_DEBUG_LINKS native:MlePythonNative)
+  ENDIF()
   IF(MLE_BUILD_JDK)
     LIST(APPEND MLE_DEBUG_LINKS jdk:MleJdk)
   ENDIF()
@@ -152,3 +157,6 @@ ENDIF()
 CONFIGURE_FILE(cmake/mtr.sh.in ${CMAKE_BINARY_DIR}/mtr @ONLY
   FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ
   GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+
+# Packages (CPack): cmake/packaging.cmake.
+INCLUDE(packaging)

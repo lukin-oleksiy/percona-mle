@@ -18,5 +18,5 @@ case "$1" in
 		;;
 esac
 
-#DEBHELPER#
+# (no debhelper: packages built with CPack, cmake/packaging.cmake)
 exit 0

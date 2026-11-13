@@ -21,5 +21,5 @@ MYSQL_ADD_EXECUTABLE(mle_launcher
   cgroup.cc
   LINK_LIBRARIES mle_host
   DESTINATION ${INSTALL_PLUGINDIR}/mle
-  COMPONENT MleCore
+  COMPONENT MleCommon
   )

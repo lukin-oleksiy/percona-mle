@@ -1,0 +1,5 @@
+# percona-mle %preun: the AOT cache is not a file of the package; remove it on erase ($1 = 0).
+if [ "$1" = 0 ]; then
+  rm -f /usr/lib64/mysql/plugin/mle/mle.aot /usr/lib64/mysql/plugin/mle/mle.aot.new
+fi
+exit 0

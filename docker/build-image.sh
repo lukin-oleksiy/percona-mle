@@ -32,7 +32,7 @@ echo "Installing $SERVER and $BUILD into the image context"
 for c in Server Client SharedLibraries; do
   cmake --install "$SERVER" --prefix "$CTX/stage" --component "$c" >> "$CTX/install.log"
 done
-for c in MleCore MlePython MleTools; do
+for c in MleCommon MleCore MlePythonRuntime MlePython MleTools; do
   cmake --install "$BUILD" --prefix "$CTX/stage" --component "$c" >> "$CTX/install.log"
 done
 if grep -q '^MLE_BUILD_JDK:BOOL=ON' "$BUILD/CMakeCache.txt"; then

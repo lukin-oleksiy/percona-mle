@@ -1,4 +1,5 @@
-# The AOT cache must match the installed JDK and languages: rebuild it when
-# percona-mle-jdk or percona-mle-python changes.
+# The AOT cache must match the installed JDK, jars and languages: rebuild it when
+# percona-mle-jdk, percona-mle-python (GraalPy jars in deps/) or percona-mle-python-runtime changes.
 interest-noawait /usr/lib/mysql/plugin/mle/jdk
+interest-noawait /usr/lib/mysql/plugin/mle/deps
 interest-noawait /usr/lib/mysql/plugin/mle/python-venv

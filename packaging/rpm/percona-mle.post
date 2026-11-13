@@ -1,0 +1,9 @@
+# percona-mle %post: the JDK AOT cache MLE workers start from (it must match the installed JDK, jars and
+# languages). Without it workers start slower. (RPM layout: plugin dir /usr/lib64/mysql/plugin; to check
+# on RHEL; file triggers for percona-mle-jdk / percona-mle-python changes: later.)
+if [ -x /usr/lib64/mysql/plugin/mle/mle_aot_cache ]; then
+  echo "Creating the MLE AOT cache (up to a minute)..."
+  /usr/lib64/mysql/plugin/mle/mle_aot_cache ||
+    echo "Warning: no MLE AOT cache; workers start slower. Run /usr/lib64/mysql/plugin/mle/mle_aot_cache to retry." >&2
+fi
+exit 0

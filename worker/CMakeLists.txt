@@ -36,7 +36,7 @@ MYSQL_ADD_EXECUTABLE(mle_worker
   bootstrap/seccomp.cc
   LINK_LIBRARIES ${CMAKE_DL_LIBS}
   DESTINATION ${INSTALL_PLUGINDIR}/mle
-  COMPONENT MleCore
+  COMPONENT MleCommon
   )
 TARGET_INCLUDE_DIRECTORIES(mle_worker SYSTEM PRIVATE
   ${MLE_JAVA_HOME}/include ${MLE_JAVA_HOME}/include/linux)
@@ -174,7 +174,8 @@ INSTALL(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/maven/deps
   DIRECTORY_PERMISSIONS ${MLE_DIRECTORY_PERMISSIONS}
   FILES_MATCHING PATTERN "python-*.jar")
 # The languages' extracted resources: the Python standard library goes with
-# Python.
+# the Python runtime (MlePythonRuntime: both builds use it; the GraalPy jars,
+# MlePython, only the JVM build).
 INSTALL(DIRECTORY ${MLE_RESOURCE_CACHE}
   DESTINATION ${MLE_INSTALL_DIR} COMPONENT MleCore
   FILE_PERMISSIONS ${MLE_FILE_PERMISSIONS}
@@ -182,18 +183,18 @@ INSTALL(DIRECTORY ${MLE_RESOURCE_CACHE}
   PATTERN ".mle-*" EXCLUDE
   REGEX "/resources/python(/.*)?$" EXCLUDE)
 INSTALL(DIRECTORY ${MLE_RESOURCE_CACHE}/python
-  DESTINATION ${MLE_INSTALL_DIR}/resources COMPONENT MlePython
+  DESTINATION ${MLE_INSTALL_DIR}/resources COMPONENT MlePythonRuntime
   FILE_PERMISSIONS ${MLE_FILE_PERMISSIONS}
   DIRECTORY_PERMISSIONS ${MLE_DIRECTORY_PERMISSIONS})
 INSTALL(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/python-venv
-  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MlePython
+  DESTINATION ${MLE_INSTALL_DIR} COMPONENT MlePythonRuntime
   FILE_PERMISSIONS ${MLE_FILE_PERMISSIONS}
   DIRECTORY_PERMISSIONS ${MLE_DIRECTORY_PERMISSIONS}
   PATTERN ".mle-*" EXCLUDE
   REGEX "/venv/bin(/.*)?$" EXCLUDE)
 INSTALL(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/mle-venv-python
   DESTINATION ${MLE_INSTALL_DIR}/python-venv/venv/bin RENAME python
-  COMPONENT MlePython)
+  COMPONENT MlePythonRuntime)
 
 # A trimmed GraalVM runtime for the packages (percona-mle-jdk): what
 # the workers use of the JDK (the Graal compiler with libgraal for Truffle,
