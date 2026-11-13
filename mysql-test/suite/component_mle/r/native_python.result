@@ -58,6 +58,20 @@ read /etc/passwd: refused, socket: refused
 # Process creation is refused (a host SecurityException, not a Python OSError).
 SELECT py_spawn();
 ERROR HY000: Python> (process creation refused)
+# The worker stays after its runtime has started its own threads (the
+# thread check runs at most every 5 s and knows the native build's).
+SET SESSION cte_max_recursion_depth = 300000;
+SELECT SUM(py_add(seq, 1)) AS s FROM (WITH RECURSIVE c(seq) AS (SELECT 1 UNION ALL
+SELECT seq + 1 FROM c WHERE seq < 200000) SELECT seq FROM c) AS t;
+s
+20000300000
+SELECT SLEEP(5.5) AS waited;
+waited
+0
+SELECT py_add(3, 4);
+py_add(3, 4)
+7
+include/assert.inc [The same worker after the thread check]
 #
 # 3. max_execution_time and KILL QUERY stop a Python loop; the worker stays.
 #

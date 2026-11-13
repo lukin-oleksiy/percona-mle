@@ -111,6 +111,18 @@ SELECT py_spawn();
 --let $con1_id = `SELECT CONNECTION_ID()`
 --let $pid0 = `SELECT mle_debug_worker_pid()`
 
+--echo # The worker stays after its runtime has started its own threads (the
+--echo # thread check runs at most every 5 s and knows the native build's).
+SET SESSION cte_max_recursion_depth = 300000;
+SELECT SUM(py_add(seq, 1)) AS s FROM (WITH RECURSIVE c(seq) AS (SELECT 1 UNION ALL
+  SELECT seq + 1 FROM c WHERE seq < 200000) SELECT seq FROM c) AS t;
+SELECT SLEEP(5.5) AS waited;
+SELECT py_add(3, 4);
+--let $pid_threads = `SELECT mle_debug_worker_pid()`
+--let $assert_text = The same worker after the thread check
+--let $assert_cond = $pid_threads = $pid0
+--source include/assert.inc
+
 --echo #
 --echo # 3. max_execution_time and KILL QUERY stop a Python loop; the worker stays.
 --echo #

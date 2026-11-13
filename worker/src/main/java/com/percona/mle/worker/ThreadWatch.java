@@ -64,6 +64,10 @@ final class ThreadWatch {
   private static boolean system(String name) {
     for (String s : SYSTEM)
       if (name.startsWith(s)) return true;
-    return false;
+    // The Python-only native build (23) runs executor threads of its own ("pool-N-thread-M")
+    // and GraalPy's native-memory "Python GC". No routine can start a thread there (Python's
+    // thread API is refused; no Java routines, no JavaScript), so they are the runtime's.
+    // On the JVM a "pool-" thread may come from a Java routine: still a stranger there.
+    return Polyglot.nativeImage() && (name.startsWith("pool-") || name.startsWith("Python GC"));
   }
 }
