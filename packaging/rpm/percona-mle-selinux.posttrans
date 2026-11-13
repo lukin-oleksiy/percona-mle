@@ -1,0 +1,6 @@
+# percona-mle-selinux posttrans: label MLE's files (installed before the module was, or with it).
+if /usr/sbin/selinuxenabled; then
+  /usr/sbin/restorecon -iR /usr/lib64/mysql/plugin/mle /usr/lib64/mysql/plugin/debug/mle \
+    /var/lib/mysql-mle-packages || :
+fi
+exit 0

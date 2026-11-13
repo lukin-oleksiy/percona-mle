@@ -24,6 +24,8 @@
 #   percona-mle-python         GraalPy for the JVM build (jars)                      -> percona-mle, runtime
 #   percona-mle-python-native  the Python-only native build (-DMLE_PYTHON_NATIVE=ON) -> common, runtime
 #   percona-mle-tools          mle_package (third-party packages; uses the JVM build)
+#   percona-mle-selinux        the SELinux policy module (RPM only; -DMLE_SELINUX=ON, the default
+#                              with selinux-policy-devel)                          <- common
 #
 # mle.worker = AUTO runs the JVM build when percona-mle is installed, else the native one.
 
@@ -44,6 +46,10 @@ SET(CPACK_PACKAGE_DESCRIPTION_SUMMARY
   "Percona MLE: Python, Java and JavaScript stored programs for Percona Server")
 SET(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
 SET(CPACK_COMPONENTS_ALL MleCommon MleCore MleJdk MlePythonRuntime MlePython MlePythonNative MleTools)
+IF(MLE_SELINUX)
+  LIST(APPEND CPACK_COMPONENTS_ALL MleSelinux)
+ENDIF()
+SET(CPACK_PROJECT_CONFIG_FILE ${CMAKE_SOURCE_DIR}/cmake/cpack_project_config.cmake)
 SET(CPACK_DEB_COMPONENT_INSTALL ON)
 SET(CPACK_RPM_COMPONENT_INSTALL ON)
 SET(CPACK_COMPONENTS_GROUPING IGNORE)
@@ -79,7 +85,7 @@ SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_NAME percona-mle-tools)
 SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_DEPENDS "percona-mle (= ${mle_deb_ver})")
 SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_RECOMMENDS "nodejs, npm, maven")
 
-# RPM (to be checked on RHEL)
+# RPM (checked on Oracle Linux 10)
 SET(CPACK_RPM_PACKAGE_RELEASE ${MLE_PACKAGE_RELEASE})
 SET(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 SET(CPACK_RPM_PACKAGE_LICENSE "GPLv2")
@@ -92,15 +98,26 @@ SET(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
 SET(CPACK_RPM_SPEC_MORE_DEFINE "%define __strip /bin/true
 %define __os_install_post %{nil}
 %define _build_id_links none
-%define debug_package %{nil}")
+%define debug_package %{nil}
+%define source_date_epoch_from_changelog 0")
 SET(mle_rpm_ver "${MLE_VERSION}-${MLE_PACKAGE_RELEASE}")
 SET(CPACK_RPM_MLECOMMON_PACKAGE_NAME percona-mle-common)
 SET(CPACK_RPM_MLECOMMON_PACKAGE_REQUIRES "percona-server-server >= ${MLE_SERVER_VERSION}")
+IF(MLE_SELINUX)
+  # Where SELinux policy is installed, the policy module for the launcher and the workers.
+  STRING(APPEND CPACK_RPM_MLECOMMON_PACKAGE_REQUIRES
+    ", (percona-mle-selinux = ${mle_rpm_ver} if selinux-policy-targeted)")
+ENDIF()
 SET(CPACK_RPM_MLECORE_PACKAGE_NAME percona-mle)
 SET(CPACK_RPM_MLECORE_PACKAGE_REQUIRES
   "percona-mle-common = ${mle_rpm_ver}, percona-mle-jdk = ${mle_rpm_ver}")
-SET(CPACK_RPM_MLECORE_POST_INSTALL_SCRIPT_FILE ${CMAKE_SOURCE_DIR}/packaging/rpm/percona-mle.post)
-SET(CPACK_RPM_MLECORE_PRE_UNINSTALL_SCRIPT_FILE ${CMAKE_SOURCE_DIR}/packaging/rpm/percona-mle.preun)
+# The AOT cache: made by file triggers (packaging/rpm/percona-mle.triggers), once per transaction
+# that changes the JDK, jars or Python. CPack has no trigger sections: they follow the erase
+# scriptlet, the last section before the file list.
+FILE(READ ${CMAKE_SOURCE_DIR}/packaging/rpm/percona-mle.preun mle_preun)
+FILE(READ ${CMAKE_SOURCE_DIR}/packaging/rpm/percona-mle.triggers mle_triggers)
+FILE(WRITE ${CMAKE_BINARY_DIR}/packaging/percona-mle.preun "${mle_preun}\n${mle_triggers}")
+SET(CPACK_RPM_MLECORE_PRE_UNINSTALL_SCRIPT_FILE ${CMAKE_BINARY_DIR}/packaging/percona-mle.preun)
 SET(CPACK_RPM_MLEJDK_PACKAGE_NAME percona-mle-jdk)
 SET(CPACK_RPM_MLEPYTHONRUNTIME_PACKAGE_NAME percona-mle-python-runtime)
 SET(CPACK_RPM_MLEPYTHONRUNTIME_PACKAGE_REQUIRES "percona-mle-common = ${mle_rpm_ver}")
@@ -112,5 +129,14 @@ SET(CPACK_RPM_MLEPYTHONNATIVE_PACKAGE_REQUIRES
   "percona-mle-common = ${mle_rpm_ver}, percona-mle-python-runtime = ${mle_rpm_ver}")
 SET(CPACK_RPM_MLETOOLS_PACKAGE_NAME percona-mle-tools)
 SET(CPACK_RPM_MLETOOLS_PACKAGE_REQUIRES "percona-mle = ${mle_rpm_ver}")
+SET(CPACK_RPM_MLESELINUX_PACKAGE_NAME percona-mle-selinux)
+SET(CPACK_RPM_MLESELINUX_PACKAGE_ARCHITECTURE noarch)
+SET(CPACK_RPM_MLESELINUX_PACKAGE_REQUIRES "selinux-policy-targeted")
+SET(CPACK_RPM_MLESELINUX_PACKAGE_REQUIRES_POST "policycoreutils, selinux-policy-targeted")
+SET(CPACK_RPM_MLESELINUX_PACKAGE_REQUIRES_POSTUN "policycoreutils")
+SET(CPACK_RPM_MLESELINUX_POST_INSTALL_SCRIPT_FILE ${CMAKE_SOURCE_DIR}/packaging/rpm/percona-mle-selinux.post)
+SET(CPACK_RPM_MLESELINUX_POST_TRANS_SCRIPT_FILE ${CMAKE_SOURCE_DIR}/packaging/rpm/percona-mle-selinux.posttrans)
+SET(CPACK_RPM_MLESELINUX_POST_UNINSTALL_SCRIPT_FILE ${CMAKE_SOURCE_DIR}/packaging/rpm/percona-mle-selinux.postun)
+SET(CPACK_RPM_MLESELINUX_PACKAGE_SUMMARY "Percona MLE: SELinux policy for the MLE launcher and workers")
 
 INCLUDE(CPack)

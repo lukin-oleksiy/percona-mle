@@ -200,8 +200,11 @@ bool Launcher::configure(Reader &r) {
       c.error = "Landlock ABI " + std::to_string(kMinLandlockAbi) +
                 " or later (Linux 6.2) is required to isolate workers; "
                 "this kernel has " +
-                (m_landlock_abi == 0 ? std::string("none")
-                                     : std::to_string(m_landlock_abi));
+                (m_landlock_abi == 0
+                     ? std::string("none (where the kernel has it but does not "
+                                   "enable it, as on RHEL, add landlock to "
+                                   "its lsm= boot option)")
+                     : std::to_string(m_landlock_abi));
     } else {
       for (const auto *list : {&cfg.read_paths, &cfg.exec_paths})
         for (const std::string &p : *list)

@@ -1,0 +1,135 @@
+policy_module(percona_mle, 0.1.0)
+
+########################################
+#
+# Percona MLE: routines run in worker processes outside mysqld. mysqld
+# (mysqld_t) starts mle_launcher, which runs in mle_launcher_t; the launcher
+# starts the workers, which run in mle_worker_t. mysqld_t itself gains only
+# what it needs to talk to them: their descriptors (a control socket, the
+# mailbox memfd, a pidfd) and SIGKILL.
+#
+# mle_launcher_t: creates the workers' cgroups and mailboxes, no JIT.
+# mle_worker_t: runs routines (a JVM or a Native Image): needs execmem for
+# the JIT compilers; Landlock and seccomp confine it further.
+#
+
+gen_require(`
+	type mysqld_t;
+	type mysqld_log_t;
+	type passwd_file_t;
+	class process2 nnp_transition;
+')
+
+type mle_launcher_t;
+type mle_launcher_exec_t;
+domain_type(mle_launcher_t)
+domain_entry_file(mle_launcher_t, mle_launcher_exec_t)
+role system_r types mle_launcher_t;
+
+type mle_worker_t;
+type mle_worker_exec_t;
+domain_type(mle_worker_t)
+domain_entry_file(mle_worker_t, mle_worker_exec_t)
+role system_r types mle_worker_t;
+
+# The mailboxes (memfd, created by the launcher).
+type mle_tmpfs_t;
+files_tmpfs_file(mle_tmpfs_t)
+
+# Third-party packages the DBA installs with mle_package (mle.package_dir).
+type mle_packages_t;
+files_type(mle_packages_t)
+
+
+########################################
+#
+# mysqld
+#
+
+domtrans_pattern(mysqld_t, mle_launcher_exec_t, mle_launcher_t)
+allow mysqld_t { mle_launcher_t mle_worker_t }:process { signal sigkill };
+allow mysqld_t { mle_launcher_t mle_worker_t }:fd use;
+allow mysqld_t mle_launcher_t:unix_stream_socket { read write getattr setopt getopt shutdown };
+allow mysqld_t mle_tmpfs_t:file { read write getattr map };
+read_files_pattern(mysqld_t, mle_packages_t, mle_packages_t)
+# mle_launcher runs with AT_SECURE and mysqld's signal state and soft limits
+# reset: it needs none of them (its configuration comes over its socket).
+dontaudit mysqld_t mle_launcher_t:process { siginh rlimitinh noatsecure };
+
+########################################
+#
+# The launcher
+#
+
+domtrans_pattern(mle_launcher_t, mle_worker_exec_t, mle_worker_t)
+# The launcher sets no_new_privs (for seccomp) before it executes a worker.
+allow mle_launcher_t mle_worker_t:process2 nnp_transition;
+allow mle_launcher_t self:process { fork signal sigkill setrlimit };
+allow mle_launcher_t mle_worker_t:process { signal sigkill rlimitinh siginh noatsecure };
+allow mle_launcher_t mysqld_t:fd use;
+allow mle_launcher_t mysqld_t:unix_stream_socket { read write getattr setopt getopt shutdown };
+allow mle_launcher_t mysqld_t:process sigchld;
+allow mle_launcher_t self:unix_stream_socket create_stream_socket_perms;
+allow mle_launcher_t self:fifo_file rw_fifo_file_perms;
+allow mle_launcher_t mysqld_log_t:file { append getattr ioctl };
+
+fs_tmpfs_filetrans(mle_launcher_t, mle_tmpfs_t, file)
+allow mle_launcher_t mle_tmpfs_t:file { create read write getattr setattr map };
+
+# The workers' cgroups (below mysqld's delegated cgroup).
+fs_getattr_cgroup(mle_launcher_t)
+fs_manage_cgroup_dirs(mle_launcher_t)
+fs_rw_cgroup_files(mle_launcher_t)
+
+# The workers' Landlock rules: the launcher opens (O_PATH) and stats the
+# paths a worker may read and walks the directories around the paths hidden
+# from it; it reads none of them.
+files_getattr_all_dirs(mle_launcher_t)
+files_getattr_all_files(mle_launcher_t)
+files_getattr_all_symlinks(mle_launcher_t)
+files_search_all(mle_launcher_t)
+files_list_all(mle_launcher_t)
+dev_getattr_all_chr_files(mle_launcher_t)
+
+kernel_read_system_state(mle_launcher_t)
+files_read_etc_files(mle_launcher_t)
+libs_use_ld_so(mle_launcher_t)
+libs_use_shared_libs(mle_launcher_t)
+miscfiles_read_localization(mle_launcher_t)
+dev_rw_null(mle_launcher_t)
+
+########################################
+#
+# The workers
+#
+
+allow mle_worker_t self:process { execmem fork signal sigchld getsched setsched getcap setrlimit };
+allow mle_worker_t self:fifo_file rw_fifo_file_perms;
+allow mle_worker_t self:unix_stream_socket create_stream_socket_perms;
+allow mle_worker_t { mle_launcher_t mysqld_t }:fd use;
+allow mle_worker_t mle_launcher_t:unix_stream_socket { read write getattr setopt getopt shutdown };
+allow mle_worker_t mle_launcher_t:fifo_file { write getattr };
+allow mle_worker_t mle_tmpfs_t:file { read write getattr map };
+allow mle_worker_t mysqld_log_t:file { append getattr ioctl };
+allow mle_worker_t mle_worker_exec_t:file { read getattr map execute execute_no_trans };
+
+# The JVM: the user name (getpwuid), memory settings, cgroup limits.
+allow mle_worker_t passwd_file_t:file { read open getattr };
+kernel_read_system_state(mle_worker_t)
+kernel_read_kernel_sysctls(mle_worker_t)
+kernel_read_vm_sysctls(mle_worker_t)
+fs_getattr_cgroup(mle_worker_t)
+read_files_pattern(mle_worker_t, mle_packages_t, mle_packages_t)
+list_dirs_pattern(mle_worker_t, mle_packages_t, mle_packages_t)
+dev_read_sysfs(mle_worker_t)
+dev_read_urand(mle_worker_t)
+dev_read_rand(mle_worker_t)
+dev_rw_null(mle_worker_t)
+fs_read_cgroup_files(mle_worker_t)
+fs_search_cgroup_dirs(mle_worker_t)
+files_read_etc_files(mle_worker_t)
+files_read_usr_files(mle_worker_t)
+libs_use_ld_so(mle_worker_t)
+libs_use_shared_libs(mle_worker_t)
+libs_read_lib_files(mle_worker_t)
+miscfiles_read_localization(mle_worker_t)

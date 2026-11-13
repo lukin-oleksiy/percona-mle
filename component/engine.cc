@@ -139,7 +139,10 @@ std::string mib(uint64_t bytes) {
   return std::to_string(bytes >> 20) + " MiB";
 }
 
-/** The files the engine needs; "" if all are there, else what is missing. */
+/** The files the engine needs; "" if all are there, else what is missing.
+    mle_worker is only checked to exist: the launcher executes it (and reports
+    why it cannot), and under SELinux mysqld itself may not (it is
+    mle_worker_exec_t, for the workers' domain). */
 std::string check_layout(const mle::Layout &l, const Settings &s, bool native) {
   struct Need {
     const std::string &path;
@@ -149,7 +152,7 @@ std::string check_layout(const mle::Layout &l, const Settings &s, bool native) {
   if (native) {
     // The Python-only native build (23): no jar, no JDK.
     const Need needs[] = {{l.launcher_exe, X_OK, "mle_launcher"},
-                          {l.worker_exe, X_OK, "mle_worker"}};
+                          {l.worker_exe, F_OK, "mle_worker"}};
     for (const Need &n : needs)
       if (access(n.path.c_str(), n.mode) != 0)
         return std::string("the MLE files are not installed in mle.dir '") +
@@ -163,7 +166,7 @@ std::string check_layout(const mle::Layout &l, const Settings &s, bool native) {
   const std::string libjvm = l.java_home + "/lib/server/libjvm.so";
   const Need needs[] = {
       {l.launcher_exe, X_OK, "mle_launcher"},
-      {l.worker_exe, X_OK, "mle_worker"},
+      {l.worker_exe, F_OK, "mle_worker"},
       {l.worker_jar, R_OK, "mle-worker.jar"},
       {l.resource_cache, R_OK | X_OK, "resources"},
   };
@@ -220,20 +223,11 @@ std::string auto_cgroup_base(std::string *why) {
     *why = "mysqld is in the root cgroup";
     return "";
   }
-  const std::string parent = "/sys/fs/cgroup" + own.substr(0, slash);
-  if (access(parent.c_str(), W_OK) != 0 ||
-      access((parent + "/cgroup.procs").c_str(), W_OK) != 0) {
-    *why = "the parent of mysqld's cgroup (" + parent +
-           ") is not delegated to mysqld (systemd: Delegate=yes, "
-           "DelegateSubgroup=)";
-    return "";
-  }
-  if (!read_file(parent + "/cgroup.procs").empty()) {
-    *why = "the parent of mysqld's cgroup (" + parent +
-           ") has processes of its own";
-    return "";
-  }
-  return parent;
+  // Whether it is delegated (writable, no processes of its own) is checked
+  // by mle_launcher, which creates the worker cgroups: under SELinux mysqld
+  // itself may not write to cgroups (mysqld_t; the launcher runs in
+  // mle_launcher_t).
+  return "/sys/fs/cgroup" + own.substr(0, slash);
 }
 
 /** Starts a launcher with settings s and makes it the engine's; caller holds

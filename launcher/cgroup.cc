@@ -99,7 +99,10 @@ std::string cgroup_prepare(const std::string &base) {
            "(e.g. systemd DelegateSubgroup=)";
   std::string error;
   if (!write_file(base + "/cgroup.subtree_control", "+memory +pids", &error))
-    return error;
+    return errno == EACCES || errno == EPERM || errno == EROFS
+               ? base + " is not delegated to mysqld (systemd: Delegate=yes, "
+                        "DelegateSubgroup=): " + error
+               : error;
   // Leaves of launchers that are gone (their workers died with them; a
   // leaf that still has processes is not removed).
   if (DIR *d = opendir(base.c_str())) {

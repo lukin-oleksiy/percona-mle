@@ -1,0 +1,4 @@
+# percona-mle-selinux post: install (or upgrade) the policy module of the MLE launcher and
+# workers (packaging/selinux/percona_mle.te).
+/usr/sbin/semodule -X 200 -i /usr/share/selinux/packages/targeted/percona_mle.pp.bz2 || :
+exit 0

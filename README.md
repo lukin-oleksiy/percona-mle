@@ -71,9 +71,16 @@ Packages (`cpack -G DEB` or `cpack -G RPM` in the build directory; the server mu
 | `percona-mle-python` | `MlePython` | GraalPy for the JVM build | percona-mle, python-runtime |
 | `percona-mle-python-native` | `MlePythonNative` | the Python-only native build (`-DMLE_PYTHON_NATIVE=ON`) | common, python-runtime |
 | `percona-mle-tools` | `MleTools` | `mle_package` (third-party npm, PyPI, Maven packages) | percona-mle |
+| `percona-mle-selinux` | `MleSelinux` | the SELinux policy module (RPM only; `-DMLE_SELINUX=ON`, the default with selinux-policy-devel) | pulled by common where SELinux policy is installed |
 
 With the JVM build, `<plugin dir>/mle/mle_aot_cache` makes the JDK AOT cache that workers start from (the
-`percona-mle` package runs it). In the server:
+`percona-mle` package runs it: Debian triggers, RPM file triggers, once per transaction that changes the JDK,
+jars or Python).
+
+SELinux (`packaging/selinux/percona_mle.te`): mysqld (`mysqld_t`) starts `mle_launcher` in `mle_launcher_t`
+(cgroups, mailboxes; no JIT), which starts workers in `mle_worker_t` (`execmem` for the JIT compilers); mysqld
+gains only the workers' descriptors and signals. On RHEL-like kernels Landlock must be enabled on the kernel
+command line (`lsm=landlock,...`). In the server:
 
     INSTALL COMPONENT 'file://component_lang_router';
     INSTALL COMPONENT 'file://component_mle';

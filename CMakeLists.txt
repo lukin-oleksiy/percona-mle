@@ -84,6 +84,37 @@ INSTALL(PROGRAMS tools/mle_package DESTINATION ${INSTALL_PLUGINDIR}/mle
 INSTALL(PROGRAMS tools/mle_aot_cache DESTINATION ${INSTALL_PLUGINDIR}/mle
   COMPONENT MleCore)
 
+# The SELinux policy module (packaging/selinux; percona-mle-selinux): the
+# launcher and the workers in domains of their own, mysqld_t unchanged but for
+# talking to them. Needs selinux-policy-devel (RHEL and compatible).
+SET(MLE_SELINUX_MAKEFILE /usr/share/selinux/devel/Makefile)
+IF(EXISTS ${MLE_SELINUX_MAKEFILE})
+  SET(MLE_SELINUX_DEFAULT ON)
+ELSE()
+  SET(MLE_SELINUX_DEFAULT OFF)
+ENDIF()
+OPTION(MLE_SELINUX "Build the SELinux policy module (selinux-policy-devel)"
+  ${MLE_SELINUX_DEFAULT})
+IF(MLE_SELINUX)
+  IF(NOT EXISTS ${MLE_SELINUX_MAKEFILE})
+    MESSAGE(FATAL_ERROR "MLE_SELINUX needs ${MLE_SELINUX_MAKEFILE} (selinux-policy-devel)")
+  ENDIF()
+  SET(se_src ${CMAKE_CURRENT_SOURCE_DIR}/packaging/selinux)
+  SET(se_dir ${CMAKE_CURRENT_BINARY_DIR}/selinux)
+  FILE(MAKE_DIRECTORY ${se_dir})
+  ADD_CUSTOM_COMMAND(OUTPUT ${se_dir}/percona_mle.pp.bz2
+    COMMAND ${CMAKE_COMMAND} -E copy ${se_src}/percona_mle.te ${se_src}/percona_mle.fc ${se_dir}
+    COMMAND make -s -f ${MLE_SELINUX_MAKEFILE} percona_mle.pp 2>&1 | grep -v "duplicate definition" || true
+    COMMAND bzip2 -f -9 percona_mle.pp
+    WORKING_DIRECTORY ${se_dir}
+    DEPENDS ${se_src}/percona_mle.te ${se_src}/percona_mle.fc
+    COMMENT "Building the MLE SELinux policy module"
+    )
+  ADD_CUSTOM_TARGET(mle_selinux ALL DEPENDS ${se_dir}/percona_mle.pp.bz2)
+  INSTALL(FILES ${se_dir}/percona_mle.pp.bz2
+    DESTINATION share/selinux/packages/targeted COMPONENT MleSelinux)
+ENDIF()
+
 ADD_SUBDIRECTORY(component)
 
 # The debug server (mysqld-debug, plugin_dir <plugin>/debug) gets MLE too: a

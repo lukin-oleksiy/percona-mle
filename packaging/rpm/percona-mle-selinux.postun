@@ -1,0 +1,9 @@
+# percona-mle-selinux postun: on erase ($1 = 0) remove the policy module and relabel.
+if [ "$1" = 0 ]; then
+  /usr/sbin/semodule -X 200 -r percona_mle >/dev/null 2>&1 || :
+  if /usr/sbin/selinuxenabled; then
+    /usr/sbin/restorecon -iR /usr/lib64/mysql/plugin/mle /usr/lib64/mysql/plugin/debug/mle \
+      /var/lib/mysql-mle-packages || :
+  fi
+fi
+exit 0

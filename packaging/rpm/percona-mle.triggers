@@ -1,0 +1,19 @@
+# percona-mle: the JDK AOT cache MLE workers start from. It must match the installed JDK, jars
+# and languages, so it is made once after a transaction that installs, upgrades or removes any
+# of them (percona-mle itself: deps/; percona-mle-jdk: jdk/; percona-mle-python: deps/;
+# percona-mle-python-runtime: python-venv/). Without it workers start slower.
+# (Appended to the erase scriptlet by cmake/packaging.cmake: CPack has no trigger sections.)
+%transfiletriggerin -- /usr/lib64/mysql/plugin/mle/jdk /usr/lib64/mysql/plugin/mle/deps /usr/lib64/mysql/plugin/mle/python-venv
+if [ -x /usr/lib64/mysql/plugin/mle/mle_aot_cache ]; then
+  echo "Creating the MLE AOT cache (up to a minute)..."
+  /usr/lib64/mysql/plugin/mle/mle_aot_cache ||
+    echo "Warning: no MLE AOT cache; workers start slower. Run /usr/lib64/mysql/plugin/mle/mle_aot_cache to retry." >&2
+fi
+exit 0
+%transfiletriggerpostun -- /usr/lib64/mysql/plugin/mle/jdk /usr/lib64/mysql/plugin/mle/deps /usr/lib64/mysql/plugin/mle/python-venv
+if [ -x /usr/lib64/mysql/plugin/mle/mle_aot_cache ]; then
+  echo "Creating the MLE AOT cache (up to a minute)..."
+  /usr/lib64/mysql/plugin/mle/mle_aot_cache ||
+    echo "Warning: no MLE AOT cache; workers start slower. Run /usr/lib64/mysql/plugin/mle/mle_aot_cache to retry." >&2
+fi
+exit 0
