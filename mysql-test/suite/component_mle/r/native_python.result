@@ -52,6 +52,10 @@ py_vat(price)
 0.6
 0.91
 10890
+# A third-party package installed by the DBA (mle.package_dir).
+SELECT py_package(1, 2, 6);
+py_package(1, 2, 6)
+1.0.0 3.00 5.00
 SELECT py_probe();
 py_probe()
 read /etc/passwd: refused, socket: refused
@@ -102,6 +106,7 @@ DROP LIBRARY pyprices;
 DROP FUNCTION py_loop;
 DROP FUNCTION py_probe;
 DROP FUNCTION py_spawn;
+DROP FUNCTION py_package;
 DROP FUNCTION py_crash;
 DROP TABLE items;
 REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;

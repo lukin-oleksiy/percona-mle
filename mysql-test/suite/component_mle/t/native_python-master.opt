@@ -1,1 +1,1 @@
-$MLE_COMPONENT_OPT --loose-mle.worker=NATIVE
+$MLE_COMPONENT_OPT --loose-mle.worker=NATIVE --loose-mle.package_dir=$MLE_SUITE_DIR/std_data/mle_packages

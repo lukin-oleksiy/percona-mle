@@ -89,6 +89,11 @@ CREATE FUNCTION py_spawn() RETURNS INT LANGUAGE PYTHON AS $$
     import os
     return os.system('true')
 $$;
+CREATE FUNCTION py_package(a DOUBLE, b DOUBLE, c DOUBLE) RETURNS VARCHAR(100) LANGUAGE PYTHON AS $$
+    import mle_demo_py
+    m, spread = mle_demo_py.mean_and_spread([a, b, c])
+    return '%s %.2f %.2f' % (mle_demo_py.__version__, m, spread)
+$$;
 CREATE FUNCTION py_crash() RETURNS INT LANGUAGE PYTHON AS $$
     import ctypes
     return ctypes.string_at(0)[0]
@@ -103,6 +108,8 @@ SELECT id, py_cosine(v, STRING_TO_VECTOR('[1, 0.05, 0]')) AS cosine FROM items O
 CALL py_sql(@r);
 SELECT @r;
 SELECT py_vat(price) FROM items ORDER BY id;
+--echo # A third-party package installed by the DBA (mle.package_dir).
+SELECT py_package(1, 2, 6);
 SELECT py_probe();
 --echo # Process creation is refused (a host SecurityException, not a Python OSError).
 --replace_regex /Python> .*/Python> (process creation refused)/
@@ -168,6 +175,7 @@ DROP LIBRARY pyprices;
 DROP FUNCTION py_loop;
 DROP FUNCTION py_probe;
 DROP FUNCTION py_spawn;
+DROP FUNCTION py_package;
 DROP FUNCTION py_crash;
 DROP TABLE items;
 REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
