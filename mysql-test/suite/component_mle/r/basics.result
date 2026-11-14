@@ -58,6 +58,7 @@ mle_stored_programs	#
 mle_threads	#
 mle_threads_max	#
 mle_worker_failures	#
+mle_worker_memory_gcs	#
 mle_worker_reuses	#
 mle_workers	#
 mle_workers_cached	#

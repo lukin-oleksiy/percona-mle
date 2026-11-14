@@ -163,9 +163,30 @@ SELECT py_add(20, 22);
 --let $assert_cond = $pid2 != $pid0
 --source include/assert.inc
 
+--echo #
+--echo # 5. numpy temporaries beyond mle.memory_max in all: the memory watcher
+--echo #    forces GCs (exp note 30); the call completes.
+--echo #
+--write_file $MYSQLTEST_VARDIR/tmp/native_churn.sql
+CREATE FUNCTION py_churn(n INT) RETURNS TEXT LANGUAGE PYTHON AS $$
+    import numpy as np
+    total = 0.0
+    for i in range(n):
+        a = np.full((4096, 8192), i, dtype=np.float64)
+        total += float(a[0, 0] + a[-1, -1])
+    return '%d rounds, total %.0f' % (n, total)
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/native_churn.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/native_churn.sql
+SELECT py_churn(12) AS churn;
+
 --disconnect con1
 --connection default
 --source include/wait_until_count_sessions.inc
+SELECT VARIABLE_VALUE > 0 AS watcher_forced_gcs FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_worker_memory_gcs';
+DROP FUNCTION py_churn;
 DROP FUNCTION py_add;
 DROP FUNCTION py_np;
 DROP FUNCTION py_cosine;

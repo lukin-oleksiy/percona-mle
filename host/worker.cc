@@ -157,6 +157,8 @@ WorkerStats Worker::stats() const {
   WorkerStats r;
   r.heap_max = s.heap_max;
   r.heap_used = std::min(s.heap_used, s.heap_max);
+  // At most one per 10 ms of a call: a larger count is not the watcher's.
+  r.memory_gcs = s.gc_count <= (uint64_t{1} << 32) ? s.gc_count : 0;
   r.state = s.state <= uint32_t(wire::WorkerState::kCompiling) ? s.state : 0;
   r.tainted = s.tainted != 0;
   return r;

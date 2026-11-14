@@ -1,0 +1,72 @@
+--echo #
+--echo # component_mle: numpy memory in Python routines (exp design note 30).
+--echo # GraalPy frees a numpy array only when the Java object referring to it
+--echo # is collected, and numpy's malloc does not make the JVM collect: a loop
+--echo # of large temporaries outgrew mle.memory_max and the worker was killed.
+--echo # The worker's memory watcher forces a GC while a call grows
+--echo # (mle_worker_memory_gcs counts them). Also: JMX (java.lang.management
+--echo # and the other management packages) is out of reach of guest code.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+--write_file $MYSQLTEST_VARDIR/tmp/numpy_memory.sql
+CREATE FUNCTION py_churn(n INT) RETURNS TEXT LANGUAGE PYTHON AS $$
+    import numpy as np
+    total = 0.0
+    for i in range(n):
+        # 256 MiB, garbage after each round: n rounds allocate n / 4 GiB in all.
+        a = np.full((4096, 8192), i, dtype=np.float64)
+        total += float(a[0, 0] + a[-1, -1])
+    return '%d rounds, total %.0f' % (n, total)
+$$;
+CREATE FUNCTION py_jmx() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import java
+    out = []
+    for name in ('java.lang.management.ManagementFactory', 'com.sun.management.HotSpotDiagnosticMXBean',
+                 'javax.management.MBeanServerFactory', 'java.util.ArrayList'):
+        try:
+            java.type(name)
+            out.append(name + ': reachable')
+        except KeyError:
+            out.append(name + ': refused')
+    return '\n'.join(out)
+$$;
+CREATE FUNCTION js_jmx() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  try { Java.type('java.lang.management.ManagementFactory'); return 'reachable' } catch (e) { return e.name }
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/numpy_memory.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/numpy_memory.sql
+
+--echo # 1. 3 GiB of numpy temporaries under the default limit (2 GiB): the
+--echo # call completes, the watcher forced GCs, no worker was lost.
+SELECT @@mle.memory_max / 1024 / 1024 / 1024 AS memory_max_gib;
+let $failures0 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_worker_failures', Value, 1);
+--connect (con1, localhost, root,,test)
+SELECT py_churn(12) AS churn;
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+let $failures1 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_worker_failures', Value, 1);
+--expr $lost = $failures1 - $failures0
+--echo workers lost: $lost
+SELECT VARIABLE_VALUE > 0 AS watcher_forced_gcs FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_worker_memory_gcs';
+
+--echo # 2. No JMX from guest code.
+--connect (con1, localhost, root,,test)
+SELECT py_jmx() AS python;
+SELECT js_jmx() AS javascript;
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+
+DROP FUNCTION py_churn;
+DROP FUNCTION py_jmx;
+DROP FUNCTION js_jmx;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

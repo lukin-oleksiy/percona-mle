@@ -1,0 +1,39 @@
+#
+# component_mle: numpy memory in Python routines (exp design note 30).
+# GraalPy frees a numpy array only when the Java object referring to it
+# is collected, and numpy's malloc does not make the JVM collect: a loop
+# of large temporaries outgrew mle.memory_max and the worker was killed.
+# The worker's memory watcher forces a GC while a call grows
+# (mle_worker_memory_gcs counts them). Also: JMX (java.lang.management
+# and the other management packages) is out of reach of guest code.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+# 1. 3 GiB of numpy temporaries under the default limit (2 GiB): the
+# call completes, the watcher forced GCs, no worker was lost.
+SELECT @@mle.memory_max / 1024 / 1024 / 1024 AS memory_max_gib;
+memory_max_gib
+2.000000000000
+SELECT py_churn(12) AS churn;
+churn
+12 rounds, total 132
+workers lost: 0
+SELECT VARIABLE_VALUE > 0 AS watcher_forced_gcs FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_worker_memory_gcs';
+watcher_forced_gcs
+1
+# 2. No JMX from guest code.
+SELECT py_jmx() AS python;
+python
+java.lang.management.ManagementFactory: refused
+com.sun.management.HotSpotDiagnosticMXBean: refused
+javax.management.MBeanServerFactory: refused
+java.util.ArrayList: reachable
+SELECT js_jmx() AS javascript;
+javascript
+TypeError
+DROP FUNCTION py_churn;
+DROP FUNCTION py_jmx;
+DROP FUNCTION js_jmx;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

@@ -564,6 +564,8 @@ void engine_session_end(uint64_t mark) {
 void engine_release_worker(std::unique_ptr<mle::Worker> worker,
                            const std::string &principal, uint64_t mark) {
   if (!worker) return;
+  // The session's forced GCs, before RESET (which restarts the worker's count).
+  g_counters.memory_gcs += static_cast<long>(worker->stats().memory_gcs);
   uint64_t generation = 0;
   bool current = false;
   // Under g_mutex: whether the account was dropped or renamed since the

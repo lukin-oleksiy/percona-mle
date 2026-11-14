@@ -153,6 +153,7 @@ final class Control implements Runnable {
 
   /** A top-level call starts (on the main thread); guest: a JS or Python routine. */
   synchronized void begin(long seq, boolean guest) {
+    MemoryWatch.begin();
     running = seq;
     this.guest = guest;
     interrupted = false;
@@ -165,6 +166,7 @@ final class Control implements Runnable {
 
   /** The top-level call ended; true if it was interrupted. Clears the thread's interrupt flag. */
   synchronized boolean end() {
+    MemoryWatch.end();
     last = Math.max(last, running);
     running = -1;
     notifyAll();  // an interrupter waiting to escalate

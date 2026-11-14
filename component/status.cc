@@ -40,6 +40,7 @@
     mle_workers              workers held by sessions
     mle_workers_spawned      worker processes started by the launcher
     mle_worker_failures      workers that died, were killed or misbehaved
+    mle_worker_memory_gcs    GCs forced by the workers' memory watchers
     mle_pool_idle            started workers waiting in the pool
     mle_workers_cached       reset workers kept for sessions of their account
     mle_worker_reuses        sessions that got a kept worker
@@ -164,6 +165,8 @@ SHOW_VAR g_status_vars[] = {
     MLE_STATUS("mle_workers_spawned", &show_spawned),
     MLE_STATUS("mle_worker_failures",
                &show_counter<&Counters::worker_failures>),
+    MLE_STATUS("mle_worker_memory_gcs",
+               &show_counter<&Counters::memory_gcs>),
     MLE_STATUS("mle_pool_idle", &show_pool_idle),
     MLE_STATUS("mle_workers_cached", &show_workers_cached),
     MLE_STATUS("mle_worker_reuses", &show_worker_reuses),

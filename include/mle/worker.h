@@ -94,6 +94,8 @@ class NoSql : public CallHooks {
 struct WorkerStats {
   uint64_t heap_used = 0;
   uint64_t heap_max = 0;
+  /** GCs the memory watcher forced since the last RESET. */
+  uint64_t memory_gcs = 0;
   uint32_t state = 0;
   bool tainted = false;
 };

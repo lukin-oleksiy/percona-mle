@@ -174,6 +174,7 @@ final class Mailbox {
     Runtime rt = Runtime.getRuntime();
     region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_HEAP_USED, rt.totalMemory() - rt.freeMemory());
     region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_HEAP_MAX, rt.maxMemory());
+    region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_GC_COUNT, MemoryWatch.gcs());
     region.set(ValueLayout.JAVA_INT, Wire.OFF_STATS + Wire.STATS_STATE, state);
     region.set(ValueLayout.JAVA_INT, Wire.OFF_STATS + Wire.STATS_TAINTED, tainted ? 1 : 0);
   }

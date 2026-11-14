@@ -75,6 +75,8 @@ struct Counters {
   std::atomic<long> oom_errors{0};
   /** Workers lost: died, killed or broke the protocol (W5). */
   std::atomic<long> worker_failures{0};
+  /** GCs the workers' memory watchers forced (exp note 30). */
+  std::atomic<long> memory_gcs{0};
 };
 extern Counters g_counters;
 

@@ -97,6 +97,18 @@ SELECT py_add(20, 22);
 py_add(20, 22)
 42
 include/assert.inc [A new worker after the crash]
+#
+# 5. numpy temporaries beyond mle.memory_max in all: the memory watcher
+#    forces GCs (exp note 30); the call completes.
+#
+SELECT py_churn(12) AS churn;
+churn
+12 rounds, total 132
+SELECT VARIABLE_VALUE > 0 AS watcher_forced_gcs FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_worker_memory_gcs';
+watcher_forced_gcs
+1
+DROP FUNCTION py_churn;
 DROP FUNCTION py_add;
 DROP FUNCTION py_np;
 DROP FUNCTION py_cosine;

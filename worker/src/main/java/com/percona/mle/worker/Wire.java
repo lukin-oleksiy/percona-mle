@@ -59,7 +59,7 @@ final class Wire {
   // WorkerStats fields, relative to OFF_STATS.
   static final long STATS_HEAP_USED = 0;
   static final long STATS_HEAP_MAX = 8;
-  static final long STATS_GC_COUNT = 16;
+  static final long STATS_GC_COUNT = 16;  // GCs the memory watcher forced since RESET (30)
   static final long STATS_STATE = 24;
   static final long STATS_TAINTED = 28;
 

@@ -129,6 +129,8 @@ final class Dispatcher {
           polyglot.reset();
           // A worker with a thread a routine left is not kept for reuse (the host retires it).
           if (!tainted && threads.strangers()) tainted = true;
+          // The host took the memory watcher's count with the session's statistics.
+          MemoryWatch.clear();
           // A reset worker is usually parked for reuse: give its memory back (12 §17).
           System.gc();
           result(Wire.OK, null, null, null);

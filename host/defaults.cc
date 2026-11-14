@@ -98,7 +98,9 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
       // ThreadWatch: the thread containers list virtual threads too (also
       // in the AOT cache's options, worker/CMakeLists.txt, mle_aot_cache).
       "--add-exports=java.base/jdk.internal.vm=ALL-UNNAMED",
-      "-Dmle.class=" + o.name};
+      "-Dmle.class=" + o.name,
+      // The worker's memory watcher forces GCs below this limit (exp note 30).
+      "-Dmle.memoryMax=" + std::to_string(o.memory_max)};
   if (!layout.aot_cache.empty())
     c.args.push_back("-XX:AOTCache=" + layout.aot_cache);
   if (!o.prewarm.empty()) c.args.push_back("-Dmle.prewarm=" + o.prewarm);
@@ -134,7 +136,8 @@ ClassConfig native_worker_class(const Layout &layout, const JvmClassOptions &o) 
   // time, since workers cannot write a resource cache (same GraalVM release, same resources).
   c.args = {"--jvm=" + layout.native_lib,
             "-Dpolyglot.engine.userResourceCache=" + layout.resource_cache,
-            "-Xmx" + o.heap, "-Dmle.class=" + o.name};
+            "-Xmx" + o.heap, "-Dmle.class=" + o.name,
+            "-Dmle.memoryMax=" + std::to_string(o.memory_max)};
   if (!o.prewarm.empty()) c.args.push_back("-Dmle.prewarm=" + o.prewarm);
   if (!layout.python_venv.empty())
     c.args.push_back("-Dmle.python.venv=" + layout.python_venv);

@@ -106,6 +106,10 @@ final class Polyglot {
       .denyAccess(java.util.concurrent.ForkJoinPool.class)
       .denyAccess(java.util.concurrent.CompletableFuture.class)
       .denyAccess(java.util.Timer.class)
+      // JMX (exp note 30): MXBeans reach JVM options, heap dumps, GC and thread control.
+      .denyAccess(java.lang.management.ManagementFactory.class)
+      .denyAccess(java.lang.management.PlatformManagedObject.class)
+      .denyAccess(javax.management.MBeanServer.class)
       .build();
 
   /** Phase 7: guest code cannot start threads through Java either. */
@@ -113,6 +117,18 @@ final class Polyglot {
       "java.lang.ThreadGroup", "java.lang.Thread$Builder", "java.util.concurrent.Executors",
       "java.util.concurrent.ThreadPoolExecutor", "java.util.concurrent.ScheduledThreadPoolExecutor",
       "java.util.concurrent.ForkJoinPool", "java.util.concurrent.CompletableFuture", "java.util.Timer");
+
+  /** JMX (exp note 30): no class of the management packages can be looked up. */
+  private static final String[] MANAGEMENT_PACKAGES = {"java.lang.management.", "com.sun.management.",
+      "javax.management.", "jdk.management.", "sun.management."};
+
+  /** Whether guest code (Java.type, java.type) may look up the class. */
+  static boolean lookupAllowed(String name) {
+    if (name.startsWith("com.percona.mle.worker.") || THREAD_CLASSES.contains(name)) return false;
+    for (String p : MANAGEMENT_PACKAGES)
+      if (name.startsWith(p)) return false;
+    return true;
+  }
 
   /**
    * A prepared routine. Body form (entry ""): js is set for JavaScript; Python routines with OUT
@@ -258,7 +274,7 @@ final class Polyglot {
         // The process is the sandbox; only the worker's own classes are hidden. In the native
         // build no class can be looked up (classes need reflection metadata there; 23).
         .allowHostClassLookup(nativeImage() ? name -> false
-            : name -> !name.startsWith("com.percona.mle.worker.") && !THREAD_CLASSES.contains(name))
+            : Polyglot::lookupAllowed)
         .allowPolyglotAccess(PolyglotAccess.ALL)
         .allowCreateThread(true)  // GraalPy's C API helper thread
         .allowCreateProcess(false)

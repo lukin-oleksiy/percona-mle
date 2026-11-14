@@ -348,6 +348,7 @@ static_assert(sizeof(MessageHeader) == 40);
 struct WorkerStats {
   uint64_t heap_used;
   uint64_t heap_max;
+  /** GCs the worker's memory watcher forced since its last RESET (exp note 30). */
   uint64_t gc_count;
   uint32_t state;
   /** Non-zero: the worker hit OutOfMemoryError or StackOverflowError and

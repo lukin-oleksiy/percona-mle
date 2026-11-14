@@ -37,6 +37,7 @@ public final class Main {
       Polyglot polyglot = new Polyglot(console, options);
       Control control = new Control(Thread.currentThread(), polyglot);
       control.start();
+      MemoryWatch.start();
       JavaRoutines java = new JavaRoutines();
       Dispatcher d = new Dispatcher(mb, java, polyglot, console, control, options,
           Integer.getInteger("mle.maxDepth", 32));
