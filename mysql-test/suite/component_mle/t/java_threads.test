@@ -1,0 +1,93 @@
+--echo #
+--echo # component_mle: parallel work in Java routines. Threads that end with the
+--echo # call (virtual threads, parallel streams, a pool the routine closes)
+--echo # leave the worker reusable: the JDK's shared pools (the virtual-thread
+--echo # scheduler, the common pool) are the runtime's while idle. A pool left
+--echo # open, or a shared-pool thread still running routine code, is not.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE USER u7@localhost;
+GRANT EXECUTE ON test.* TO u7@localhost;
+--write_file $MYSQLTEST_VARDIR/tmp/java_threads.sql
+CREATE FUNCTION jt_mark(v TEXT, how TEXT) RETURNS TEXT SQL SECURITY INVOKER LANGUAGE JAVA AS $$
+  // A mark that stays in the worker, and some parallel work.
+  System.setProperty("mle.test.mark", v);
+  java.util.function.LongUnaryOperator work = i -> {
+    long s = 0;
+    for (long j = 0; j < 200_000; j++) s += (i * 31 + j) % 7;
+    return s;
+  };
+  long sum = 0;
+  try {
+  switch (how) {
+    case "virtual" -> {
+      try (var ex = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+        var parts = new java.util.ArrayList<java.util.concurrent.Future<Long>>();
+        for (long i = 0; i < 64; i++) { long k = i; parts.add(ex.submit(() -> work.applyAsLong(k))); }
+        for (var f : parts) sum += f.get();
+      }
+    }
+    case "parallel" -> sum = java.util.stream.LongStream.range(0, 64).parallel().map(work).sum();
+    case "pool_closed" -> {
+      try (var ex = java.util.concurrent.Executors.newFixedThreadPool(4)) {
+        var parts = new java.util.ArrayList<java.util.concurrent.Future<Long>>();
+        for (long i = 0; i < 64; i++) { long k = i; parts.add(ex.submit(() -> work.applyAsLong(k))); }
+        for (var f : parts) sum += f.get();
+      }
+    }
+    case "pool_open" -> {
+      var pool = new java.util.concurrent.ForkJoinPool(4);
+      sum = pool.submit(() -> java.util.stream.LongStream.range(0, 64).parallel().map(work).sum()).get();
+    }
+    case "async_left" -> {
+      java.util.concurrent.CompletableFuture.runAsync(() -> {
+        try { Thread.sleep(600000); } catch (InterruptedException e) { }
+      });
+      sum = java.util.stream.LongStream.range(0, 64).map(work).sum();
+    }
+    default -> sum = java.util.stream.LongStream.range(0, 64).map(work).sum();
+  }
+  } catch (Exception e) {
+    throw new RuntimeException(e);
+  }
+  return "marked " + v + ": " + how + " " + sum;
+$$;
+CREATE FUNCTION jt_seen() RETURNS TEXT SQL SECURITY INVOKER LANGUAGE JAVA AS $$
+  return String.valueOf(System.getProperty("mle.test.mark"));
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/java_threads.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/java_threads.sql
+SET GLOBAL mle.worker_cache_timeout = 3600;
+
+--echo # Each case marks the account's worker, ends the session, and looks for the
+--echo # mark in the account's next session: kept (the mark is there) or a new
+--echo # worker (null).
+let $cases = sequential virtual parallel pool_closed pool_open async_left;
+while ($cases)
+{
+  let $how = `SELECT SUBSTRING_INDEX('$cases', ' ', 1)`;
+  let $cases = `SELECT TRIM(SUBSTRING('$cases', LENGTH('$how') + 1))`;
+  --connect (con1, localhost, u7,,test)
+  eval SELECT jt_mark('$how', '$how') AS jt_mark;
+  --disconnect con1
+  --connection default
+  --source include/wait_until_count_sessions.inc
+  --connect (con1, localhost, u7,,test)
+  SELECT jt_seen() AS next_session_sees;
+  --disconnect con1
+  --connection default
+  --source include/wait_until_count_sessions.inc
+}
+
+SET GLOBAL mle.worker_cache_timeout = DEFAULT;
+DROP FUNCTION jt_mark;
+DROP FUNCTION jt_seen;
+DROP USER u7@localhost;
+REVOKE CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

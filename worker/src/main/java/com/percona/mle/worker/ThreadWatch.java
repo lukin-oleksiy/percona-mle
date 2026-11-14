@@ -33,6 +33,12 @@ package com.percona.mle.worker;
  * a library or a DBA jar (their class loaders' names): a routine cannot pass its thread off as
  * the runtime's by its name alone. Not caught: such a thread idle in JDK code only (e.g. a pool
  * the routine made, with runtime-like names), until it runs routine code again.
+ *
+ * <p>The JDK's shared pools are the runtime's too: the virtual-thread scheduler's carriers and
+ * the common pool's workers (parallel streams, CompletableFuture). A routine may use them for
+ * parallel work; their threads stay idle for a while after it (30 s, 60 s), and the routine
+ * cannot end them. Like the runtime-named ones, they are strangers while they run routine code;
+ * a virtual thread is always seen by itself. A pool the routine makes is its own: it must close it.
  */
 final class ThreadWatch {
   /** The JVM's, Truffle's, GraalPy's and the worker's own threads. */
@@ -55,7 +61,7 @@ final class ThreadWatch {
   /** True if a thread not belonging to the runtime is alive. */
   boolean strangers() {
     for (Thread t : allThreads())
-      if (t.isAlive() && (!system(t.getName()) || runsGuestCode(t))) return true;
+      if (t.isAlive() && (!(system(t.getName()) || sharedPool(t)) || runsGuestCode(t))) return true;
     return false;
   }
 
@@ -119,6 +125,13 @@ final class ThreadWatch {
     ThreadGroup g = Thread.currentThread().getThreadGroup();
     while (g.getParent() != null) g = g.getParent();
     return g;
+  }
+
+  /** A worker of the common pool or a carrier of the virtual-thread scheduler (by its class). */
+  private static boolean sharedPool(Thread t) {
+    return t instanceof java.util.concurrent.ForkJoinWorkerThread w
+        && (w.getPool() == java.util.concurrent.ForkJoinPool.commonPool()
+            || t.getClass().getName().equals("jdk.internal.misc.CarrierThread"));
   }
 
   private static boolean system(String name) {

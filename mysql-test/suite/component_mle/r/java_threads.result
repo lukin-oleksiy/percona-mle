@@ -1,0 +1,57 @@
+#
+# component_mle: parallel work in Java routines. Threads that end with the
+# call (virtual threads, parallel streams, a pool the routine closes)
+# leave the worker reusable: the JDK's shared pools (the virtual-thread
+# scheduler, the common pool) are the runtime's while idle. A pool left
+# open, or a shared-pool thread still running routine code, is not.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE USER u7@localhost;
+GRANT EXECUTE ON test.* TO u7@localhost;
+SET GLOBAL mle.worker_cache_timeout = 3600;
+# Each case marks the account's worker, ends the session, and looks for the
+# mark in the account's next session: kept (the mark is there) or a new
+# worker (null).
+SELECT jt_mark('sequential', 'sequential') AS jt_mark;
+jt_mark
+marked sequential: sequential 38399994
+SELECT jt_seen() AS next_session_sees;
+next_session_sees
+sequential
+SELECT jt_mark('virtual', 'virtual') AS jt_mark;
+jt_mark
+marked virtual: virtual 38399994
+SELECT jt_seen() AS next_session_sees;
+next_session_sees
+virtual
+SELECT jt_mark('parallel', 'parallel') AS jt_mark;
+jt_mark
+marked parallel: parallel 38399994
+SELECT jt_seen() AS next_session_sees;
+next_session_sees
+parallel
+SELECT jt_mark('pool_closed', 'pool_closed') AS jt_mark;
+jt_mark
+marked pool_closed: pool_closed 38399994
+SELECT jt_seen() AS next_session_sees;
+next_session_sees
+pool_closed
+SELECT jt_mark('pool_open', 'pool_open') AS jt_mark;
+jt_mark
+marked pool_open: pool_open 38399994
+SELECT jt_seen() AS next_session_sees;
+next_session_sees
+null
+SELECT jt_mark('async_left', 'async_left') AS jt_mark;
+jt_mark
+marked async_left: async_left 38399994
+SELECT jt_seen() AS next_session_sees;
+next_session_sees
+null
+SET GLOBAL mle.worker_cache_timeout = DEFAULT;
+DROP FUNCTION jt_mark;
+DROP FUNCTION jt_seen;
+DROP USER u7@localhost;
+REVOKE CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
