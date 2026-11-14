@@ -61,21 +61,23 @@ using mle::Tag;
 using mle::Value;
 using mle::wire::ParamMode;
 
-namespace {
-
-std::atomic<uint64_t> g_next_id{0};
-std::atomic<long> g_alive{0};
-
 const char *worker_language(unsigned bit) {
   switch (bit) {
     case kJavaScript:
       return "js";
     case kPython:
       return "python";
-    default:
+    case kJava:
       return "java";
+    default:
+      return "";
   }
 }
+
+namespace {
+
+std::atomic<uint64_t> g_next_id{0};
+std::atomic<long> g_alive{0};
 
 // ------------------------------------------------------------- names
 

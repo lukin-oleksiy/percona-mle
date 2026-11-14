@@ -45,7 +45,8 @@ namespace mle_component {
 
 void log_info(const std::string &message);  // component.cc
 void log_warning(const std::string &message);  // component.cc
-std::vector<std::string> server_private_paths();  // session.cc
+/** mysqld's plugin_dir and datadir; false if they cannot be read. */
+bool server_private_paths(std::vector<std::string> *paths);  // session.cc
 size_t worker_cache_size();       // settings.cc
 uint32_t worker_cache_timeout();  // settings.cc
 
@@ -60,9 +61,20 @@ std::mutex g_mutex;
 std::shared_ptr<mle::Launcher> g_launcher;  // guarded by g_mutex
 std::string g_error;                        // guarded by g_mutex
 Settings g_settings;                        // guarded by g_mutex
-/** Workers held by sessions (for mle_memory_used), with the engine
-    generation that started them. */
-std::map<const mle::Worker *, uint64_t> g_live;  // guarded by g_mutex
+/** A worker held by a session: the engine generation that started it and
+    the account-forget count when the session took it. */
+struct Live {
+  uint64_t generation;
+  uint64_t forgets;
+};
+/** Workers held by sessions (for mle_memory_used). */
+std::map<const mle::Worker *, Live> g_live;  // guarded by g_mutex
+/** DROP USER / RENAME USER (engine_forget_account): a count, and the count at
+    each account's last one. A worker a session took before its account was
+    forgotten is not kept when released (a new account of that name must not
+    get it). Grows by one entry per dropped account name. */
+uint64_t g_forgets = 0;                          // guarded by g_mutex
+std::map<std::string, uint64_t> g_forgotten_at;  // guarded by g_mutex
 /** Incremented at every engine (re)start: workers of an older one are never
     kept for reuse (they have the old settings and package view). */
 uint64_t g_generation = 0;                  // guarded by g_mutex
@@ -183,19 +195,33 @@ std::string check_layout(const mle::Layout &l, const Settings &s, bool native) {
 
 }  // namespace
 
+namespace {
+/** The zone name of a tzfile path ("/usr/share/zoneinfo/Europe/Berlin", or a
+    link to one such as /etc/localtime), or "". */
+std::string zone_of_file(const std::string &file) {
+  std::string path = file;
+  char target[PATH_MAX];
+  const ssize_t n = readlink(file.c_str(), target, sizeof target - 1);
+  if (n > 0) path.assign(target, static_cast<size_t>(n));
+  const size_t at = path.find("zoneinfo/");
+  return at == std::string::npos ? "" : path.substr(at + 9);
+}
+}  // namespace
+
 std::string system_time_zone() {
+  std::string file = "/etc/localtime";
   if (const char *tz = getenv("TZ"); tz != nullptr && *tz != '\0') {
     const std::string zone = tz[0] == ':' ? tz + 1 : tz;
-    if (zone.find('/') != std::string::npos && zone[0] != '/') return zone;
     if (zone == "UTC") return zone;
-  } else {
-    char target[PATH_MAX];
-    const ssize_t n = readlink("/etc/localtime", target, sizeof target - 1);
-    if (n > 0) {
-      const std::string path(target, static_cast<size_t>(n));
-      const size_t at = path.find("zoneinfo/");
-      if (at != std::string::npos) return path.substr(at + 9);
+    if (zone[0] != '/') {
+      if (zone.find('/') != std::string::npos) return zone;  // Area/City
+      file.clear();  // a POSIX rule such as CET-1CEST: the offset below
+    } else {
+      file = zone;  // TZ=:/etc/localtime (systemd units, containers)
     }
+  }
+  if (!file.empty()) {
+    if (std::string zone = zone_of_file(file); !zone.empty()) return zone;
   }
   const time_t now = time(nullptr);
   struct tm local;
@@ -254,9 +280,11 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   }
   // Python is an optional package: without GraalPy, PYTHON routines are an
   // unsupported language; the native build runs Python only.
-  set_installed_languages(native         ? kPython
-                          : layout.python ? kAllLanguages
-                                          : kAllLanguages & ~kPython);
+  // Applied only when the new launcher runs (a failed restart keeps the
+  // running engine as it is).
+  const unsigned languages = native          ? kPython
+                             : layout.python ? kAllLanguages
+                                             : kAllLanguages & ~kPython;
   *error = check_layout(layout, s, native);
   if (!error->empty()) {
     if (!g_launcher) g_error = *error;
@@ -283,7 +311,13 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   // (and numpy) only when mle.pool_prewarm asks (15 §1: Python starts lazily
   // by default, for memory). The native build skips what it does not have.
   options.prewarm = s.pool_prewarm == "none" ? "java,js" : "java,js," + s.pool_prewarm;
-  options.hidden_paths = server_private_paths();
+  if (!server_private_paths(&options.hidden_paths)) {
+    *error =
+        "cannot read mysqld's plugin_dir and datadir (hidden from routines); "
+        "install component_mle with INSTALL COMPONENT";
+    if (!g_launcher) g_error = *error;
+    return false;
+  }
   // JavaScript's local time (Date.toString(), getHours()) follows mysqld's
   // system time zone; the worker cannot read the system's zone itself.
   const std::string zone = system_time_zone();
@@ -353,6 +387,7 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   // not kept then: an older generation).
   { auto old = take_cache_locked(); }
   g_launcher = std::move(launcher);
+  set_installed_languages(languages);
   g_settings = s;
   g_error.clear();
   ++g_generation;
@@ -495,7 +530,7 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
   *why = AcquireError::kNone;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_live[worker.get()] = generation;
+    g_live[worker.get()] = {generation, g_forgets};
   }
   return worker;
 }
@@ -504,13 +539,20 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
                            const std::string &principal) {
   if (!worker) return;
   uint64_t generation = 0;
+  uint64_t forgets = 0;
   bool current = false;
+  // Under g_mutex: whether the account was dropped or renamed since forgets.
+  const auto forgotten_since = [&principal](uint64_t forgets) {
+    const auto f = g_forgotten_at.find(principal);
+    return f != g_forgotten_at.end() && f->second > forgets;
+  };
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto it = g_live.find(worker.get());
     if (it != g_live.end()) {
-      generation = it->second;
-      current = generation == g_generation;
+      generation = it->second.generation;
+      forgets = it->second.forgets;
+      current = generation == g_generation && !forgotten_since(forgets);
       g_live.erase(it);
     }
   }
@@ -527,7 +569,8 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
       std::vector<std::unique_ptr<mle::Worker>> evicted;
       {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_launcher && generation == g_generation) {
+        if (g_launcher && generation == g_generation &&
+            !forgotten_since(forgets)) {
           g_cache.push_back({principal, std::move(worker),
                              std::chrono::steady_clock::now(), generation});
           while (g_cache.size() > worker_cache_size()) {
@@ -567,7 +610,7 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
   }
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_live[worker.get()] = generation;
+    g_live[worker.get()] = {generation, g_forgets};
   }
   ++g_cache_hits;
   return worker;
@@ -577,6 +620,7 @@ void engine_forget_account(const std::string &principal) {
   std::vector<std::unique_ptr<mle::Worker>> gone;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
+    g_forgotten_at[principal] = ++g_forgets;
     for (auto it = g_cache.begin(); it != g_cache.end();) {
       if (it->principal == principal) {
         gone.push_back(std::move(it->worker));
@@ -593,7 +637,7 @@ long engine_memory_used_percent() {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_live.empty() || g_settings.heap_max == 0) return 0;
   uint64_t used = 0;
-  for (const auto &[w, generation] : g_live) used += w->stats().heap_used;
+  for (const auto &[w, live] : g_live) used += w->stats().heap_used;
   return static_cast<long>(used * 100 / (g_settings.heap_max * g_live.size()));
 }
 

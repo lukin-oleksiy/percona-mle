@@ -108,20 +108,26 @@ class Hooks : public mle::CallHooks {
             {"", 0}, &h) ||
         h == nullptr) {
       r->message = "library " + what + " does not exist";
+      // The lookup's error is not the routine's; an inner statement's error
+      // kept in the DA goes with it (the SqlRunner must know, or a rethrown
+      // SQL error would be taken as still raised).
       clear_server_error(m_thd);
+      if (m_sql != nullptr) m_sql->clear();
       return;
     }
     mysql_cstring_with_length body{nullptr, 0}, language{nullptr, 0};
     if (mysql_service_mysql_library->get_body(h, &body) ||
         mysql_service_mysql_library->get_language(h, &language)) {
       (void)mysql_service_mysql_library->deinit(h);
-      r->message = "library " + what + " cannot be read";
+      // The server's init() succeeds for a library that does not exist;
+      // reading its body is what fails.
+      r->message = "library " + what + " does not exist or cannot be read";
       return;
     }
     const std::string_view text(body.str == nullptr ? "" : body.str, body.length);
     r->hash = mle::library_hash(text);
     const unsigned bit = language_bit({language.str, language.length});
-    r->language = bit == kJavaScript ? "js" : bit == kPython ? "python" : bit == kJava ? "java" : "";
+    r->language = worker_language(bit);
     if (r->language.empty()) {
       r->message = "library " + what + " is in a language MLE does not run";
     } else if (r->hash == m.known_hash) {
@@ -652,32 +658,38 @@ bool Session::set_options(mle::wire::IntegerType integer_type,
 
 // ------------------------------------------------------------- server paths
 
-std::vector<std::string> server_private_paths() {
-  // Read once (at INSTALL): they do not change while mysqld runs, and later
-  // engine restarts come from SET GLOBAL, which holds the system variables'
-  // lock the reader takes.
+bool server_private_paths(std::vector<std::string> *paths) {
+  // Read once (at INSTALL, or at boot for an installed component): they do
+  // not change while mysqld runs, and later engine restarts come from SET
+  // GLOBAL, which holds the system variables' lock the reader takes. The
+  // first engine start reads them, so later ones never do.
   static std::mutex lock;
   static std::vector<std::string> known;
   static bool done = false;
   std::lock_guard<std::mutex> guard(lock);
-  if (done) return known;
-  std::vector<std::string> out;
-  MYSQL_THD thd = nullptr;
-  // GLOBAL values are read through the current THD (none: skip).
-  if (mysql_service_mysql_current_thread_reader->get(&thd) || thd == nullptr)
-    return out;
-  for (const char *name : {"plugin_dir", "datadir"}) {
-    char buffer[PATH_MAX];
-    void *value = buffer;
-    size_t length = sizeof buffer - 1;
-    if (!mysql_service_mysql_system_variable_reader->get(
-            thd, "GLOBAL", "mysql_server", name, &value, &length) &&
-        length > 0)
-      out.emplace_back(static_cast<const char *>(value), length);
+  if (!done) {
+    MYSQL_THD thd = nullptr;
+    // GLOBAL values are read through the current THD. None (a component
+    // manifest loads components before there is one): fail closed, workers
+    // would see plugin_dir and datadir.
+    if (mysql_service_mysql_current_thread_reader->get(&thd) || thd == nullptr)
+      return false;
+    for (const char *name : {"plugin_dir", "datadir"}) {
+      char buffer[PATH_MAX];
+      void *value = buffer;
+      size_t length = sizeof buffer - 1;
+      if (mysql_service_mysql_system_variable_reader->get(
+              thd, "GLOBAL", "mysql_server", name, &value, &length) ||
+          length == 0) {
+        known.clear();
+        return false;
+      }
+      known.emplace_back(static_cast<const char *>(value), length);
+    }
+    done = true;
   }
-  known = out;
-  done = true;
-  return out;
+  *paths = known;
+  return true;
 }
 
 // ------------------------------------------------------------- privileges
@@ -724,7 +736,7 @@ bool Session::parse_library(unsigned language, const std::string &name,
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr) return false;
   mle::ParseLibraryMsg m;
-  m.language = language == kJavaScript ? "js" : language == kPython ? "python" : "java";
+  m.language = worker_language(language);
   m.name = name;
   m.body = body;
   Hooks hooks(m_thd);
@@ -759,15 +771,8 @@ bool check_create_privilege(MYSQL_THD thd, const Routine &routine) {
   // "create_function" (a UDF is "create_udf").
   const std::string cmd(command.str, command.length);
   if (cmd != "create_procedure" && cmd != "create_function") return true;
-  Security_context_handle sctx = nullptr;
-  if (mysql_service_mysql_thd_security_context->get(thd, &sctx)) {
-    my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
-    return false;
-  }
   const char *privilege = privilege_of(routine);
-  if (mysql_service_global_grants_check->has_global_grant(sctx, privilege,
-                                                          strlen(privilege)))
-    return true;
+  if (has_global_privilege(thd, privilege)) return true;
   my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), privilege);
   return false;
 }

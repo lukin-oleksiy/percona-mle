@@ -60,7 +60,7 @@ struct WorkerOptions {
   /** Nested calls (routine -> SQL -> routine ...). */
   uint32_t max_depth = wire::kDefaultMaxDepth;
   /** Largest message accepted from the worker. */
-  uint64_t max_message = 64ULL << 20;
+  uint64_t max_message = wire::kMaxWorkerMessage;
   /** DROP, OPTIONS and RESET run no routine code: a worker that does not
       answer them in this time is killed (they are not KILLable). */
   int control_timeout_ms = 10000;

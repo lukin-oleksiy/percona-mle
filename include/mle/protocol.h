@@ -76,6 +76,12 @@ constexpr uint32_t kDefaultArenaSize = 1U << 20;
 constexpr uint32_t kMinArenaSize = 64U << 10;
 /** Upper bound of one logical message (all chunks together). */
 constexpr uint64_t kMaxMessageSize = 1ULL << 30;
+/** Largest message the host accepts from a worker (all chunks together):
+    bounds what a worker can make mysqld allocate. The worker refuses larger
+    results and SQL requests itself, with an error (Wire.MAX_WORKER_MESSAGE);
+    the host treats one as a protocol violation. */
+constexpr uint64_t kMaxWorkerMessage = 64ULL << 20;
+static_assert(kMaxWorkerMessage <= kMaxMessageSize);
 /** Default limit of nested calls (routine -> SQL -> routine ...). */
 constexpr uint32_t kDefaultMaxDepth = 32;
 /** Same limit as MySQL's VECTOR type. */
@@ -137,8 +143,11 @@ enum class Op : uint32_t {
   kFetch = 7,
   /** h->w. u64 routine id: forget the routine. Answered by kResult. */
   kDrop = 8,
-  /** h->w. Empty: forget all routines and guest state (mle_session_reset).
-      Answered by kResult. */
+  /** h->w. Empty: forget all routines (and the VECTOR buffers) and trim the
+      heap; sent when a session releases a worker for reuse by the same
+      account (mle_session_reset gives new workers instead). Guest globals
+      (JavaScript globalThis, Python modules) and loaded libraries are not
+      reset (17 D11: kept by decision). Answered by kResult. */
   kReset = 9,
   /** both. Empty: acknowledges a chunk that had MessageFlag::kMore. */
   kContinue = 10,

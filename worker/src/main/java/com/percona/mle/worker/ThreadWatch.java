@@ -27,6 +27,11 @@ package com.percona.mle.worker;
  *
  * <p>Plain thread enumeration, no java.lang.management (JMX is slow to start in every worker and
  * not in the AOT cache).
+ *
+ * <p>A thread named like the runtime's is still a stranger when its stack holds code of a routine,
+ * a library or a DBA jar (their class loaders' names): a routine cannot pass its thread off as
+ * the runtime's by its name alone. Not caught: such a thread idle in JDK code only (e.g. a pool
+ * the routine made, with runtime-like names), until it runs routine code again.
  */
 final class ThreadWatch {
   /** The JVM's, Truffle's, GraalPy's and the worker's own threads. */
@@ -51,7 +56,19 @@ final class ThreadWatch {
     Thread[] all = new Thread[ROOT.activeCount() + 16];
     int n = ROOT.enumerate(all, true);
     for (int i = 0; i < n; i++)
-      if (all[i].isAlive() && !system(all[i].getName())) return true;
+      if (all[i].isAlive() && (!system(all[i].getName()) || runsGuestCode(all[i]))) return true;
+    return false;
+  }
+
+  /** Whether t's stack has a frame of routine, library or DBA-jar code (JavaRoutines' loaders). */
+  private static boolean runsGuestCode(Thread t) {
+    if (Polyglot.nativeImage() || t == Thread.currentThread()) return false;  // no Java code there
+    for (StackTraceElement e : t.getStackTrace()) {
+      String loader = e.getClassLoaderName();
+      if (loader != null && (loader.startsWith(JavaRoutines.LOADER_PREFIX) || loader.startsWith("mle-library-")
+          || loader.equals("mle-packages")))
+        return true;
+    }
     return false;
   }
 

@@ -1,0 +1,63 @@
+#
+# component_mle: regressions for the second review (28-deep-review.md).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE USER u4@localhost, u5@localhost;
+GRANT EXECUTE ON test.* TO u4@localhost, u5@localhost;
+# 1: setpriority / ioprio_set only for the worker itself (the group and
+# user forms reach mysqld, which runs as the same OS user).
+SELECT py_prio() AS probes;
+probes
+setpriority(PROCESS,self):ok
+setpriority(PGRP,0):refused
+setpriority(USER,0):refused
+ioprio_set(PGRP,0):refused
+ioprio_set(USER,0):refused
+# 4: DROP USER while the account is connected: its session's worker is
+# not kept at disconnect, so a new account of that name starts fresh.
+SELECT py_mark2('old u5') AS old_u5_marks;
+old_u5_marks
+None
+DROP USER u5@localhost;
+CREATE USER u5@localhost;
+GRANT EXECUTE ON test.* TO u5@localhost;
+SELECT py_mark2('new u5') AS new_u5_sees;
+new_u5_sees
+None
+# 5: a result or SQL request larger than the host accepts is a clean
+# error; the worker goes on (no failure counted).
+SELECT LENGTH(py_big());
+ERROR HY000: MLE-Type> the routine's result and output are too large for MLE: 70000020 bytes (at most 64 MiB) in 'py_big()'
+CALL js_big_sql(@r);
+SELECT @r AS sql_request;
+sql_request
+the SQL statement and its parameters are too large for MLE: 70000043 bytes (at most 64 MiB)
+SELECT py_mark2('still') IS NOT NULL AS same_session_goes_on;
+same_session_goes_on
+1
+workers lost: 0
+# 6: a missing library: the message says so; after a caught SQL error,
+# rethrowing that error still reports it.
+CALL js_import(@r);
+SELECT @r AS missing_library;
+missing_library
+Error: Error reading module '/test/no_such_library' imported from js_import: library test.no_such_library does not exist or cannot be read
+CALL js_rethrow();
+ERROR 42S02: Table 'test.no_such_table' doesn't exist
+# 8: a thread a Java routine leaves is found even when it is named like
+# the runtime's: the worker is not kept for the account.
+SELECT java_sneaky() AS java_thread;
+java_thread
+left a thread named like the runtime's
+workers kept: 0
+DROP FUNCTION py_prio;
+DROP FUNCTION py_mark2;
+DROP FUNCTION py_big;
+DROP PROCEDURE js_big_sql;
+DROP PROCEDURE js_import;
+DROP PROCEDURE js_rethrow;
+DROP FUNCTION java_sneaky;
+DROP USER u4@localhost, u5@localhost;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

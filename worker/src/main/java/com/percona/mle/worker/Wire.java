@@ -34,6 +34,8 @@ final class Wire {
   static final int MAX_TIME_HOUR = 838;
   static final int MAX_STACK_FRAMES = 1000;
   static final int VECTOR_ALIGNMENT = 16;
+  /** Largest message the host accepts from the worker (protocol.h kMaxWorkerMessage). */
+  static final long MAX_WORKER_MESSAGE = 64L << 20;
 
   // RegionHeader offsets.
   static final long OFF_MAGIC = 0;

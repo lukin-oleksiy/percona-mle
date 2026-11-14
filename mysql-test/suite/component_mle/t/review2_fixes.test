@@ -1,0 +1,135 @@
+--echo #
+--echo # component_mle: regressions for the second review (28-deep-review.md).
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE USER u4@localhost, u5@localhost;
+GRANT EXECUTE ON test.* TO u4@localhost, u5@localhost;
+--write_file $MYSQLTEST_VARDIR/tmp/review2.sql
+CREATE FUNCTION py_prio() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import ctypes, os
+    libc = ctypes.CDLL(None, use_errno=True)
+    def call(name, f, *args):
+        ctypes.set_errno(0)
+        if f(*args) == 0:
+            return name + ':ok'
+        err = ctypes.get_errno()
+        return name + (':refused' if err == 1 else ':ALLOWED(kernel errno %d)' % err)
+    ioprio_set = {'x86_64': 251, 'aarch64': 30}[os.uname().machine]
+    nice = libc.getpriority(0, 0)
+    # Group and user forms with values the kernel refuses by itself (nice -20
+    # needs CAP_SYS_NICE, I/O class 7 does not exist): if seccomp let them
+    # through, the kernel's errno shows it and nothing changes.
+    return '\n'.join([
+        call('setpriority(PROCESS,self)', libc.setpriority, 0, 0, nice),
+        call('setpriority(PGRP,0)', libc.setpriority, 1, 0, -20),
+        call('setpriority(USER,0)', libc.setpriority, 2, 0, -20),
+        call('ioprio_set(PGRP,0)', libc.syscall, ioprio_set, 2, 0, 7 << 13),
+        call('ioprio_set(USER,0)', libc.syscall, ioprio_set, 3, 0, 7 << 13)])
+$$;
+CREATE FUNCTION py_mark2(v TEXT) RETURNS TEXT SQL SECURITY INVOKER LANGUAGE PYTHON AS $$
+    import builtins
+    old = getattr(builtins, 'mle_mark2', None)
+    builtins.mle_mark2 = v
+    return str(old)
+$$;
+CREATE FUNCTION py_big() RETURNS LONGBLOB LANGUAGE PYTHON AS $$ return b'x' * 70000000 $$;
+CREATE PROCEDURE js_big_sql(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  try {
+    session.runSql('SELECT LENGTH(?)', ['x'.repeat(70000000)]);
+    r = 'sent';
+  } catch (e) {
+    r = e.message;
+  }
+$$;
+CREATE PROCEDURE js_import(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  try { await import('/test/no_such_library'); r = 'imported' } catch (e) { r = String(e) }
+$$;
+CREATE PROCEDURE js_rethrow() LANGUAGE JAVASCRIPT AS $$
+  let saved;
+  try { session.runSql('SELECT * FROM no_such_table') } catch (e) { saved = e }
+  try { await import('/test/no_such_library') } catch (e) { }
+  throw saved;
+$$;
+CREATE FUNCTION java_sneaky() RETURNS TEXT SQL SECURITY INVOKER LANGUAGE JAVA AS $$
+  Thread t = new Thread(() -> { try { Thread.sleep(600000); } catch (InterruptedException e) { } }, "mle-sneaky");
+  t.setDaemon(true);
+  t.start();
+  return "left a thread named like the runtime's";
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review2.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review2.sql
+
+--echo # 1: setpriority / ioprio_set only for the worker itself (the group and
+--echo # user forms reach mysqld, which runs as the same OS user).
+--connect (con3, localhost, root,,test)
+SELECT py_prio() AS probes;
+--disconnect con3
+--connection default
+
+--echo # 4: DROP USER while the account is connected: its session's worker is
+--echo # not kept at disconnect, so a new account of that name starts fresh.
+--connect (con1, localhost, u5,,test)
+SELECT py_mark2('old u5') AS old_u5_marks;
+--connection default
+DROP USER u5@localhost;
+CREATE USER u5@localhost;
+GRANT EXECUTE ON test.* TO u5@localhost;
+--disconnect con1
+--source include/wait_until_count_sessions.inc
+--connect (con1, localhost, u5,,test)
+SELECT py_mark2('new u5') AS new_u5_sees;
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+
+--echo # 5: a result or SQL request larger than the host accepts is a clean
+--echo # error; the worker goes on (no failure counted).
+let $failures0 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_worker_failures', Value, 1);
+--connect (con3, localhost, root,,test)
+--error ER_LANGUAGE_COMPONENT
+SELECT LENGTH(py_big());
+CALL js_big_sql(@r);
+SELECT @r AS sql_request;
+SELECT py_mark2('still') IS NOT NULL AS same_session_goes_on;
+let $failures1 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_worker_failures', Value, 1);
+--expr $lost = $failures1 - $failures0
+--echo workers lost: $lost
+
+--echo # 6: a missing library: the message says so; after a caught SQL error,
+--echo # rethrowing that error still reports it.
+CALL js_import(@r);
+SELECT @r AS missing_library;
+--error ER_NO_SUCH_TABLE
+CALL js_rethrow();
+--disconnect con3
+--connection default
+--source include/wait_until_count_sessions.inc
+
+--echo # 8: a thread a Java routine leaves is found even when it is named like
+--echo # the runtime's: the worker is not kept for the account.
+let $cached0 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_workers_cached', Value, 1);
+--connect (con2, localhost, u4,,test)
+SELECT java_sneaky() AS java_thread;
+--disconnect con2
+--connection default
+--source include/wait_until_count_sessions.inc
+let $cached1 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_workers_cached', Value, 1);
+--expr $kept = $cached1 - $cached0
+--echo workers kept: $kept
+
+DROP FUNCTION py_prio;
+DROP FUNCTION py_mark2;
+DROP FUNCTION py_big;
+DROP PROCEDURE js_big_sql;
+DROP PROCEDURE js_import;
+DROP PROCEDURE js_rethrow;
+DROP FUNCTION java_sneaky;
+DROP USER u4@localhost, u5@localhost;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

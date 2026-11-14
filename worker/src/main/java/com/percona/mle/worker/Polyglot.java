@@ -192,9 +192,15 @@ final class Polyglot {
     if (c == null || interrupter == null) return;
     c.leave();
     try {
-      interrupter.join(10_000);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
+      long until = System.nanoTime() + 10_000_000_000L;
+      while (interrupter.isAlive() && until - System.nanoTime() > 0) {
+        try {
+          interrupter.join(Math.max(1, (until - System.nanoTime()) / 1_000_000));
+        } catch (InterruptedException e) {
+          // the call has ended (Control.end): an interrupt now belongs to no call
+        }
+      }
+      Thread.interrupted();
     } finally {
       c.enter();
     }

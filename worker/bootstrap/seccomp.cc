@@ -95,6 +95,23 @@ class Filter {
     stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
     stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
   }
+  /** nr allowed only for one process: argument 0 (`which`) is
+      which_process (PRIO_PROCESS, IOPRIO_WHO_PROCESS) and argument 1
+      (`who`) is 0 or pid. Other `which` values with who 0 mean the
+      caller's process group or user: every process of mysqld's OS user. */
+  void process_only(long nr, uint32_t which_process, pid_t pid) {
+    stmt(BPF_LD | BPF_W | BPF_ABS, kNr);
+    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(nr), 0, 9);
+    stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(0));
+    jump(BPF_JMP | BPF_JEQ | BPF_K, which_process, 0, 5);
+    stmt(BPF_LD | BPF_W | BPF_ABS, arg_hi(1));
+    jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3);  // high word set: refuse
+    stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(1));
+    jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 2, 0);
+    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(pid), 1, 0);
+    stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
+    stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+  }
   /** nr refused (EPERM) when argument arg is one of values. */
   void deny_arg(long nr, int arg, std::initializer_list<uint32_t> values) {
     stmt(BPF_LD | BPF_W | BPF_ABS, kNr);
@@ -234,8 +251,10 @@ int install_seccomp() {
   f.zero_or_self(__NR_sched_setscheduler, 0, self);
   f.zero_or_self(__NR_sched_setparam, 0, self);
   f.zero_or_self(__NR_sched_setattr, 0, self);
-  f.zero_or_self(__NR_setpriority, 1, self);
-  f.zero_or_self(__NR_ioprio_set, 1, self);
+  // Priorities: PRIO_PROCESS / IOPRIO_WHO_PROCESS (0 / 1) only; the group
+  // and user forms reach mysqld.
+  f.process_only(__NR_setpriority, 0, self);
+  f.process_only(__NR_ioprio_set, 1, self);
   f.deny(__NR_move_pages);
   f.deny(__NR_migrate_pages);
   // Files: Landlock does not cover mode, owner, times and extended

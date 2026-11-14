@@ -115,6 +115,10 @@ struct Routine {
   std::string call_text(const std::vector<mle::Value> &args) const;
 };
 
+/** The worker's name of a language bit ("js", "python", "java"; "" for
+    none or an unknown one). */
+const char *worker_language(unsigned bit);
+
 /** Display name of a worker error language ("js" -> "JavaScript"). */
 const char *display_language(const std::string &worker_language);
 

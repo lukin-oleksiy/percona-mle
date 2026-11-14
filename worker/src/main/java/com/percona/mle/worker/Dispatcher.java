@@ -434,6 +434,13 @@ final class Dispatcher {
     return frames;
   }
 
+  /** MySQL's error for a packet larger than max_allowed_packet. */
+  private static final int ER_NET_PACKET_TOO_LARGE = 1153;
+
+  private static String tooLarge(String what, long size) {
+    return what + " are too large for MLE: " + size + " bytes (at most " + (Wire.MAX_WORKER_MESSAGE >> 20) + " MiB)";
+  }
+
   private static ErrorInfo guest(String language, String message) {
     return new ErrorInfo(language, message, List.of(), 0, "");
   }
@@ -457,6 +464,13 @@ final class Dispatcher {
     } catch (Values.ConversionException e) {
       status = Wire.GUEST_ERROR;
       writeResult(null, null, guest(Wire.LANGUAGE_TYPE, e.getMessage()), null, null, null);
+    }
+    if (w.size() > Wire.MAX_WORKER_MESSAGE) {
+      // The host would take it for a protocol violation and kill the worker.
+      long size = w.size();
+      status = Wire.GUEST_ERROR;
+      writeResult(null, null, guest(Wire.LANGUAGE_TYPE, tooLarge("the routine's result and output", size)),
+          null, null, null);
     }
     mb.stats(depth == 0 ? Wire.STATE_IDLE : Wire.STATE_RUNNING, tainted);
     mb.send(Wire.RESULT, status, depth, seq, w);
@@ -535,6 +549,8 @@ final class Dispatcher {
     if (params != null) for (Object p : params) Values.writeParam(w, p);
     w.u8(flags);
     w.u32(maxRows);
+    if (w.size() > Wire.MAX_WORKER_MESSAGE)
+      throw new MleSqlException(ER_NET_PACKET_TOO_LARGE, "08S01", tooLarge("the SQL statement and its parameters", w.size()));
     mb.send(Wire.SQL, Wire.OK, depth, seq, w);
     while (true) {
       Mailbox.Message m = mb.receive();

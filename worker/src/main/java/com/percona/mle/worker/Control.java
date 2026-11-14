@@ -65,6 +65,9 @@ final class Control implements Runnable {
 
   private synchronized void interrupt(long seq) {
     if (seq == running) {
+      // The host may send more than one INTERRUPT per KILL (its KILL handler, then its wait
+      // loop): one interrupter per call, which escalates by itself.
+      if (interrupted) return;
       interrupted = true;
       stop();
     } else if (seq > last) {
@@ -86,16 +89,25 @@ final class Control implements Runnable {
     Thread t = new Thread(() -> {
       if (guestFirst) {
         if (c == null || interruptContext(c, 500)) return;
-        main.interrupt();
-        interruptContext(c, 4500);
+        if (interruptMain(seq)) interruptContext(c, 4500);
       } else {
-        main.interrupt();
+        interruptMain(seq);
         if (c != null && stillRunning(seq, 500)) interruptContext(c, 4500);
       }
     }, "mle-interrupt");
     t.setDaemon(true);
     interrupter = t;
     t.start();
+  }
+
+  /**
+   * Thread.interrupt of the main thread, only while call seq still runs: end() clears the flag, so
+   * an interrupt after it would reach the next call.
+   */
+  private synchronized boolean interruptMain(long seq) {
+    if (running != seq) return false;
+    main.interrupt();
+    return true;
   }
 
   private static boolean interruptContext(org.graalvm.polyglot.Context c, long ms) {
