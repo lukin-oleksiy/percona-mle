@@ -437,8 +437,8 @@ final class Dispatcher {
   /** MySQL's error for a packet larger than max_allowed_packet. */
   private static final int ER_NET_PACKET_TOO_LARGE = 1153;
 
-  private static String tooLarge(String what, long size) {
-    return what + " are too large for MLE: " + size + " bytes (at most " + (Wire.MAX_WORKER_MESSAGE >> 20) + " MiB)";
+  private static String tooLarge(String what) {
+    return what + " is larger than MLE allows (" + (Wire.MAX_WORKER_MESSAGE >> 20) + " MiB)";
   }
 
   private static ErrorInfo guest(String language, String message) {
@@ -459,18 +459,24 @@ final class Dispatcher {
    */
   private void result(int status, Object ret, Values.ParamType retType, ErrorInfo error, int[] outIndexes,
       Object[] outs, Values.ParamType[] types) {
+    ErrorInfo instead = null;
     try {
       writeResult(ret, retType, error, outIndexes, outs, types);
     } catch (Values.ConversionException e) {
-      status = Wire.GUEST_ERROR;
-      writeResult(null, null, guest(Wire.LANGUAGE_TYPE, e.getMessage()), null, null, null);
+      instead = guest(Wire.LANGUAGE_TYPE, e.getMessage());
+    } catch (MessageWriter.TooLarge e) {
+      // More than the host accepts (it would take it for a protocol violation and kill the worker).
+      instead = guest(Wire.LANGUAGE_TYPE, tooLarge("the routine's result with its output"));
     }
-    if (w.size() > Wire.MAX_WORKER_MESSAGE) {
-      // The host would take it for a protocol violation and kill the worker.
-      long size = w.size();
+    if (instead != null) {
       status = Wire.GUEST_ERROR;
-      writeResult(null, null, guest(Wire.LANGUAGE_TYPE, tooLarge("the routine's result and output", size)),
-          null, null, null);
+      try {
+        writeResult(null, null, instead, null, null, null);
+      } catch (MessageWriter.TooLarge e) {
+        console.takeOut();  // the output alone is too large: dropped
+        console.takeErr();
+        writeResult(null, null, guest(Wire.LANGUAGE_TYPE, tooLarge("the routine's output")), null, null, null);
+      }
     }
     mb.stats(depth == 0 ? Wire.STATE_IDLE : Wire.STATE_RUNNING, tainted);
     mb.send(Wire.RESULT, status, depth, seq, w);
@@ -541,16 +547,20 @@ final class Dispatcher {
       boolean raw) {
     if (Thread.currentThread() != thread)
       throw new IllegalStateException("SQL must be run on the routine's thread");
-    w.reset();
-    w.u8(action);
-    w.u64(id);
-    w.str(text == null ? "" : text);
-    w.u32(params == null ? 0 : params.length);
-    if (params != null) for (Object p : params) Values.writeParam(w, p);
-    w.u8(flags);
-    w.u32(maxRows);
-    if (w.size() > Wire.MAX_WORKER_MESSAGE)
-      throw new MleSqlException(ER_NET_PACKET_TOO_LARGE, "08S01", tooLarge("the SQL statement and its parameters", w.size()));
+    try {
+      w.reset();
+      w.u8(action);
+      w.u64(id);
+      w.str(text == null ? "" : text);
+      w.u32(params == null ? 0 : params.length);
+      if (params != null) for (Object p : params) Values.writeParam(w, p);
+      w.u8(flags);
+      w.u32(maxRows);
+    } catch (MessageWriter.TooLarge e) {
+      // MySQL's error for a packet over max_allowed_packet, but not its SQLSTATE 08S01 (a lost
+      // connection to pools and drivers): the session is fine.
+      throw new MleSqlException(ER_NET_PACKET_TOO_LARGE, "HY000", tooLarge("the SQL statement with its parameters"));
+    }
     mb.send(Wire.SQL, Wire.OK, depth, seq, w);
     while (true) {
       Mailbox.Message m = mb.receive();

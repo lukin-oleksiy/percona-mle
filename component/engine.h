@@ -120,7 +120,13 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
   mle.worker_cache_timeout; 12 §17); otherwise it is destroyed (killed).
 */
 void engine_release_worker(std::unique_ptr<mle::Worker> worker,
-                           const std::string &principal = "");
+                           const std::string &principal = "",
+                           uint64_t mark = 0);
+
+/** An MLE session begins / ends: its mark for engine_release_worker (a
+    worker of an account dropped or renamed after the mark is not kept). */
+uint64_t engine_session_begin();
+void engine_session_end(uint64_t mark);
 
 /**
   A kept worker of this principal (READY, reset), counted like

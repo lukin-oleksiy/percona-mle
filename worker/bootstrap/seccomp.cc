@@ -33,6 +33,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -64,6 +65,21 @@ class Filter {
   void jump(uint16_t code, uint32_t k, uint8_t jt, uint8_t jf) {
     m_f.push_back(BPF_JUMP(code, k, jt, jf));
   }
+  /** Statements self_tail() emits. */
+  static constexpr uint8_t kSelfTail = 7;
+  /** Allow if argument arg is 0 or pid (high word 0), else EPERM; the last
+      two statements are the refusal and the allowance. */
+  void self_tail(int arg, pid_t pid) {
+    const size_t start = m_f.size();
+    stmt(BPF_LD | BPF_W | BPF_ABS, arg_hi(arg));
+    jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3);  // high word set: refuse
+    stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(arg));
+    jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 2, 0);
+    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(pid), 1, 0);
+    stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
+    stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    assert(m_f.size() - start == kSelfTail);
+  }
   /** nr -> errno. */
   void deny(long nr, int err = EPERM) {
     stmt(BPF_LD | BPF_W | BPF_ABS, kNr);
@@ -86,14 +102,8 @@ class Filter {
       process of that user (rlimits, scheduling, I/O priority). */
   void zero_or_self(long nr, int arg, pid_t pid) {
     stmt(BPF_LD | BPF_W | BPF_ABS, kNr);
-    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(nr), 0, 7);
-    stmt(BPF_LD | BPF_W | BPF_ABS, arg_hi(arg));
-    jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3);  // high word set: refuse
-    stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(arg));
-    jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 2, 0);
-    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(pid), 1, 0);
-    stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
-    stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(nr), 0, kSelfTail);
+    self_tail(arg, pid);
   }
   /** nr allowed only for one process: argument 0 (`which`) is
       which_process (PRIO_PROCESS, IOPRIO_WHO_PROCESS) and argument 1
@@ -101,16 +111,12 @@ class Filter {
       caller's process group or user: every process of mysqld's OS user. */
   void process_only(long nr, uint32_t which_process, pid_t pid) {
     stmt(BPF_LD | BPF_W | BPF_ABS, kNr);
-    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(nr), 0, 9);
+    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(nr), 0,
+         kSelfTail + 2);
     stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(0));
-    jump(BPF_JMP | BPF_JEQ | BPF_K, which_process, 0, 5);
-    stmt(BPF_LD | BPF_W | BPF_ABS, arg_hi(1));
-    jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3);  // high word set: refuse
-    stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(1));
-    jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 2, 0);
-    jump(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(pid), 1, 0);
-    stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
-    stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    // Another `which`: to the tail's refusal (its second-to-last statement).
+    jump(BPF_JMP | BPF_JEQ | BPF_K, which_process, 0, kSelfTail - 2);
+    self_tail(1, pid);
   }
   /** nr refused (EPERM) when argument arg is one of values. */
   void deny_arg(long nr, int arg, std::initializer_list<uint32_t> values) {

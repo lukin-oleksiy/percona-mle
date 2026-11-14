@@ -95,6 +95,9 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
       "-XX:-UsePerfData",
       "--enable-native-access=ALL-UNNAMED",
       "--add-modules=jdk.incubator.vector",
+      // ThreadWatch: the thread containers list virtual threads too (also
+      // in the AOT cache's options, worker/CMakeLists.txt, mle_aot_cache).
+      "--add-exports=java.base/jdk.internal.vm=ALL-UNNAMED",
       "-Dmle.class=" + o.name};
   if (!layout.aot_cache.empty())
     c.args.push_back("-XX:AOTCache=" + layout.aot_cache);

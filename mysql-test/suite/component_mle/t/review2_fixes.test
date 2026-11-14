@@ -54,11 +54,22 @@ CREATE PROCEDURE js_rethrow() LANGUAGE JAVASCRIPT AS $$
   try { await import('/test/no_such_library') } catch (e) { }
   throw saved;
 $$;
-CREATE FUNCTION java_sneaky() RETURNS TEXT SQL SECURITY INVOKER LANGUAGE JAVA AS $$
-  Thread t = new Thread(() -> { try { Thread.sleep(600000); } catch (InterruptedException e) { } }, "mle-sneaky");
-  t.setDaemon(true);
-  t.start();
-  return "left a thread named like the runtime's";
+CREATE FUNCTION java_mark(v TEXT, thread TEXT) RETURNS TEXT SQL SECURITY INVOKER LANGUAGE JAVA AS $$
+  // A mark that stays in the worker; and a thread left running, named like
+  // the runtime's own: a platform or a virtual one.
+  System.setProperty("mle.test.mark", v);
+  Runnable sleep = () -> { try { Thread.sleep(600000); } catch (InterruptedException e) { } };
+  if (thread.equals("platform")) {
+    Thread t = new Thread(sleep, "mle-sneaky");
+    t.setDaemon(true);
+    t.start();
+  } else if (thread.equals("virtual")) {
+    Thread.ofVirtual().name("mle-sneaky").start(sleep);
+  }
+  return "marked " + v + ", thread: " + thread;
+$$;
+CREATE FUNCTION java_seen() RETURNS TEXT SQL SECURITY INVOKER LANGUAGE JAVA AS $$
+  return String.valueOf(System.getProperty("mle.test.mark"));
 $$;
 EOF
 --exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review2.sql 2>&1
@@ -80,6 +91,24 @@ DROP USER u5@localhost;
 CREATE USER u5@localhost;
 GRANT EXECUTE ON test.* TO u5@localhost;
 --disconnect con1
+--source include/wait_until_count_sessions.inc
+--connect (con1, localhost, u5,,test)
+SELECT py_mark2('new u5') AS new_u5_sees;
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+--echo # Also a worker the old session takes after the DROP (here after a reset).
+--connect (con1, localhost, u5,,test)
+SELECT py_mark2('old u5 again') AS old_u5_marks;
+--connection default
+DROP USER u5@localhost;
+CREATE USER u5@localhost;
+GRANT EXECUTE ON test.* TO u5@localhost;
+--connection con1
+SELECT mle_session_reset() AS reset;
+SELECT py_mark2('taken after the drop') AS fresh_worker;
+--disconnect con1
+--connection default
 --source include/wait_until_count_sessions.inc
 --connect (con1, localhost, u5,,test)
 SELECT py_mark2('new u5') AS new_u5_sees;
@@ -110,17 +139,34 @@ CALL js_rethrow();
 --connection default
 --source include/wait_until_count_sessions.inc
 
---echo # 8: a thread a Java routine leaves is found even when it is named like
---echo # the runtime's: the worker is not kept for the account.
-let $cached0 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_workers_cached', Value, 1);
+--echo # 8: a thread a Java routine leaves (named like the runtime's, a
+--echo # platform or a virtual one) keeps the worker from being kept for the
+--echo # account: the account's next session gets a new worker. Without a
+--echo # thread, it gets the same one (the mark is still there).
+SET GLOBAL mle.worker_cache_timeout = 3600;
 --connect (con2, localhost, u4,,test)
-SELECT java_sneaky() AS java_thread;
+SELECT java_mark('control', 'none') AS java_mark;
 --disconnect con2
 --connection default
 --source include/wait_until_count_sessions.inc
-let $cached1 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_workers_cached', Value, 1);
---expr $kept = $cached1 - $cached0
---echo workers kept: $kept
+--connect (con2, localhost, u4,,test)
+SELECT java_seen() AS kept_without_thread;
+SELECT java_mark('platform', 'platform') AS java_mark;
+--disconnect con2
+--connection default
+--source include/wait_until_count_sessions.inc
+--connect (con2, localhost, u4,,test)
+SELECT java_seen() AS after_platform_thread;
+SELECT java_mark('virtual', 'virtual') AS java_mark;
+--disconnect con2
+--connection default
+--source include/wait_until_count_sessions.inc
+--connect (con2, localhost, u4,,test)
+SELECT java_seen() AS after_virtual_thread;
+--disconnect con2
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.worker_cache_timeout = DEFAULT;
 
 DROP FUNCTION py_prio;
 DROP FUNCTION py_mark2;
@@ -128,7 +174,8 @@ DROP FUNCTION py_big;
 DROP PROCEDURE js_big_sql;
 DROP PROCEDURE js_import;
 DROP PROCEDURE js_rethrow;
-DROP FUNCTION java_sneaky;
+DROP FUNCTION java_mark;
+DROP FUNCTION java_seen;
 DROP USER u4@localhost, u5@localhost;
 REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
 --source include/wait_until_count_sessions.inc

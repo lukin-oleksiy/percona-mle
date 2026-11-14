@@ -27,6 +27,18 @@ import java.nio.charset.StandardCharsets;
  * "spills" into a growing native buffer, and {@link Mailbox#send} sends it in chunks.
  */
 final class MessageWriter {
+  /**
+   * The message would be larger than the host accepts (Wire.MAX_WORKER_MESSAGE): thrown before
+   * anything larger is allocated, so an oversized value cannot exhaust the worker's memory here.
+   */
+  static final class TooLarge extends RuntimeException {
+    @java.io.Serial private static final long serialVersionUID = 1L;
+
+    TooLarge() {
+      super(null, null, false, false);
+    }
+  }
+
   private final MemorySegment arena;
   private MemorySegment buf;
   private long pos;
@@ -61,7 +73,8 @@ final class MessageWriter {
 
   private void ensure(long n) {
     if (pos + n <= buf.byteSize()) return;
-    long size = Math.max(buf.byteSize() * 2, pos + n);
+    if (n < 0 || pos + n > Wire.MAX_WORKER_MESSAGE) throw new TooLarge();
+    long size = Math.min(Math.max(buf.byteSize() * 2, pos + n), Wire.MAX_WORKER_MESSAGE);
     MemorySegment bigger = Arena.ofAuto().allocate(size, Wire.VECTOR_ALIGNMENT);
     MemorySegment.copy(buf, 0, bigger, 0, pos);
     buf = bigger;

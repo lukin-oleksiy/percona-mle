@@ -87,12 +87,19 @@ final class Control implements Runnable {
     final boolean guestFirst = guest;
     org.graalvm.polyglot.Context c = polyglot.contextIfCreated();
     Thread t = new Thread(() -> {
+      org.graalvm.polyglot.Context ctx = c;
       if (guestFirst) {
-        if (c == null || interruptContext(c, 500)) return;
-        if (interruptMain(seq)) interruptContext(c, 4500);
+        // A first guest routine may still be building the context: wait for it while the call
+        // runs (a repeated INTERRUPT is ignored, so this interrupter must not give up early).
+        while (ctx == null && stillRunning(seq, 20)) ctx = polyglot.contextIfCreated();
+        if (ctx == null || interruptContext(ctx, 500)) return;
+        if (interruptMain(seq)) interruptContext(ctx, 4500);
       } else {
         interruptMain(seq);
-        if (c != null && stillRunning(seq, 500)) interruptContext(c, 4500);
+        if (stillRunning(seq, 500)) {
+          if (ctx == null) ctx = polyglot.contextIfCreated();  // made by the Java code meanwhile
+          if (ctx != null) interruptContext(ctx, 4500);
+        }
       }
     }, "mle-interrupt");
     t.setDaemon(true);

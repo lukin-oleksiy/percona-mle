@@ -96,6 +96,7 @@ SET(MLE_AOT_CACHE ${CMAKE_CURRENT_BINARY_DIR}/mle.aot)
 SET(MLE_AOT_JVM_OPTIONS
   -XX:+UseSerialGC --enable-native-access=ALL-UNNAMED
   --add-modules=jdk.incubator.vector
+  --add-exports=java.base/jdk.internal.vm=ALL-UNNAMED
   -Dpolyglot.engine.userResourceCache=${MLE_RESOURCE_CACHE}
   -Dmle.python.venv=${MLE_PYTHON_VENV}
   -cp ${MLE_WORKER_JAR})

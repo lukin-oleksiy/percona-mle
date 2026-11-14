@@ -106,7 +106,7 @@ class Session {
     std::unordered_set<uint64_t> prepared;
   };
 
-  explicit Session(MYSQL_THD thd) : m_thd(thd) {}
+  explicit Session(MYSQL_THD thd);
 
   /** The account the current request runs as ('user'@'host', from the
       security context's contents on every call). */
@@ -147,6 +147,8 @@ class Session {
   std::vector<std::unique_ptr<mle::Worker>> m_retired;
 
   MYSQL_THD m_thd;
+  /** engine_session_begin(); renewed at COM_CHANGE_USER. */
+  uint64_t m_mark;
   std::map<std::string, Slot> m_workers;
   /** Argument buffer of the top-level call, reused. */
   std::vector<mle::Value> m_args;

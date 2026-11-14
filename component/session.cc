@@ -102,17 +102,22 @@ class Hooks : public mle::CallHooks {
                    " (import it with USING, or use a library of the routine's schema)";
       return;
     }
+    // A failed lookup may leave the server's error (a missing library, an
+    // MDL timeout, KILL) in the DA: it is not the routine's, the routine
+    // gets r->message. An inner statement's error kept there goes with it,
+    // and the SqlRunner must know (or a rethrown SQL error would be taken as
+    // still raised).
+    const auto lookup_failed = [&](std::string message) {
+      r->message = std::move(message);
+      clear_server_error(m_thd);
+      if (m_sql != nullptr) m_sql->clear();
+    };
     my_h_library h = nullptr;
     if (mysql_service_mysql_library->init(
             m_thd, {m.schema.data(), m.schema.size()}, {m.name.data(), m.name.size()},
             {"", 0}, &h) ||
         h == nullptr) {
-      r->message = "library " + what + " does not exist";
-      // The lookup's error is not the routine's; an inner statement's error
-      // kept in the DA goes with it (the SqlRunner must know, or a rethrown
-      // SQL error would be taken as still raised).
-      clear_server_error(m_thd);
-      if (m_sql != nullptr) m_sql->clear();
+      lookup_failed("library " + what + " does not exist");
       return;
     }
     mysql_cstring_with_length body{nullptr, 0}, language{nullptr, 0};
@@ -121,7 +126,7 @@ class Hooks : public mle::CallHooks {
       (void)mysql_service_mysql_library->deinit(h);
       // The server's init() succeeds for a library that does not exist;
       // reading its body is what fails.
-      r->message = "library " + what + " does not exist or cannot be read";
+      lookup_failed("library " + what + " does not exist or cannot be read");
       return;
     }
     const std::string_view text(body.str == nullptr ? "" : body.str, body.length);
@@ -284,10 +289,13 @@ Session *Session::current(bool create) {
   return s;
 }
 
+Session::Session(MYSQL_THD thd) : m_thd(thd), m_mark(engine_session_begin()) {}
+
 Session::~Session() {
   for (auto &[principal, slot] : m_workers)
-    engine_release_worker(std::move(slot.worker), principal);
+    engine_release_worker(std::move(slot.worker), principal, m_mark);
   for (auto &w : m_retired) engine_release_worker(std::move(w));
+  engine_session_end(m_mark);
   g_counters.sessions = --g_sessions;
 }
 
@@ -617,7 +625,8 @@ void Session::reset_output(bool out, bool err) {
 
 void Session::clear_state(bool reuse) {
   for (auto &[principal, slot] : m_workers)
-    engine_release_worker(std::move(slot.worker), reuse ? principal : "");
+    engine_release_worker(std::move(slot.worker), reuse ? principal : "",
+                          m_mark);
   m_workers.clear();
   m_programs.clear();
   m_stack.clear();
@@ -640,6 +649,9 @@ bool Session::reset() {
 void Session::account_changed() {
   if (m_calls > 0) return;  // between commands: never (defensive)
   clear_state(true);
+  // The new account's workers: kept unless it is forgotten from now on.
+  engine_session_end(m_mark);
+  m_mark = engine_session_begin();
 }
 
 bool Session::set_options(mle::wire::IntegerType integer_type,
@@ -771,8 +783,15 @@ bool check_create_privilege(MYSQL_THD thd, const Routine &routine) {
   // "create_function" (a UDF is "create_udf").
   const std::string cmd(command.str, command.length);
   if (cmd != "create_procedure" && cmd != "create_function") return true;
+  Security_context_handle sctx = nullptr;
+  if (mysql_service_mysql_thd_security_context->get(thd, &sctx)) {
+    my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));  // not a grant matter
+    return false;
+  }
   const char *privilege = privilege_of(routine);
-  if (has_global_privilege(thd, privilege)) return true;
+  if (mysql_service_global_grants_check->has_global_grant(sctx, privilege,
+                                                          strlen(privilege)))
+    return true;
   my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), privilege);
   return false;
 }

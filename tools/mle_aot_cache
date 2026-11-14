@@ -42,6 +42,7 @@ fi
 
 set -- -XX:+UseSerialGC --enable-native-access=ALL-UNNAMED \
   --add-modules=jdk.incubator.vector \
+  --add-exports=java.base/jdk.internal.vm=ALL-UNNAMED \
   -Dpolyglot.engine.userResourceCache="$DIR/resources" \
   -cp "$DIR/mle-worker.jar"
 if [ -d "$DIR/python-venv/venv" ] && ls "$DIR"/deps/python-language-*.jar >/dev/null 2>&1; then

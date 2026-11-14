@@ -25,14 +25,30 @@ GRANT EXECUTE ON test.* TO u5@localhost;
 SELECT py_mark2('new u5') AS new_u5_sees;
 new_u5_sees
 None
+# Also a worker the old session takes after the DROP (here after a reset).
+SELECT py_mark2('old u5 again') AS old_u5_marks;
+old_u5_marks
+new u5
+DROP USER u5@localhost;
+CREATE USER u5@localhost;
+GRANT EXECUTE ON test.* TO u5@localhost;
+SELECT mle_session_reset() AS reset;
+reset
+The session state is successfully reset.
+SELECT py_mark2('taken after the drop') AS fresh_worker;
+fresh_worker
+None
+SELECT py_mark2('new u5') AS new_u5_sees;
+new_u5_sees
+None
 # 5: a result or SQL request larger than the host accepts is a clean
 # error; the worker goes on (no failure counted).
 SELECT LENGTH(py_big());
-ERROR HY000: MLE-Type> the routine's result and output are too large for MLE: 70000020 bytes (at most 64 MiB) in 'py_big()'
+ERROR HY000: MLE-Type> the routine's result with its output is larger than MLE allows (64 MiB) in 'py_big()'
 CALL js_big_sql(@r);
 SELECT @r AS sql_request;
 sql_request
-the SQL statement and its parameters are too large for MLE: 70000043 bytes (at most 64 MiB)
+the SQL statement with its parameters is larger than MLE allows (64 MiB)
 SELECT py_mark2('still') IS NOT NULL AS same_session_goes_on;
 same_session_goes_on
 1
@@ -45,19 +61,38 @@ missing_library
 Error: Error reading module '/test/no_such_library' imported from js_import: library test.no_such_library does not exist or cannot be read
 CALL js_rethrow();
 ERROR 42S02: Table 'test.no_such_table' doesn't exist
-# 8: a thread a Java routine leaves is found even when it is named like
-# the runtime's: the worker is not kept for the account.
-SELECT java_sneaky() AS java_thread;
-java_thread
-left a thread named like the runtime's
-workers kept: 0
+# 8: a thread a Java routine leaves (named like the runtime's, a
+# platform or a virtual one) keeps the worker from being kept for the
+# account: the account's next session gets a new worker. Without a
+# thread, it gets the same one (the mark is still there).
+SET GLOBAL mle.worker_cache_timeout = 3600;
+SELECT java_mark('control', 'none') AS java_mark;
+java_mark
+marked control, thread: none
+SELECT java_seen() AS kept_without_thread;
+kept_without_thread
+control
+SELECT java_mark('platform', 'platform') AS java_mark;
+java_mark
+marked platform, thread: platform
+SELECT java_seen() AS after_platform_thread;
+after_platform_thread
+null
+SELECT java_mark('virtual', 'virtual') AS java_mark;
+java_mark
+marked virtual, thread: virtual
+SELECT java_seen() AS after_virtual_thread;
+after_virtual_thread
+null
+SET GLOBAL mle.worker_cache_timeout = DEFAULT;
 DROP FUNCTION py_prio;
 DROP FUNCTION py_mark2;
 DROP FUNCTION py_big;
 DROP PROCEDURE js_big_sql;
 DROP PROCEDURE js_import;
 DROP PROCEDURE js_rethrow;
-DROP FUNCTION java_sneaky;
+DROP FUNCTION java_mark;
+DROP FUNCTION java_seen;
 DROP USER u4@localhost, u5@localhost;
 REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_mle";

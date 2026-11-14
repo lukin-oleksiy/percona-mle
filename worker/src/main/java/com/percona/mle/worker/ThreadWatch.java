@@ -25,8 +25,9 @@ package com.percona.mle.worker;
  * are not the runtime's own at RESET (which decides whether it is kept for reuse) and, during a
  * session, after a top-level request at most every few seconds; with one, it is retired (tainted).
  *
- * <p>Plain thread enumeration, no java.lang.management (JMX is slow to start in every worker and
- * not in the AOT cache).
+ * <p>No java.lang.management (JMX is slow to start in every worker and not in the AOT cache). The
+ * JDK's thread containers (jdk.internal.vm, exported to the worker by its JVM options) also list
+ * virtual threads, which thread groups do not; without them, platform threads only.
  *
  * <p>A thread named like the runtime's is still a stranger when its stack holds code of a routine,
  * a library or a DBA jar (their class loaders' names): a routine cannot pass its thread off as
@@ -53,11 +54,53 @@ final class ThreadWatch {
 
   /** True if a thread not belonging to the runtime is alive. */
   boolean strangers() {
+    for (Thread t : allThreads())
+      if (t.isAlive() && (!system(t.getName()) || runsGuestCode(t))) return true;
+    return false;
+  }
+
+  private static final java.lang.reflect.Method CONTAINER_ROOT, CONTAINER_THREADS, CONTAINER_CHILDREN;
+
+  static {
+    java.lang.reflect.Method root = null, threads = null, children = null;
+    try {
+      Class<?> containers = Class.forName("jdk.internal.vm.ThreadContainers");
+      Class<?> container = Class.forName("jdk.internal.vm.ThreadContainer");
+      root = containers.getMethod("root");
+      threads = container.getMethod("threads");
+      children = container.getMethod("children");
+      root.invoke(null);  // fails here if the package is not exported to us
+    } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
+      root = null;
+    }
+    CONTAINER_ROOT = root;
+    CONTAINER_THREADS = threads;
+    CONTAINER_CHILDREN = children;
+  }
+
+  /** Live threads, virtual ones included when the thread containers can be read. */
+  private static java.util.List<Thread> allThreads() {
+    if (CONTAINER_ROOT != null && !Polyglot.nativeImage()) {
+      try {
+        java.util.List<Thread> out = new java.util.ArrayList<>();
+        collect(CONTAINER_ROOT.invoke(null), out, 0);
+        return out;
+      } catch (ReflectiveOperationException | RuntimeException e) {
+        // fall back to the thread groups
+      }
+    }
     Thread[] all = new Thread[ROOT.activeCount() + 16];
     int n = ROOT.enumerate(all, true);
-    for (int i = 0; i < n; i++)
-      if (all[i].isAlive() && (!system(all[i].getName()) || runsGuestCode(all[i]))) return true;
-    return false;
+    return java.util.Arrays.asList(all).subList(0, n);
+  }
+
+  /** The container's threads and its child containers' (executors, structured scopes). */
+  private static void collect(Object container, java.util.List<Thread> out, int depth)
+      throws ReflectiveOperationException {
+    ((java.util.stream.Stream<?>) CONTAINER_THREADS.invoke(container)).forEach(t -> out.add((Thread) t));
+    if (depth >= 32) return;
+    for (Object child : ((java.util.stream.Stream<?>) CONTAINER_CHILDREN.invoke(container)).toList())
+      collect(child, out, depth + 1);
   }
 
   /** Whether t's stack has a frame of routine, library or DBA-jar code (JavaRoutines' loaders). */
@@ -65,8 +108,8 @@ final class ThreadWatch {
     if (Polyglot.nativeImage() || t == Thread.currentThread()) return false;  // no Java code there
     for (StackTraceElement e : t.getStackTrace()) {
       String loader = e.getClassLoaderName();
-      if (loader != null && (loader.startsWith(JavaRoutines.LOADER_PREFIX) || loader.startsWith("mle-library-")
-          || loader.equals("mle-packages")))
+      if (loader != null && (loader.startsWith(JavaRoutines.LOADER_PREFIX)
+          || loader.startsWith(JavaRoutines.LIBRARY_LOADER_PREFIX) || loader.equals(JavaRoutines.PACKAGE_LOADER)))
         return true;
     }
     return false;

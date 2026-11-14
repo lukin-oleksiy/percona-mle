@@ -70,6 +70,9 @@ import javax.tools.ToolProvider;
  */
 final class JavaRoutines {
   static final String LOADER_PREFIX = "mle-routine-";
+  /** Loader names of database libraries and DBA jars (ThreadWatch looks for their code). */
+  static final String LIBRARY_LOADER_PREFIX = "mle-library-";
+  static final String PACKAGE_LOADER = "mle-packages";
 
   static final class CompileException extends Exception {
     private static final long serialVersionUID = 1L;
@@ -143,7 +146,7 @@ final class JavaRoutines {
   static synchronized Map<String, Class<?>> loadLibrary(String name, String source) throws CompileException {
     if (libraryCompiler == null) libraryCompiler = new JavaRoutines();
     Map<String, byte[]> bytes = libraryCompiler.compile(source, 0, name, List.of());
-    ClassLoader loader = new ClassLoader("mle-library-" + name, LIBRARY_PARENT) {
+    ClassLoader loader = new ClassLoader(LIBRARY_LOADER_PREFIX + name, LIBRARY_PARENT) {
       @Override
       protected Class<?> findClass(String n) throws ClassNotFoundException {
         byte[] b = bytes.get(n);
@@ -172,7 +175,7 @@ final class JavaRoutines {
     } catch (java.net.MalformedURLException e) {
       return api;
     }
-    return new java.net.URLClassLoader("mle-packages", urls, api);
+    return new java.net.URLClassLoader(PACKAGE_LOADER, urls, api);
   }
 
   /** Loads JDK and the API, nothing of the worker. */

@@ -61,20 +61,23 @@ std::mutex g_mutex;
 std::shared_ptr<mle::Launcher> g_launcher;  // guarded by g_mutex
 std::string g_error;                        // guarded by g_mutex
 Settings g_settings;                        // guarded by g_mutex
-/** A worker held by a session: the engine generation that started it and
-    the account-forget count when the session took it. */
-struct Live {
-  uint64_t generation;
-  uint64_t forgets;
-};
-/** Workers held by sessions (for mle_memory_used). */
-std::map<const mle::Worker *, Live> g_live;  // guarded by g_mutex
-/** DROP USER / RENAME USER (engine_forget_account): a count, and the count at
-    each account's last one. A worker a session took before its account was
-    forgotten is not kept when released (a new account of that name must not
-    get it). Grows by one entry per dropped account name. */
+/** Workers held by sessions (for mle_memory_used), with the engine
+    generation that started them. */
+std::map<const mle::Worker *, uint64_t> g_live;  // guarded by g_mutex
+/** DROP USER / RENAME USER (engine_forget_account) count, the count at each
+    account's last one, and each MLE session's count when it began (its
+    mark). A session that began before its account (or a DEFINER's) was
+    forgotten keeps none of that account's workers: a new account of that
+    name must not get them. An entry goes once no session is older. */
 uint64_t g_forgets = 0;                          // guarded by g_mutex
 std::map<std::string, uint64_t> g_forgotten_at;  // guarded by g_mutex
+std::multiset<uint64_t> g_marks;                 // guarded by g_mutex
+
+void prune_forgotten_locked() {
+  const uint64_t oldest = g_marks.empty() ? g_forgets : *g_marks.begin();
+  std::erase_if(g_forgotten_at,
+                [oldest](const auto &entry) { return entry.second <= oldest; });
+}
 /** Incremented at every engine (re)start: workers of an older one are never
     kept for reuse (they have the old settings and package view). */
 uint64_t g_generation = 0;                  // guarded by g_mutex
@@ -199,12 +202,23 @@ namespace {
 /** The zone name of a tzfile path ("/usr/share/zoneinfo/Europe/Berlin", or a
     link to one such as /etc/localtime), or "". */
 std::string zone_of_file(const std::string &file) {
-  std::string path = file;
+  const auto zone_in = [](const std::string &path) {
+    const size_t at = path.find("zoneinfo/");
+    return at == std::string::npos ? std::string() : path.substr(at + 9);
+  };
+  // The name as configured first (TZ=:/usr/share/zoneinfo/US/Eastern),
+  // then the link's target (/etc/localtime), then the file itself (a
+  // relative link inside zoneinfo, e.g. Europe/Kiev -> Kyiv).
+  if (std::string zone = zone_in(file); !zone.empty()) return zone;
   char target[PATH_MAX];
-  const ssize_t n = readlink(file.c_str(), target, sizeof target - 1);
-  if (n > 0) path.assign(target, static_cast<size_t>(n));
-  const size_t at = path.find("zoneinfo/");
-  return at == std::string::npos ? "" : path.substr(at + 9);
+  if (const ssize_t n = readlink(file.c_str(), target, sizeof target - 1); n > 0) {
+    if (std::string zone = zone_in(std::string(target, static_cast<size_t>(n)));
+        !zone.empty())
+      return zone;
+  }
+  if (char real[PATH_MAX]; realpath(file.c_str(), real) != nullptr)
+    return zone_in(real);
+  return "";
 }
 }  // namespace
 
@@ -530,29 +544,40 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
   *why = AcquireError::kNone;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_live[worker.get()] = {generation, g_forgets};
+    g_live[worker.get()] = generation;
   }
   return worker;
 }
 
+uint64_t engine_session_begin() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_marks.insert(g_forgets);
+  return g_forgets;
+}
+
+void engine_session_end(uint64_t mark) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (const auto it = g_marks.find(mark); it != g_marks.end()) g_marks.erase(it);
+  prune_forgotten_locked();
+}
+
 void engine_release_worker(std::unique_ptr<mle::Worker> worker,
-                           const std::string &principal) {
+                           const std::string &principal, uint64_t mark) {
   if (!worker) return;
   uint64_t generation = 0;
-  uint64_t forgets = 0;
   bool current = false;
-  // Under g_mutex: whether the account was dropped or renamed since forgets.
-  const auto forgotten_since = [&principal](uint64_t forgets) {
+  // Under g_mutex: whether the account was dropped or renamed since the
+  // session began.
+  const auto forgotten = [&principal, mark] {
     const auto f = g_forgotten_at.find(principal);
-    return f != g_forgotten_at.end() && f->second > forgets;
+    return f != g_forgotten_at.end() && f->second > mark;
   };
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto it = g_live.find(worker.get());
     if (it != g_live.end()) {
-      generation = it->second.generation;
-      forgets = it->second.forgets;
-      current = generation == g_generation && !forgotten_since(forgets);
+      generation = it->second;
+      current = generation == g_generation && !forgotten();
       g_live.erase(it);
     }
   }
@@ -569,8 +594,7 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
       std::vector<std::unique_ptr<mle::Worker>> evicted;
       {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_launcher && generation == g_generation &&
-            !forgotten_since(forgets)) {
+        if (g_launcher && generation == g_generation && !forgotten()) {
           g_cache.push_back({principal, std::move(worker),
                              std::chrono::steady_clock::now(), generation});
           while (g_cache.size() > worker_cache_size()) {
@@ -610,7 +634,7 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
   }
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_live[worker.get()] = {generation, g_forgets};
+    g_live[worker.get()] = generation;
   }
   ++g_cache_hits;
   return worker;
@@ -621,6 +645,7 @@ void engine_forget_account(const std::string &principal) {
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_forgotten_at[principal] = ++g_forgets;
+    prune_forgotten_locked();
     for (auto it = g_cache.begin(); it != g_cache.end();) {
       if (it->principal == principal) {
         gone.push_back(std::move(it->worker));
@@ -637,7 +662,7 @@ long engine_memory_used_percent() {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_live.empty() || g_settings.heap_max == 0) return 0;
   uint64_t used = 0;
-  for (const auto &[w, live] : g_live) used += w->stats().heap_used;
+  for (const auto &[w, generation] : g_live) used += w->stats().heap_used;
   return static_cast<long>(used * 100 / (g_settings.heap_max * g_live.size()));
 }
 
