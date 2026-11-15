@@ -50,6 +50,7 @@
 #include <mysqld_error.h>
 
 #include "mle_component.h"
+#include "session.h"
 
 extern REQUIRES_SERVICE_PLACEHOLDER(component_sys_variable_register);
 extern REQUIRES_SERVICE_PLACEHOLDER(component_sys_variable_unregister);
@@ -113,8 +114,11 @@ void restart_engine(MYSQL_THD thd, const char *variable) {
 /** Whether a session holds a worker, after waiting up to a second for the
     sessions that are ending: a client that disconnects and runs SET GLOBAL
     at once used to get 6116, the server not having ended its session yet
-    (exp note 34). The check runs without the system variables' lock. */
-bool workers_held() {
+    (exp note 34). The check runs without the system variables' lock. The
+    session running the SET cannot give its own worker back: no wait. */
+bool workers_held(MYSQL_THD thd) {
+  const Session *own = Session::of(thd);
+  if (own != nullptr && own->holds_worker()) return true;
   for (int i = 0; i < 100 && engine_workers_in_use() > 0; ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   return engine_workers_in_use() > 0;
@@ -124,18 +128,18 @@ bool workers_held() {
     session holds a worker; range checked here (a custom check replaces the
     server's range check; the server rejects non-integers before). */
 template <typename T, const char *Name, ulonglong Min, ulonglong Max>
-int check_shaping(MYSQL_THD, SYS_VAR *, void *save,
+int check_shaping(MYSQL_THD thd, SYS_VAR *, void *save,
                   struct st_mysql_value *value) {
-  if (workers_held()) {
-    my_error(ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE, MYF(0),
-             (std::string("mle.") + Name).c_str());
-    return 1;
-  }
   long long v = 0;
   if (value->val_int(value, &v) != 0) return 1;
   if (v < 0 && !value->is_unsigned(value)) return 1;
   const auto u = static_cast<ulonglong>(v);
-  if (u < Min || u > Max) return 1;  // ER_WRONG_VALUE_FOR_VAR
+  if (u < Min || u > Max) return 1;  // ER_WRONG_VALUE_FOR_VAR, no wait
+  if (workers_held(thd)) {
+    my_error(ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE, MYF(0),
+             (std::string("mle.") + Name).c_str());
+    return 1;
+  }
   *static_cast<T *>(save) = static_cast<T>(u);
   return 0;
 }
@@ -176,17 +180,17 @@ int check_languages(MYSQL_THD, SYS_VAR *, void *save,
 
 /** mle.pool_prewarm: none, python or numpy; shapes workers (refused while a
     session holds one). */
-int check_prewarm(MYSQL_THD, SYS_VAR *, void *save, struct st_mysql_value *value) {
-  if (workers_held()) {
-    my_error(ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE, MYF(0), "mle.pool_prewarm");
-    return 1;
-  }
+int check_prewarm(MYSQL_THD thd, SYS_VAR *, void *save, struct st_mysql_value *value) {
   int length = 0;
   const char *s = value->val_str(value, nullptr, &length);
   if (s == nullptr) return 1;
   std::string v(s, static_cast<size_t>(length));
   for (char &c : v) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
   if (v != "none" && v != "python" && v != "numpy") return 1;
+  if (workers_held(thd)) {
+    my_error(ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE, MYF(0), "mle.pool_prewarm");
+    return 1;
+  }
   *static_cast<const char **>(save) = s;
   return 0;
 }

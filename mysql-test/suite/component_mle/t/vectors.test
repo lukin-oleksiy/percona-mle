@@ -95,6 +95,16 @@ for (Vectors.Metric m : Vectors.Metric.values()) {
   Matches[] rel = Vectors.related(tall, 5, m);
   for (int i = 0; i < tall.length; i += 97) ref.check("tall related " + m, tall[i], tall, 5, m, i, rel[i]);
 }
+// EUCLIDEAN far from the origin (|r|² ~ 6e7, distances ~ 0.1): ranked by the exact distance.
+float[][] off = random.apply(300, 64);
+for (float[] v : off) for (int i = 0; i < v.length; i++) v[i] = 1000f + v[i] * 0.01f;
+for (int i = 0; i < 5; i++) ref.check("offset nearest", off[i], off, 10, Vectors.Metric.EUCLIDEAN, -1,
+    Vectors.nearest(off[i], off, 10, Vectors.Metric.EUCLIDEAN));
+Matches[] offRel = Vectors.related(off, 10, Vectors.Metric.EUCLIDEAN);
+for (int i = 0; i < off.length; i += 7) ref.check("offset related", off[i], off, 10, Vectors.Metric.EUCLIDEAN, i, offRel[i]);
+// A dot product that overflows to -Infinity is still a match: k rows give k matches.
+float[][] huge = {{3e38f, 3e38f}, {-3e38f, -3e38f}, {1f, 1f}};
+if (Vectors.nearest(huge[0], huge, 3, Vectors.Metric.DOT).size() != 3 && fail.length() == 0) fail.append("-Infinity dropped");
 return fail.length() > 0 ? "FAIL " + fail : "ok " + Long.toHexString(digest[0]);
 $$;
 CREATE FUNCTION vec_threads() RETURNS TEXT LANGUAGE JAVA AS $$
@@ -203,6 +213,9 @@ SET GLOBAL mle.vector_threads = 0;
 CALL fill_items(200);
 SELECT vec_threads();
 SELECT vec_basic();
+--echo # This session holds a worker: refused at once (no wait for it).
+--error ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
+SET GLOBAL mle.vector_threads = 2;
 
 --echo # 2. Against the reference; with mle.vector_threads = 4.
 --let $d4 = `SELECT vec_selfcheck()`

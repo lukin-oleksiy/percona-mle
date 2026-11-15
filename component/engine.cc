@@ -33,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -614,17 +615,22 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
       g_live.erase(it);
     }
   }
-  --g_workers_in_use;
   // Only a healthy worker of the current engine that is not running
   // anything is kept, after RESET (it forgets the session's routines and
   // trims its heap).
-  if (current && !principal.empty() && worker_cache_size() > 0 && worker->usable() &&
-      !worker->stats().tainted && worker->depth() == 0) {
+  const bool keep = current && !principal.empty() && worker_cache_size() > 0 &&
+                    worker->usable() && !worker->stats().tainted &&
+                    worker->depth() == 0;
+  // Until the worker is kept (or not), a new session of this principal waits
+  // for it (engine_reuse_worker). Registered before the worker stops counting
+  // as held: once mle_workers no longer counts it, a new session finds it
+  // kept or being reset, never neither.
+  std::optional<Releasing> releasing;
+  if (keep) releasing.emplace(principal);
+  --g_workers_in_use;
+  if (keep) {
     std::vector<std::unique_ptr<mle::Worker>> evicted;
     {
-      // Until the worker is kept (or not), a new session of this principal
-      // waits for it (engine_reuse_worker).
-      const Releasing releasing(principal);
       std::string error;
       // RESET also tells whether a routine left a thread running (tainted).
       if (worker->reset(&error) == mle::Status::kOk && worker->usable() &&
@@ -640,7 +646,8 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
         }
       }
     }
-    evicted.clear();  // ends them, without the mutex
+    releasing.reset();  // kept (or not): waiting sessions look again
+    evicted.clear();    // ends them, without the mutex
     if (!worker) return;
   }
   worker.reset();

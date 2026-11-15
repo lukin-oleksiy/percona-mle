@@ -92,6 +92,13 @@ class Session {
   /** COM_CHANGE_USER: the session's state belongs to the old account; its
       workers go back to the engine for that account's later sessions. */
   void account_changed();
+  /** Whether this session holds a worker (SET GLOBAL of a worker-shaping
+      variable cannot wait for it). */
+  bool holds_worker() const {
+    for (const auto &[principal, slot] : m_workers)
+      if (slot.worker) return true;
+    return false;
+  }
   /** Programs prepared in this session's workers (Oracle: "active"). */
   bool has_programs() const { return !m_programs.empty(); }
   /** The pid of the current principal's worker, or -1 (debug UDF). */

@@ -100,7 +100,7 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
       // call in a worker then waits less for the JIT (0.9 -> 0.6 s, related
       // items 10k x 768), with the same speed once compiled.
       "-XX:CompileCommand=quiet",
-      "-XX:CompileCommand=dontinline,com.percona.mle.api.VectorEngine::tile",
+      "-XX:CompileCommand=dontinline,com.percona.mle.api.VectorEngine::tile*",
       "-XX:CompileCommand=dontinline,com.percona.mle.api.VectorEngine::offer*",
       "-XX:CompileCommand=dontinline,com.percona.mle.api.VectorEngine::row*",
       // ThreadWatch: the thread containers list virtual threads too (also

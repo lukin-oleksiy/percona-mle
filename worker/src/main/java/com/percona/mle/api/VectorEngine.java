@@ -48,13 +48,14 @@ import jdk.incubator.vector.VectorSpecies;
  * <p>Threads: one pool per worker ("mle-vectors-N", daemon, idle ones end after a minute), at most
  * mle.vector_threads (-Dmle.vectorThreads), never more than the CPUs. It only runs this class's
  * kernels, never guest code, so the worker's thread watch counts them as the runtime's. KILL: the
- * waiting thread sees the call killed (or its interrupt), stops the tasks that have not started
- * and waits for the running ones (a task is a few milliseconds), then throws.
+ * waiting thread sees the call killed (or its interrupt) and stops the tasks that have not
+ * started; running tasks check between panels (and a scan every 4096 rows), so the call stops
+ * within milliseconds and throws.
  *
  * <p>The species is a static final field and used directly: the JIT intrinsifies the Vector API
  * only for a constant species (a captured local made a kernel 16x slower, note 31).
  *
- * <p>The worker's JVM options keep tile(), row*() and offer*() from being inlined (host/defaults.cc,
+ * <p>The worker's JVM options keep tile*(), row*() and offer*() from being inlined (host/defaults.cc,
  * CompileCommand dontinline): smaller compilation units reach compiled code sooner in a new
  * worker. Renaming them means changing those options too.
  */
@@ -161,7 +162,29 @@ final class VectorEngine {
     return dot;
   }
 
-  /** Euclidean distance, summed directly (exact, unlike |a|² + |b|² - 2a·b). */
+  /**
+   * |q - r|², summed directly. EUCLIDEAN ranks by it: |q|² + |r|² - 2q·r loses the difference
+   * between close vectors far from the origin (a common offset), and so would pick the wrong rows.
+   */
+  static float rowDistanceSquared(float[] q, float[] r, float[] lanes) {
+    int d = q.length, i = 0;
+    var a0 = FloatVector.zero(SP);
+    var a1 = a0;
+    for (int end = d - d % (2 * L); i < end; i += 2 * L) {
+      var x0 = FloatVector.fromArray(SP, q, i).sub(FloatVector.fromArray(SP, r, i));
+      var x1 = FloatVector.fromArray(SP, q, i + L).sub(FloatVector.fromArray(SP, r, i + L));
+      a0 = x0.fma(x0, a0);
+      a1 = x1.fma(x1, a1);
+    }
+    float s = sum(a0.add(a1), lanes);
+    for (; i < d; i++) {
+      float x = q[i] - r[i];
+      s += x * x;
+    }
+    return s;
+  }
+
+  /** Euclidean distance, summed directly. */
   static float distance(float[] a, float[] b) {
     int d = a.length, i = 0;
     var s0 = FloatVector.zero(SP);
@@ -188,21 +211,22 @@ final class VectorEngine {
     return s;
   }
 
-  /** 1 / |v|, 0 for a zero vector. */
-  static float inverseNorm(float[] v) {
-    float n = dot(v, v);
+  /** 1 / |v|, 0 for a zero vector (lanes: scratch of L floats). */
+  static float inverseNorm(float[] v, float[] lanes) {
+    float n = rowDot(v, v, lanes);
     return n > 0 ? (float) (1 / Math.sqrt(n)) : 0f;
   }
 
-  /** Per row: 1/|r| (COSINE) or |r|² (EUCLIDEAN); null for DOT. */
+  /** Per row 1/|r| for COSINE; null for the other metrics. */
   static float[] rowTerms(float[][] rows, int metric) {
-    if (metric == DOT) return null;
+    if (metric != COSINE) return null;
     final int n = rows.length;
     final float[] t = new float[n];
     final int parts = parts((long) n * (rows.length == 0 ? 0 : rows[0].length), n);
     run(parts, parts > 1, p -> {
+      final float[] lanes = new float[L];
       int lo = (int) ((long) n * p / parts), hi = (int) ((long) n * (p + 1) / parts);
-      for (int j = lo; j < hi; j++) t[j] = metric == COSINE ? inverseNorm(rows[j]) : dot(rows[j], rows[j]);
+      for (int j = lo; j < hi; j++) t[j] = inverseNorm(rows[j], lanes);
     });
     return t;
   }
@@ -210,13 +234,14 @@ final class VectorEngine {
   // ------------------------------------------------------------- one query
 
   /**
-   * Top k of rows for one query. rowTerm: 1/|r| or |r|² per row (from a VectorSet), or null to
-   * compute it with the dot product. self: a row to leave out, or -1.
+   * Top k of rows for one query. rowTerm: 1/|r| per row for COSINE (from a VectorSet), or null to
+   * compute it with the dot product. self: a row to leave out, or -1. Keys: the dot product, the
+   * cosine, or -|q - r|² (higher is better for all three).
    */
   static Matches nearest(float[] q, float[][] rows, float[] rowTerm, int k, int metric, int self, long[] ids) {
     final int n = rows.length;
     k = Math.min(k, Math.max(1, n));
-    final float qInv = metric == COSINE ? inverseNorm(q) : 0f;
+    final float qInv = metric == COSINE ? inverseNorm(q, new float[L]) : 0f;
     final float[] s = new float[k];
     final int[] x = new int[k];
     Arrays.fill(s, Float.NEGATIVE_INFINITY);
@@ -240,36 +265,41 @@ final class VectorEngine {
       run(slices, false, sl -> scan(q, rows, rowTerm, sl * SLICE, Math.min(n, (sl + 1) * SLICE), self, metric, qInv,
           s, x, kk));
     }
-    return matches(q, rows, s, x, metric, ids);
+    return matches(s, x, metric, ids);
   }
 
-  /** Into s/x (descending keys): the rows [lo, hi) for query q. */
+  /** Into s/x (descending keys): the rows [lo, hi) for query q; checks for KILL every 4096 rows. */
   private static void scan(float[] q, float[][] rows, float[] rowTerm, int lo, int hi, int self, int metric, float qInv,
       float[] s, int[] x, int k) {
-    final boolean needSquare = metric != DOT && rowTerm == null;
+    final boolean needSquare = metric == COSINE && rowTerm == null;
     final float[] lanes = new float[L], square = new float[1];
     for (int j = lo; j < hi; j++) {
+      if ((j - lo & 4095) == 0) stopIfKilled();
       if (j == self) continue;
-      final float dot = needSquare ? rowDotSquare(q, rows[j], lanes, square) : rowDot(q, rows[j], lanes);
-      final float rr = square[0];
-      float key = switch (metric) {
-        case COSINE -> dot * qInv * (rowTerm != null ? rowTerm[j] : rr > 0 ? (float) (1 / Math.sqrt(rr)) : 0f);
-        case EUCLIDEAN -> 2 * dot - (rowTerm != null ? rowTerm[j] : rr);
-        default -> dot;
-      };
-      if (key > s[k - 1]) offer(s, x, key, j);  // NaN never enters
+      final float key;
+      if (metric == EUCLIDEAN) {
+        key = -rowDistanceSquared(q, rows[j], lanes);
+      } else {
+        final float dot = needSquare ? rowDotSquare(q, rows[j], lanes, square) : rowDot(q, rows[j], lanes);
+        final float rr = square[0];
+        key = metric == COSINE
+            ? dot * qInv * (rowTerm != null ? rowTerm[j] : rr > 0 ? (float) (1 / Math.sqrt(rr)) : 0f)
+            : dot;
+      }
+      if (key >= s[k - 1]) offer(s, x, key, j);  // offer() decides ties; NaN never enters
     }
   }
 
   /**
    * Inserts (key, j) into the top k: higher key first, an equal key ordered by the lower row. The
-   * order is total, so the result does not depend on the order of the offers (threads).
+   * order is total, so the result does not depend on the order of the offers (threads). An empty
+   * slot (x = -1, key -Infinity) takes any key but NaN, -Infinity included.
    */
   private static void offer(float[] s, int[] x, float key, int j) {
     int k = s.length;
-    if (!(key > s[k - 1] || key == s[k - 1] && j < x[k - 1])) return;
+    if (!(key > s[k - 1] || key == s[k - 1] && (x[k - 1] < 0 || j < x[k - 1]))) return;
     int p = k - 1;
-    while (p > 0 && (s[p - 1] < key || s[p - 1] == key && x[p - 1] > j)) {
+    while (p > 0 && (s[p - 1] < key || s[p - 1] == key && (x[p - 1] < 0 || x[p - 1] > j))) {
       s[p] = s[p - 1];
       x[p] = x[p - 1];
       p--;
@@ -282,7 +312,7 @@ final class VectorEngine {
 
   /**
    * Top k of rows for each query. related: queries are the rows themselves, each row left out of
-   * its own result. Fewer than 4 queries: one query at a time.
+   * its own result (related(), each pair once). Fewer than 4 queries: one query at a time.
    */
   static Matches[] nearest(float[][] queries, float[][] rows, float[] rowTerm, int k, int metric, boolean related,
       long[] ids) {
@@ -295,9 +325,9 @@ final class VectorEngine {
     final int d = rows[0].length, kk = Math.min(k, n);
     final float[] rt = rowTerm != null ? rowTerm : rowTerms(rows, metric);
     if (related) return related(rows, rt, kk, metric, ids);
-    final float[] qInv = new float[nq];
+    final float[] qInv = new float[nq], lanes = new float[L];
     if (metric == COSINE)
-      for (int a = 0; a < nq; a++) qInv[a] = related ? rt[a] : inverseNorm(queries[a]);
+      for (int a = 0; a < nq; a++) qInv[a] = inverseNorm(queries[a], lanes);
     final float[][] bs = new float[nq][kk];
     final int[][] bx = new int[nq][kk];
     for (int a = 0; a < nq; a++) {
@@ -317,11 +347,16 @@ final class VectorEngine {
         final float[] tile = new float[4 * NR];
         final int lo = t * rb, hi = Math.min(nq, lo + rb);
         for (int p = 0; p < panels; p++) {
+          stopIfKilled();
           final float[] panel = pk[p];
           final int j0 = start + p * NR, cols = Math.min(NR, c1 - j0);
           for (int a = lo; a < hi; a += 4) {
-            tile(queries[a], a + 1 < hi ? queries[a + 1] : zero, a + 2 < hi ? queries[a + 2] : zero,
-                a + 3 < hi ? queries[a + 3] : zero, panel, d, tile);
+            if (metric == EUCLIDEAN)
+              tileDistance(queries[a], a + 1 < hi ? queries[a + 1] : zero, a + 2 < hi ? queries[a + 2] : zero,
+                  a + 3 < hi ? queries[a + 3] : zero, panel, d, tile);
+            else
+              tile(queries[a], a + 1 < hi ? queries[a + 1] : zero, a + 2 < hi ? queries[a + 2] : zero,
+                  a + 3 < hi ? queries[a + 3] : zero, panel, d, tile);
             for (int r = 0; r < 4 && a + r < hi; r++) {
               final int qa = a + r;
               final float[] s = bs[qa];
@@ -329,20 +364,20 @@ final class VectorEngine {
               final float qi = qInv[qa];
               for (int c = 0; c < cols; c++) {
                 final int j = j0 + c;
-                final float dot = tile[r * NR + c];
+                final float v = tile[r * NR + c];
                 final float key = switch (metric) {
-                  case COSINE -> dot * qi * rt[j];
-                  case EUCLIDEAN -> 2 * dot - rt[j];
-                  default -> dot;
+                  case COSINE -> v * qi * rt[j];
+                  case EUCLIDEAN -> -v;  // v = |q - r|²
+                  default -> v;
                 };
-                if (key > s[kk - 1] && !(related && j == qa)) offer(s, x, key, j);
+                if (key >= s[kk - 1]) offer(s, x, key, j);
               }
             }
           }
         }
       });
     }
-    for (int a = 0; a < nq; a++) out[a] = matches(queries[a], rows, bs[a], bx[a], metric, ids);
+    for (int a = 0; a < nq; a++) out[a] = matches(bs[a], bx[a], metric, ids);
     return out;
   }
 
@@ -350,8 +385,9 @@ final class VectorEngine {
    * All pairs, each computed once: a task takes a block of rows a and the rows j > a, and offers
    * the score to both rows. A row's top k then gets offers from several tasks: under its lock, taken
    * only when the score beats its k-th best (rare once it is full; the k-th best only rises, so the
-   * test without the lock never rejects wrongly). The cosine key is dot * (1/|a| * 1/|j|), the same
-   * for both rows. Half the work of the general batch, with blocks of rows in order of their work.
+   * test without the lock never rejects wrongly). The cosine key is dot * (1/|a| * 1/|j|) and the
+   * EUCLIDEAN key -|a - j|², the same for both rows. Half the work of the general batch, with blocks
+   * of rows in order of their work.
    */
   private static Matches[] related(float[][] rows, float[] rt, int kk, int metric, long[] ids) {
     final int n = rows.length, d = rows[0].length;
@@ -376,32 +412,29 @@ final class VectorEngine {
         final float[] tile = new float[4 * NR];
         final int lo = t * rb, hi = Math.min(n, lo + rb);
         for (int p = Math.max(0, (lo + 1 - start) / NR); p < panels; p++) {
+          stopIfKilled();
           final float[] panel = pk[p];
           final int j0 = start + p * NR, cols = Math.min(NR, c1 - j0);
           for (int a = lo; a < hi; a += 4) {
             if (j0 + cols - 1 <= a) break;  // no j > a here, nor for the later rows
-            tile(rows[a], a + 1 < hi ? rows[a + 1] : zero, a + 2 < hi ? rows[a + 2] : zero,
-                a + 3 < hi ? rows[a + 3] : zero, panel, d, tile);
+            if (metric == EUCLIDEAN)
+              tileDistance(rows[a], a + 1 < hi ? rows[a + 1] : zero, a + 2 < hi ? rows[a + 2] : zero,
+                  a + 3 < hi ? rows[a + 3] : zero, panel, d, tile);
+            else
+              tile(rows[a], a + 1 < hi ? rows[a + 1] : zero, a + 2 < hi ? rows[a + 2] : zero,
+                  a + 3 < hi ? rows[a + 3] : zero, panel, d, tile);
             for (int r = 0; r < 4 && a + r < hi; r++) {
               final int qa = a + r;
               for (int c = Math.max(0, qa + 1 - j0); c < cols; c++) {
                 final int j = j0 + c;
-                final float dot = tile[r * NR + c];
-                switch (metric) {
-                  case COSINE -> {
-                    final float key = dot * (rt[qa] * rt[j]);
-                    offerShared(bs[qa], bx[qa], key, j);
-                    offerShared(bs[j], bx[j], key, qa);
-                  }
-                  case EUCLIDEAN -> {
-                    offerShared(bs[qa], bx[qa], 2 * dot - rt[j], j);
-                    offerShared(bs[j], bx[j], 2 * dot - rt[qa], qa);
-                  }
-                  default -> {
-                    offerShared(bs[qa], bx[qa], dot, j);
-                    offerShared(bs[j], bx[j], dot, qa);
-                  }
-                }
+                final float v = tile[r * NR + c];
+                final float key = switch (metric) {
+                  case COSINE -> v * (rt[qa] * rt[j]);
+                  case EUCLIDEAN -> -v;  // v = |a - j|²
+                  default -> v;
+                };
+                offerShared(bs[qa], bx[qa], key, j);
+                offerShared(bs[j], bx[j], key, qa);
               }
             }
           }
@@ -409,7 +442,7 @@ final class VectorEngine {
       });
     }
     final Matches[] out = new Matches[n];
-    for (int a = 0; a < n; a++) out[a] = matches(rows[a], rows, bs[a], bx[a], metric, ids);
+    for (int a = 0; a < n; a++) out[a] = matches(bs[a], bx[a], metric, ids);
     return out;
   }
 
@@ -480,28 +513,76 @@ final class VectorEngine {
     c32.intoArray(tile, 3 * NR + 2 * L);
   }
 
-  /** The result: scores per metric (EUCLIDEAN: exact distances, ascending). */
-  private static Matches matches(float[] q, float[][] rows, float[] s, int[] x, int metric, long[] ids) {
+  /** The 4 x NR squared distances |a - b|² of queries a0..a3 to a packed panel (as tile()). */
+  private static void tileDistance(float[] a0, float[] a1, float[] a2, float[] a3, float[] q, int d,
+      float[] tile) {
+    var c00 = FloatVector.zero(SP);
+    var c01 = c00;
+    var c02 = c00;
+    var c10 = c00;
+    var c11 = c00;
+    var c12 = c00;
+    var c20 = c00;
+    var c21 = c00;
+    var c22 = c00;
+    var c30 = c00;
+    var c31 = c00;
+    var c32 = c00;
+    for (int i = 0, o = 0; i < d; i++, o += NR) {
+      var b0 = FloatVector.fromArray(SP, q, o);
+      var b1 = FloatVector.fromArray(SP, q, o + L);
+      var b2 = FloatVector.fromArray(SP, q, o + 2 * L);
+      var x = FloatVector.broadcast(SP, a0[i]);
+      var y0 = b0.sub(x);
+      var y1 = b1.sub(x);
+      var y2 = b2.sub(x);
+      c00 = y0.fma(y0, c00);
+      c01 = y1.fma(y1, c01);
+      c02 = y2.fma(y2, c02);
+      x = FloatVector.broadcast(SP, a1[i]);
+      y0 = b0.sub(x);
+      y1 = b1.sub(x);
+      y2 = b2.sub(x);
+      c10 = y0.fma(y0, c10);
+      c11 = y1.fma(y1, c11);
+      c12 = y2.fma(y2, c12);
+      x = FloatVector.broadcast(SP, a2[i]);
+      y0 = b0.sub(x);
+      y1 = b1.sub(x);
+      y2 = b2.sub(x);
+      c20 = y0.fma(y0, c20);
+      c21 = y1.fma(y1, c21);
+      c22 = y2.fma(y2, c22);
+      x = FloatVector.broadcast(SP, a3[i]);
+      y0 = b0.sub(x);
+      y1 = b1.sub(x);
+      y2 = b2.sub(x);
+      c30 = y0.fma(y0, c30);
+      c31 = y1.fma(y1, c31);
+      c32 = y2.fma(y2, c32);
+    }
+    c00.intoArray(tile, 0);
+    c01.intoArray(tile, L);
+    c02.intoArray(tile, 2 * L);
+    c10.intoArray(tile, NR);
+    c11.intoArray(tile, NR + L);
+    c12.intoArray(tile, NR + 2 * L);
+    c20.intoArray(tile, 2 * NR);
+    c21.intoArray(tile, 2 * NR + L);
+    c22.intoArray(tile, 2 * NR + 2 * L);
+    c30.intoArray(tile, 3 * NR);
+    c31.intoArray(tile, 3 * NR + L);
+    c32.intoArray(tile, 3 * NR + 2 * L);
+  }
+
+  /** The result: the scores of the keys (EUCLIDEAN: the distance, sqrt(-key); ascending). */
+  private static Matches matches(float[] s, int[] x, int metric, long[] ids) {
     int m = 0;
     while (m < x.length && x[m] >= 0) m++;
     int[] index = Arrays.copyOf(x, m);
     float[] score = Arrays.copyOf(s, m);
-    if (metric == EUCLIDEAN) {
-      for (int i = 0; i < m; i++) score[i] = distance(q, rows[index[i]]);
-      // Re-rank by the exact distance (the ranking key loses precision for close vectors);
-      // ties keep the order found (the lower row first). Insertion sort: m is small.
-      for (int i = 1; i < m; i++) {
-        float sv = score[i];
-        int xv = index[i], p = i;
-        while (p > 0 && score[p - 1] > sv) {
-          score[p] = score[p - 1];
-          index[p] = index[p - 1];
-          p--;
-        }
-        score[p] = sv;
-        index[p] = xv;
-      }
-    }
+    if (metric == EUCLIDEAN)
+      for (int i = 0; i < m; i++) score[i] = (float) Math.sqrt(-score[i]);
     long[] id = null;
     if (ids != null) {
       id = new long[m];
@@ -537,6 +618,11 @@ final class VectorEngine {
       p.execute(() -> job.run(tt, body));
     }
     job.await();
+  }
+
+  /** Inside a task (on the pool or the calling thread): a killed call stops here. */
+  private static void stopIfKilled() {
+    if (killed()) throw cancelled();
   }
 
   private static boolean killed() {

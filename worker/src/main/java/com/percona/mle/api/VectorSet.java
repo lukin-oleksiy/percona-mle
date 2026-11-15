@@ -26,14 +26,13 @@ import java.util.Map;
 /**
  * Vectors read with {@link Vectors#load} and their ids, kept in Java (JavaScript and Python
  * routines search them without copying the rows). Lives as long as the routine keeps it; nothing
- * is kept between calls. Norms are computed once per set.
+ * is kept between calls. Cosine norms are computed once per set.
  */
 public final class VectorSet {
   private final float[][] rows;
   private final long[] ids;
   private final int skipped;
   private float[] inverseNorms;
-  private float[] squaredNorms;
   private Map<Long, Integer> byId;
 
   private VectorSet(float[][] rows, long[] ids, int skipped) {
@@ -187,11 +186,7 @@ public final class VectorSet {
       if (inverseNorms == null) inverseNorms = VectorEngine.rowTerms(rows, metric);
       return inverseNorms;
     }
-    if (metric == VectorEngine.EUCLIDEAN) {
-      if (squaredNorms == null) squaredNorms = VectorEngine.rowTerms(rows, metric);
-      return squaredNorms;
-    }
-    return null;
+    return null;  // DOT and EUCLIDEAN need none
   }
 
   @Override

@@ -46,8 +46,10 @@ final class GuestVectors {
       if (shape.length != 1)
         throw new IllegalArgumentException(
             what + " must be one vector, not an array of " + shape.length + " dimensions");
-      return numpyFloats(v, shape[0]);
+      return numpyFloats(v, elements(shape[0], 1, what));
     }
+    float[] typed = float32Array(v);
+    if (typed != null) return typed;
     if (!v.hasArrayElements()) throw new IllegalArgumentException(what + " is not a vector: " + describe(v));
     long n = v.getArraySize();
     if (n > Integer.MAX_VALUE) throw new IllegalArgumentException(what + " is too long");
@@ -63,7 +65,7 @@ final class GuestVectors {
     if (shape != null) {
       if (shape.length != 2)
         throw new IllegalArgumentException(what + " must be an array of 2 dimensions, not " + shape.length);
-      float[] all = numpyFloats(v, shape[0] * shape[1]);
+      float[] all = numpyFloats(v, elements(shape[0], shape[1], what));
       float[][] m = new float[shape[0]][];
       for (int i = 0; i < m.length; i++) m[i] = java.util.Arrays.copyOfRange(all, i * shape[1], (i + 1) * shape[1]);
       return m;
@@ -74,6 +76,32 @@ final class GuestVectors {
     float[][] m = new float[(int) n][];
     for (int i = 0; i < m.length; i++) m[i] = vector(v.getArrayElement(i), what + " row " + i);
     return m;
+  }
+
+  /** rows x columns as an int, or a clear error (a float[] holds at most 2^31 - 1 elements). */
+  private static int elements(int rows, int columns, String what) {
+    long n = (long) rows * columns;
+    if (rows < 0 || columns < 0 || n > Integer.MAX_VALUE - 8)
+      throw new IllegalArgumentException(what + " is too large: " + rows + " x " + columns + " elements");
+    return (int) n;
+  }
+
+  /**
+   * A JavaScript Float32Array: one copy of its bytes (as Polyglot's VECTOR conversion), not one
+   * interop call per element. Null for anything else.
+   */
+  private static float[] float32Array(Value v) {
+    if (!v.hasArrayElements() || !v.hasMember("buffer")) return null;
+    Value meta = v.getMetaObject();
+    if (meta == null || !"Float32Array".equals(meta.getMetaSimpleName())) return null;
+    Value buffer = v.getMember("buffer");
+    long offset = v.getMember("byteOffset").asLong(), length = v.getMember("byteLength").asLong();
+    if (!buffer.hasBufferElements() || length > Integer.MAX_VALUE - 8) return null;
+    byte[] raw = new byte[(int) length];
+    buffer.readBuffer(offset, raw, 0, raw.length);
+    float[] f = new float[raw.length / 4];
+    ByteBuffer.wrap(raw).order(ByteOrder.nativeOrder()).asFloatBuffer().get(f);
+    return f;
   }
 
   private static float number(Value e, String what, int i) {
@@ -104,7 +132,7 @@ final class GuestVectors {
     Value a = v.getMember("dtype").getMember("str").asString().equals("<f4") ? v : v.invokeMember("astype", "<f4");
     Value bytes = a.invokeMember("tobytes");
     float[] f = new float[n];
-    if (bytes.hasBufferElements() && bytes.getBufferSize() == 4L * n) {
+    if (bytes.hasBufferElements() && bytes.getBufferSize() == 4L * n && n <= (Integer.MAX_VALUE - 8) / 4) {
       byte[] raw = new byte[4 * n];
       bytes.readBuffer(0, raw, 0, raw.length);
       ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(f);

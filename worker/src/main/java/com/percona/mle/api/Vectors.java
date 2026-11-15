@@ -32,8 +32,9 @@ package com.percona.mle.api;
  * copied when passed: for many rows use {@link #load}, which keeps them in Java.
  *
  * <p>Results: {@link Matches}, best first: highest cosine similarity or dot product, lowest
- * Euclidean distance. A zero vector has cosine similarity 0 with everything; a NaN score is never
- * a match. One query and a batch of queries are computed differently and may order near-ties
+ * Euclidean distance (ranked by the exact distance, not by |q|² + |r|² - 2q·r, which loses close
+ * vectors far from the origin). A zero vector has cosine similarity 0 with everything; a NaN score
+ * is never a match. The JVM build only: the Python-only native build cannot look up Java classes. One query and a batch of queries are computed differently and may order near-ties
  * (equal to ~1e-7) differently; the number of threads never changes a result. A killed
  * statement stops the work within milliseconds.
  */
@@ -69,7 +70,8 @@ public final class Vectors {
   /** The cosine similarity of a and b; 0 if either is a zero vector. */
   public static float cosine(float[] a, float[] b) {
     same(a, b);
-    return VectorEngine.dot(a, b) * VectorEngine.inverseNorm(a) * VectorEngine.inverseNorm(b);
+    float[] lanes = new float[VectorEngine.L];
+    return VectorEngine.rowDot(a, b, lanes) * VectorEngine.inverseNorm(a, lanes) * VectorEngine.inverseNorm(b, lanes);
   }
 
   /** The Euclidean distance between a and b. */
@@ -81,7 +83,7 @@ public final class Vectors {
   /** Scales v to length 1 in place (a zero vector stays zero); returns v. */
   public static float[] normalize(float[] v) {
     if (v == null) throw new IllegalArgumentException("the vector must not be null");
-    float inv = VectorEngine.inverseNorm(v);
+    float inv = VectorEngine.inverseNorm(v, new float[VectorEngine.L]);
     for (int i = 0; i < v.length; i++) v[i] *= inv;
     return v;
   }

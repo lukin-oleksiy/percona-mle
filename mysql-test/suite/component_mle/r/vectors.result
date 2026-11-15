@@ -20,6 +20,9 @@ mle.vector_threads, at most the CPUs
 SELECT vec_basic();
 vec_basic()
 dot 32.0  cosine 0.9746  distance 5.1962  cosine(zero) 0.0  normalize [0.6, 0.8]
+# This session holds a worker: refused at once (no wait for it).
+SET GLOBAL mle.vector_threads = 2;
+ERROR HY000: Language component: System variable 'mle.vector_threads' cannot be configured when component is active.
 # 2. Against the reference; with mle.vector_threads = 4.
 SELECT LEFT('ok DIGEST', 2) AS selfcheck;
 selfcheck

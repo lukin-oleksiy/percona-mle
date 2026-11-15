@@ -55,13 +55,16 @@ let $other = `SELECT $pid3 <> $pid2`;
 let $wait_condition = SELECT VARIABLE_VALUE = 2 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
 --source include/wait_condition.inc
 
---echo # Back to back: a session that starts while the account's worker is
---echo # still being reset (no wait in between) waits for it rather than starting
---echo # a new, cold one (exp note 34).
+--echo # Back to back: once the ended session's worker no longer counts as held
+--echo # (mle_workers), it is kept or still being reset, and the next session
+--echo # waits for it rather than starting a new, cold one (exp note 34).
 --connect (con6, localhost, root,,test)
 SELECT js_add(6, 7);
 let $pid6 = `SELECT mle_debug_worker_pid()`;
 --disconnect con6
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers';
+--source include/wait_condition.inc
 --connect (con7, localhost, root,,test)
 SELECT js_add(7, 8);
 let $pid7 = `SELECT mle_debug_worker_pid()`;
