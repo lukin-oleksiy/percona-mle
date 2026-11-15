@@ -54,8 +54,14 @@ final class MemoryWatch implements Runnable {
 
   private final long limit;
   private final Thread thread;
-  private volatile boolean running;
-  /** Set before the thread parks (begin() unparks it only then: no wake-up per call). */
+  /**
+   * Calls begun plus calls ended (the main thread writes it): odd while a call runs. One volatile
+   * write per begin and per end; the thread parks only after a whole period in which no call
+   * began, so a stream of short calls never has to wake it (exp note 37: waking it on every call
+   * cost 0.23 µs per call in the native build).
+   */
+  private volatile long state;
+  /** Set before the thread parks; begin() unparks it only then. */
   private volatile boolean parked;
   /** /proc/self/status, kept open, and the buffer it is read into (this thread only, after start). */
   private static RandomAccessFile status;
@@ -88,15 +94,15 @@ final class MemoryWatch implements Runnable {
   static void begin() {
     MemoryWatch w = instance;
     if (w == null) return;
-    w.running = true;
-    // The thread sets parked and then re-reads running: one of the two sees the other's write.
+    w.state = w.state + 1;  // odd: running (only the main thread writes state)
+    // The thread sets parked and then re-reads state: one of the two sees the other's write.
     if (w.parked) LockSupport.unpark(w.thread);
   }
 
   /** The top-level call ended. */
   static void end() {
     MemoryWatch w = instance;
-    if (w != null) w.running = false;
+    if (w != null) w.state = w.state + 1;  // even: idle
   }
 
   /** GCs forced since the last RESET. */
@@ -111,19 +117,23 @@ final class MemoryWatch implements Runnable {
 
   @Override
   public void run() {
+    long seen = -1;
     while (true) {
-      if (!running) {
+      long s = state;
+      if (s == seen && (s & 1) == 0) {  // idle, and no call began during the last period
         parked = true;
-        if (!running) LockSupport.park(this);
+        if (state == s) LockSupport.park(this);
         parked = false;
+        seen = -1;
         continue;
       }
+      seen = s;
       try {
         Thread.sleep(PERIOD_MS);
       } catch (InterruptedException e) {
         Thread.interrupted();  // nothing interrupts this thread on purpose; go on
       }
-      if (running) check();
+      if ((state & 1) != 0) check();
     }
   }
 

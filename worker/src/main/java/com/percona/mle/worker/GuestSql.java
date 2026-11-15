@@ -460,7 +460,6 @@ final class GuestSql {
 
   /** A row: methods getField/getLength/toArray, columns by label, values by index. */
   static final class GRow implements ProxyObject, ProxyArray {
-    private static final Set<String> NAMES = Set.of("getField", "getLength", "toArray");
     private final Lang lang;
     private final Row row;
 
@@ -469,10 +468,18 @@ final class GuestSql {
       this.row = row;
     }
 
+    /** One of NAMES (a switch: cheaper than the set, per row.x). */
+    private static boolean method(String k) {
+      return switch (k) {
+        case "getField", "getLength", "toArray" -> true;
+        default -> false;
+      };
+    }
+
     @Override
     public Object getMember(String key) {
       String k = lang.member(key);
-      if (NAMES.contains(k)) {
+      if (method(k)) {
         return switch (k) {
           case "getField" -> (ProxyExecutable) a -> lang.out(guard(lang, () -> row.getField(str(a, 0))));
           case "getLength" -> (ProxyExecutable) a -> row.getLength();
@@ -480,7 +487,18 @@ final class GuestSql {
         };
       }
       int i = row.indexOf(key);
-      return i < 0 ? null : lang.out(guard(lang, () -> row.get(i)));
+      if (i < 0) return null;
+      Object v;
+      try {  // guard() without a lambda per read
+        v = row.get(i);
+      } catch (MleSqlException e) {
+        throw lang.sqlError(e);
+      } catch (PolyglotException e) {
+        throw e;
+      } catch (RuntimeException e) {
+        throw lang.error(e);
+      }
+      return lang.out(v);
     }
 
     @Override
@@ -490,7 +508,7 @@ final class GuestSql {
 
     @Override
     public boolean hasMember(String key) {
-      return row.indexOf(key) >= 0 || NAMES.contains(lang.member(key));
+      return row.indexOf(key) >= 0 || method(lang.member(key));
     }
 
     @Override

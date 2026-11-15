@@ -250,8 +250,25 @@ final class Values {
     }
     switch (t.tag()) {
       case Wire.T_I64, Wire.T_U64 -> {
-        BigInteger b = toBigInteger(v, t);
         boolean unsigned = t.unsigned() || t.tag() == Wire.T_U64;
+        // The usual case without a BigInteger (exp note 37: it was 40 % of the garbage per call):
+        // a Java integer always fits 64 signed bits, and fits unsigned unless negative.
+        long small = 0;
+        boolean isSmall = true;
+        switch (v) {
+          case Long l -> small = l;
+          case Integer i -> small = i;
+          case Short h -> small = h;
+          case Byte y -> small = y;
+          default -> isSmall = false;
+        }
+        if (isSmall) {
+          if (unsigned && small < 0) throw range(v, t);
+          w.u8(unsigned ? Wire.T_U64 : Wire.T_I64);
+          w.u64(small);
+          return;
+        }
+        BigInteger b = toBigInteger(v, t);
         if (unsigned) {
           if (b.signum() < 0 || b.bitLength() > 64) throw range(v, t);
           w.u8(Wire.T_U64);

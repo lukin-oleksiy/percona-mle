@@ -79,6 +79,8 @@ final class Console {
     return err.take();
   }
 
+  private static final byte[] EMPTY = new byte[0];
+
   private static final class Capture extends OutputStream {
     private final ByteArrayOutputStream buf = new ByteArrayOutputStream();
     private boolean truncated;
@@ -102,6 +104,7 @@ final class Console {
     }
 
     synchronized byte[] take() {
+      if (buf.size() == 0 && !truncated) return EMPTY;  // the usual case: no garbage per call
       if (truncated) buf.writeBytes("\n[output truncated]\n".getBytes(StandardCharsets.UTF_8));
       byte[] r = buf.toByteArray();
       buf.reset();

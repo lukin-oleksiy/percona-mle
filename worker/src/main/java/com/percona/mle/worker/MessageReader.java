@@ -103,7 +103,9 @@ final class MessageReader {
   byte[] bytes() {
     long n = u32();
     need(n);
-    byte[] b = s.asSlice(pos, n).toArray(ValueLayout.JAVA_BYTE);
+    if (n > Integer.MAX_VALUE - 8) throw new IllegalStateException("value too large: " + n + " bytes");
+    byte[] b = new byte[(int) n];
+    MemorySegment.copy(s, ValueLayout.JAVA_BYTE, pos, b, 0, (int) n);
     pos += n;
     return b;
   }

@@ -24,8 +24,6 @@ import java.util.List;
  * language of the session that ran the statement (mapped when first read).
  */
 public final class Row {
-  private static final Object UNMAPPED = new Object();
-
   private final SqlResult.Set set;
   private final Object[] raw;
   private Object[] mapped;
@@ -38,13 +36,12 @@ public final class Row {
   /** The value of column i (from 0). */
   public Object get(int i) {
     if (i < 0 || i >= raw.length) throw new IndexOutOfBoundsException("no column " + i + " in a row of " + raw.length);
-    if (mapped == null) {
-      mapped = new Object[raw.length];
-      java.util.Arrays.fill(mapped, UNMAPPED);
-    }
+    Object r = raw[i];
+    if (r == null) return null;
+    if (mapped == null) mapped = new Object[raw.length];
     Object v = mapped[i];
-    if (v == UNMAPPED) {
-      v = raw[i] == null ? null : set.mapper.value(raw[i], set.columns.get(i), set.options);
+    if (v == null) {  // not mapped yet: a non-null raw value maps to a non-null value
+      v = set.mapper.value(r, set.columns.get(i), set.options);
       mapped[i] = v;
     }
     return v;
@@ -52,15 +49,14 @@ public final class Row {
 
   /** The value of the first column labelled name. */
   public Object getField(String name) {
-    Integer i = set.index.get(name);
-    if (i == null) throw new IllegalArgumentException("no column '" + name + "' in the row");
+    int i = set.indexOf(name);
+    if (i < 0) throw new IllegalArgumentException("no column '" + name + "' in the row");
     return get(i);
   }
 
   /** The index of the first column labelled name, or -1. */
   public int indexOf(String name) {
-    Integer i = set.index.get(name);
-    return i == null ? -1 : i;
+    return set.indexOf(name);
   }
 
   public int getLength() {

@@ -51,6 +51,33 @@ public final class SqlResult implements Iterable<Row> {
       this.labels = List.copyOf(labels);
       this.mapper = mapper;
       this.options = options;
+      int n = idx.size() <= SCAN_MAX ? idx.size() : 0;
+      this.scanKeys = new String[n];
+      this.scanIndexes = new int[n];
+      int k = 0;
+      if (n > 0)
+        for (Map.Entry<String, Integer> e : idx.entrySet()) {
+          scanKeys[k] = e.getKey();
+          scanIndexes[k++] = e.getValue();
+        }
+    }
+
+    /** Up to this many labels are found by a scan, not the map (exp note 37: row.x in a loop). */
+    private static final int SCAN_MAX = 8;
+    private final String[] scanKeys;
+    private final int[] scanIndexes;
+
+    /** The index of the first column labelled name, or -1. */
+    int indexOf(String name) {
+      if (scanKeys.length == 0 && !index.isEmpty()) {
+        Integer i = index.get(name);
+        return i == null ? -1 : i;
+      }
+      for (int k = 0; k < scanKeys.length; k++) {
+        String key = scanKeys[k];
+        if (key == name || (key.length() == name.length() && key.equals(name))) return scanIndexes[k];
+      }
+      return -1;
     }
   }
 
