@@ -35,6 +35,16 @@ SELECT js_inv(7);
 js_inv(7)
 7
 another process for u1: 1
+# Back to back: a session that starts while the account's worker is
+# still being reset (no wait in between) waits for it rather than starting
+# a new, cold one (exp note 34).
+SELECT js_add(6, 7);
+js_add(6, 7)
+13
+SELECT js_add(7, 8);
+js_add(7, 8)
+15
+same worker process: 1
 # Kept workers end after mle.worker_cache_timeout.
 SET GLOBAL mle.worker_cache_timeout = 1;
 SET GLOBAL mle.worker_cache_timeout = DEFAULT;

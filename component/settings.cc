@@ -35,7 +35,9 @@
 #include <strings.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <unistd.h>
 #include <string>
 
@@ -108,13 +110,23 @@ void restart_engine(MYSQL_THD thd, const char *variable) {
                                             message.c_str());
 }
 
+/** Whether a session holds a worker, after waiting up to a second for the
+    sessions that are ending: a client that disconnects and runs SET GLOBAL
+    at once used to get 6116, the server not having ended its session yet
+    (exp note 34). The check runs without the system variables' lock. */
+bool workers_held() {
+  for (int i = 0; i < 100 && engine_workers_in_use() > 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  return engine_workers_in_use() > 0;
+}
+
 /** Check of an integer setting that shapes workers: refused while a
     session holds a worker; range checked here (a custom check replaces the
     server's range check; the server rejects non-integers before). */
 template <typename T, const char *Name, ulonglong Min, ulonglong Max>
 int check_shaping(MYSQL_THD, SYS_VAR *, void *save,
                   struct st_mysql_value *value) {
-  if (engine_workers_in_use() > 0) {
+  if (workers_held()) {
     my_error(ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE, MYF(0),
              (std::string("mle.") + Name).c_str());
     return 1;
@@ -165,7 +177,7 @@ int check_languages(MYSQL_THD, SYS_VAR *, void *save,
 /** mle.pool_prewarm: none, python or numpy; shapes workers (refused while a
     session holds one). */
 int check_prewarm(MYSQL_THD, SYS_VAR *, void *save, struct st_mysql_value *value) {
-  if (engine_workers_in_use() > 0) {
+  if (workers_held()) {
     my_error(ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE, MYF(0), "mle.pool_prewarm");
     return 1;
   }

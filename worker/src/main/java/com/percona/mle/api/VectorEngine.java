@@ -53,6 +53,10 @@ import jdk.incubator.vector.VectorSpecies;
  *
  * <p>The species is a static final field and used directly: the JIT intrinsifies the Vector API
  * only for a constant species (a captured local made a kernel 16x slower, note 31).
+ *
+ * <p>The worker's JVM options keep tile(), row*() and offer*() from being inlined (host/defaults.cc,
+ * CompileCommand dontinline): smaller compilation units reach compiled code sooner in a new
+ * worker. Renaming them means changing those options too.
  */
 final class VectorEngine {
   private VectorEngine() {}
@@ -112,6 +116,14 @@ final class VectorEngine {
   }
 
   static float dot(float[] a, float[] b) {
+    return rowDot(a, b, new float[L]);
+  }
+
+  /**
+   * a·b (lanes: scratch of L floats). With rowDotSquare, the one-query kernel; small on purpose
+   * and not inlined (worker JVM options), so a new worker compiles it within milliseconds.
+   */
+  static float rowDot(float[] a, float[] b, float[] lanes) {
     int d = a.length, i = 0;
     var s0 = FloatVector.zero(SP);
     var s1 = s0;
@@ -119,9 +131,34 @@ final class VectorEngine {
       s0 = FloatVector.fromArray(SP, a, i).fma(FloatVector.fromArray(SP, b, i), s0);
       s1 = FloatVector.fromArray(SP, a, i + L).fma(FloatVector.fromArray(SP, b, i + L), s1);
     }
-    float s = sum(s0.add(s1), new float[L]);
+    float s = sum(s0.add(s1), lanes);
     for (; i < d; i++) s += a[i] * b[i];
     return s;
+  }
+
+  /** q·r, and r·r into square[0], in one pass over r. */
+  static float rowDotSquare(float[] q, float[] r, float[] lanes, float[] square) {
+    int d = q.length, i = 0;
+    var a0 = FloatVector.zero(SP);
+    var a1 = a0;
+    var b0 = a0;
+    var b1 = a0;
+    for (int end = d - d % (2 * L); i < end; i += 2 * L) {
+      var r0 = FloatVector.fromArray(SP, r, i);
+      var r1 = FloatVector.fromArray(SP, r, i + L);
+      a0 = FloatVector.fromArray(SP, q, i).fma(r0, a0);
+      a1 = FloatVector.fromArray(SP, q, i + L).fma(r1, a1);
+      b0 = r0.fma(r0, b0);
+      b1 = r1.fma(r1, b1);
+    }
+    float dot = sum(a0.add(a1), lanes);
+    float rr = sum(b0.add(b1), lanes);
+    for (; i < d; i++) {
+      dot += q[i] * r[i];
+      rr += r[i] * r[i];
+    }
+    square[0] = rr;
+    return dot;
   }
 
   /** Euclidean distance, summed directly (exact, unlike |a|² + |b|² - 2a·b). */
@@ -209,38 +246,12 @@ final class VectorEngine {
   /** Into s/x (descending keys): the rows [lo, hi) for query q. */
   private static void scan(float[] q, float[][] rows, float[] rowTerm, int lo, int hi, int self, int metric, float qInv,
       float[] s, int[] x, int k) {
-    final int d = q.length, end = d - d % (2 * L);
     final boolean needSquare = metric != DOT && rowTerm == null;
-    final float[] lanes = new float[L];
+    final float[] lanes = new float[L], square = new float[1];
     for (int j = lo; j < hi; j++) {
       if (j == self) continue;
-      final float[] r = rows[j];
-      var a0 = FloatVector.zero(SP);
-      var a1 = a0;
-      var b0 = a0;
-      var b1 = a0;
-      int i = 0;
-      if (needSquare) {
-        for (; i < end; i += 2 * L) {
-          var r0 = FloatVector.fromArray(SP, r, i);
-          var r1 = FloatVector.fromArray(SP, r, i + L);
-          a0 = FloatVector.fromArray(SP, q, i).fma(r0, a0);
-          a1 = FloatVector.fromArray(SP, q, i + L).fma(r1, a1);
-          b0 = r0.fma(r0, b0);
-          b1 = r1.fma(r1, b1);
-        }
-      } else {
-        for (; i < end; i += 2 * L) {
-          a0 = FloatVector.fromArray(SP, q, i).fma(FloatVector.fromArray(SP, r, i), a0);
-          a1 = FloatVector.fromArray(SP, q, i + L).fma(FloatVector.fromArray(SP, r, i + L), a1);
-        }
-      }
-      float dot = sum(a0.add(a1), lanes);
-      float rr = needSquare ? sum(b0.add(b1), lanes) : 0f;
-      for (; i < d; i++) {
-        dot += q[i] * r[i];
-        if (needSquare) rr += r[i] * r[i];
-      }
+      final float dot = needSquare ? rowDotSquare(q, rows[j], lanes, square) : rowDot(q, rows[j], lanes);
+      final float rr = square[0];
       float key = switch (metric) {
         case COSINE -> dot * qInv * (rowTerm != null ? rowTerm[j] : rr > 0 ? (float) (1 / Math.sqrt(rr)) : 0f);
         case EUCLIDEAN -> 2 * dot - (rowTerm != null ? rowTerm[j] : rr);
@@ -250,12 +261,15 @@ final class VectorEngine {
     }
   }
 
-  /** Inserts (key, j) into the descending top k; an equal key does not displace an earlier one. */
+  /**
+   * Inserts (key, j) into the top k: higher key first, an equal key ordered by the lower row. The
+   * order is total, so the result does not depend on the order of the offers (threads).
+   */
   private static void offer(float[] s, int[] x, float key, int j) {
     int k = s.length;
-    if (!(key > s[k - 1])) return;
+    if (!(key > s[k - 1] || key == s[k - 1] && j < x[k - 1])) return;
     int p = k - 1;
-    while (p > 0 && s[p - 1] < key) {
+    while (p > 0 && (s[p - 1] < key || s[p - 1] == key && x[p - 1] > j)) {
       s[p] = s[p - 1];
       x[p] = x[p - 1];
       p--;
@@ -280,6 +294,7 @@ final class VectorEngine {
     }
     final int d = rows[0].length, kk = Math.min(k, n);
     final float[] rt = rowTerm != null ? rowTerm : rowTerms(rows, metric);
+    if (related) return related(rows, rt, kk, metric, ids);
     final float[] qInv = new float[nq];
     if (metric == COSINE)
       for (int a = 0; a < nq; a++) qInv[a] = related ? rt[a] : inverseNorm(queries[a]);
@@ -329,6 +344,81 @@ final class VectorEngine {
     }
     for (int a = 0; a < nq; a++) out[a] = matches(queries[a], rows, bs[a], bx[a], metric, ids);
     return out;
+  }
+
+  /**
+   * All pairs, each computed once: a task takes a block of rows a and the rows j > a, and offers
+   * the score to both rows. A row's top k then gets offers from several tasks: under its lock, taken
+   * only when the score beats its k-th best (rare once it is full; the k-th best only rises, so the
+   * test without the lock never rejects wrongly). The cosine key is dot * (1/|a| * 1/|j|), the same
+   * for both rows. Half the work of the general batch, with blocks of rows in order of their work.
+   */
+  private static Matches[] related(float[][] rows, float[] rt, int kk, int metric, long[] ids) {
+    final int n = rows.length, d = rows[0].length;
+    final float[][] bs = new float[n][kk];
+    final int[][] bx = new int[n][kk];
+    for (int a = 0; a < n; a++) {
+      Arrays.fill(bs[a], Float.NEGATIVE_INFINITY);
+      Arrays.fill(bx[a], -1);
+    }
+    // Blocks: the first ones have the most rows j > a; small enough to balance the threads.
+    final int rb = Math.max(4, Math.min(128, (n + 4 * THREADS - 1) / (4 * THREADS) + 3 & ~3));
+    final boolean parallel = (long) n * n / 2 * d >= PARALLEL_MIN;
+    final float[][] pk = new float[(Math.min(n, CHUNK) + NR - 1) / NR][d * NR];
+    final float[] zero = new float[d];
+    for (int c0 = 0; c0 < n; c0 += CHUNK) {
+      final int c1 = Math.min(n, c0 + CHUNK), panels = (c1 - c0 + NR - 1) / NR, start = c0;
+      // Blocks with a row below the chunk's last row have pairs in it.
+      final int tasks = Math.min((n + rb - 1) / rb, (c1 - 1 + rb - 1) / rb);
+      if (tasks == 0) continue;
+      run(panels, parallel, p -> pack(rows, start, c1, p, pk[p], d));
+      run(tasks, parallel, t -> {
+        final float[] tile = new float[4 * NR];
+        final int lo = t * rb, hi = Math.min(n, lo + rb);
+        for (int p = Math.max(0, (lo + 1 - start) / NR); p < panels; p++) {
+          final float[] panel = pk[p];
+          final int j0 = start + p * NR, cols = Math.min(NR, c1 - j0);
+          for (int a = lo; a < hi; a += 4) {
+            if (j0 + cols - 1 <= a) break;  // no j > a here, nor for the later rows
+            tile(rows[a], a + 1 < hi ? rows[a + 1] : zero, a + 2 < hi ? rows[a + 2] : zero,
+                a + 3 < hi ? rows[a + 3] : zero, panel, d, tile);
+            for (int r = 0; r < 4 && a + r < hi; r++) {
+              final int qa = a + r;
+              for (int c = Math.max(0, qa + 1 - j0); c < cols; c++) {
+                final int j = j0 + c;
+                final float dot = tile[r * NR + c];
+                switch (metric) {
+                  case COSINE -> {
+                    final float key = dot * (rt[qa] * rt[j]);
+                    offerShared(bs[qa], bx[qa], key, j);
+                    offerShared(bs[j], bx[j], key, qa);
+                  }
+                  case EUCLIDEAN -> {
+                    offerShared(bs[qa], bx[qa], 2 * dot - rt[j], j);
+                    offerShared(bs[j], bx[j], 2 * dot - rt[qa], qa);
+                  }
+                  default -> {
+                    offerShared(bs[qa], bx[qa], dot, j);
+                    offerShared(bs[j], bx[j], dot, qa);
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+    }
+    final Matches[] out = new Matches[n];
+    for (int a = 0; a < n; a++) out[a] = matches(rows[a], rows, bs[a], bx[a], metric, ids);
+    return out;
+  }
+
+  /** offer() into a top k that other threads offer to as well. */
+  private static void offerShared(float[] s, int[] x, float key, int j) {
+    if (key < s[s.length - 1]) return;  // the k-th best only rises: never wrong without the lock
+    synchronized (x) {
+      offer(s, x, key, j);
+    }
   }
 
   /** Packs rows [c0 + p*NR, ...) of the chunk ending at c1 into panel p (k-major; missing columns zero). */

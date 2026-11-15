@@ -257,9 +257,9 @@ SELECT vec_pool();
 --source include/assert.inc
 --disconnect con1
 --connection default
---source include/wait_until_count_sessions.inc
 
---echo # 6. mle.vector_threads = 1: the same results.
+--echo # 6. mle.vector_threads = 1: the same results. Set right after the session
+--echo # ended (its worker may still be being given back: the check waits).
 SET GLOBAL mle.vector_threads = 1;
 --connect (con1, localhost, root,,test)
 SELECT vec_threads();

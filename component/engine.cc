@@ -95,6 +95,36 @@ struct Cached {
 };
 std::deque<Cached> g_cache;  // guarded by g_mutex
 std::atomic<uint64_t> g_cache_hits{0};
+/** Workers being RESET to be kept, per principal (exp note 34): a session of
+    the same principal that needs a worker meanwhile waits for that one (warm:
+    JIT-compiled code, loaded languages) instead of starting a cold one, which
+    made back-to-back sessions alternate between two workers. */
+std::map<std::string, int> g_releasing;  // guarded by g_mutex
+std::condition_variable g_released;
+/** At most this long; a RESET normally takes milliseconds. */
+constexpr std::chrono::milliseconds kReuseWait{1000};
+
+/** A release in progress for principal, from construction to destruction. */
+class Releasing {
+ public:
+  explicit Releasing(const std::string &principal) : m_principal(principal) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_releasing[m_principal];
+  }
+  ~Releasing() {
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      const auto it = g_releasing.find(m_principal);
+      if (it != g_releasing.end() && --it->second <= 0) g_releasing.erase(it);
+    }
+    g_released.notify_all();
+  }
+  Releasing(const Releasing &) = delete;
+  Releasing &operator=(const Releasing &) = delete;
+
+ private:
+  const std::string m_principal;
+};
 /** Ends kept workers idle longer than mle.worker_cache_timeout. */
 std::thread g_reaper;
 std::condition_variable g_reaper_cv;
@@ -590,12 +620,15 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
   // trims its heap).
   if (current && !principal.empty() && worker_cache_size() > 0 && worker->usable() &&
       !worker->stats().tainted && worker->depth() == 0) {
-    std::string error;
-    // RESET also tells whether a routine left a thread running (tainted).
-    if (worker->reset(&error) == mle::Status::kOk && worker->usable() &&
-        !worker->stats().tainted) {
-      std::vector<std::unique_ptr<mle::Worker>> evicted;
-      {
+    std::vector<std::unique_ptr<mle::Worker>> evicted;
+    {
+      // Until the worker is kept (or not), a new session of this principal
+      // waits for it (engine_reuse_worker).
+      const Releasing releasing(principal);
+      std::string error;
+      // RESET also tells whether a routine left a thread running (tainted).
+      if (worker->reset(&error) == mle::Status::kOk && worker->usable() &&
+          !worker->stats().tainted) {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_launcher && generation == g_generation && !forgotten()) {
           g_cache.push_back({principal, std::move(worker),
@@ -606,9 +639,9 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
           }
         }
       }
-      evicted.clear();
-      if (!worker) return;
     }
+    evicted.clear();  // ends them, without the mutex
+    if (!worker) return;
   }
   worker.reset();
 }
@@ -618,14 +651,21 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
   std::unique_ptr<mle::Worker> worker;
   uint64_t generation = 0;
   {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    for (auto it = g_cache.end(); it != g_cache.begin();) {
-      --it;
-      if (it->principal != principal) continue;
-      worker = std::move(it->worker);
-      generation = it->generation;
-      g_cache.erase(it);
-      break;
+    std::unique_lock<std::mutex> lock(g_mutex);
+    const auto deadline = std::chrono::steady_clock::now() + kReuseWait;
+    while (true) {
+      for (auto it = g_cache.end(); it != g_cache.begin();) {
+        --it;
+        if (it->principal != principal) continue;
+        worker = std::move(it->worker);
+        generation = it->generation;
+        g_cache.erase(it);
+        break;
+      }
+      // None kept: wait while one of this principal is being reset.
+      if (worker || g_releasing.count(principal) == 0 ||
+          g_released.wait_until(lock, deadline) == std::cv_status::timeout)
+        break;
     }
   }
   if (!worker) return nullptr;

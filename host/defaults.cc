@@ -95,6 +95,14 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
       "-XX:-UsePerfData",
       "--enable-native-access=ALL-UNNAMED",
       "--add-modules=jdk.incubator.vector",
+      // The vector helper (exp note 34): its kernels and its top-k insertion
+      // compiled on their own, not inlined into the task loops; the first
+      // call in a worker then waits less for the JIT (0.9 -> 0.6 s, related
+      // items 10k x 768), with the same speed once compiled.
+      "-XX:CompileCommand=quiet",
+      "-XX:CompileCommand=dontinline,com.percona.mle.api.VectorEngine::tile",
+      "-XX:CompileCommand=dontinline,com.percona.mle.api.VectorEngine::offer*",
+      "-XX:CompileCommand=dontinline,com.percona.mle.api.VectorEngine::row*",
       // ThreadWatch: the thread containers list virtual threads too (also
       // in the AOT cache's options, worker/CMakeLists.txt, mle_aot_cache).
       "--add-exports=java.base/jdk.internal.vm=ALL-UNNAMED",

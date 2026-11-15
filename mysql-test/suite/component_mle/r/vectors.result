@@ -79,7 +79,8 @@ SELECT vec_pool();
 vec_pool()
 helper threads within mle.vector_threads
 include/assert.inc [The same worker after KILL QUERY]
-# 6. mle.vector_threads = 1: the same results.
+# 6. mle.vector_threads = 1: the same results. Set right after the session
+# ended (its worker may still be being given back: the check waits).
 SET GLOBAL mle.vector_threads = 1;
 SELECT vec_threads();
 vec_threads()
