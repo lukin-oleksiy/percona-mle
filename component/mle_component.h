@@ -54,6 +54,11 @@ unsigned language_bit(std::string_view name);
 /** "JAVASCRIPT, python" -> bits. False on an unknown name. */
 bool parse_languages(std::string_view text, unsigned *bits);
 
+/** Parses mle.pool_prewarm: "none", or a comma list of python, numpy and
+    vectors (any case, spaces around items). On success *normalized is
+    "none" or the items lowercase, in that order, without repeats. */
+bool parse_prewarm(std::string_view text, std::string *normalized);
+
 /** Display names, e.g. "JavaScript,Python,Java" (Oracle's
     mle_languages_supported spelling). */
 std::string language_names(unsigned bits);

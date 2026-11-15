@@ -77,7 +77,8 @@ struct JvmClassOptions {
   uint32_t pids_max = 512;
   /** Java heap (-Xmx). */
   std::string heap = "512m";
-  /** Loaded before READY (comma list of java, js, python, numpy). */
+  /** Loaded before READY (comma list of java, js, python, numpy); vectors:
+      the vector helper warmed up after READY while the worker is idle. */
   std::string prewarm = "java,js,python";
   uint32_t pool_size = 0;
   /** BLAS threads per worker; many sessions each have a worker. */

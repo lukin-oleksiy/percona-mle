@@ -21,6 +21,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.VarHandle;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * The worker's side of the shared memory mailbox (protocol.h): mapped with FFM, sequence words
@@ -87,6 +88,21 @@ final class Mailbox {
         return;
       }
     }
+  }
+
+  /** True if the host has sent a message that receive() has not taken yet. */
+  boolean pending() {
+    return (int) INT.getAcquire(region, Wire.OFF_TO_W) != seenW;
+  }
+
+  /** Waits up to {@code nanos} for a message from the host (polling every 1 ms); true if one came. */
+  boolean awaitPending(long nanos) {
+    long end = System.nanoTime() + nanos;
+    while (!pending()) {
+      if (System.nanoTime() - end >= 0) return false;
+      LockSupport.parkNanos(1_000_000L);
+    }
+    return true;
   }
 
   private void post() {

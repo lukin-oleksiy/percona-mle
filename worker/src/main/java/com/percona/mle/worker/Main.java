@@ -22,7 +22,8 @@ package com.percona.mle.worker;
  *
  * <p>System properties: mle.class (worker class name for READY), mle.spin (spin iterations
  * before sleeping on the futex, default 2000), mle.prewarm (comma list of java, js, python,
- * numpy: loaded before READY), mle.maxDepth (nested calls, default 32), mle.python.venv.
+ * numpy: loaded before READY; vectors: the vector helper, warmed up after READY while idle),
+ * mle.maxDepth (nested calls, default 32), mle.python.venv.
  */
 public final class Main {
   private Main() {}
@@ -66,6 +67,13 @@ public final class Main {
         t.printStackTrace();
       }
       d.ready(status, info);
+      // mle.pool_prewarm=vectors (exp note 35): the vector helper's kernels, after READY and
+      // only while no request comes, so a session never waits for more than one step (~70 ms).
+      // A worker started for a waiting session gets its first request at once (the grace
+      // below) and skips it; a pool worker warms up while it waits in the pool.
+      if (status == Wire.OK && System.getProperty("mle.prewarm", "").contains("vectors")
+          && !Polyglot.nativeImage() && !mb.awaitPending(50_000_000L) && VectorWarmup.run(mb::pending))
+        System.gc();  // as after starting: the warm-up's garbage, before waiting in the pool
       d.loop();
     } catch (Throwable t) {
       console.log().println("mle worker: fatal: " + t);

@@ -200,6 +200,11 @@ int n = 0;
 for (Thread t : Thread.getAllStackTraces().keySet()) if (t.getName().startsWith("mle-vectors-")) n++;
 return n <= Vectors.threads() ? "helper threads within mle.vector_threads" : "too many: " + n;
 $$;
+CREATE FUNCTION vec_warm() RETURNS TEXT LANGUAGE JAVA AS $$
+int n = 0;
+for (Thread t : Thread.getAllStackTraces().keySet()) if (t.getName().startsWith("mle-vectors-")) n++;
+return n > 0 ? "helper warmed up" : "helper not started";
+$$;
 EOF
 --exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/vectors.sql 2>&1
 --remove_file $MYSQLTEST_VARDIR/tmp/vectors.sql
@@ -287,6 +292,28 @@ SELECT vec_threads();
 --source include/wait_until_count_sessions.inc
 SET GLOBAL mle.vector_threads = DEFAULT;
 
+--echo # 7. mle.pool_prewarm: by default (vectors) pool workers warm the helper up
+--echo # while they wait (its threads run); with none they don't. The engine
+--echo # restarted above, so the next session's worker comes from the pool.
+SELECT @@mle.pool_prewarm;
+--source ../include/wait_for_pool.inc
+# The warm-up takes ~0.6 s after READY.
+--sleep 5
+--connect (con1, localhost, root,,test)
+SELECT vec_warm();
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.pool_prewarm = 'none';
+--source ../include/wait_for_pool.inc
+--sleep 5
+--connect (con1, localhost, root,,test)
+SELECT vec_warm();
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.pool_prewarm = DEFAULT;
+
 DROP TABLE items;
 DROP PROCEDURE fill_items;
 DROP FUNCTION vec_selfcheck;
@@ -305,6 +332,7 @@ DROP FUNCTION js_bad_metric;
 DROP PROCEDURE java_errors;
 DROP FUNCTION vec_long;
 DROP FUNCTION vec_pool;
+DROP FUNCTION vec_warm;
 REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
 --source include/wait_until_count_sessions.inc
 UNINSTALL COMPONENT "file://component_mle";

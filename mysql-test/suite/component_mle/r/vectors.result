@@ -93,6 +93,20 @@ selfcheck
 ok
 include/assert.inc [The same results with 1 thread as with 4]
 SET GLOBAL mle.vector_threads = DEFAULT;
+# 7. mle.pool_prewarm: by default (vectors) pool workers warm the helper up
+# while they wait (its threads run); with none they don't. The engine
+# restarted above, so the next session's worker comes from the pool.
+SELECT @@mle.pool_prewarm;
+@@mle.pool_prewarm
+vectors
+SELECT vec_warm();
+vec_warm()
+helper warmed up
+SET GLOBAL mle.pool_prewarm = 'none';
+SELECT vec_warm();
+vec_warm()
+helper not started
+SET GLOBAL mle.pool_prewarm = DEFAULT;
 DROP TABLE items;
 DROP PROCEDURE fill_items;
 DROP FUNCTION vec_selfcheck;
@@ -111,5 +125,6 @@ DROP FUNCTION js_bad_metric;
 DROP PROCEDURE java_errors;
 DROP FUNCTION vec_long;
 DROP FUNCTION vec_pool;
+DROP FUNCTION vec_warm;
 REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_mle";

@@ -81,11 +81,18 @@ row 1 again: ndarray float32 True [42.0, 0.0, 0.0]
 prepared: [0.9, 0.1, 0.0] / [0.0, 0.0, 1.0] / [0.0, 0.2, 0.9]
 DROP PROCEDURE py_row_vecs;
 SET GLOBAL mle.sql_chunk_rows = DEFAULT;
-# 5. mle.pool_prewarm: none, python or numpy (a DBA choice).
+# 5. mle.pool_prewarm: none, or a list of python, numpy and vectors (a DBA
+# choice).
 SELECT @@mle.pool_prewarm;
 @@mle.pool_prewarm
-none
+vectors
 SET GLOBAL mle.pool_prewarm = 'ruby';
+Got one of the listed errors
+SET GLOBAL mle.pool_prewarm = 'none,python';
+Got one of the listed errors
+SET GLOBAL mle.pool_prewarm = 'python,,vectors';
+Got one of the listed errors
+SET GLOBAL mle.pool_prewarm = '';
 Got one of the listed errors
 SET GLOBAL mle.worker_cache_size = 0;
 SET GLOBAL mle.worker_cache_size = DEFAULT;
@@ -93,6 +100,10 @@ SET GLOBAL mle.pool_prewarm = 'python';
 SELECT @@mle.pool_prewarm;
 @@mle.pool_prewarm
 python
+SET GLOBAL mle.pool_prewarm = 'Numpy , VECTORS';
+SELECT @@mle.pool_prewarm;
+@@mle.pool_prewarm
+Numpy , VECTORS
 SET GLOBAL mle.pool_prewarm = DEFAULT;
 DROP FUNCTION py_counter;
 DROP FUNCTION py_lib_counter;

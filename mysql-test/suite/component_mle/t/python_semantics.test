@@ -146,16 +146,27 @@ SELECT @r;
 DROP PROCEDURE py_row_vecs;
 SET GLOBAL mle.sql_chunk_rows = DEFAULT;
 
---echo # 5. mle.pool_prewarm: none, python or numpy (a DBA choice).
+--echo # 5. mle.pool_prewarm: none, or a list of python, numpy and vectors (a DBA
+--echo # choice).
 SELECT @@mle.pool_prewarm;
 --error ER_WRONG_VALUE_FOR_VAR,ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
 SET GLOBAL mle.pool_prewarm = 'ruby';
+--error ER_WRONG_VALUE_FOR_VAR,ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
+SET GLOBAL mle.pool_prewarm = 'none,python';
+--error ER_WRONG_VALUE_FOR_VAR,ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
+SET GLOBAL mle.pool_prewarm = 'python,,vectors';
+--error ER_WRONG_VALUE_FOR_VAR,ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
+SET GLOBAL mle.pool_prewarm = '';
 --disconnect con1
 --connection default
 --source include/wait_until_count_sessions.inc
 SET GLOBAL mle.worker_cache_size = 0;
 SET GLOBAL mle.worker_cache_size = DEFAULT;
 SET GLOBAL mle.pool_prewarm = 'python';
+SELECT @@mle.pool_prewarm;
+--let $mle_pool = 2
+--source ../include/wait_for_pool.inc
+SET GLOBAL mle.pool_prewarm = 'Numpy , VECTORS';
 SELECT @@mle.pool_prewarm;
 --let $mle_pool = 2
 --source ../include/wait_for_pool.inc

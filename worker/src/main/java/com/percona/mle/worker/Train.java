@@ -17,12 +17,9 @@
 
 package com.percona.mle.worker;
 
-import com.percona.mle.api.Vectors;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.List;
-import java.util.Arrays;
-import java.util.Random;
 
 /**
  * Build step: the training run for the JDK AOT cache (mle.aot). Runs what a worker runs — the
@@ -90,20 +87,9 @@ public final class Train {
           List.of(new JavaRoutines.Param("v", 0, vec)), f64, List.of());
       polyglot.context().eval("python", "import numpy; numpy.ones(768) @ numpy.ones(768)");
     }
-    // The vector helper (exp note 33): its classes linked and its kernels profiled (one query,
-    // the tiled batch, each metric), so a worker's first use compiles sooner.
-    Random random = new Random(1);
-    float[][] rows = new float[1024][768];
-    for (float[] row : rows)
-      for (int i = 0; i < row.length; i++) row[i] = (float) random.nextGaussian();
-    float[][] few = Arrays.copyOf(rows, 128);
-    for (int i = 0; i < 20; i++) {
-      for (Vectors.Metric m : Vectors.Metric.values()) {
-        Vectors.nearest(rows[i], rows, 10, m);
-        Vectors.related(few, 10, m);
-      }
-      Vectors.cosine(rows[0], rows[i]);
-    }
+    // The vector helper (exp notes 33, 35): its classes linked and its kernels profiled, as a
+    // pool worker's warm-up runs them.
+    VectorWarmup.run(() -> false);
     System.out.println("mle training done");
     System.exit(0);  // GraalPy leaves non-daemon threads; exit writes the AOT configuration
   }

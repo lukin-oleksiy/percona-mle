@@ -154,6 +154,8 @@ void update_shaping(MYSQL_THD thd, SYS_VAR *, void *val_ptr,
 constexpr const char kMemoryMax[] = "memory_max";
 constexpr const char kHeapMax[] = "heap_max";
 constexpr const char kPoolSize[] = "pool_size";
+/** mle.pool_prewarm's default (exp note 35): the vector helper warmed up. */
+constexpr const char kPoolPrewarm[] = "vectors";
 constexpr const char kVectorThreads[] = "vector_threads";
 
 constexpr ulonglong kMiB = 1ULL << 20;
@@ -178,15 +180,14 @@ int check_languages(MYSQL_THD, SYS_VAR *, void *save,
   return 0;
 }
 
-/** mle.pool_prewarm: none, python or numpy; shapes workers (refused while a
-    session holds one). */
+/** mle.pool_prewarm: none, or a list of python, numpy and vectors; shapes
+    workers (refused while a session holds one). */
 int check_prewarm(MYSQL_THD thd, SYS_VAR *, void *save, struct st_mysql_value *value) {
   int length = 0;
   const char *s = value->val_str(value, nullptr, &length);
-  if (s == nullptr) return 1;
-  std::string v(s, static_cast<size_t>(length));
-  for (char &c : v) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-  if (v != "none" && v != "python" && v != "numpy") return 1;
+  std::string normalized;
+  if (s == nullptr || !parse_prewarm({s, static_cast<size_t>(length)}, &normalized))
+    return 1;
   if (workers_held(thd)) {
     my_error(ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE, MYF(0), "mle.pool_prewarm");
     return 1;
@@ -310,12 +311,14 @@ bool register_settings() {
     return true;
 
   STR_CHECK_ARG(pool_prewarm) pool_prewarm;
-  pool_prewarm.def_val = const_cast<char *>("none");
+  pool_prewarm.def_val = const_cast<char *>(kPoolPrewarm);
   if (reg("pool_prewarm", PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC,
-          "What pool workers start before a session needs them: none, python "
-          "(GraalPy, ~1-5 s and ~195 MB per idle worker) or numpy (Python and "
-          "numpy). Can be changed while no session holds a worker; restarts the "
-          "engine.",
+          "What pool workers prepare before a session needs them: none, or a "
+          "comma list of python (GraalPy started, ~1-5 s and ~195 MB per idle "
+          "worker), numpy (Python and numpy) and vectors (the vector helper's "
+          "kernels compiled, ~0.6 s and ~2 CPU-seconds per worker, while it "
+          "waits in the pool). Can be changed while no session holds a "
+          "worker; restarts the engine.",
           check_prewarm, update_prewarm, &pool_prewarm, &g_pool_prewarm))
     return true;
 
@@ -527,9 +530,8 @@ Settings current_settings() {
                       : MLE_DEFAULT_JAVA_HOME;
   }
   s.package_dir = text(g_package_dir);
-  s.pool_prewarm = text(g_pool_prewarm);
-  for (char &c : s.pool_prewarm) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-  if (s.pool_prewarm.empty()) s.pool_prewarm = "none";
+  // A value set at startup was not checked: an invalid one means the default.
+  if (!parse_prewarm(text(g_pool_prewarm), &s.pool_prewarm)) s.pool_prewarm = kPoolPrewarm;
   s.worker = text(g_worker);
   for (char &c : s.worker) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
   if (s.worker.empty()) s.worker = "AUTO";
@@ -578,6 +580,41 @@ bool parse_languages(std::string_view text, unsigned *bits) {
     if (comma == std::string_view::npos) break;
     text.remove_prefix(comma + 1);
   }
+  return true;
+}
+
+bool parse_prewarm(std::string_view text, std::string *normalized) {
+  static constexpr const char *kItems[] = {"python", "numpy", "vectors"};
+  bool seen[3] = {false, false, false};
+  bool none = false;
+  int items = 0;
+  while (true) {
+    const size_t comma = text.find(',');
+    std::string_view item = text.substr(0, comma);
+    while (!item.empty() && item.front() == ' ') item.remove_prefix(1);
+    while (!item.empty() && item.back() == ' ') item.remove_suffix(1);
+    std::string lower(item);
+    for (char &c : lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    bool known = false;
+    if (lower == "none") {
+      none = known = true;
+    } else {
+      for (size_t i = 0; i < 3; i++)
+        if (lower == kItems[i]) seen[i] = known = true;
+    }
+    if (!known) return false;
+    items++;
+    if (comma == std::string_view::npos) break;
+    text.remove_prefix(comma + 1);
+  }
+  if (none && items > 1) return false;  // none alone
+  normalized->clear();
+  for (size_t i = 0; i < 3; i++) {
+    if (!seen[i]) continue;
+    if (!normalized->empty()) *normalized += ",";
+    *normalized += kItems[i];
+  }
+  if (normalized->empty()) *normalized = "none";
   return true;
 }
 

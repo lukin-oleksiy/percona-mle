@@ -53,9 +53,9 @@ struct Settings {
   std::string cgroup_base = "AUTO";
   std::string dir;
   std::string java_home;
-  /** What pool workers start before they are needed (15 §2): none, python,
-      numpy. */
-  std::string pool_prewarm = "none";
+  /** What pool workers prepare before they are needed (15 §2, exp note 35):
+      none, or a list of python, numpy and vectors (parse_prewarm). */
+  std::string pool_prewarm = "vectors";
   /** Third-party packages installed by the DBA (14 §3); "": <dir>/packages. */
   std::string package_dir;
   /** Which worker build runs routines (23): AUTO, JVM or NATIVE (the

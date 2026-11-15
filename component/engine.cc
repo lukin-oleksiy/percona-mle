@@ -355,7 +355,9 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   options.vector_threads = s.vector_threads;
   // Pool workers start Java (javac) and JavaScript, which are cheap; GraalPy
   // (and numpy) only when mle.pool_prewarm asks (15 §1: Python starts lazily
-  // by default, for memory). The native build skips what it does not have.
+  // by default, for memory); "vectors" warms the vector helper up after READY
+  // while the worker is idle (exp note 35). The native build skips what it
+  // does not have.
   options.prewarm = s.pool_prewarm == "none" ? "java,js" : "java,js," + s.pool_prewarm;
   if (!server_private_paths(&options.hidden_paths)) {
     *error =
