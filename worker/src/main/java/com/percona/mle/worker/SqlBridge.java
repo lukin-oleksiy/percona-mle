@@ -67,6 +67,12 @@ public final class SqlBridge {
     return dispatcher().interrupted();
   }
 
+  /** Whether the running call was killed; false outside a worker (the vector helper in Train). */
+  public static boolean killed() {
+    Dispatcher d = dispatcher;
+    return d != null && d.interrupted();
+  }
+
   private static Dispatcher dispatcher() {
     Dispatcher d = dispatcher;
     if (d == null) throw new IllegalStateException("MLE worker not running");

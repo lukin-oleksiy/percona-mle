@@ -20,7 +20,8 @@
 
   The mle.* system variables (11-phase4-component.md §6).
 
-  - Settings that shape workers (memory_max, heap_max, pool_size) can be
+  - Settings that shape workers (memory_max, heap_max, pool_size,
+    vector_threads) can be
     changed while no session holds a worker, else 6116 (as Oracle's
     mle.memory_max "while the component is active"). A change restarts the
     engine, so INSTALL COMPONENT ... SET GLOBAL mle.memory_max = ... works
@@ -64,6 +65,7 @@ constexpr const char kAllLanguageNames[] = "JAVASCRIPT,PYTHON,JAVA";
 ulonglong g_memory_max = 0;
 ulonglong g_heap_max = 0;
 uint g_pool_size = 0;
+uint g_vector_threads = 4;
 uint g_max_workers = 0;
 uint g_worker_cache_size = 0;
 uint g_worker_cache_timeout = 0;
@@ -136,6 +138,7 @@ void update_shaping(MYSQL_THD thd, SYS_VAR *, void *val_ptr,
 constexpr const char kMemoryMax[] = "memory_max";
 constexpr const char kHeapMax[] = "heap_max";
 constexpr const char kPoolSize[] = "pool_size";
+constexpr const char kVectorThreads[] = "vector_threads";
 
 constexpr ulonglong kMiB = 1ULL << 20;
 constexpr ulonglong kMemoryMaxMin = 256 * kMiB;
@@ -143,6 +146,7 @@ constexpr ulonglong kMemoryMaxMax = 1ULL << 40;
 constexpr ulonglong kHeapMaxMin = 64 * kMiB;
 constexpr ulonglong kHeapMaxMax = 64ULL << 30;
 constexpr ulonglong kPoolSizeMax = 64;
+constexpr ulonglong kVectorThreadsMax = 256;
 
 int check_languages(MYSQL_THD, SYS_VAR *, void *save,
                     struct st_mysql_value *value) {
@@ -199,7 +203,8 @@ Registered g_registered[] = {
     {"java_home", false},  {"sql_result_max", false}, {"sql_row_max", false},
     {"sql_statements_max", false}, {"sql_chunk_rows", false},
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
-    {"package_dir", false}, {"pool_prewarm", false}, {"worker", false}};
+    {"package_dir", false}, {"pool_prewarm", false}, {"worker", false},
+    {"vector_threads", false}};
 
 void mark(const char *name) {
   for (auto &r : g_registered)
@@ -271,6 +276,21 @@ bool register_settings() {
           "holds a worker; restarts the engine.",
           check_shaping<uint, kPoolSize, 0, kPoolSizeMax>,
           update_shaping<uint, kPoolSize>, &pool_size, &g_pool_size))
+    return true;
+
+  uint_check_arg_s vector_threads;
+  vector_threads.def_val = 4;
+  vector_threads.min_val = 1;
+  vector_threads.max_val = kVectorThreadsMax;
+  vector_threads.blk_sz = 0;
+  if (reg("vector_threads", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Threads the vector helper (com.percona.mle.api.Vectors) may use for "
+          "one call in a worker, at most the number of CPUs; 1: no threads. "
+          "Can be changed while no session holds a worker; restarts the "
+          "engine.",
+          check_shaping<uint, kVectorThreads, 1, kVectorThreadsMax>,
+          update_shaping<uint, kVectorThreads>, &vector_threads,
+          &g_vector_threads))
     return true;
 
   STR_CHECK_ARG(pool_prewarm) pool_prewarm;
@@ -479,6 +499,7 @@ Settings current_settings() {
   s.memory_max = g_memory_max;
   s.heap_max = g_heap_max;
   s.pool_size = g_pool_size;
+  s.vector_threads = g_vector_threads;
   s.cgroup_base = text(g_cgroup_base);
   s.dir = text(g_dir);
   s.java_home = text(g_java_home);

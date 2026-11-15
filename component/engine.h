@@ -47,6 +47,8 @@ struct Settings {
   uint64_t memory_max = 2ULL << 30;
   uint64_t heap_max = 512ULL << 20;
   uint32_t pool_size = 1;
+  /** Threads of the vector helper (com.percona.mle.api.Vectors) per worker. */
+  uint32_t vector_threads = 4;
   /** AUTO, NONE or a cgroup v2 directory. */
   std::string cgroup_base = "AUTO";
   std::string dir;

@@ -100,7 +100,8 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
       "--add-exports=java.base/jdk.internal.vm=ALL-UNNAMED",
       "-Dmle.class=" + o.name,
       // The worker's memory watcher forces GCs below this limit (exp note 30).
-      "-Dmle.memoryMax=" + std::to_string(o.memory_max)};
+      "-Dmle.memoryMax=" + std::to_string(o.memory_max),
+      "-Dmle.vectorThreads=" + std::to_string(o.vector_threads)};
   if (!layout.aot_cache.empty())
     c.args.push_back("-XX:AOTCache=" + layout.aot_cache);
   if (!o.prewarm.empty()) c.args.push_back("-Dmle.prewarm=" + o.prewarm);

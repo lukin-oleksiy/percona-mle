@@ -1,0 +1,111 @@
+#
+# component_mle: the vector helper com.percona.mle.api.Vectors (exp design
+# note 33): dot, cosine, distance, the k nearest rows (one query, a batch,
+# all pairs) with SIMD and threads (mle.vector_threads), VectorSet from SQL,
+# from Java, JavaScript and Python; KILL; results independent of threads.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE items (id BIGINT PRIMARY KEY, v VECTOR(8));
+# 1. The setting.
+SELECT @@mle.vector_threads;
+@@mle.vector_threads
+4
+SET GLOBAL mle.vector_threads = 0;
+ERROR 42000: Variable 'mle.vector_threads' can't be set to the value of '0'
+CALL fill_items(200);
+SELECT vec_threads();
+vec_threads()
+mle.vector_threads, at most the CPUs
+SELECT vec_basic();
+vec_basic()
+dot 32.0  cosine 0.9746  distance 5.1962  cosine(zero) 0.0  normalize [0.6, 0.8]
+# 2. Against the reference; with mle.vector_threads = 4.
+SELECT LEFT('ok DIGEST', 2) AS selfcheck;
+selfcheck
+ok
+# 3. VectorSet from SQL, the same from Java, JavaScript and Python.
+CALL java_near(1, 'cosine', @j);
+CALL js_near(1, 'COSINE', @js);
+CALL py_near(1, 'Cosine', @py);
+SELECT @j AS java, @js AS js, @py AS python;
+java	js	python
+VectorSet(199 vectors of 8 dimensions, 1 NULL skipped) [38, 162, 135]	VectorSet(199 vectors of 8 dimensions, 1 NULL skipped) [38, 162, 135]	VectorSet(199 vectors of 8 dimensions, 1 NULL skipped) [38, 162, 135]
+CALL java_near(1, 'euclidean', @j);
+CALL js_near(1, 'euclidean', @js);
+CALL py_near(1, 'euclidean', @py);
+SELECT @j = @js AND @js = @py AS same_euclidean, @j AS java;
+same_euclidean	java
+1	VectorSet(199 vectors of 8 dimensions, 1 NULL skipped) [38, 162, 135]
+CALL java_near(7, 'dot', @j);
+CALL js_near(7, 'dot', @js);
+CALL py_near(7, 'dot', @py);
+SELECT @j = @js AND @js = @py AS same_dot, @j AS java;
+same_dot	java
+1	VectorSet(199 vectors of 8 dimensions, 1 NULL skipped) [138, 149, 71]
+# A VECTOR argument as the query (float[] / Float32Array / numpy array).
+SELECT v INTO @q FROM items WHERE id = 1;
+CALL java_near_vec(@q, 'cosine', @j);
+CALL py_near_vec(@q, 'cosine', @py);
+CALL js_near_vec(@q, 'cosine', @js);
+SELECT @j AS java, @py AS python, JSON_EXTRACT(@js, '$[*].id') AS js;
+java	python	js
+[1, 38, 162]	[1, 38, 162]	[1, 38, 162]
+CALL js_related(@r);
+SELECT @r AS js_related;
+js_related
+199 results; id 1: [{"id": 150, "score": S}, {"id": 38, "score": S}]
+SELECT js_inline('dot') AS js_inline, py_inline() AS py_inline;
+js_inline	py_inline
+2 0 dot 11	2 0 1.0000
+# 4. Errors.
+SELECT js_bad_metric() AS js;
+js
+unknown metric 'manhattan' (cosine, dot or euclidean)
+CALL java_errors(@r);
+SELECT @r AS java;
+java
+the vectors have 3 and 4 dimensions
+row 1 has 2 dimensions, row 0 has 3
+k must be at least 1, not 0
+the query must return (id, vector) or (vector), not 3 columns
+the first column must be an integer id (row 0 has float[])
+no vector with id 999
+# 5. KILL QUERY stops the work; the worker stays, and has no extra threads.
+SELECT vec_long();
+KILL QUERY CON1;
+ERROR 70100: Query execution was interrupted
+SELECT vec_pool();
+vec_pool()
+helper threads within mle.vector_threads
+include/assert.inc [The same worker after KILL QUERY]
+# 6. mle.vector_threads = 1: the same results.
+SET GLOBAL mle.vector_threads = 1;
+SELECT vec_threads();
+vec_threads()
+mle.vector_threads, at most the CPUs
+SELECT LEFT('ok DIGEST', 2) AS selfcheck;
+selfcheck
+ok
+include/assert.inc [The same results with 1 thread as with 4]
+SET GLOBAL mle.vector_threads = DEFAULT;
+DROP TABLE items;
+DROP PROCEDURE fill_items;
+DROP FUNCTION vec_selfcheck;
+DROP FUNCTION vec_threads;
+DROP FUNCTION vec_basic;
+DROP PROCEDURE java_near;
+DROP PROCEDURE java_near_vec;
+DROP PROCEDURE js_near;
+DROP PROCEDURE js_near_vec;
+DROP PROCEDURE js_related;
+DROP FUNCTION js_inline;
+DROP PROCEDURE py_near;
+DROP PROCEDURE py_near_vec;
+DROP FUNCTION py_inline;
+DROP FUNCTION js_bad_metric;
+DROP PROCEDURE java_errors;
+DROP FUNCTION vec_long;
+DROP FUNCTION vec_pool;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

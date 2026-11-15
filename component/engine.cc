@@ -321,6 +321,7 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   options.memory_max = s.memory_max;
   options.heap = std::to_string(s.heap_max >> 20) + "m";
   options.pool_size = s.pool_size;
+  options.vector_threads = s.vector_threads;
   // Pool workers start Java (javac) and JavaScript, which are cheap; GraalPy
   // (and numpy) only when mle.pool_prewarm asks (15 §1: Python starts lazily
   // by default, for memory). The native build skips what it does not have.

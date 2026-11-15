@@ -79,6 +79,10 @@
             <!-- The Truffle processor leaves @GeneratedBy unclaimed. -->
             <arg>-Xlint:-processing</arg>
             <arg>-Werror</arg>
+            <!-- The vector helper (com.percona.mle.api.Vectors) uses the Vector API. -->
+            <arg>--add-modules</arg>
+            <arg>jdk.incubator.vector</arg>
+            <arg>-Xlint:-incubating</arg>
           </compilerArgs>
           <!-- Generates the instrument's registration and options. -->
           <annotationProcessorPaths>

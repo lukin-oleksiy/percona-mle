@@ -82,6 +82,9 @@ struct JvmClassOptions {
   uint32_t pool_size = 0;
   /** BLAS threads per worker; many sessions each have a worker. */
   int blas_threads = 1;
+  /** Threads of the vector helper (com.percona.mle.api.Vectors, exp note
+      33): at most this many per call, never more than the CPUs. */
+  uint32_t vector_threads = 4;
   /** Truffle and C2 compiler threads. */
   int compiler_threads = 2;
   bool inherit_stderr = false;

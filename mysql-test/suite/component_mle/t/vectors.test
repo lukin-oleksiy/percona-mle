@@ -1,0 +1,297 @@
+--echo #
+--echo # component_mle: the vector helper com.percona.mle.api.Vectors (exp design
+--echo # note 33): dot, cosine, distance, the k nearest rows (one query, a batch,
+--echo # all pairs) with SIMD and threads (mle.vector_threads), VectorSet from SQL,
+--echo # from Java, JavaScript and Python; KILL; results independent of threads.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE items (id BIGINT PRIMARY KEY, v VECTOR(8));
+--write_file $MYSQLTEST_VARDIR/tmp/vectors.sql
+-- Rows id 1..n, 8 dimensions, java.util.Random(42) (the same on every platform); id 5 NULL.
+CREATE PROCEDURE fill_items(IN n INT) LANGUAGE JAVA AS $$
+Random r = new Random(42);
+PreparedStatement p = Mle.session().prepare("INSERT INTO items VALUES (?, ?)");
+for (int i = 1; i <= n; i++) {
+  float[] v = new float[8];
+  for (int j = 0; j < 8; j++) v[j] = (float) r.nextGaussian();
+  p.bind((long) i, i == 5 ? null : v).execute();
+}
+$$;
+-- Against a brute-force reference in double precision: every size class (dimensions that do not
+-- fill a vector, rows that do not fill a tile, k > n, zero and duplicate rows), a single query
+-- split over threads, related() over two chunks of rows. 'ok <digest>' or the first failure.
+CREATE FUNCTION vec_selfcheck() RETURNS TEXT LANGUAGE JAVA AS $$
+Random r = new Random(7);
+long[] digest = {17};
+StringBuilder fail = new StringBuilder();
+interface Ref { void check(String what, float[] q, float[][] rows, int k, Vectors.Metric m, int self, Matches got); }
+Ref ref = (what, q, rows, k, m, self, got) -> {
+  if (fail.length() > 0) return;
+  List<double[]> all = new ArrayList<>();
+  for (int j = 0; j < rows.length; j++) {
+    if (j == self) continue;
+    double dot = 0, qq = 0, rr = 0, dd = 0;
+    for (int i = 0; i < q.length; i++) {
+      dot += (double) q[i] * rows[j][i]; qq += (double) q[i] * q[i]; rr += (double) rows[j][i] * rows[j][i];
+      double x = (double) q[i] - rows[j][i]; dd += x * x;
+    }
+    double s = switch (m) {
+      case DOT -> dot;
+      case COSINE -> qq > 0 && rr > 0 ? dot / Math.sqrt(qq) / Math.sqrt(rr) : 0;
+      case EUCLIDEAN -> Math.sqrt(dd);
+    };
+    all.add(new double[] {s, j});
+  }
+  Comparator<double[]> c = m == Vectors.Metric.EUCLIDEAN ? Comparator.comparingDouble((double[] x) -> x[0])
+      : Comparator.comparingDouble((double[] x) -> -x[0]);
+  all.sort(c.thenComparingDouble(x -> x[1]));
+  int want = Math.min(k, all.size());
+  if (got.size() != want) { fail.append(what).append(": ").append(got.size()).append(" matches, want ").append(want); return; }
+  Map<Integer, Double> exact = new HashMap<>();
+  for (double[] x : all) exact.put((int) x[1], x[0]);
+  double tol = 1e-4 * Math.max(1, Math.sqrt(q.length));
+  for (int i = 0; i < want; i++) {
+    double want_s = all.get(i)[0];
+    Double g = exact.get(got.index(i));
+    if (g == null || Math.abs(g - want_s) > tol || Math.abs(got.score(i) - want_s) > tol) {
+      fail.append(what).append(": position ").append(i).append(" row ").append(got.index(i)).append(" score ")
+          .append(got.score(i)).append(", want row ").append((int) all.get(i)[1]).append(" score ").append(want_s);
+      return;
+    }
+    digest[0] = digest[0] * 31 + got.index(i);
+    digest[0] = digest[0] * 31 + Float.floatToIntBits(got.score(i));
+  }
+};
+java.util.function.BiFunction<Integer, Integer, float[][]> random = (n, d) -> {
+  float[][] m = new float[n][d];
+  for (float[] v : m) for (int i = 0; i < d; i++) v[i] = (float) r.nextGaussian();
+  return m;
+};
+for (int d : new int[] {1, 5, 13, 48, 769})
+  for (int n : new int[] {0, 1, 4, 5, 49, 97, 200}) {
+    float[][] rows = random.apply(n, d);
+    if (n > 3) { Arrays.fill(rows[2], 0f); rows[3] = rows[1].clone(); }
+    float[][] qs = random.apply(Math.min(6, Math.max(1, n)), d);
+    for (Vectors.Metric m : Vectors.Metric.values())
+      for (int k : new int[] {1, 10, 300}) {
+        String w = " d=" + d + " n=" + n + " " + m + " k=" + k;
+        for (float[] q : qs) ref.check("nearest" + w, q, rows, k, m, -1, Vectors.nearest(q, rows, k, m));
+        Matches[] b = Vectors.nearest(qs, rows, k, m);
+        for (int i = 0; i < qs.length; i++) ref.check("batch" + w, qs[i], rows, k, m, -1, b[i]);
+        Matches[] rel = Vectors.related(rows, k, m);
+        for (int i = 0; i < n; i++) ref.check("related" + w, rows[i], rows, k, m, i, rel[i]);
+      }
+  }
+// A single query over 6000 x 768 (split over threads), related() over 8300 rows (two chunks).
+float[][] big = random.apply(6000, 768);
+for (Vectors.Metric m : Vectors.Metric.values())
+  for (int i = 0; i < 3; i++) ref.check("big nearest " + m, big[i], big, 10, m, -1, Vectors.nearest(big[i], big, 10, m));
+float[][] tall = random.apply(8300, 8);
+for (Vectors.Metric m : Vectors.Metric.values()) {
+  Matches[] rel = Vectors.related(tall, 5, m);
+  for (int i = 0; i < tall.length; i += 97) ref.check("tall related " + m, tall[i], tall, 5, m, i, rel[i]);
+}
+return fail.length() > 0 ? "FAIL " + fail : "ok " + Long.toHexString(digest[0]);
+$$;
+CREATE FUNCTION vec_threads() RETURNS TEXT LANGUAGE JAVA AS $$
+return Vectors.threads() == Math.min(Integer.getInteger("mle.vectorThreads", -1), Runtime.getRuntime().availableProcessors())
+    ? "mle.vector_threads, at most the CPUs" : "unexpected: " + Vectors.threads();
+$$;
+CREATE FUNCTION vec_basic() RETURNS TEXT LANGUAGE JAVA AS $$
+float[] a = {1, 2, 3}, b = {4, 5, 6}, z = {0, 0, 0};
+return String.format("dot %.1f  cosine %.4f  distance %.4f  cosine(zero) %.1f  normalize %s",
+    Vectors.dot(a, b), Vectors.cosine(a, b), Vectors.distance(a, b), Vectors.cosine(z, a),
+    Arrays.toString(Vectors.normalize(new float[] {3, 4})));
+$$;
+-- load() runs SQL: procedures only (a stored function cannot run SQL).
+CREATE PROCEDURE java_near(IN id BIGINT, IN metric TEXT, OUT r TEXT) LANGUAGE JAVA AS $$
+VectorSet s = Vectors.load("SELECT id, v FROM items ORDER BY id");
+r[0] = s + " " + Arrays.toString(s.nearestTo(id, 3, metric).ids());
+$$;
+CREATE PROCEDURE java_near_vec(IN q VECTOR(8), IN metric TEXT, OUT r TEXT) LANGUAGE JAVA AS $$
+r[0] = Arrays.toString(Vectors.load("SELECT id, v FROM items WHERE id > ?", 0L).nearest(q, 3, metric).ids());
+$$;
+CREATE PROCEDURE js_near(IN id BIGINT, IN metric TEXT, OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors');
+  const s = V.load('SELECT id, v FROM items ORDER BY id');
+  const m = s.nearestTo(id, 3, metric);
+  const ids = [];
+  for (let i = 0; i < m.size(); i++) ids.push(m.id(i));
+  r = `${s} [${ids.join(', ')}]`;
+$$;
+CREATE PROCEDURE js_near_vec(IN q VECTOR(8), IN metric TEXT, OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors');
+  r = String(V.load('SELECT id, v FROM items').nearest(q, 3, metric));
+$$;
+CREATE PROCEDURE js_related(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors');
+  const all = V.load('SELECT id, v FROM items').related(2, 'dot');
+  r = `${all.length} results; id 1: ${all[0]}`.replace(/"score": [-0-9.eE]+/g, '"score": S');
+$$;
+CREATE FUNCTION js_inline(metric TEXT) RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors');
+  const rows = [new Float32Array([1, 0]), new Float32Array([0, 1]), new Float32Array([1, 1])];
+  const m = V.nearest(new Float32Array([2, 1]), rows, 2, metric);
+  return `${m.index(0)} ${m.index(1)} dot ${V.dot(new Float32Array([1, 2]), new Float32Array([3, 4]))}`;
+$$;
+CREATE PROCEDURE py_near(IN id BIGINT, IN metric TEXT, OUT r TEXT) LANGUAGE PYTHON AS $$
+    import java
+    V = java.type('com.percona.mle.api.Vectors')
+    s = V.load('SELECT id, v FROM items ORDER BY id')
+    m = s.nearestTo(id, 3, metric)
+    r = '%s [%s]' % (s, ', '.join(str(m.id(i)) for i in range(m.size())))
+$$;
+CREATE PROCEDURE py_near_vec(IN q VECTOR(8), IN metric TEXT, OUT r TEXT) LANGUAGE PYTHON AS $$
+    import java
+    V = java.type('com.percona.mle.api.Vectors')
+    m = V.load('SELECT id, v FROM items').nearest(q, 3, metric)
+    r = '[%s]' % ', '.join(str(i) for i in m.ids())
+$$;
+CREATE FUNCTION py_inline() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import java
+    V = java.type('com.percona.mle.api.Vectors')
+    m = V.nearest([2.0, 1.0], [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], 2, 'euclidean')
+    return '%d %d %.4f' % (m.index(0), m.index(1), m.score(0))
+$$;
+CREATE FUNCTION js_bad_metric() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors');
+  try { V.nearest(new Float32Array([1]), [new Float32Array([1])], 1, 'manhattan'); return 'no error'; }
+  catch (e) { return e.message; }
+$$;
+CREATE PROCEDURE java_errors(OUT r TEXT) LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+Runnable[] cases = {
+  () -> Vectors.dot(new float[3], new float[4]),
+  () -> Vectors.nearest(new float[3], new float[][] {new float[3], new float[2]}, 1, Vectors.Metric.DOT),
+  () -> Vectors.nearest(new float[3], new float[][] {new float[3]}, 0, Vectors.Metric.DOT),
+  () -> Vectors.load("SELECT id, v, 1 FROM items"),
+  () -> Vectors.load("SELECT v, id FROM items"),
+  () -> Vectors.load("SELECT id, v FROM items").nearestTo(999, 1, "dot"),
+};
+for (Runnable c : cases) {
+  try { c.run(); b.append("no error\n"); }
+  catch (IllegalArgumentException e) { b.append(e.getMessage()).append('\n'); }
+}
+r[0] = b.toString().trim();
+$$;
+-- Long enough to be killed: all pairs of 50000 x 768 (several seconds even with threads).
+CREATE FUNCTION vec_long() RETURNS TEXT LANGUAGE JAVA AS $$
+Random r = new Random(1);
+float[][] m = new float[50000][768];
+for (float[] v : m) for (int i = 0; i < v.length; i++) v[i] = (float) r.nextGaussian();
+return "finished: " + Vectors.related(m, 10, Vectors.Metric.COSINE).length;
+$$;
+CREATE FUNCTION vec_pool() RETURNS TEXT LANGUAGE JAVA AS $$
+int n = 0;
+for (Thread t : Thread.getAllStackTraces().keySet()) if (t.getName().startsWith("mle-vectors-")) n++;
+return n <= Vectors.threads() ? "helper threads within mle.vector_threads" : "too many: " + n;
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/vectors.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/vectors.sql
+--source include/wait_until_count_sessions.inc
+
+--echo # 1. The setting.
+SELECT @@mle.vector_threads;
+--error ER_WRONG_VALUE_FOR_VAR
+SET GLOBAL mle.vector_threads = 0;
+--connect (con1, localhost, root,,test)
+CALL fill_items(200);
+SELECT vec_threads();
+SELECT vec_basic();
+
+--echo # 2. Against the reference; with mle.vector_threads = 4.
+--let $d4 = `SELECT vec_selfcheck()`
+--replace_regex /'ok [0-9a-f]+'/'ok DIGEST'/
+--eval SELECT LEFT('$d4', 2) AS selfcheck
+
+--echo # 3. VectorSet from SQL, the same from Java, JavaScript and Python.
+CALL java_near(1, 'cosine', @j);
+CALL js_near(1, 'COSINE', @js);
+CALL py_near(1, 'Cosine', @py);
+SELECT @j AS java, @js AS js, @py AS python;
+CALL java_near(1, 'euclidean', @j);
+CALL js_near(1, 'euclidean', @js);
+CALL py_near(1, 'euclidean', @py);
+SELECT @j = @js AND @js = @py AS same_euclidean, @j AS java;
+CALL java_near(7, 'dot', @j);
+CALL js_near(7, 'dot', @js);
+CALL py_near(7, 'dot', @py);
+SELECT @j = @js AND @js = @py AS same_dot, @j AS java;
+--echo # A VECTOR argument as the query (float[] / Float32Array / numpy array).
+SELECT v INTO @q FROM items WHERE id = 1;
+CALL java_near_vec(@q, 'cosine', @j);
+CALL py_near_vec(@q, 'cosine', @py);
+CALL js_near_vec(@q, 'cosine', @js);
+SELECT @j AS java, @py AS python, JSON_EXTRACT(@js, '$[*].id') AS js;
+CALL js_related(@r);
+SELECT @r AS js_related;
+SELECT js_inline('dot') AS js_inline, py_inline() AS py_inline;
+
+--echo # 4. Errors.
+SELECT js_bad_metric() AS js;
+CALL java_errors(@r);
+SELECT @r AS java;
+
+--echo # 5. KILL QUERY stops the work; the worker stays, and has no extra threads.
+--let $con1_id = `SELECT CONNECTION_ID()`
+--let $pid0 = `SELECT mle_debug_worker_pid()`
+--send SELECT vec_long()
+--connection default
+--let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE id = $con1_id AND info LIKE 'SELECT vec_long%'
+--source include/wait_condition.inc
+--sleep 1
+--replace_result $con1_id CON1
+--eval KILL QUERY $con1_id
+--connection con1
+--error ER_QUERY_INTERRUPTED
+--reap
+SELECT vec_pool();
+--let $pid1 = `SELECT mle_debug_worker_pid()`
+--let $assert_text = The same worker after KILL QUERY
+--let $assert_cond = $pid1 = $pid0
+--source include/assert.inc
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+
+--echo # 6. mle.vector_threads = 1: the same results.
+SET GLOBAL mle.vector_threads = 1;
+--connect (con1, localhost, root,,test)
+SELECT vec_threads();
+--let $d1 = `SELECT vec_selfcheck()`
+--replace_regex /'ok [0-9a-f]+'/'ok DIGEST'/
+--eval SELECT LEFT('$d1', 2) AS selfcheck
+--let $assert_text = The same results with 1 thread as with 4
+--let $assert_cond = "$d1" = "$d4"
+--source include/assert.inc
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.vector_threads = DEFAULT;
+
+DROP TABLE items;
+DROP PROCEDURE fill_items;
+DROP FUNCTION vec_selfcheck;
+DROP FUNCTION vec_threads;
+DROP FUNCTION vec_basic;
+DROP PROCEDURE java_near;
+DROP PROCEDURE java_near_vec;
+DROP PROCEDURE js_near;
+DROP PROCEDURE js_near_vec;
+DROP PROCEDURE js_related;
+DROP FUNCTION js_inline;
+DROP PROCEDURE py_near;
+DROP PROCEDURE py_near_vec;
+DROP FUNCTION py_inline;
+DROP FUNCTION js_bad_metric;
+DROP PROCEDURE java_errors;
+DROP FUNCTION vec_long;
+DROP FUNCTION vec_pool;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";
