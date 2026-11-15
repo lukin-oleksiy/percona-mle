@@ -175,6 +175,10 @@ int apply_landlock(int abi, const ClassConfig &c, const std::string &leaf) {
   allow("/proc/" + std::to_string(getpid()), kRead);
   if (!leaf.empty()) allow(leaf, kRead);  // the JVM reads its limits here
   allow("/dev/null", kFsReadFile | kFsWriteFile);
+  // Diagnostics (README): a directory workers may write in, for JDK Flight
+  // Recorder recordings and Truffle logs; set only in mysqld's environment.
+  if (const char *d = getenv("MLE_DEBUG_WRITE_DIR"); d != nullptr && *d == '/')
+    allow(d, handled & ~kFsExecute);
 
   if (err == 0 && prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) err = errno;
   if (err == 0 && syscall(SYS_landlock_restrict_self, rs, 0) != 0) err = errno;

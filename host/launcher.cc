@@ -193,7 +193,12 @@ bool LauncherChannel::start(const LauncherConfig &config, std::string *error) {
                                       POSIX_SPAWN_SETSID);
   std::string exe = config.launcher_exe;
   char *argv[] = {exe.data(), nullptr};
-  char *envp[] = {nullptr};
+  // Diagnostics: the only variable the launcher gets (its workers' sandbox
+  // allows writes in that directory; README, launcher/child.cc).
+  std::string debug_dir;
+  if (const char *d = getenv("MLE_DEBUG_WRITE_DIR"); d != nullptr && *d == '/')
+    debug_dir = std::string("MLE_DEBUG_WRITE_DIR=") + d;
+  char *envp[] = {debug_dir.empty() ? nullptr : debug_dir.data(), nullptr};
   const int rc = posix_spawn(&m_pid, exe.c_str(), &fa, &attr, argv, envp);
   posix_spawn_file_actions_destroy(&fa);
   posix_spawnattr_destroy(&attr);

@@ -90,6 +90,9 @@ struct JvmClassOptions {
   int compiler_threads = 2;
   bool inherit_stderr = false;
   std::vector<std::string> extra_jvm_options;
+  /** More runtime options of the native image (-XX:..., -D...; diagnostics:
+      MLE_NATIVE_OPTIONS). The JVM class's -XX options do not apply to it. */
+  std::vector<std::string> extra_native_options;
   /** Paths workers must never read (ClassConfig::hidden_paths). */
   std::vector<std::string> hidden_paths;
 };

@@ -375,19 +375,29 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   // stderr (the error log) instead of nowhere.
   if (const char *e = getenv("MLE_WORKER_STDERR"); e != nullptr && *e == '1')
     options.inherit_stderr = true;
-  // Undocumented, for measurements: more JVM options for the workers.
-  if (const char *extra = getenv("MLE_JVM_OPTIONS"); extra != nullptr) {
+  // Diagnostics (README): more options for the JVM workers and for the native
+  // image's runtime (GC logging and policy, for example).
+  const auto words = [](const char *text, std::vector<std::string> *out) {
     std::string word;
-    for (const char *c = extra;; c++) {
+    for (const char *c = text;; c++) {
       if (*c == ' ' || *c == '\0') {
-        if (!word.empty()) options.extra_jvm_options.push_back(word);
+        if (!word.empty()) out->push_back(word);
         word.clear();
         if (*c == '\0') break;
       } else {
         word += *c;
       }
     }
-  }
+  };
+  if (const char *extra = getenv("MLE_JVM_OPTIONS"); extra != nullptr)
+    words(extra, &options.extra_jvm_options);
+  if (const char *extra = getenv("MLE_NATIVE_OPTIONS"); extra != nullptr)
+    words(extra, &options.extra_native_options);
+  // Diagnostics: a directory workers may write in (JFR recordings, Truffle
+  // logs); the launcher passes it to the sandbox (launcher/child.cc).
+  if (const char *d = getenv("MLE_DEBUG_WRITE_DIR"); d != nullptr && *d != '\0')
+    log_warning(std::string("MLE_DEBUG_WRITE_DIR is set: MLE workers may write files in ") + d +
+                " (a diagnostic setting; unset it for production)");
   config.classes = {native ? mle::native_worker_class(layout, options)
                            : mle::jvm_worker_class(layout, options)};
 

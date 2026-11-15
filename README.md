@@ -57,6 +57,28 @@ The build type follows the server build's (a debug server gives a debug MLE). Fo
     BUILD-mle/mtr --parallel=4                           # the MTR suite on the server build
     systemd-run --user --scope -q -p Delegate=yes BUILD-mle/runtime_output_directory/mle_codec-t   # each gtest
 
+## Diagnostics
+
+Environment variables of mysqld, for diagnosing and profiling workers; not for production:
+
+| Variable | Effect |
+|---|---|
+| `MLE_WORKER_STDERR=1` | workers write to mysqld's stderr (the error log) |
+| `MLE_JVM_OPTIONS="..."` | more JVM options for JVM workers (`-D` options also reach native workers) |
+| `MLE_NATIVE_OPTIONS="..."` | more runtime options for native workers, e.g. `-XX:+PrintGC` |
+| `MLE_DEBUG_WRITE_DIR=/dir` | workers may write files in `/dir` (the sandbox allows it; a warning in the error log) |
+
+A JDK Flight Recorder recording of a JVM worker:
+
+    MLE_DEBUG_WRITE_DIR=/tmp/mle-jfr \
+    MLE_JVM_OPTIONS="-XX:FlightRecorderOptions=repository=/tmp/mle-jfr -XX:StartFlightRecording=delay=10s,duration=30s,filename=/tmp/mle-jfr/w.jfr,settings=profile" \
+      mysqld ...
+    jfr view hot-methods /tmp/mle-jfr/w.jfr
+
+The same directory takes Truffle's compilation log: `-Dpolyglot.log.file=/dir/truffle.log
+-Dpolyglot.engine.TraceCompilation=true`. For native workers, `perf` needs an image built with
+`MLE_NATIVE_IMAGE_OPTIONS=-g` (worker/native/build-native.sh), its `.debug` file beside the library.
+
 ## Install and packages
 
 Packages (`cpack -G DEB` or `cpack -G RPM` in the build directory; the server must be built with

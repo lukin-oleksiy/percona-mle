@@ -169,6 +169,7 @@ ClassConfig native_worker_class(const Layout &layout, const JvmClassOptions &o) 
   // apply to a Native Image.
   for (const std::string &x : o.extra_jvm_options)
     if (x.rfind("-D", 0) == 0) c.args.push_back(x);
+  c.args.insert(c.args.end(), o.extra_native_options.begin(), o.extra_native_options.end());
   c.exec_paths = {dir_of(layout.worker_exe), lib_dir};
   c.read_paths = {lib_dir, layout.resource_cache};
   if (!layout.python_venv.empty()) c.read_paths.push_back(layout.python_venv);
