@@ -51,12 +51,13 @@ js_ok()
 7
 include/assert.inc [A new worker after the old one was killed]
 #
-# 4. The worker killed from outside: the call fails (6111), the next one
-#    runs in a fresh worker.
+# 4. The worker killed from outside: the call fails with the reason
+#    (6000, "MLE> the worker died: ..."; exceptions of routine code are
+#    6113), the next one runs in a fresh worker.
 #
 # (wait until it is gone: kill is asynchronous)
 SELECT js_ok();
-ERROR HY000: MLE> the MLE worker died: killed by signal 9 (Killed)
+ERROR HY000: MLE> the worker died: <reason>
 SELECT js_ok();
 js_ok()
 7
@@ -74,7 +75,7 @@ include/assert.inc [A new worker after heap exhaustion]
 #    new launcher when the next worker is needed.
 #
 SELECT js_ok();
-ERROR HY000: MLE> the MLE worker died: exit status unknown
+ERROR HY000: MLE> the worker died: <reason>
 SELECT js_ok();
 js_ok()
 7

@@ -92,7 +92,7 @@ include/assert.inc [The same worker after the timeout and KILL QUERY]
 # 4. A native crash ends the worker, not mysqld; the next call gets a new one.
 #
 SELECT py_crash();
-Got one of the listed errors
+ERROR HY000: MLE> the worker died: <reason>
 SELECT py_add(20, 22);
 py_add(20, 22)
 42

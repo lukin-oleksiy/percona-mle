@@ -19,6 +19,8 @@
 #include "mle_component.h"
 
 #include <unistd.h>
+#include <cerrno>
+#include <cstring>
 
 #include <climits>
 #include <cstdlib>
@@ -395,9 +397,16 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
     words(extra, &options.extra_native_options);
   // Diagnostics: a directory workers may write in (JFR recordings, Truffle
   // logs); the launcher passes it to the sandbox (launcher/child.cc).
-  if (const char *d = getenv("MLE_DEBUG_WRITE_DIR"); d != nullptr && *d != '\0')
-    log_warning(std::string("MLE_DEBUG_WRITE_DIR is set: MLE workers may write files in ") + d +
-                " (a diagnostic setting; unset it for production)");
+  if (const char *d = getenv("MLE_DEBUG_WRITE_DIR"); d != nullptr && *d != '\0') {
+    if (*d != '/')
+      log_warning(std::string("MLE_DEBUG_WRITE_DIR=") + d + " is ignored: it must be an absolute path");
+    else if (access(d, W_OK) != 0)
+      log_warning(std::string("MLE_DEBUG_WRITE_DIR=") + d +
+                  " is ignored: not a directory mysqld can write (" + strerror(errno) + ")");
+    else
+      log_warning(std::string("MLE_DEBUG_WRITE_DIR is set: MLE workers may write files in ") + d +
+                  " (a diagnostic setting; unset it for production)");
+  }
   config.classes = {native ? mle::native_worker_class(layout, options)
                            : mle::jvm_worker_class(layout, options)};
 

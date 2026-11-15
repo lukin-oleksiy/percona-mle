@@ -77,6 +77,32 @@ v2	lib2
 SELECT java_ver(), java_lib(), java_count();
 java_ver()	java_lib()	java_count()
 v2	lib2	3
+# The same Java routine text in two schemas: two routines (their own
+# static state); a class that failed to initialise is compiled again by
+# the next session (it is not kept failed).
+CREATE DATABASE wr1;
+CREATE DATABASE wr2;
+CREATE FUNCTION wr1.cnt() RETURNS INT LANGUAGE JAVA AS $$ class C { static int n; } return ++C.n; $$;
+CREATE FUNCTION wr2.cnt() RETURNS INT LANGUAGE JAVA AS $$ class C { static int n; } return ++C.n; $$;
+SELECT wr1.cnt(), wr1.cnt(), wr2.cnt();
+wr1.cnt()	wr1.cnt()	wr2.cnt()
+1	2	1
+CREATE PROCEDURE wr1.init_once(OUT r BIGINT) LANGUAGE JAVA AS $$
+class C {
+static final long rows = ((Number) Mle.session().runSql("SELECT COUNT(*) FROM wr1.later").fetchOne().get(0)).longValue();
+}
+r[0] = C.rows;
+$$;
+CALL wr1.init_once(@r);
+ERROR HY000: Java> java.lang.ExceptionInInitializerError; caused by com.percona.mle.api.MleSqlException: Table 'wr1.later' doesn't exist
+CREATE TABLE wr1.later (k INT);
+INSERT INTO wr1.later VALUES (1), (2);
+CALL wr1.init_once(@r);
+SELECT @r AS rows_seen;
+rows_seen
+2
+DROP DATABASE wr1;
+DROP DATABASE wr2;
 # Kept workers end after mle.worker_cache_timeout.
 SET GLOBAL mle.worker_cache_timeout = 1;
 SET GLOBAL mle.worker_cache_timeout = DEFAULT;

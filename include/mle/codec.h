@@ -217,6 +217,9 @@ struct PrepareMsg {
   std::vector<Param> params;
   std::optional<ParamType> returns;
   std::vector<Import> imports;
+  /** The routine's schema: the worker keeps routines by schema too
+      (JavaRoutines' cache: db1.f and db2.f with the same text are not one). */
+  std::string schema;
   bool operator==(const PrepareMsg &) const = default;
 };
 

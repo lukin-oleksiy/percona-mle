@@ -118,6 +118,39 @@ SELECT java_ver(), java_lib(), java_count();
 let $wait_condition = SELECT VARIABLE_VALUE = 2 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
 --source include/wait_condition.inc
 
+--echo # The same Java routine text in two schemas: two routines (their own
+--echo # static state); a class that failed to initialise is compiled again by
+--echo # the next session (it is not kept failed).
+CREATE DATABASE wr1;
+CREATE DATABASE wr2;
+--connect (con11, localhost, root,,test)
+CREATE FUNCTION wr1.cnt() RETURNS INT LANGUAGE JAVA AS $$ class C { static int n; } return ++C.n; $$;
+CREATE FUNCTION wr2.cnt() RETURNS INT LANGUAGE JAVA AS $$ class C { static int n; } return ++C.n; $$;
+SELECT wr1.cnt(), wr1.cnt(), wr2.cnt();
+CREATE PROCEDURE wr1.init_once(OUT r BIGINT) LANGUAGE JAVA AS $$
+  class C {
+    static final long rows = ((Number) Mle.session().runSql("SELECT COUNT(*) FROM wr1.later").fetchOne().get(0)).longValue();
+  }
+  r[0] = C.rows;
+$$;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CALL wr1.init_once(@r);
+--disconnect con11
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers';
+--source include/wait_condition.inc
+CREATE TABLE wr1.later (k INT);
+INSERT INTO wr1.later VALUES (1), (2);
+--connect (con12, localhost, root,,test)
+CALL wr1.init_once(@r);
+SELECT @r AS rows_seen;
+--disconnect con12
+--connection default
+DROP DATABASE wr1;
+DROP DATABASE wr2;
+let $wait_condition = SELECT VARIABLE_VALUE = 2 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+--source include/wait_condition.inc
+
 --echo # Kept workers end after mle.worker_cache_timeout.
 SET GLOBAL mle.worker_cache_timeout = 1;
 let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';

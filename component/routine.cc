@@ -565,6 +565,7 @@ Routine *Routine::create(stored_program_handle sp) {
   m.routine_id = r->id;
   m.language = worker_language(bit);
   m.name = r->name;
+  m.schema = r->schema;
   m.source = get_string("sp_body");
   // USING (Phase 6): the libraries the routine imports.
   uint32_t imports = 0;

@@ -104,8 +104,8 @@ final class JavaRoutines {
   private final Map<Long, Routine> routines = new HashMap<>();
 
   /**
-   * Prepared routines kept across sessions (exp note 38), by their content (the compiled unit,
-   * entry, name, parameters, result and USING libraries' text): a later session of the account
+   * Prepared routines kept across sessions (exp note 38), by their content (the schema, compiled
+   * unit, entry, name, parameters, result and USING libraries' text): a later session of the account
    * gets the same loaded classes, so neither javac nor the JIT starts again. A changed routine or
    * library is another key. Static fields of a routine's own classes therefore live as long as the
    * worker, like those of the DBA's jars.
@@ -289,15 +289,15 @@ final class JavaRoutines {
 
   void prepare(long id, String routineName, String entry, String source, List<Param> params, Values.ParamType ret)
       throws CompileException {
-    prepare(id, routineName, entry, source, params, ret, List.of());
+    prepare(id, "", routineName, entry, source, params, ret, List.of());
   }
 
   /**
    * With database libraries (USING, Phase 6): Java libraries are compiled with the routine (their
    * classes are the routine's); a changed library applies when the routine is loaded again.
    */
-  void prepare(long id, String routineName, String entry, String source, List<Param> params, Values.ParamType ret,
-      List<LibraryFileSystem.Import> imports) throws CompileException {
+  void prepare(long id, String schema, String routineName, String entry, String source, List<Param> params,
+      Values.ParamType ret, List<LibraryFileSystem.Import> imports) throws CompileException {
     List<String[]> libraries = new ArrayList<>();
     for (LibraryFileSystem.Import i : imports) {
       LibraryFileSystem.Library l;
@@ -312,7 +312,7 @@ final class JavaRoutines {
             + " library: Java routines use Java libraries (other languages through Mle.context())");
       libraries.add(new String[] {i.schema() + "." + i.name(), new String(l.body(), StandardCharsets.UTF_8)});
     }
-    prepareWith(id, routineName, entry, source, params, ret, libraries);
+    prepareWith(id, schema, routineName, entry, source, params, ret, libraries);
   }
 
   /** CREATE LIBRARY ... LANGUAGE JAVA: compiles the library alone; the error or null. */
@@ -325,8 +325,8 @@ final class JavaRoutines {
     }
   }
 
-  private void prepareWith(long id, String routineName, String entry, String source, List<Param> params,
-      Values.ParamType ret, List<String[]> libraries) throws CompileException {
+  private void prepareWith(long id, String schema, String routineName, String entry, String source,
+      List<Param> params, Values.ParamType ret, List<String[]> libraries) throws CompileException {
     int n = params.size();
     String name = routineName.isEmpty() ? "routine_" + id : routineName;
     boolean bodyForm = entry.isEmpty() && !PUBLIC_TYPE.matcher(source).find();
@@ -338,7 +338,7 @@ final class JavaRoutines {
       unit = wrap[0] + source + wrap[1];
     }
     StringBuilder k = new StringBuilder(unit.length() + 256).append(unit).append('\0').append(entry).append('\0')
-        .append(routineName).append('\0').append(params).append('\0').append(ret);
+        .append(schema).append('\0').append(routineName).append('\0').append(params).append('\0').append(ret);
     for (String[] l : libraries) k.append('\0').append(l[0]).append('\0').append(l[1]);
     String key = k.toString();
     Cached hit = cache.get(key);
@@ -422,6 +422,11 @@ final class JavaRoutines {
     cache.put(key, new Cached(routine, LOADER_PREFIX + id, origin));
   }
 
+  /** Drops the kept routine with r's code (its classes are unusable). */
+  private void forgetCached(Routine r) {
+    cache.values().removeIf(c -> c.routine().invoker() == r.invoker());
+  }
+
   /** OUT/INOUT: a one-element array of the component type; OUT starts as null (0 for primitives). */
   private static Values.Converter arrayConverter(Class<?> component, boolean outOnly) {
     Values.Converter element = Values.converter(component);
@@ -443,7 +448,16 @@ final class JavaRoutines {
         throw new Values.ConversionException("argument " + (i + 1) + " (" + r.names()[i] + "): " + e.getMessage());
       }
     }
-    Object result = (Object) r.invoker().invokeExact(args);
+    Object result;
+    try {
+      result = (Object) r.invoker().invokeExact(args);
+    } catch (ExceptionInInitializerError | NoClassDefFoundError e) {
+      // A class of the routine failed to initialise: the JVM keeps it failed for good, so the
+      // kept routine would fail in every later session (exp note 38). Forget it; the next
+      // PREPARE compiles it again.
+      forgetCached(r);
+      throw e;
+    }
     for (int i : r.outs()) outs[i] = java.lang.reflect.Array.get(args[i], 0);
     return result;
   }

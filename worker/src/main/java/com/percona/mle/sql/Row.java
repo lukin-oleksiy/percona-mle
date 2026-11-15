@@ -24,6 +24,8 @@ import java.util.List;
  * language of the session that ran the statement (mapped when first read).
  */
 public final class Row {
+  /** In mapped[]: the value is mapped, to null (a Python zero date: not mapped again per read). */
+  private static final Object MAPPED_NULL = new Object();
   private final SqlResult.Set set;
   private final Object[] raw;
   private Object[] mapped;
@@ -40,11 +42,12 @@ public final class Row {
     if (r == null) return null;
     if (mapped == null) mapped = new Object[raw.length];
     Object v = mapped[i];
-    if (v == null) {  // not mapped yet: a non-null raw value maps to a non-null value
+    if (v == null) {  // not mapped yet
       v = set.mapper.value(r, set.columns.get(i), set.options);
-      mapped[i] = v;
+      mapped[i] = v == null ? MAPPED_NULL : v;
+      return v;
     }
-    return v;
+    return v == MAPPED_NULL ? null : v;
   }
 
   /** The value of the first column labelled name. */

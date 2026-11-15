@@ -154,8 +154,8 @@ SELECT py_add(1, 1);
 --echo #
 --echo # 4. A native crash ends the worker, not mysqld; the next call gets a new one.
 --echo #
---replace_regex /signal [0-9]+/signal N/
---error ER_LANGUAGE_COMPONENT_INTERNAL,ER_LANGUAGE_COMPONENT_RUNTIME
+--replace_regex /died: .*/died: <reason>/
+--error ER_LANGUAGE_COMPONENT
 SELECT py_crash();
 SELECT py_add(20, 22);
 --let $pid2 = `SELECT mle_debug_worker_pid()`

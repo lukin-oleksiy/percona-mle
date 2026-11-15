@@ -106,7 +106,10 @@ final class Dispatcher {
       // (back to back, the same account) does not wait ~20 ms for it (exp note 38).
       if (gcWhenIdle) {
         gcWhenIdle = false;
-        if (!mb.awaitPending(IDLE_GC_NS)) System.gc();
+        if (!mb.awaitPending(IDLE_GC_NS)) {
+          System.gc();
+          mb.stats(Wire.STATE_IDLE, tainted);  // the host's memory figures: after the GC
+        }
       }
       Mailbox.Message m = mb.receive();
       if (m.depth() != 0) throw new IllegalStateException("top-level message at depth " + m.depth());
@@ -229,6 +232,7 @@ final class Dispatcher {
     int ni = r.count();
     List<LibraryFileSystem.Import> imports = new ArrayList<>(ni);
     for (int i = 0; i < ni; i++) imports.add(new LibraryFileSystem.Import(r.str(), r.str(), r.str()));
+    String schema = r.str();
     r.finish();
 
     // Java routines need the JVM build (23); mysqld refuses them earlier (the worker's READY).
@@ -252,7 +256,7 @@ final class Dispatcher {
       // A routine id is prepared again after ALTER; it may change language.
       java.drop(id);
       polyglot.drop(id);
-      if (javaRoutine) java.prepare(id, name, entry, source, params, ret, imports);
+      if (javaRoutine) java.prepare(id, schema, name, entry, source, params, ret, imports);
       else polyglot.prepare(id, language, name, entry, source, params, ret, imports);
     } catch (JavaRoutines.CompileException e) {
       compileError = e.getMessage();

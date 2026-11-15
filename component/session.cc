@@ -192,6 +192,22 @@ void append_capped(std::string *buffer, const std::string &more) {
     buffer->erase(0, buffer->size() - kConsoleKeep);
 }
 
+
+/**
+  A failure of the engine rather than of the routine's code (a lost worker,
+  the engine not running): ER_LANGUAGE_COMPONENT (6000) with "MLE> " and the
+  reason. Exceptions thrown by routine code are ER_LANGUAGE_COMPONENT_RUNTIME
+  (6113, "<language>> message"), so handlers and retry logic can tell them
+  apart; internal errors are ER_LANGUAGE_COMPONENT_INTERNAL (6111), with the
+  details in the error log only.
+*/
+void engine_error(std::string why) {
+  // The host's reasons name "the MLE worker"; after "MLE> " once is enough.
+  constexpr std::string_view kWorker = "the MLE worker";
+  if (why.compare(0, kWorker.size(), kWorker) == 0)
+    why.replace(0, kWorker.size(), "the worker");
+  my_error(ER_LANGUAGE_COMPONENT, MYF(0), ("MLE> " + why).c_str());
+}
 }  // namespace
 
 /** KILL QUERY / KILL CONNECTION / max_execution_time interrupt the worker
@@ -393,8 +409,7 @@ Session::Slot *Session::worker_for(const std::string &principal,
                ("mle.max_workers = " + std::to_string(max_workers())).c_str());
       return nullptr;
     case AcquireError::kInactive:
-      my_error(ER_LANGUAGE_COMPONENT, MYF(0),
-               ("MLE> The MLE engine is not running: " + error).c_str());
+      engine_error("The MLE engine is not running: " + error);
       return nullptr;
     case AcquireError::kFailed:
       log_error("No worker for " + principal + ": " + log_safe(error));
@@ -510,6 +525,7 @@ void Session::keep_console(const ResultMsg &result) {
   append_capped(&m_err, result.console_err);
 }
 
+
 void Session::report(const std::string &principal, Status status,
                      const ResultMsg &result, const std::string &error,
                      const Routine &routine, const std::vector<Value> *args,
@@ -527,7 +543,15 @@ void Session::report(const std::string &principal, Status status,
     case Status::kGuestError:
     case Status::kExhausted: {
       if (status == Status::kExhausted) ++g_counters.oom_errors;
-      if (e == nullptr) break;
+      if (e == nullptr) {
+        // A guest error without its details is the worker's fault, not the
+        // routine's, and not a reason to give the worker up.
+        log_error("Internal error in the worker of " + principal + " during " +
+                  log_safe(routine.qualified_name) +
+                  ": an error result without an error");
+        my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+        return;
+      }
       if (e->language == "MLE-Type") {
         std::string message = "MLE-Type> " + e->message;
         if (args != nullptr)
@@ -562,6 +586,17 @@ void Session::report(const std::string &principal, Status status,
   // The worker is lost (died, killed, misbehaved) or failed internally.
   const std::string why =
       !error.empty() ? error : e != nullptr ? e->message : "no details";
+  if (status == Status::kProtocolError) {
+    // Lost, but the reason is a host-side diagnostic: the log has it, the
+    // caller gets an internal error.
+    ++g_counters.worker_failures;
+    log_error("The worker of " + principal + " broke the protocol during " +
+              log_safe(routine.qualified_name) + " and was killed: " +
+              log_safe(why));
+    drop_worker(principal);
+    my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+    return;
+  }
   if (status != Status::kInternal) {
     ++g_counters.worker_failures;
     if (why.find("out-of-memory") != std::string::npos) ++g_counters.oom_errors;
@@ -571,7 +606,7 @@ void Session::report(const std::string &principal, Status status,
     if (status == Status::kKilled && Hooks(m_thd).killed()) return;
     // The caller learns why (the worker died: signal ..., did not stop after
     // KILL ...); the next call of the session gets a new worker.
-    my_error(ER_LANGUAGE_COMPONENT_RUNTIME, MYF(0), "MLE", why.c_str());
+    engine_error(why);
     return;
   }
   log_error("Internal error in the worker of " + principal + " during " +

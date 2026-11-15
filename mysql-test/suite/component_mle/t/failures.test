@@ -78,13 +78,16 @@ SELECT js_ok();
 --source include/assert.inc
 
 --echo #
---echo # 4. The worker killed from outside: the call fails (6111), the next one
---echo #    runs in a fresh worker.
+--echo # 4. The worker killed from outside: the call fails with the reason
+--echo #    (6000, "MLE> the worker died: ..."; exceptions of routine code are
+--echo #    6113), the next one runs in a fresh worker.
 --echo #
 --exec kill -9 $pid2
 --echo # (wait until it is gone: kill is asynchronous)
 --exec for i in `seq 200`; do grep -qs '^State:.[^Z]' /proc/$pid2/status || exit 0; sleep 0.05; done; exit 1
---error ER_LANGUAGE_COMPONENT_RUNTIME
+# The reason depends on how fast the exit is reported (signal 9, or unknown).
+--replace_regex /died: .*/died: <reason>/
+--error ER_LANGUAGE_COMPONENT
 SELECT js_ok();
 SELECT js_ok();
 
@@ -108,7 +111,8 @@ SELECT js_ok();
 --let $pid_file = `SELECT @@pid_file`
 --exec pkill -9 -x -P `cat $pid_file` mle_launcher
 --exec for i in `seq 200`; do ps -o stat=,comm= --ppid `cat $pid_file` | grep -v '^Z' | grep -q mle_launcher || exit 0; sleep 0.05; done; exit 1
---error ER_LANGUAGE_COMPONENT_RUNTIME
+--replace_regex /died: .*/died: <reason>/
+--error ER_LANGUAGE_COMPONENT
 SELECT js_ok();
 SELECT js_ok();
 SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status

@@ -562,6 +562,7 @@ void encode(const PrepareMsg &m, std::string *out) {
     w.str(i.name);
     w.str(i.alias);
   }
+  w.str(m.schema);
 }
 
 bool decode(std::string_view body, PrepareMsg *m, std::string *error) {
@@ -592,7 +593,7 @@ bool decode(std::string_view body, PrepareMsg *m, std::string *error) {
     x->imports.resize(n);
     for (Import &i : x->imports)
       if (!r.str(&i.schema) || !r.str(&i.name) || !r.str(&i.alias)) return false;
-    return true;
+    return r.str(&x->schema);
   });
 }
 

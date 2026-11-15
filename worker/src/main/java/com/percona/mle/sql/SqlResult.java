@@ -69,6 +69,7 @@ public final class SqlResult implements Iterable<Row> {
 
     /** The index of the first column labelled name, or -1. */
     int indexOf(String name) {
+      if (name == null) return -1;
       if (scanKeys.length == 0 && !index.isEmpty()) {
         Integer i = index.get(name);
         return i == null ? -1 : i;
