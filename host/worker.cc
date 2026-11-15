@@ -185,6 +185,16 @@ void Worker::post(wire::Op op, uint32_t flags, const char *data, size_t len,
 Worker::Wait Worker::wait_change(CallHooks *hooks, int timeout_ms,
                                  std::string *error) {
   wire::RegionHeader *h = m_process->header();
+  // A quick reply needs no clock (exp note 37: the clock was ~3 % of mysqld's
+  // time in a stream of short calls).
+  for (int i = 0; i < 64; i++) {
+    const uint32_t v = h->to_h.load(std::memory_order_acquire);
+    if (v != m_seen_h) {
+      m_seen_h = v;
+      return Wait::kMessage;
+    }
+    cpu_relax();
+  }
   const int64_t start = now_ns();
   const int64_t spin_until = start + int64_t{m_options.spin_us} * 1000;
   const int64_t deadline = timeout_ms < 0

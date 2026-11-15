@@ -301,10 +301,19 @@ Session::~Session() {
 
 std::string account_key(std::string_view user, std::string_view host) {
   // MySQL's quoting: unambiguous ('a@b'@'c' is not 'a'@'b@c').
-  std::string key = "'";
-  for (char c : user) key += c == '\'' ? std::string("''") : std::string(1, c);
+  // Built in place: it runs on every call (exp note 37).
+  std::string key;
+  key.reserve(user.size() + host.size() + 8);
+  key += '\'';
+  for (char c : user) {
+    key += c;
+    if (c == '\'') key += c;
+  }
   key += "'@'";
-  for (char c : host) key += c == '\'' ? std::string("''") : std::string(1, c);
+  for (char c : host) {
+    key += c;
+    if (c == '\'') key += c;
+  }
   key += '\'';
   return key;
 }
