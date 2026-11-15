@@ -44,6 +44,10 @@ final class Dispatcher {
   private int depth;
   private long seq;
   private boolean tainted;
+  /** RESET asked for a GC (memory back before the worker waits); run when idle, not on the way. */
+  private boolean gcWhenIdle;
+  /** How long a reset worker waits for a request before it collects (exp note 38). */
+  private static final long IDLE_GC_NS = 200_000_000L;
   private final ThreadWatch threads = new ThreadWatch();
 
   record Frame(String function, String file, int line, int column, int endColumn) {}
@@ -97,6 +101,13 @@ final class Dispatcher {
 
   void loop() {
     while (true) {
+      // After a RESET: the full GC gives memory back to a worker that now waits for a session.
+      // Done only if no request comes for a while, so a session that takes the worker at once
+      // (back to back, the same account) does not wait ~20 ms for it (exp note 38).
+      if (gcWhenIdle) {
+        gcWhenIdle = false;
+        if (!mb.awaitPending(IDLE_GC_NS)) System.gc();
+      }
       Mailbox.Message m = mb.receive();
       if (m.depth() != 0) throw new IllegalStateException("top-level message at depth " + m.depth());
       handle(m);
@@ -131,8 +142,8 @@ final class Dispatcher {
           if (!tainted && threads.strangers()) tainted = true;
           // The host took the memory watcher's count with the session's statistics.
           MemoryWatch.clear();
-          // A reset worker is usually parked for reuse: give its memory back (12 §17).
-          System.gc();
+          // A reset worker is usually parked for reuse: give its memory back (12 §17), once idle.
+          gcWhenIdle = true;
           result(Wire.OK, null, null, null);
         }
         case Wire.OPTIONS -> options(m);

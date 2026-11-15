@@ -8,7 +8,7 @@
 --source include/count_sessions.inc
 
 INSTALL COMPONENT "file://component_mle";
-GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
 CREATE USER u1@localhost;
 GRANT EXECUTE ON test.* TO u1@localhost;
 SELECT @@mle.worker_cache_size, @@mle.worker_cache_timeout;
@@ -75,6 +75,49 @@ let $same = `SELECT $pid6 = $pid7`;
 let $wait_condition = SELECT VARIABLE_VALUE = 2 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
 --source include/wait_condition.inc
 
+--echo # Java routines stay compiled in a kept worker (exp note 38): the next
+--echo # session of the account reuses them, static state included; a changed
+--echo # routine or USING library is compiled again.
+--connect (con8, localhost, root,,test)
+CREATE LIBRARY jlib LANGUAGE JAVA AS $$
+package jlib;
+public final class V { public static String v() { return "lib1"; } }
+$$;
+CREATE FUNCTION java_ver() RETURNS VARCHAR(20) LANGUAGE JAVA AS $$ return "v1"; $$;
+CREATE FUNCTION java_lib() RETURNS VARCHAR(20) LANGUAGE JAVA USING (jlib) AS $$ return jlib.V.v(); $$;
+CREATE FUNCTION java_count() RETURNS INT LANGUAGE JAVA AS $$ class C { static int n; } return ++C.n; $$;
+SELECT java_ver(), java_lib(), java_count();
+let $pid8 = `SELECT mle_debug_worker_pid()`;
+--disconnect con8
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers';
+--source include/wait_condition.inc
+--connect (con9, localhost, root,,test)
+SELECT java_ver(), java_lib(), java_count();
+let $pid9 = `SELECT mle_debug_worker_pid()`;
+let $same = `SELECT $pid8 = $pid9`;
+--echo same worker process: $same
+DROP FUNCTION java_ver;
+CREATE FUNCTION java_ver() RETURNS VARCHAR(20) LANGUAGE JAVA AS $$ return "v2"; $$;
+DROP FUNCTION java_lib;
+DROP LIBRARY jlib;
+CREATE LIBRARY jlib LANGUAGE JAVA AS $$
+package jlib;
+public final class V { public static String v() { return "lib2"; } }
+$$;
+CREATE FUNCTION java_lib() RETURNS VARCHAR(20) LANGUAGE JAVA USING (jlib) AS $$ return jlib.V.v(); $$;
+SELECT java_ver(), java_lib();
+--disconnect con9
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers';
+--source include/wait_condition.inc
+--connect (con10, localhost, root,,test)
+SELECT java_ver(), java_lib(), java_count();
+--disconnect con10
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE = 2 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+--source include/wait_condition.inc
+
 --echo # Kept workers end after mle.worker_cache_timeout.
 SET GLOBAL mle.worker_cache_timeout = 1;
 let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
@@ -102,6 +145,10 @@ let $wait_condition = SELECT VARIABLE_VALUE = 1 FROM performance_schema.global_s
 DROP FUNCTION js_add;
 DROP FUNCTION js_inv;
 DROP FUNCTION py_leftover;
+DROP FUNCTION java_ver;
+DROP FUNCTION java_lib;
+DROP FUNCTION java_count;
+DROP LIBRARY jlib;
 DROP USER u1@localhost;
-REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_mle";

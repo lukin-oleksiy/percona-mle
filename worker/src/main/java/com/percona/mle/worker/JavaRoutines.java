@@ -102,6 +102,23 @@ final class JavaRoutines {
       "\\bpublic\\s+(?:(?:final|abstract|sealed|non-sealed|strictfp)\\s+)*(?:class|record|interface|enum)\\s+(\\w+)");
 
   private final Map<Long, Routine> routines = new HashMap<>();
+
+  /**
+   * Prepared routines kept across sessions (exp note 38), by their content (the compiled unit,
+   * entry, name, parameters, result and USING libraries' text): a later session of the account
+   * gets the same loaded classes, so neither javac nor the JIT starts again. A changed routine or
+   * library is another key. Static fields of a routine's own classes therefore live as long as the
+   * worker, like those of the DBA's jars.
+   */
+  private record Cached(Routine routine, String loaderName, Origin origin) {}
+
+  private static final int CACHE_MAX = 64;
+  private final Map<String, Cached> cache = new java.util.LinkedHashMap<>(16, 0.75f, true) {
+    @Override
+    protected boolean removeEldestEntry(Map.Entry<String, Cached> eldest) {
+      return size() > CACHE_MAX;
+    }
+  };
   /** The API, then the DBA's third-party jars (14 §3), for every routine. */
   private final ClassLoader apiLoader = packageLoader(new ApiLoader(JavaRoutines.class.getClassLoader()));
   private JavaCompiler javac;
@@ -320,9 +337,21 @@ final class JavaRoutines {
       prefix = wrap[0].length();
       unit = wrap[0] + source + wrap[1];
     }
+    StringBuilder k = new StringBuilder(unit.length() + 256).append(unit).append('\0').append(entry).append('\0')
+        .append(routineName).append('\0').append(params).append('\0').append(ret);
+    for (String[] l : libraries) k.append('\0').append(l[0]).append('\0').append(l[1]);
+    String key = k.toString();
+    Cached hit = cache.get(key);
+    if (hit != null) {
+      Routine r = hit.routine();
+      routines.put(id, new Routine(id, r.invoker(), r.converters(), r.names(), r.ret(), r.outs(), r.types()));
+      origins.put(hit.loaderName(), hit.origin());
+      return;
+    }
     Map<String, byte[]> classes = compile(unit, prefix, bodyForm ? name : null, libraries);
     RoutineLoader loader = new RoutineLoader(id, apiLoader, classes);
-    origins.put(LOADER_PREFIX + id, new Origin(name, bodyForm));
+    Origin origin = new Origin(name, bodyForm);
+    origins.put(LOADER_PREFIX + id, origin);
 
     String className;
     String methodName;
@@ -388,7 +417,9 @@ final class JavaRoutines {
     }
     mh = mh.asType(MethodType.genericMethodType(n)).asSpreader(Object[].class, n);
     Values.ParamType[] types = params.stream().map(Param::type).toArray(Values.ParamType[]::new);
-    routines.put(id, new Routine(id, mh, converters, names, ret, outs, types));
+    Routine routine = new Routine(id, mh, converters, names, ret, outs, types);
+    routines.put(id, routine);
+    cache.put(key, new Cached(routine, LOADER_PREFIX + id, origin));
   }
 
   /** OUT/INOUT: a one-element array of the component type; OUT starts as null (0 for primitives). */
