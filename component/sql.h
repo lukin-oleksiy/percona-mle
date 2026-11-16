@@ -105,6 +105,13 @@ class SqlRunner {
   /** Rows of the current result set into result (at most max_rows). */
   bool read_rows(Statement &s, uint32_t max_rows, mle::SqlResultMsg *result);
   void statement_error(Statement &s, mle::SqlResultMsg *result);
+  /** A new statement the server refused: its error (statement_error), the
+      statement closed, the refusal of SQL in a function explained. */
+  void statement_failed(std::unique_ptr<Statement> s,
+                        mle::SqlResultMsg *result);
+  /** The refusal of SQL in a stored function or trigger, in the routine
+      author's terms (and out of the diagnostics area). */
+  void explain_refusal(mle::SqlResultMsg *result);
   void clear_pending_error();
   void close(uint64_t id);
   /** True (and the server's error in result) if statements are not allowed

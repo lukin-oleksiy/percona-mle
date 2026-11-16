@@ -109,7 +109,9 @@ enum class Op : uint32_t {
       stack traces and messages), str entry, str source, u32 n + n x Param,
       u8 has_return [, ParamType return type], u32 n + n x (str schema,
       str library, str alias) libraries of USING (Phase 6; alias "": the
-      library's name). An empty entry means the
+      library's name), str schema (the routine's schema: part of the key of
+      the worker's Java routine cache), u8 check (1 at CREATE: report names
+      that are never defined, exp note 39). An empty entry means the
       source is a routine *body* (CREATE ... AS $$ body $$): the worker
       wraps it with the parameters as named variables (Oracle's form for
       JavaScript). Answered by kResult (OK, or kGuestError with the compile
@@ -278,7 +280,8 @@ enum class ParamMode : uint8_t { kIn = 0, kOut = 1, kInOut = 2 };
              name, str schema, str original table, str charset, str
              collation, u32 field flags.
     Error = str language, str message, u32 n + n x (str function, str file,
-            u32 line, u32 column, u32 end column) stack frames, u32 sql
+            u32 line, u32 column, u32 end column, str text: the frame's
+            source line, may be empty) stack frames, u32 sql
             errno (0 = not a MySQL error), str sqlstate (empty or 5
             characters). The language "MLE-Type" marks a value conversion
             error (Oracle: 6000 "MLE-Type> Cannot convert value ..."). */

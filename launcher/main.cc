@@ -198,7 +198,7 @@ bool Launcher::configure(Reader &r) {
     } else if (m_landlock_abi < kMinLandlockAbi &&
                !cfg.insecure_without_landlock) {
       c.error = "Landlock ABI " + std::to_string(kMinLandlockAbi) +
-                " or later (Linux 6.2) is required to isolate workers; "
+                " or later (Linux 6.12) is required to isolate workers; "
                 "this kernel has " +
                 (m_landlock_abi == 0
                      ? std::string("none (where the kernel has it but does not "

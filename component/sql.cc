@@ -304,8 +304,8 @@ bool SqlRunner::refused_here(SqlResultMsg *result) {
   // The server refuses statements in stored functions and triggers, but its
   // check for direct statements misses a function called by a trigger
   // (in_sub_stmt compared with ==, not as a mask); the prepared path checks
-  // it right. Ask that path once per call, before any statement starts (and
-  // again while it refuses, so that each statement gets the refusal).
+  // it right. Ask that path once per call (and again while it refuses, so
+  // that each refusal is reported).
   if (m_context_checked && !m_refused) return false;
   m_context_checked = true;
   {
@@ -317,23 +317,34 @@ bool SqlRunner::refused_here(SqlResultMsg *result) {
     if (m_refused) statement_error(probe, result);
   }  // closed while its error is in the diagnostics area (closing a failed
      // statement adds an error of its own to an empty one)
-  if (m_refused &&
-      result->sql_errno == ER_STMT_EXECUTION_NOT_ALLOWED_WITHIN_SP_OR_TRG_OR_UDF) {
-    // The server's text names its statement interface ("Prepared Statement
-    // Handle Interface"), which tells a routine's author nothing: the same
-    // error, in their terms. It leaves the diagnostics area; uncaught, it is
-    // reported as the routine's error, with where it happened.
-    clear_pending_error();
-    result->message =
-        "SQL statements are not allowed in stored functions and triggers: "
-        "use a stored procedure";
-  }
+  if (m_refused) explain_refusal(result);
   return m_refused;
+}
+
+void SqlRunner::statement_failed(std::unique_ptr<Statement> s,
+                                 SqlResultMsg *result) {
+  statement_error(*s, result);
+  s.reset();  // closed while its error is in the diagnostics area
+  explain_refusal(result);
+}
+
+void SqlRunner::explain_refusal(SqlResultMsg *result) {
+  if (result->kind != SqlResultKind::kError ||
+      result->sql_errno != ER_STMT_EXECUTION_NOT_ALLOWED_WITHIN_SP_OR_TRG_OR_UDF)
+    return;
+  // The server's text names its statement interface ("Prepared Statement
+  // Handle Interface"), which tells a routine's author nothing: the same
+  // error, in their terms. It leaves the diagnostics area; uncaught, it is
+  // reported as the routine's error, with where it happened.
+  clear_pending_error();
+  result->message =
+      "SQL statements are not allowed in stored functions and triggers: "
+      "use a stored procedure";
 }
 
 void SqlRunner::execute_text(const mle::SqlMsg &request,
                              SqlResultMsg *result) {
-  if (refused_here(result)) return;
+  if (request.params.empty() && refused_here(result)) return;
   if (m_statements.count(request.stmt_id) != 0)
     return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
                      "the statement id is in use");
@@ -362,7 +373,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
   } else {
     failed = mysql_service_mysql_stmt_execute_direct->execute(text, s->h);
   }
-  if (failed) return statement_error(*s, result);
+  if (failed) return statement_failed(std::move(s), result);
   Statement &st = *s;
   m_statements[request.stmt_id] = std::move(s);
   reply(request.stmt_id, st,
@@ -371,7 +382,6 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
 }
 
 void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
-  if (refused_here(result)) return;
   if (m_statements.count(request.stmt_id) != 0)
     return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
                      "the statement id is in use");
@@ -390,7 +400,7 @@ void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
   const mysql_cstring_with_length text{request.statement.data(),
                                        request.statement.size()};
   if (mysql_service_mysql_stmt_execute->prepare(text, s->h))
-    return statement_error(*s, result);
+    return statement_failed(std::move(s), result);
   (void)mysql_service_mysql_stmt_metadata->param_count(s->h, &s->param_count);
   *result = SqlResultMsg();
   result->kind = SqlResultKind::kOk;
