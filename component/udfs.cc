@@ -21,7 +21,8 @@
   Oracle MLE's session UDFs (MySQL manual 26.10, 05 §7):
     mle_session_state(key)  is_active, stdout, stderr, stack_trace,
                             stored_functions, stored_procedures,
-                            stored_programs
+                            stored_programs; and (exp note 39) traceback,
+                            last_output
     mle_session_reset([what])  'stdout', 'stderr', 'output', or no argument
                             for the whole session (workers, programs, stack
                             trace, options, time-zone binding)
@@ -29,6 +30,11 @@
                             only while no programs are cached, else 1123
                             "... Cannot set options of an active session.
                             Please reset the session first."
+  MLE's own:
+    mle_eval(language, code)  a snippet in the session's worker: what it
+                            printed and the value of its last expression
+                            (exp note 39); the language's CREATE privilege;
+                            no SQL.
   Debug builds add mle_debug_worker_pid() for the failure tests.
 */
 
@@ -236,6 +242,35 @@ class mle_set_session_state_impl {
   }
 };
 
+class mle_eval_impl {
+ public:
+  explicit mle_eval_impl(mysqlpp::udf_context &ctx) {
+    if (ctx.get_number_of_args() != 2)
+      throw std::invalid_argument("Wrong argument list: should be (language, code)");
+    ctx.set_arg_type(0, STRING_RESULT);
+    ctx.set_arg_type(1, STRING_RESULT);
+    ctx.mark_arg_nullable(0, false);
+    ctx.mark_arg_nullable(1, false);
+    ctx.mark_result_nullable(true);
+    ctx.mark_result_const(false);
+    utf8_result(ctx);
+  }
+  mysqlpp::udf_result_t<STRING_RESULT> calculate(
+      const mysqlpp::udf_context &ctx) {
+    const auto language = ctx.get_arg<STRING_RESULT>(0);
+    const auto code = ctx.get_arg<STRING_RESULT>(1);
+    const unsigned bit = mle_component::language_bit(std::string(language));
+    if (bit == 0)
+      throw std::invalid_argument("the language must be JAVASCRIPT, PYTHON or JAVA");
+    if ((mle_component::enabled_languages() & bit) == 0)
+      throw std::invalid_argument("the language is not enabled (mle.languages)");
+    Session *s = Session::current(true);
+    if (s == nullptr) throw std::invalid_argument("no MLE session");
+    // An error was reported (my_error): the statement fails with it.
+    return s->eval(bit, std::string(code));
+  }
+};
+
 #ifndef NDEBUG
 /** Debug builds: the pid of the session's worker for the current user
     (failure tests kill it from outside). NULL without a worker. */
@@ -263,6 +298,7 @@ DECLARE_STRING_UDF_AUTO(mle_session_reset)
 DECLARE_INT_UDF_AUTO(mle_set_session_state)
 DECLARE_STRING_UDF_AUTO(mle_packages)
 DECLARE_STRING_UDF_AUTO(mle_packages_refresh)
+DECLARE_STRING_UDF_AUTO(mle_eval)
 #ifndef NDEBUG
 DECLARE_INT_UDF_AUTO(mle_debug_worker_pid)
 #endif
@@ -273,7 +309,8 @@ std::array g_udfs{DECLARE_UDF_INFO_AUTO(mle_session_state),
                   DECLARE_UDF_INFO_AUTO(mle_session_reset),
                   DECLARE_UDF_INFO_AUTO(mle_packages),
                   DECLARE_UDF_INFO_AUTO(mle_packages_refresh),
-                  DECLARE_UDF_INFO_AUTO(mle_set_session_state)
+                  DECLARE_UDF_INFO_AUTO(mle_set_session_state),
+                  DECLARE_UDF_INFO_AUTO(mle_eval)
 #ifndef NDEBUG
                       ,
                   DECLARE_UDF_INFO_AUTO(mle_debug_worker_pid)

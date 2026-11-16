@@ -329,7 +329,12 @@ final class Polyglot {
     if (PYTHON && !venv.isEmpty())
       b.option("python.Executable", Path.of(venv).resolve("bin/python").toString())
           .option("python.ForceImportSite", "true");
-    if (console != null) b.out(console.outStream()).err(console.errStream());
+    if (console != null) {
+      b.out(console.outStream()).err(console.errStream());
+      // The engine's and the languages' own log lines (GraalPy's C API notices, Truffle) are the
+      // worker's diagnostics, not the routine's output (exp note 39): the worker's stderr.
+      b.logHandler(console.log());
+    }
     return b;
   }
 
@@ -476,9 +481,16 @@ final class Polyglot {
                 body = [inner, call, ret]
             mod = ast.Module(body=[fn('__mle_routine', list(params), body)], type_ignores=[])
             ast.fix_missing_locations(mod)
+            try:
+                code = compile(mod, name, 'exec')
+            except SyntaxError as e:
+                # Errors found after parsing (import * in a function, a misplaced nonlocal): the
+                # compiled tree has no source text, and GraalPy fails (UnsupportedOperationException)
+                # to pass such an error to Java. The same error, raised here, passes.
+                raise SyntaxError(e.msg, (name, e.lineno, e.offset, e.text, e.end_lineno, e.end_offset)) from None
             ns = {'__name__': name, 'Mle': mle}
             ns.update(_mle_globals)
-            exec(compile(mod, name, 'exec'), ns)
+            exec(code, ns)
             # Phase 7: fresh globals per call; state belongs in libraries (15 §1). Each call runs
             # the routine's code with a copy of the prepared globals.
             code, base, make = ns['__mle_routine'].__code__, ns, _mle_types_mod.FunctionType
@@ -486,6 +498,71 @@ final class Polyglot {
                 return make(code, base.copy())(*args)
             fresh.__mle_base__ = base
             return fresh
+
+        def _check_names(src, params, known):
+            # CREATE (exp note 39): names the code reads but never binds (a typo such as lenght),
+            # not built-ins, parameters, MLE's globals or USING aliases. Scopes are not told
+            # apart, so it never reports a name bound anywhere; exec/eval/globals/vars and star
+            # imports turn it off. Line numbers are the body's.
+            import ast, textwrap, builtins
+            try:
+                tree = ast.parse(textwrap.dedent(src))
+            except SyntaxError:
+                first, _, rest = src.partition('\\n')
+                try:
+                    tree = ast.parse(first.strip() + '\\n' + textwrap.dedent(rest))
+                except SyntaxError:
+                    return []
+            bound = set(params) | set(known) | set(dir(builtins)) | set(_mle_globals)
+            bound |= {'Mle', '__name__', '__file__', '__doc__'}
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                    bound.add(n.id)
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    bound.add(n.name)
+                elif isinstance(n, ast.arg):
+                    bound.add(n.arg)
+                elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                    for a in n.names:
+                        if a.name == '*':
+                            return []
+                        bound.add((a.asname or a.name).split('.')[0])
+                elif isinstance(n, ast.ExceptHandler) and n.name:
+                    bound.add(n.name)
+                elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                    bound.update(n.names)
+                elif type(n).__name__ in ('MatchAs', 'MatchStar') and getattr(n, 'name', None):
+                    bound.add(n.name)
+                elif type(n).__name__ == 'MatchMapping' and getattr(n, 'rest', None):
+                    bound.add(n.rest)
+                elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                      and n.func.id in ('exec', 'eval', 'globals', 'locals', 'vars')):
+                    return []
+            found = {}
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in bound:
+                    found.setdefault(n.id, n.lineno)
+            return ["line %d: name '%s' is not defined" % (line, name)
+                    for name, line in sorted(found.items(), key=lambda x: x[1])]
+
+        def _load_eval(src, mle):
+            # mle_eval (exp note 39): the snippet's statements, then the value of its last
+            # expression as text (repr, as a REPL shows it; a str as it is), or None.
+            import ast, textwrap
+            tree = ast.parse(textwrap.dedent(src), filename='mle_eval')
+            tail = None
+            if tree.body and isinstance(tree.body[-1], ast.Expr):
+                tail = compile(ast.Expression(tree.body.pop().value), 'mle_eval', 'eval')
+            body = compile(tree, 'mle_eval', 'exec')
+            def run():
+                ns = {'__name__': 'mle_eval', 'Mle': mle}
+                ns.update(_mle_globals)
+                exec(body, ns)
+                if tail is None:
+                    return None
+                v = eval(tail, ns)
+                return None if v is None else v if isinstance(v, str) else repr(v)
+            return run
 
         _mle_helpers = {
             'bytes': lambda b: bytes(b),
@@ -502,7 +579,7 @@ final class Polyglot {
             'toVector': _to_vector,
             'toNumber': lambda v: float(v),
             'loader': _load,
-            'body_loader': _load_body,
+            'body_loader': _load_body, 'eval_loader': _load_eval, 'check_names': _check_names,
             'numpy_buffer': _numpy_buffer,
             'numpy_numbers': _numpy_numbers,
             'numpy_matrix': _numpy_matrix,
@@ -515,6 +592,72 @@ final class Polyglot {
         ns.getHashValue("decimal"), ns.getHashValue("bigint"), ns.getHashValue("str"),
         ns.getHashValue("toJson"), ns.getHashValue("toBytes"), ns.getHashValue("toVector"),
         ns.getHashValue("toNumber"), ns.getHashValue("loader"));
+  }
+
+  /** Set by the dispatcher for a CREATE's PREPARE: also check the code (Python names). */
+  boolean check;
+
+  /** CREATE (exp note 39): the check's findings as marked stderr lines (warnings in mysqld). */
+  private void checkPython(String source, List<JavaRoutines.Param> params, List<LibraryFileSystem.Import> imports) {
+    try {
+      List<String> names = new java.util.ArrayList<>();
+      for (JavaRoutines.Param p : params) names.add(p.name());
+      List<String> known = new java.util.ArrayList<>();
+      for (LibraryFileSystem.Import i : imports) known.add(i.alias().isEmpty() ? i.name() : i.alias());
+      Value found = context.getBindings("python").getMember("_mle_helpers").getHashValue("check_names")
+          .execute(source, names.toArray(), known.toArray());
+      for (long i = 0; i < found.getArraySize(); i++)
+        System.err.println("\u001fmle-check:" + found.getArrayElement(i).asString());
+    } catch (PolyglotException e) {
+      // A check that fails is no reason to refuse the routine; KILL still stops the statement.
+      if (e.isInterrupted() || e.isCancelled() || e.isResourceExhausted()) throw e;
+    } catch (RuntimeException e) {
+      // The same for a host-side failure (an unexpected result type, a GraalPy bug).
+    }
+  }
+
+  /** JavaScript values of mle_eval as text (JSON for objects and arrays, else String(v)). */
+  private Value jsShow;
+
+  /**
+   * mle_eval (exp note 39): a snippet as a routine without parameters whose result is the value
+   * of its last expression as text. JavaScript runs it as a strict-mode block (let/const and
+   * functions stay in it; the script's completion value is the block's), with the routine's URI so
+   * that errors have their location; Python through _load_eval (fresh globals per call).
+   */
+  void prepareEval(long id, String language, String code, Values.ParamType ret)
+      throws JavaRoutines.CompileException {
+    Context c = context();
+    Value fn;
+    try {
+      if (language.equals("js")) {
+        java.net.URI uri = routineUri(id);
+        String prefix = "'use strict';{";
+        prefixes.put(uri, prefix.length());
+        // Syntax errors now, as for a routine, and of the code as written (not of the block).
+        c.parse(Source.newBuilder("js", code, "mle_eval").buildLiteral());
+        Source src = Source.newBuilder("js", prefix + code + "\n}", "mle_eval").uri(uri).buildLiteral();
+        if (jsShow == null)
+          jsShow = c.eval("js", "(v) => v === undefined || v === null ? null : typeof v === 'string' ? v"
+              + " : typeof v === 'object' ? (() => { try { return JSON.stringify(v) } catch (e) { return String(v) } })()"
+              + " : String(v)");
+        Value show = jsShow;
+        fn = c.asValue((org.graalvm.polyglot.proxy.ProxyExecutable) a -> show.execute(c.eval(src)));
+      } else {
+        pythonReady();
+        pythonSources.add("mle_eval");
+        SOURCE_LINES.put("mle_eval", code.split("\n", -1));
+        fn = context.getBindings("python").getMember("_mle_helpers").getHashValue("eval_loader")
+            .execute(code, mleApi);
+      }
+    } catch (PolyglotException e) {
+      if (e.isInterrupted() || e.isCancelled() || e.isResourceExhausted()) throw e;
+      // The message alone: JavaScript's names the place itself, and the server adds the location
+      // of the frames (Python).
+      throw new JavaRoutines.CompileException(describe(e, false));
+    }
+    routines.put(id, new Routine(language, fn, new Value[0], ret, new Values.ParamType[0], new int[0], null,
+        List.of()));
   }
 
   private Value pythonBodyLoader() {
@@ -693,10 +836,12 @@ final class Polyglot {
         SOURCE_LINES.put(name, source.split("\n", -1));
         String[] names = params.stream().map(JavaRoutines.Param::name).toArray(String[]::new);
         fn = pythonBodyLoader().execute(source, name, names, outs.length > 0, mleApi);
+        if (check) checkPython(source, params, imports);
       } else {
         pythonSources.add(name + ".py");
         SOURCE_LINES.put(name + ".py", source.split("\n", -1));
         fn = h.loader().execute(source, name, entry, mleApi);
+        if (check) checkPython(source, List.of(), imports);
       }
     } catch (PolyglotException e) {
       // KILL and exhaustion while loading are not compile errors.

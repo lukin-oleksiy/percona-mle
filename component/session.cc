@@ -17,6 +17,8 @@
 
 #include "session.h"
 
+#include "my_sqlcommand.h"  // enum_sql_command (CREATE checks)
+
 #include <unistd.h>
 
 #include <atomic>
@@ -79,8 +81,9 @@ void clear_server_error(MYSQL_THD thd) {
 class Hooks : public mle::CallHooks {
  public:
   explicit Hooks(MYSQL_THD thd, SqlRunner *sql = nullptr,
-                 const Routine *routine = nullptr)
-      : m_thd(thd), m_sql(sql), m_routine(routine) {}
+                 const Routine *routine = nullptr,
+                 const char *no_sql = "SQL is only possible while a routine runs")
+      : m_thd(thd), m_sql(sql), m_routine(routine), m_no_sql(no_sql) {}
 
   /**
     A database library the routine imports (Phase 6, 14 §2). Importable:
@@ -149,8 +152,7 @@ class Hooks : public mle::CallHooks {
   /** SQL from the routine (Phase 5): the call's statements (sql.cc). */
   void sql(const mle::SqlMsg &m, mle::SqlResultMsg *r) override {
     if (m_sql != nullptr) return m_sql->handle(m, r);
-    sql_error(r, ER_LANGUAGE_COMPONENT_INTERNAL,
-              "SQL is only possible while a routine runs");
+    sql_error(r, ER_LANGUAGE_COMPONENT_INTERNAL, m_no_sql);
   }
 
   /** KILL QUERY / KILL CONNECTION / max_execution_time. */
@@ -164,6 +166,7 @@ class Hooks : public mle::CallHooks {
   MYSQL_THD m_thd;
   SqlRunner *m_sql;
   const Routine *m_routine;
+  const char *m_no_sql;
 };
 
 std::string session_time_zone(MYSQL_THD thd) {
@@ -514,7 +517,48 @@ bool Session::parse(Routine &routine) {
   if (!check_create_privilege(m_thd, routine)) return false;
   const std::string who = principal();
   Slot *slot = worker_for(who, routine);
-  return slot != nullptr && prepare_in(who, *slot, routine);
+  if (slot == nullptr) return false;
+  // CREATE: the worker also checks the code (exp note 39); its findings
+  // become the statement's warnings.
+  enum_sql_command command = SQLCOM_END;
+  (void)mysql_service_mysql_thd_attributes->get(m_thd, "sql_command_id", &command);
+  routine.prepare.check =
+      command == SQLCOM_CREATE_PROCEDURE || command == SQLCOM_CREATE_SPFUNCTION;
+  const bool ok = prepare_in(who, *slot, routine);
+  const bool checked = routine.prepare.check;
+  routine.prepare.check = false;
+  if (ok && checked) check_findings_to_warnings(routine);
+  return ok;
+}
+
+void Session::check_findings_to_warnings(const Routine &routine) {
+  // "\x1f" CHECK_MARK "message" lines of the PREPARE's stderr: warnings, and
+  // not the session's output.
+  constexpr std::string_view kMark = "\x1fmle-check:";
+  auto take = [&](std::string *text, bool emit) {
+    std::string kept;
+    size_t start = 0;
+    while (start < text->size()) {
+      size_t end = text->find('\n', start);
+      if (end == std::string::npos) end = text->size() - 1;
+      const std::string_view line(text->data() + start, end - start + 1);
+      if (line.substr(0, kMark.size()) == kMark) {
+        if (emit) {
+          std::string message = std::string(routine.display_language()) + "> " + routine.name +
+                                ", " + std::string(line.substr(kMark.size()));
+          while (!message.empty() && message.back() == '\n') message.pop_back();
+          mysql_service_mysql_runtime_warning->emit(m_thd, ER_LANGUAGE_COMPONENT,
+                                                    message.c_str());
+        }
+      } else {
+        kept.append(line);
+      }
+      start = end + 1;
+    }
+    *text = std::move(kept);
+  };
+  take(&m_last_err, true);
+  take(&m_err, false);
 }
 
 bool Session::execute(Routine &routine) {
@@ -898,6 +942,68 @@ bool Session::parse_library(unsigned language, const std::string &name,
   if (s == Status::kOk) return true;
   report(who, s, result, error, routine, nullptr);
   return false;
+}
+
+std::optional<std::string> Session::eval(unsigned language,
+                                         const std::string &code) {
+  // A snippet in the session's worker for this account, like a routine
+  // without CREATE (exp note 39): the language's CREATE privilege, since the
+  // same code could be put in a routine.
+  Routine routine;
+  routine.id = next_routine_id();
+  routine.language = language;
+  routine.name = "mle_eval";
+  routine.qualified_name = "mle_eval";
+  if (!has_global_privilege(m_thd, privilege_of(routine))) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), privilege_of(routine));
+    return std::nullopt;
+  }
+  mle::PrepareMsg &m = routine.prepare;
+  m.routine_id = routine.id;
+  m.language = worker_language(language);
+  m.name = routine.name;
+  m.entry = "<eval>";  // the worker evaluates the code and returns its value as text
+  m.source = code;
+  mle::ParamType text;
+  text.tag = mle::Tag::kString;
+  text.type_name = "LONGTEXT";
+  m.returns = text;
+
+  const std::string who = principal();
+  Slot *slot = worker_for(who, routine);
+  if (slot == nullptr || !prepare_in(who, *slot, routine)) {
+    forget(routine);
+    return std::nullopt;
+  }
+  // A function in a SELECT: no statements (they need a stored program's
+  // context).
+  Hooks hooks(m_thd, nullptr, &routine,
+              "mle_eval cannot run SQL: put the code in a procedure to run SQL");
+  ResultMsg result;
+  std::string error;
+  Status s;
+  {
+    const KillGuard kill(this, slot->worker.get());
+    s = slot->worker->call(routine.id, 0, {}, hooks, &result, &error);
+  }
+  keep_console(result);
+  m_console_now = (s != Status::kOk || !result.console_out.empty() ||
+                   !result.console_err.empty()) &&
+                  console_warnings(m_thd);
+  if (m_console_now) console_to_warnings(routine, result);
+  if (s != Status::kOk) {
+    report(who, s, result, error, routine, nullptr);
+    forget(routine);
+    return std::nullopt;
+  }
+  forget(routine);
+  // What it printed, then its value (as a REPL shows them); NULL for neither.
+  std::string out = result.console_out + result.console_err;
+  const bool value =
+      result.ret && !result.ret->is_null() && result.ret->tag() == mle::Tag::kString;
+  if (value) out += result.ret->as_text();
+  if (out.empty() && !value) return std::nullopt;
+  return out;
 }
 
 bool has_global_privilege(MYSQL_THD thd, const char *privilege) {

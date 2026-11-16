@@ -240,6 +240,7 @@ final class Dispatcher {
     List<LibraryFileSystem.Import> imports = new ArrayList<>(ni);
     for (int i = 0; i < ni; i++) imports.add(new LibraryFileSystem.Import(r.str(), r.str(), r.str()));
     String schema = r.str();
+    boolean check = r.flag();
     r.finish();
 
     // Java routines need the JVM build (23); mysqld refuses them earlier (the worker's READY).
@@ -263,8 +264,19 @@ final class Dispatcher {
       // A routine id is prepared again after ALTER; it may change language.
       java.drop(id);
       polyglot.drop(id);
-      if (javaRoutine) java.prepare(id, schema, name, entry, source, params, ret, imports);
-      else polyglot.prepare(id, language, name, entry, source, params, ret, imports);
+      if (entry.equals("<eval>")) {  // mle_eval (exp note 39)
+        if (javaRoutine) java.prepareEval(id, source);
+        else polyglot.prepareEval(id, language, source, ret);
+      } else if (javaRoutine) {
+        java.prepare(id, schema, name, entry, source, params, ret, imports);
+      } else {
+        polyglot.check = check;
+        try {
+          polyglot.prepare(id, language, name, entry, source, params, ret, imports);
+        } finally {
+          polyglot.check = false;
+        }
+      }
     } catch (JavaRoutines.CompileException e) {
       compileError = e.getMessage();
     } catch (Throwable t) {

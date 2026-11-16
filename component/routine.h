@@ -119,6 +119,9 @@ struct Routine {
     none or an unknown one). */
 const char *worker_language(unsigned bit);
 
+/** A new routine id (also for mle_eval's snippets). */
+uint64_t next_routine_id();
+
 /** Display name of a worker error language ("js" -> "JavaScript"). */
 const char *display_language(const std::string &worker_language);
 

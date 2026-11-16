@@ -98,7 +98,7 @@ std::vector<std::string> seed_messages() {
   result.ret = Value::string("ok");
   result.out_params.emplace_back(0, Value::i64(1));
   result.console_out = "out";
-  result.error = Error{"python", "boom", {{"f", "r.py", 1, 2}}, 1146, "42S02"};
+  result.error = Error{"python", "boom", {{"f", "r.py", 1, 2, "return 1 // 0"}}, 1146, "42S02"};
   add(result);
   SqlMsg sql;
   sql.action = wire::SqlAction::kExecutePrepared;

@@ -500,6 +500,8 @@ const char *Routine::display_language() const {
                                  : "Java";
 }
 
+uint64_t next_routine_id() { return ++g_next_id; }
+
 Routine *Routine::create(stored_program_handle sp) {
   auto get_string = [&](const char *key) {
     mysql_cstring_with_length v{nullptr, 0};

@@ -70,6 +70,10 @@ class Session {
   bool parse(Routine &routine);
   /** CREATE LIBRARY: syntax check in the account's worker; false after
       reporting the error (6113 "JavaScript> SyntaxError: ..."). */
+  /** mle_eval(language, code): what the snippet printed and its value; nullopt
+      after reporting an error (exp note 39). */
+  std::optional<std::string> eval(unsigned language, const std::string &code);
+
   bool parse_library(unsigned language, const std::string &name,
                      const std::string &body);
   /** Runs the routine for the current principal. False after reporting
@@ -175,6 +179,8 @@ class Session {
   /** mle.console: the lines a call printed, as warnings. */
   void console_to_warnings(const Routine &routine, const mle::ResultMsg &result);
   void lines_to_warnings(const std::string &text, const std::string &prefix);
+  /** CREATE: the worker's check findings (marked stderr lines) as warnings. */
+  void check_findings_to_warnings(const Routine &routine);
   /** Routine id -> its type (stored_functions / stored_procedures). */
   std::map<uint64_t, uint16_t> m_programs;
 };

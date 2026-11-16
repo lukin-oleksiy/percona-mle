@@ -346,7 +346,7 @@ final class JavaRoutines {
         .append(schema).append('\0').append(routineName).append('\0').append(params).append('\0').append(ret);
     for (String[] l : libraries) k.append('\0').append(l[0]).append('\0').append(l[1]);
     String key = k.toString();
-    Cached hit = cache.get(key);
+    Cached hit = noCache ? null : cache.get(key);
     if (hit != null) {
       Routine r = hit.routine();
       routines.put(id, new Routine(id, r.invoker(), r.converters(), r.names(), r.ret(), r.outs(), r.types()));
@@ -425,7 +425,40 @@ final class JavaRoutines {
     Values.ParamType[] types = params.stream().map(Param::type).toArray(Values.ParamType[]::new);
     Routine routine = new Routine(id, mh, converters, names, ret, outs, types);
     routines.put(id, routine);
-    cache.put(key, new Cached(routine, LOADER_PREFIX + id, origin));
+    if (!noCache) cache.put(key, new Cached(routine, LOADER_PREFIX + id, origin));
+  }
+
+  /** mle_eval's snippets are not kept (exp note 39). */
+  private boolean noCache;
+
+  /**
+   * mle_eval (exp note 39): a snippet as a body-form routine returning its value as text. Tried
+   * as an expression, then as statements (no value), then as statements with their own return;
+   * the code starts on line 1 in each, so line numbers are the snippet's.
+   */
+  void prepareEval(long id, String code) throws CompileException {
+    Values.ParamType text = new Values.ParamType(Wire.T_STRING, false, 0, 0, 0, "LONGTEXT");
+    String[] forms = {
+        "return String.valueOf((Object) (" + code + "\n));",
+        code + "\nreturn null;",
+        "return String.valueOf(new Object() { Object run() { " + code + "\n} }.run());"};
+    CompileException first = null, statements = null;
+    noCache = true;
+    try {
+      for (int i = 0; i < forms.length; i++) {
+        try {
+          prepareWith(id, "", "mle_eval", "", forms[i], List.of(), text, List.of());
+          return;
+        } catch (CompileException e) {
+          if (i == 0) first = e;
+          if (i == 1) statements = e;
+        }
+      }
+    } finally {
+      noCache = false;
+    }
+    // The likely intent: one expression (no ';'), else statements.
+    throw code.contains(";") ? statements : first;
   }
 
   /** Drops the kept routine with r's code (its classes are unusable). */

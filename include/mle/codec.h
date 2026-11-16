@@ -222,6 +222,9 @@ struct PrepareMsg {
   /** The routine's schema: the worker keeps routines by schema too
       (JavaRoutines' cache: db1.f and db2.f with the same text are not one). */
   std::string schema;
+  /** CREATE: also check the code beyond its syntax (Python: names never
+      defined); findings come back as marked stderr lines (exp note 39). */
+  bool check = false;
   bool operator==(const PrepareMsg &) const = default;
 };
 
