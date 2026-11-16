@@ -442,6 +442,60 @@ final class Polyglot {
         # The SQL API's globals (session, mysql, SqlError), filled by PySql.
         _mle_globals = {}
 
+        # Errors of JavaScript and Java in Python code (exp note 41). GraalPy gives Python the
+        # other languages' exceptions as polyglot.ForeignException, which derives from
+        # BaseException only: the usual `except Exception` let them through. Java's become
+        # Exceptions for all Python code (register_interop_type); for JavaScript's, the code MLE
+        # compiles (routine bodies, libraries, mle_eval) gets ForeignException added where it
+        # says `except Exception`. (A single underscore: a dunder name is mangled in classes.)
+        import ast as _mle_ast, polyglot as _mle_polyglot
+        _mle_globals['_mle_ForeignException'] = _mle_polyglot.ForeignException
+        try:
+            import java as _mle_java
+
+            class JavaError(Exception):
+                pass  # Java exceptions in Python code (they are also polyglot.ForeignException)
+
+            _mle_polyglot.register_interop_type(_mle_java.type('java.lang.Throwable'), JavaError)
+        except BaseException:
+            pass  # the Python-only native build has no Java
+
+        def _mle_register_row(row_class):
+            # Python's rows (exp note 41): row['label'] besides row.label and row[0]; iteration and
+            # len() stay a tuple's.
+            class Row:
+                def __getitem__(self, key):
+                    if isinstance(key, str):
+                        try:
+                            return getattr(self, key)
+                        except AttributeError:
+                            raise KeyError(key) from None
+                    return _mle_polyglot.ForeignList.__getitem__(self, key)
+            _mle_polyglot.register_interop_type(row_class, Row, allow_method_overwrites=True)
+
+        class _MleCatchForeign(_mle_ast.NodeTransformer):
+            def visit_ExceptHandler(self, node):
+                self.generic_visit(node)
+                def is_exception(n):
+                    return isinstance(n, _mle_ast.Name) and n.id == 'Exception'
+                extra = _mle_ast.Name(id='_mle_ForeignException', ctx=_mle_ast.Load())
+                if is_exception(node.type):
+                    node.type = _mle_ast.Tuple(elts=[node.type, extra], ctx=_mle_ast.Load())
+                elif isinstance(node.type, _mle_ast.Tuple) and any(is_exception(e) for e in node.type.elts):
+                    node.type.elts.append(extra)
+                return node
+
+        def _mle_compile(tree, name):
+            # A tree with `except Exception` catching foreign errors, compiled. A SyntaxError found
+            # after parsing (import * in a function, a misplaced nonlocal) is raised again with its
+            # location: GraalPy fails (UnsupportedOperationException) to pass one of a compiled
+            # tree to Java.
+            tree = _mle_ast.fix_missing_locations(_MleCatchForeign().visit(tree))
+            try:
+                return compile(tree, name, 'exec')
+            except SyntaxError as e:
+                raise SyntaxError(e.msg, (name, e.lineno, e.offset, e.text, e.end_lineno, e.end_offset)) from None
+
         def _load(src, name, entry, mle):
             ns = {'__name__': name, 'Mle': mle}
             ns.update(_mle_globals)
@@ -481,13 +535,7 @@ final class Polyglot {
                 body = [inner, call, ret]
             mod = ast.Module(body=[fn('__mle_routine', list(params), body)], type_ignores=[])
             ast.fix_missing_locations(mod)
-            try:
-                code = compile(mod, name, 'exec')
-            except SyntaxError as e:
-                # Errors found after parsing (import * in a function, a misplaced nonlocal): the
-                # compiled tree has no source text, and GraalPy fails (UnsupportedOperationException)
-                # to pass such an error to Java. The same error, raised here, passes.
-                raise SyntaxError(e.msg, (name, e.lineno, e.offset, e.text, e.end_lineno, e.end_offset)) from None
+            code = _mle_compile(mod, name)
             ns = {'__name__': name, 'Mle': mle}
             ns.update(_mle_globals)
             exec(code, ns)
@@ -553,7 +601,7 @@ final class Polyglot {
             tail = None
             if tree.body and isinstance(tree.body[-1], ast.Expr):
                 tail = compile(ast.Expression(tree.body.pop().value), 'mle_eval', 'eval')
-            body = compile(tree, 'mle_eval', 'exec')
+            body = _mle_compile(tree, 'mle_eval')
             def run():
                 ns = {'__name__': 'mle_eval', 'Mle': mle}
                 ns.update(_mle_globals)
@@ -719,6 +767,7 @@ final class Polyglot {
             'numpy_matrix': _numpy_matrix,
             'numpy_empty': _numpy_empty,
             'import_foreign': _import_for_foreign,
+            'register_row': _mle_register_row,
             'dict': lambda: {},
         }
         _mle_helpers
@@ -1027,6 +1076,8 @@ final class Polyglot {
     Helpers h = pythonHelpers(c);
     c.getBindings("python").getMember("_mle_helpers").putHashEntry("bulk",
         (org.graalvm.polyglot.proxy.ProxyExecutable) a -> bulkArray(a[0]));
+    // Python's rows take row['label'] (exp note 41): a Python class registered for their proxy class.
+    pythonHelper0(c, "register_row").execute(c.asValue(GuestSql.GPyRow.class).getMember("static"));
     pySql = new PySql(c, options, a -> libraryModule(a[0].asString(), a[1].asString(), false),
         a -> importJs(a[0].asString()));
     python = h;
@@ -1217,6 +1268,10 @@ final class Polyglot {
     }
     ((java.lang.foreign.MemorySegment) buf[1]).copyFrom(ref.data());
     return buf[0];
+  }
+
+  private static Value pythonHelper0(Context c, String name) {
+    return c.getBindings("python").getMember("_mle_helpers").getHashValue(name);
   }
 
   Value pythonHelper(String name) {

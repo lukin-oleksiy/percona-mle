@@ -172,7 +172,7 @@ final class PySql implements GuestSql.Lang {
               # partly initialised module instead of recursing.
               cache[key] = (h, m)
               try:
-                  exec(compile(src, key, 'exec'), m.__dict__)
+                  exec(_mle_compile(_mle_ast.parse(src, key), key), m.__dict__)
               except BaseException:
                   del cache[key]
                   raise
@@ -276,6 +276,11 @@ final class PySql implements GuestSql.Lang {
   }
 
   /** snake_case (run_sql) as the API's camelCase (runSql); names starting with _ unchanged. */
+  @Override
+  public Object row(com.percona.mle.sql.Row row) {
+    return new GuestSql.GPyRow(this, row);
+  }
+
   @Override
   public String member(String name) {
     if (name.indexOf('_') < 0 || name.startsWith("_")) return name;

@@ -618,9 +618,15 @@ final class JavaRoutines {
         String library = d.getSource() == null ? null : libraryNames.get(d.getSource());
         long column = library == null && d.getLineNumber() == 1 ? Math.max(1, d.getColumnNumber() - prefix)
             : d.getColumnNumber();
+        String text = d.getMessage(Locale.ROOT);
+        // A body's class is MLE's wrapper: javac's "location: class MleRoutineBody" means the
+        // routine (exp note 41).
+        if (library == null && typeName.equals(BODY_CLASS))
+          text = text.replace("class " + BODY_CLASS, "routine " + (display != null ? display : "body"))
+              .replace(BODY_CLASS, display != null ? display : "body");
         msg.append(library != null ? "library " + library : display != null ? display : typeName + ".java")
             .append(':').append(d.getLineNumber()).append(':').append(column)
-            .append(": ").append(d.getMessage(Locale.ROOT));
+            .append(": ").append(text);
       }
       throw new CompileException(msg.isEmpty() ? "compilation failed" : msg.toString());
     }

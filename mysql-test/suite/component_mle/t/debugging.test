@@ -135,6 +135,10 @@ CREATE FUNCTION py_star_import() RETURNS DOUBLE LANGUAGE PYTHON AS $$
 from math import *
 return sqrt(4)
 $$;
+--echo # Java is compiled at CREATE; javac's messages name the routine, not MLE's
+--echo # wrapper class.
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CREATE FUNCTION java_typo(a INT) RETURNS INT LANGUAGE JAVA AS $$ int total = a + 1; return totl; $$;
 --echo # The routine runs; later loads do not repeat the warning, and the
 --echo # findings are not in the session's stderr.
 SELECT py_typo('ab');

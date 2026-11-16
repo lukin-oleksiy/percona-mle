@@ -57,6 +57,8 @@ CREATE PROCEDURE py_sql(OUT r TEXT) LANGUAGE PYTHON AS $$
     session.run_sql("INSERT INTO items VALUES (4, 'plum', 1.10, STRING_TO_VECTOR('[1, 1, 0]'))")
     session.rollback()
     out.append('after rollback: ' + str(session.run_sql('SELECT COUNT(*) AS n FROM items').fetch_one().n))
+    r = session.run_sql('SELECT 7 AS n, 8 AS m').fetch_one()
+    out.append('row by label: %s %s, by index: %s, values: %s' % (r['n'], r['m'], r[1], list(r)))
     r = '\n'.join(out)
 $$;
 CREATE LIBRARY pyprices LANGUAGE PYTHON AS $$

@@ -47,6 +47,7 @@ SELECT @r;
 cheap: apple,pear
 columns: (3, 3) float32 [1, 2, 3]
 after rollback: 3
+row by label: 7 8, by index: 8, values: [7, 8]
 SELECT py_vat(price) FROM items ORDER BY id;
 py_vat(price)
 0.6

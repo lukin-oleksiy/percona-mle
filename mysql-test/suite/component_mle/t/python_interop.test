@@ -1,0 +1,99 @@
+--echo #
+--echo # component_mle: Python code and the other languages (exp note 41).
+--echo # 1. except Exception catches errors of JavaScript and Java (GraalPy gives
+--echo #    them as polyglot.ForeignException, a BaseException only): Java's by a
+--echo #    registered interop type, JavaScript's by MLE's compilation of routine,
+--echo #    library and mle_eval code.
+--echo # 2. Rows take row['label'] besides row.label and row[0]; iteration and
+--echo #    len() stay a tuple's.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+CREATE LIBRARY jsv LANGUAGE JAVASCRIPT AS $$
+export function boom() { throw new RangeError('out of range') }
+$$;
+--write_file $MYSQLTEST_VARDIR/tmp/python_interop.sql
+CREATE FUNCTION py_exc() RETURNS TEXT LANGUAGE PYTHON USING (jsv) AS $$
+    import java
+    out = []
+    try:
+        jsv.boom()
+    except Exception as e:
+        out.append('js: ' + str(e))
+    try:
+        java.type('java.lang.Integer').parseInt('x')
+    except Exception as e:
+        out.append('java: ' + str(e))
+    try:
+        jsv.boom()
+    except (ValueError, Exception):
+        out.append('in a tuple')
+    class C:
+        def f(self):
+            try:
+                jsv.boom()
+            except Exception:
+                return 'in a class'
+    out.append(C().f())
+    try:
+        jsv.boom()
+    except ValueError:
+        out.append('wrong')
+    except BaseException:
+        out.append('not by ValueError')
+    return ' | '.join(out)
+$$;
+CREATE LIBRARY pycatch LANGUAGE PYTHON AS $$
+def safe(f):
+    try:
+        return f()
+    except Exception as e:
+        return 'library caught: ' + str(e)
+$$;
+CREATE FUNCTION py_lib_catch() RETURNS TEXT LANGUAGE PYTHON USING (jsv, pycatch) AS $$
+    return pycatch.safe(jsv.boom)
+$$;
+CREATE PROCEDURE py_rows(OUT r TEXT) LANGUAGE PYTHON AS $$
+    row = session.run_sql("SELECT 1 AS a, 'x' AS name, NULL AS n").fetch_one()
+    out = []
+    for f in (lambda: row['name'], lambda: row['a'], lambda: row[0], lambda: row[1], lambda: row.name,
+              lambda: len(row), lambda: list(row), lambda: row['n'], lambda: row['nope']):
+        try:
+            out.append(str(f()))
+        except Exception as e:
+            out.append(type(e).__name__)
+    r = ' | '.join(out)
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/python_interop.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/python_interop.sql
+--echo # 1.
+SELECT py_exc();
+SELECT py_lib_catch();
+SELECT mle_eval('python', 'import java\ntry:\n  java.type("java.lang.Integer").parseInt("y")\nexcept Exception as e:\n  print("mle_eval caught it")');
+--echo # 2.
+CALL py_rows(@r);
+SELECT @r;
+--echo # JavaScript rows are unchanged.
+CREATE PROCEDURE js_rows(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const row = session.runSql("SELECT 1 AS a, 'x' AS name").fetchOne()
+  r = [row.name, row['name'], row[0], row.length, [...row].join(',')].join(' | ')
+$$;
+CALL js_rows(@r);
+SELECT @r;
+
+--disconnect con1
+--connection default
+DROP FUNCTION py_exc;
+DROP FUNCTION py_lib_catch;
+DROP PROCEDURE py_rows;
+DROP PROCEDURE js_rows;
+DROP LIBRARY jsv;
+DROP LIBRARY pycatch;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

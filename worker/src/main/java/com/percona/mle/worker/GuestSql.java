@@ -86,6 +86,11 @@ final class GuestSql {
       return ProxyObject.fromMap(m);
     }
 
+    /** A row for the guest (Python's rows also take row['label'], exp note 41). */
+    default Object row(Row row) {
+      return new GRow(this, row);
+    }
+
     /** The guest's null (JS null; Python None, not a foreign null). */
     default Object none() {
       return null;
@@ -359,7 +364,7 @@ final class GuestSql {
           if (!hasNext()) throw new java.util.NoSuchElementException();
           Row row = next;
           next = null;
-          return new GRow(lang, row);
+          return lang.row(row);
         }
       };
     }
@@ -374,11 +379,11 @@ final class GuestSql {
       return switch (name) {
         case "fetchOne" -> {
           Row row = r.fetchOne();
-          yield row == null ? null : new GRow(lang, row);
+          yield row == null ? null : lang.row(row);
         }
         case "fetchAll" -> {
           List<Object> l = new ArrayList<>();
-          for (Row row : r.fetchAll()) l.add(new GRow(lang, row));
+          for (Row row : r.fetchAll()) l.add(lang.row(row));
           yield lang.list(l);
         }
         case "hasData" -> r.hasData();
@@ -459,9 +464,9 @@ final class GuestSql {
   }
 
   /** A row: methods getField/getLength/toArray, columns by label, values by index. */
-  static final class GRow implements ProxyObject, ProxyArray {
-    private final Lang lang;
-    private final Row row;
+  static class GRow implements ProxyObject, ProxyArray {
+    final Lang lang;
+    final Row row;
 
     GRow(Lang lang, Row row) {
       this.lang = lang;
@@ -530,6 +535,13 @@ final class GuestSql {
     @Override
     public long getSize() {
       return row.getLength();
+    }
+  }
+
+  /** Python's rows (exp note 41): row['label'] comes from a Python class registered for it. */
+  static final class GPyRow extends GRow {
+    GPyRow(Lang lang, Row row) {
+      super(lang, row);
     }
   }
 

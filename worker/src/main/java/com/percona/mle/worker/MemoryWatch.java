@@ -35,8 +35,15 @@ import java.util.concurrent.locks.LockSupport;
  *   <li>it is above half of the worker's memory limit (mle.memoryMax, from mle.memory_max);
  *   <li>it has grown by a tenth of the limit since the last GC (or since the lowest size seen);
  *   <li>at the rate it grew over the last ~50 ms, it would pass 85 % of the limit within 250 ms
- *       (a full GC takes ~150 ms).
+ *       (a full GC takes ~150 ms), or it is above 70 % of the limit already.
  * </ul>
+ * And above 85 % of the limit at most every 50 ms (or twice the last GC's time), whatever the
+ * growth. Measured under load (16 busy threads on 16 CPUs): a forced GC took 250-800 ms, and
+ * numpy's native code kept allocating meanwhile (a JVM pause doesn't stop native code); the frees
+ * show only after the GC. The 70 % floor and the 85 % rule keep collecting there, and the
+ * launcher sets the cgroup's memory.high to 90 % of memory.max, so that the kernel throttles the
+ * allocating thread instead of killing the worker. numpy_memory.test failed 1 run in 3 under that
+ * load before, none in 12 after (exp note 41).
  * The rate is what tells garbage from data (exp note 36): a numpy loop of large temporaries grows
  * at several GB/s and is collected as soon as it passes half the limit, as before; a call that
  * builds large live data (fetch_columns of 100k x VECTOR(768), 300 MB at ~1 GB/s) is left alone
@@ -74,6 +81,8 @@ final class MemoryWatch implements Runnable {
   private final long[] sizes = new long[WINDOW];
   private final long[] times = new long[WINDOW];
   private int samples;
+  /** When the last forced GC ended (System.nanoTime), and how long it took. */
+  private long lastGc, lastGcNs;
 
   private MemoryWatch(long limit) {
     this.limit = limit;
@@ -147,11 +156,21 @@ final class MemoryWatch implements Runnable {
     times[samples % WINDOW] = now;
     if (++samples == 2 * WINDOW) samples = WINDOW;  // the same ring positions, no overflow
     if (rss < base) base = rss;
-    if (rss > limit / 2 && rss - base > limit / 10 && rss + growth(HORIZON_NS) > limit / 100 * 85) {
-      System.gc();
+    // Near the limit, collect again as soon as the last GC's frees could have shown, but spend at
+    // most a third of the time in GC (a call that really holds that much data is slowed, not
+    // stopped; the cgroup's memory.high throttles its allocations meanwhile).
+    boolean near = rss > limit / 100 * 85 && now - lastGc > Math.max(50_000_000L, 2 * lastGcNs);
+    if (near || (rss > limit / 2 && rss - base > limit / 10
+        && (rss > limit / 100 * 70 || rss + growth(HORIZON_NS) > limit / 100 * 85))) {
+      // Counted first: a GC can outlast the call (~150 ms, more on a busy host), and the call's
+      // statistics (sent with its RESULT) must include it; RESET clears the count afterwards.
       GCS.incrementAndGet();
+      long t0 = System.nanoTime();
+      System.gc();
       long after = rss();
       base = after < 0 ? rss : after;
+      lastGc = System.nanoTime();
+      lastGcNs = lastGc - t0;
       samples = 0;
     }
   }

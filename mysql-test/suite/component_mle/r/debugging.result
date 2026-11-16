@@ -183,6 +183,12 @@ from math import *
 return sqrt(4)
 $$;
 ERROR HY000: Python> SyntaxError: import * only allowed at module level (py_star_import, line 2)
+# Java is compiled at CREATE; javac's messages name the routine, not MLE's
+# wrapper class.
+CREATE FUNCTION java_typo(a INT) RETURNS INT LANGUAGE JAVA AS $$ int total = a + 1; return totl; $$;
+ERROR HY000: Java> java_typo:1:28: cannot find symbol
+  symbol:   variable totl
+  location: routine java_typo
 # The routine runs; later loads do not repeat the warning, and the
 # findings are not in the session's stderr.
 SELECT py_typo('ab');
