@@ -564,6 +564,140 @@ final class Polyglot {
                 return None if v is None else v if isinstance(v, str) else repr(v)
             return run
 
+        # numpy from JavaScript and Java (exp note 41). GraalPy gives Python their arrays as
+        # polyglot.ForeignList (a list subclass) that numpy's C code cannot read (RecursionError),
+        # and numpy's scalars reach the other languages as objects. So: (A) at numpy's first
+        # import its scalar types become numbers for the other languages; (B2) numpy.array,
+        # asarray and asanyarray take foreign arrays; (B1) modules imported from JavaScript or
+        # Java convert the arguments of their functions. Arrays are copied, as VECTOR arguments.
+        import importlib as _mle_importlib, importlib.util as _mle_importlib_util
+        import polyglot as _mle_polyglot, sys as _mle_sys
+
+        def _numpy_empty(shape, dtype):
+            # For the host's bulk copy (Polyglot.bulkArray): a new array and its data address.
+            import numpy
+            a = numpy.empty(shape, dtype=dtype)
+            return (a, a.__array_interface__['data'][0])
+
+        def _mle_to_py(v, numpy_ok=True):
+            # A foreign array as a numpy array (numpy_ok) or a Python list; nested ones too.
+            if isinstance(v, _mle_polyglot.ForeignList):
+                bulk = _mle_helpers.get('bulk')
+                a = bulk(v) if bulk is not None else None
+                if a is not None:
+                    return a if numpy_ok else a.tolist()
+                return [_mle_to_py(x, numpy_ok) for x in v]
+            if type(v) in (list, tuple) and v and isinstance(v[0], _mle_polyglot.ForeignList):
+                return type(v)(_mle_to_py(x, numpy_ok) for x in v)
+            return v
+
+        def _mle_numpy_ready(np):
+            def integral(v):
+                x = v.item()
+                if isinstance(x, int):
+                    return int(x)
+                if isinstance(x, float) and x.is_integer():
+                    return int(x)
+                return None
+            def fits(lo, hi):
+                def f(v):
+                    i = integral(v)
+                    return i is not None and lo <= i <= hi
+                return f
+            def fits_float(v):
+                x = float(v.item())
+                return x != x or x in (float('inf'), float('-inf')) or float(np.float32(x)) == x
+            def fits_double(v):
+                x = v.item()
+                return isinstance(x, float) or -2 ** 53 <= x <= 2 ** 53
+            number = dict(
+                is_number=True,
+                fits_in_byte=fits(-2 ** 7, 2 ** 7 - 1), fits_in_short=fits(-2 ** 15, 2 ** 15 - 1),
+                fits_in_int=fits(-2 ** 31, 2 ** 31 - 1), fits_in_long=fits(-2 ** 63, 2 ** 63 - 1),
+                fits_in_big_integer=lambda v: integral(v) is not None,
+                fits_in_float=fits_float, fits_in_double=fits_double,
+                as_byte=integral, as_short=integral, as_int=integral, as_long=integral,
+                as_big_integer=integral,
+                as_float=lambda v: float(v.item()), as_double=lambda v: float(v.item()))
+            for t in (np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32,
+                      np.uint64, np.float16, np.float32, np.float64):
+                _mle_polyglot.register_interop_behavior(t, **number)
+            _mle_polyglot.register_interop_behavior(np.bool_, is_boolean=True,
+                                                    as_boolean=lambda v: bool(v))
+            for name in ('array', 'asarray', 'asanyarray'):
+                def taking_foreign(obj, *args, _orig=getattr(np, name), **kwargs):
+                    return _orig(_mle_to_py(obj), *args, **kwargs)
+                orig = getattr(np, name)
+                taking_foreign.__name__ = orig.__name__
+                taking_foreign.__qualname__ = orig.__name__
+                taking_foreign.__doc__ = orig.__doc__
+                taking_foreign.__wrapped__ = orig
+                setattr(np, name, taking_foreign)
+
+        class _MleNumpyHook:
+            # Runs _mle_numpy_ready once, right after numpy is first imported (by any route).
+            busy = False
+            def find_spec(self, name, path=None, target=None):
+                if name != 'numpy' or self.busy:
+                    return None
+                self.busy = True
+                try:
+                    spec = _mle_importlib_util.find_spec('numpy')
+                finally:
+                    self.busy = False
+                if spec is None or spec.loader is None:
+                    return spec
+                hook, run = self, spec.loader.exec_module
+                def exec_module(module):
+                    run(module)
+                    _mle_numpy_ready(module)
+                    if hook in _mle_sys.meta_path:
+                        _mle_sys.meta_path.remove(hook)
+                spec.loader.exec_module = exec_module
+                return spec
+
+        if 'numpy' in _mle_sys.modules:
+            _mle_numpy_ready(_mle_sys.modules['numpy'])
+        else:
+            _mle_sys.meta_path.insert(0, _MleNumpyHook())
+
+        class _MleCallable:
+            # A function of a module imported from JavaScript or Java: foreign array arguments
+            # are converted first (numpy arrays for numpy, Python lists for other modules).
+            __slots__ = ('_f', '_np')
+            def __init__(self, f, np):
+                object.__setattr__(self, '_f', f)
+                object.__setattr__(self, '_np', np)
+            def __call__(self, *args, **kwargs):
+                np = self._np
+                return self._f(*[_mle_to_py(a, np) for a in args],
+                               **{k: _mle_to_py(v, np) for k, v in kwargs.items()})
+            def __getattr__(self, name):
+                return getattr(self._f, name)
+            def __repr__(self):
+                return repr(self._f)
+
+        class _MleModule:
+            __slots__ = ('_m', '_np')
+            def __init__(self, m):
+                object.__setattr__(self, '_m', m)
+                object.__setattr__(self, '_np', m.__name__.split('.')[0] == 'numpy')
+            def __getattr__(self, name):
+                v = getattr(self._m, name)
+                if isinstance(v, _mle_types_mod.ModuleType):
+                    return _MleModule(v)
+                if callable(v):
+                    return _MleCallable(v, self._np)
+                return v
+            def __dir__(self):
+                return dir(self._m)
+            def __repr__(self):
+                return repr(self._m)
+
+        def _import_for_foreign(name):
+            # importPython (JavaScript) and Mle.importPython (Java).
+            return _MleModule(_mle_importlib.import_module(name))
+
         _mle_helpers = {
             'bytes': lambda b: bytes(b),
             'vector': _vector,
@@ -583,6 +717,8 @@ final class Polyglot {
             'numpy_buffer': _numpy_buffer,
             'numpy_numbers': _numpy_numbers,
             'numpy_matrix': _numpy_matrix,
+            'numpy_empty': _numpy_empty,
+            'import_foreign': _import_for_foreign,
             'dict': lambda: {},
         }
         _mle_helpers
@@ -741,10 +877,133 @@ final class Polyglot {
 
   /** importPython(name) / Mle.importPython: a Python module (numpy ...) for any language. */
   Value importPython(String module) {
-    Context c = context();
     if (!PYTHON)
       throw new IllegalStateException("Python is not installed in this MLE (package percona-mle-python)");
-    return c.eval("python", "import importlib\nlambda n: importlib.import_module(n)").execute(module);
+    // Converts the arguments of the module's functions (exp note 41).
+    return pythonHelper("import_foreign").execute(module);
+  }
+
+  /**
+   * Exp note 41: a JavaScript or Java array of numbers as a new numpy array in one copy (numpy
+   * cannot read foreign arrays): typed arrays and Java primitive arrays keep their element type,
+   * JavaScript numbers and Java Lists of numbers become int64 (all integral) or float64, and
+   * rectangular arrays of such rows become 2-D. Null for anything else (or without numpy): Python
+   * then converts element by element.
+   */
+  @SuppressWarnings("restricted")  // the new array's own memory, as numpy reports it
+  private Object bulkArray(Value v) {
+    Object[] flat = null;  // {dtype, MemorySegment of the data, rows, columns (-1: 1-D)}
+    if (v.isHostObject()) {
+      flat = hostNumbers(v.asHostObject());
+    } else if (JS && v.hasArrayElements()) {
+      Value r = jsBulk().execute(v);
+      if (!r.isNull()) {
+        Value buf = r.getArrayElement(1);
+        byte[] b = new byte[Math.toIntExact(buf.getBufferSize())];
+        buf.readBuffer(0, b, 0, b.length);
+        flat = new Object[] {r.getArrayElement(0).asString(), java.lang.foreign.MemorySegment.ofArray(b),
+            r.getArrayElement(2).asInt(), r.getArrayElement(3).asInt()};
+      }
+    }
+    if (flat == null) return null;
+    int rows = (int) flat[2], cols = (int) flat[3];
+    Value shape = cols < 0 ? context.asValue(rows) : context.eval("python", "lambda n, d: (n, d)").execute(rows, cols);
+    Value t;
+    try {
+      t = pythonHelper("numpy_empty").execute(shape, flat[0]);
+    } catch (org.graalvm.polyglot.PolyglotException e) {
+      if (e.isGuestException() && String.valueOf(e.getMessage()).contains("No module named 'numpy'")) return null;
+      throw e;
+    }
+    java.lang.foreign.MemorySegment data = (java.lang.foreign.MemorySegment) flat[1];
+    java.lang.foreign.MemorySegment.ofAddress(t.getArrayElement(1).asLong()).reinterpret(data.byteSize())
+        .copyFrom(data);
+    return t.getArrayElement(0);
+  }
+
+  /** JavaScript's side of bulkArray: [dtype, ArrayBuffer, rows, columns] or null. */
+  private Value jsBulk;
+
+  private Value jsBulk() {
+    if (jsBulk == null)
+      jsBulk = context().eval("js", """
+          (() => {
+            const typed = [[Float32Array, 'float32'], [Float64Array, 'float64'], [Int8Array, 'int8'],
+              [Int16Array, 'int16'], [Int32Array, 'int32'], [Uint8Array, 'uint8'], [Uint16Array, 'uint16'],
+              [Uint32Array, 'uint32'], [BigInt64Array, 'int64'], [BigUint64Array, 'uint64']];
+            const numbers = (a) => Array.isArray(a) && a.length > 0 && a.every((x) => typeof x === 'number');
+            const ints = (a) => a.every(Number.isSafeInteger);
+            return (v) => {
+              for (const [T, dtype] of typed)
+                if (v instanceof T) return [dtype, v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength), v.length, -1];
+              if (numbers(v))
+                return ints(v) ? ['int64', BigInt64Array.from(v, BigInt).buffer, v.length, -1]
+                    : ['float64', Float64Array.from(v).buffer, v.length, -1];
+              if (Array.isArray(v) && v.length > 0 && v.every((r) => numbers(r) && r.length === v[0].length)) {
+                const n = v.length, d = v[0].length, whole = v.every(ints);
+                const out = whole ? new BigInt64Array(n * d) : new Float64Array(n * d);
+                for (let i = 0; i < n; i++)
+                  for (let j = 0; j < d; j++) out[i * d + j] = whole ? BigInt(v[i][j]) : v[i][j];
+                return [whole ? 'int64' : 'float64', out.buffer, n, d];
+              }
+              return null;
+            };
+          })()
+          """);
+    return jsBulk;
+  }
+
+  /** Java's side of bulkArray: {dtype, data, rows, columns} for arrays and Lists of numbers. */
+  private static Object[] hostNumbers(Object o) {
+    return switch (o) {
+      case float[] a -> new Object[] {"float32", java.lang.foreign.MemorySegment.ofArray(a), a.length, -1};
+      case double[] a -> new Object[] {"float64", java.lang.foreign.MemorySegment.ofArray(a), a.length, -1};
+      case int[] a -> new Object[] {"int32", java.lang.foreign.MemorySegment.ofArray(a), a.length, -1};
+      case long[] a -> new Object[] {"int64", java.lang.foreign.MemorySegment.ofArray(a), a.length, -1};
+      case short[] a -> new Object[] {"int16", java.lang.foreign.MemorySegment.ofArray(a), a.length, -1};
+      case byte[] a -> new Object[] {"int8", java.lang.foreign.MemorySegment.ofArray(a), a.length, -1};
+      case float[][] m when rectangular(m) -> {
+        int n = m.length, d = m[0].length;
+        float[] out = new float[n * d];
+        for (int i = 0; i < n; i++) System.arraycopy(m[i], 0, out, i * d, d);
+        yield new Object[] {"float32", java.lang.foreign.MemorySegment.ofArray(out), n, d};
+      }
+      case double[][] m when rectangular(m) -> {
+        int n = m.length, d = m[0].length;
+        double[] out = new double[n * d];
+        for (int i = 0; i < n; i++) System.arraycopy(m[i], 0, out, i * d, d);
+        yield new Object[] {"float64", java.lang.foreign.MemorySegment.ofArray(out), n, d};
+      }
+      case java.util.List<?> l when !l.isEmpty() -> boxedNumbers(l.toArray());
+      case Object[] a when a.length > 0 -> boxedNumbers(a);
+      default -> null;
+    };
+  }
+
+  private static boolean rectangular(Object[] m) {
+    if (m.length == 0 || m[0] == null) return false;
+    int d = java.lang.reflect.Array.getLength(m[0]);
+    if (d == 0) return false;
+    for (Object r : m)
+      if (r == null || java.lang.reflect.Array.getLength(r) != d) return false;
+    return true;
+  }
+
+  /** Boxed numbers: int64 if all are integers that fit, else float64; null if not all numbers. */
+  private static Object[] boxedNumbers(Object[] a) {
+    boolean whole = true;
+    for (Object x : a) {
+      if (!(x instanceof Number)) return null;
+      whole &= x instanceof Long || x instanceof Integer || x instanceof Short || x instanceof Byte;
+    }
+    if (whole) {
+      long[] out = new long[a.length];
+      for (int i = 0; i < a.length; i++) out[i] = ((Number) a[i]).longValue();
+      return new Object[] {"int64", java.lang.foreign.MemorySegment.ofArray(out), a.length, -1};
+    }
+    double[] out = new double[a.length];
+    for (int i = 0; i < a.length; i++) out[i] = ((Number) a[i]).doubleValue();
+    return new Object[] {"float64", java.lang.foreign.MemorySegment.ofArray(out), a.length, -1};
   }
 
   /**
@@ -766,6 +1025,8 @@ final class Polyglot {
     Context c = context();
     // All or nothing: an interrupt (KILL) in between leaves Python to be set up again.
     Helpers h = pythonHelpers(c);
+    c.getBindings("python").getMember("_mle_helpers").putHashEntry("bulk",
+        (org.graalvm.polyglot.proxy.ProxyExecutable) a -> bulkArray(a[0]));
     pySql = new PySql(c, options, a -> libraryModule(a[0].asString(), a[1].asString(), false),
         a -> importJs(a[0].asString()));
     python = h;

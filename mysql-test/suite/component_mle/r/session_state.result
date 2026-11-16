@@ -111,6 +111,14 @@ is_active	programs	stdout_empty
 0	0	1
 SELECT mle_set_session_state('{"integer_type": "HUGE"}');
 ERROR HY000: mle_set_session_state<int> UDF failed; invalid integer_type 'HUGE'
+# An unknown key is an error (the SQL API spells it integerType).
+SELECT mle_set_session_state('{"integerType": "BIGINT"}');
+ERROR HY000: mle_set_session_state<int> UDF failed; unknown option 'integerType': the options are integer_type and decimal_type
+SELECT mle_set_session_state('{"integer_type": "BIGINT", "extra": "x"}');
+ERROR HY000: mle_set_session_state<int> UDF failed; unknown option 'extra': the options are integer_type and decimal_type
+# A ':' inside a value is not a key.
+SELECT mle_set_session_state('{"integer_type": "a:b"}');
+ERROR HY000: mle_set_session_state<int> UDF failed; invalid integer_type 'a:b'
 SELECT mle_set_session_state('{"integer_type": "BIGINT", "decimal_type": "number"}');
 mle_set_session_state('{"integer_type": "BIGINT", "decimal_type": "number"}')
 1

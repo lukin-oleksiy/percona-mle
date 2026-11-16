@@ -37,8 +37,12 @@ package com.percona.mle.worker;
  * <p>The JDK's shared pools are the runtime's too: the virtual-thread scheduler's carriers and
  * the common pool's workers (parallel streams, CompletableFuture). A routine may use them for
  * parallel work; their threads stay idle for a while after it (30 s, 60 s), and the routine
- * cannot end them. Like the runtime-named ones, they are strangers while they run routine code;
- * a virtual thread is always seen by itself. A pool the routine makes is its own: it must close it.
+ * cannot end them. Like the runtime-named ones, they are strangers while they run routine code.
+ * A pool the routine makes is its own: it must close it.
+ *
+ * <p>A live virtual thread is always a stranger: neither the worker nor its language runtimes
+ * start any, so it is a routine's (by its name alone it could pass for the runtime's, and before
+ * it first runs its stack is empty).
  */
 final class ThreadWatch {
   /** The JVM's, Truffle's, GraalPy's and the worker's own threads. */
@@ -49,6 +53,12 @@ final class ThreadWatch {
   private static final long PERIOD_NS = 5_000_000_000L;
   private static final ThreadGroup ROOT = root();
   private long next;
+  /** The threads alive when the worker started (before any routine): the JVM's own. */
+  private final java.util.Set<Long> startup = new java.util.HashSet<>();
+
+  ThreadWatch() {
+    for (Thread t : allThreads()) startup.add(t.threadId());
+  }
 
   /** After a top-level request: strangers(), at most once per period. */
   boolean strangersNow() {
@@ -61,7 +71,8 @@ final class ThreadWatch {
   /** True if a thread not belonging to the runtime is alive. */
   boolean strangers() {
     for (Thread t : allThreads())
-      if (t.isAlive() && (!(system(t.getName()) || sharedPool(t)) || runsGuestCode(t))) return true;
+      if (t.isAlive() && (t.isVirtual() || !(system(t.getName()) || sharedPool(t)) || runsGuestCode(t)))
+        return true;
     return false;
   }
 
@@ -109,10 +120,17 @@ final class ThreadWatch {
       collect(child, out, depth + 1);
   }
 
-  /** Whether t's stack has a frame of routine, library or DBA-jar code (JavaRoutines' loaders). */
-  private static boolean runsGuestCode(Thread t) {
+  /**
+   * Whether t's stack has a frame of routine, library or DBA-jar code (JavaRoutines' loaders), or
+   * no frame at all while it was started after the worker: a thread started but not yet run (a
+   * busy machine) could run anything. (The JVM's own threads from the start, such as the Signal
+   * Dispatcher, have no Java frames at all.)
+   */
+  private boolean runsGuestCode(Thread t) {
     if (Polyglot.nativeImage() || t == Thread.currentThread()) return false;  // no Java code there
-    for (StackTraceElement e : t.getStackTrace()) {
+    StackTraceElement[] stack = t.getStackTrace();
+    if (stack.length == 0) return t.isAlive() && !startup.contains(t.threadId());
+    for (StackTraceElement e : stack) {
       String loader = e.getClassLoaderName();
       if (loader != null && (loader.startsWith(JavaRoutines.LOADER_PREFIX)
           || loader.startsWith(JavaRoutines.LIBRARY_LOADER_PREFIX) || loader.equals(JavaRoutines.PACKAGE_LOADER)))

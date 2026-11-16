@@ -138,6 +138,26 @@ class mle_session_reset_impl {
 };
 
 /** The value of "key": "value" in a flat JSON object, or "" (absent). */
+/** The keys of a JSON object: strings followed by ':' (strings are skipped
+    whole, escapes included, so a ':' inside a value is not taken). */
+std::vector<std::string> json_keys(const std::string &json) {
+  std::vector<std::string> keys;
+  for (size_t i = 0; i < json.size(); i++) {
+    if (json[i] != '"') continue;
+    std::string text;
+    size_t j = i + 1;
+    for (; j < json.size() && json[j] != '"'; j++) {
+      if (json[j] == '\\' && j + 1 < json.size()) j++;
+      text.push_back(json[j]);
+    }
+    size_t k = j + 1;
+    while (k < json.size() && isspace(static_cast<unsigned char>(json[k]))) k++;
+    if (k < json.size() && json[k] == ':') keys.push_back(text);
+    i = j;
+  }
+  return keys;
+}
+
 std::string json_string(const std::string &json, const std::string &key) {
   const std::string quoted = "\"" + key + "\"";
   size_t at = json.find(quoted);
@@ -212,6 +232,13 @@ class mle_set_session_state_impl {
   }
   mysqlpp::udf_result_t<INT_RESULT> calculate(const mysqlpp::udf_context &ctx) {
     const std::string json(ctx.get_arg<STRING_RESULT>(0));
+    // An unknown key (e.g. integerType, the SQL API's spelling) would
+    // otherwise be ignored without a word.
+    for (const std::string &key : json_keys(json))
+      if (key != "integer_type" && key != "decimal_type")
+        throw std::invalid_argument("unknown option '" + key +
+                                    "': the options are integer_type and "
+                                    "decimal_type");
     namespace w = mle::wire;
     w::IntegerType integer_type = w::IntegerType::kUnsafeString;
     w::DecimalType decimal_type = w::DecimalType::kString;

@@ -304,21 +304,36 @@ bool SqlRunner::refused_here(SqlResultMsg *result) {
   // The server refuses statements in stored functions and triggers, but its
   // check for direct statements misses a function called by a trigger
   // (in_sub_stmt compared with ==, not as a mask); the prepared path checks
-  // it right. Ask that path once per call (and again while it refuses, so
-  // that each refusal is in the diagnostics area).
+  // it right. Ask that path once per call, before any statement starts (and
+  // again while it refuses, so that each statement gets the refusal).
   if (m_context_checked && !m_refused) return false;
   m_context_checked = true;
-  Statement probe;
-  probe.h = new_statement(false, 500);
-  if (probe.h == nullptr) return false;
-  const mysql_cstring_with_length text = cstr("DO 0");
-  m_refused = mysql_service_mysql_stmt_execute->prepare(text, probe.h);
-  if (m_refused) statement_error(probe, result);
+  {
+    Statement probe;
+    probe.h = new_statement(false, 500);
+    if (probe.h == nullptr) return false;
+    const mysql_cstring_with_length text = cstr("DO 0");
+    m_refused = mysql_service_mysql_stmt_execute->prepare(text, probe.h);
+    if (m_refused) statement_error(probe, result);
+  }  // closed while its error is in the diagnostics area (closing a failed
+     // statement adds an error of its own to an empty one)
+  if (m_refused &&
+      result->sql_errno == ER_STMT_EXECUTION_NOT_ALLOWED_WITHIN_SP_OR_TRG_OR_UDF) {
+    // The server's text names its statement interface ("Prepared Statement
+    // Handle Interface"), which tells a routine's author nothing: the same
+    // error, in their terms. It leaves the diagnostics area; uncaught, it is
+    // reported as the routine's error, with where it happened.
+    clear_pending_error();
+    result->message =
+        "SQL statements are not allowed in stored functions and triggers: "
+        "use a stored procedure";
+  }
   return m_refused;
 }
 
 void SqlRunner::execute_text(const mle::SqlMsg &request,
                              SqlResultMsg *result) {
+  if (refused_here(result)) return;
   if (m_statements.count(request.stmt_id) != 0)
     return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
                      "the statement id is in use");
@@ -345,7 +360,6 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
              bind_values(s->h, request.params) ||
              mysql_service_mysql_stmt_execute->execute(s->h);
   } else {
-    if (refused_here(result)) return;
     failed = mysql_service_mysql_stmt_execute_direct->execute(text, s->h);
   }
   if (failed) return statement_error(*s, result);
@@ -357,6 +371,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
 }
 
 void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
+  if (refused_here(result)) return;
   if (m_statements.count(request.stmt_id) != 0)
     return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
                      "the statement id is in use");
@@ -774,23 +789,32 @@ bool SqlRunner::raise(const mle::Error &e) {
       "SIGNAL SQLSTATE '" + state + "' SET MESSAGE_TEXT = " +
       (message.empty() ? std::string("''") : "_utf8mb4 X'" + message + "'") +
       ", MYSQL_ERRNO = " + std::to_string(e.sql_errno);
-  Statement s;
-  s.h = new_statement(false, 500);
-  if (s.h == nullptr) return false;
-  if (!mysql_service_mysql_stmt_execute_direct->execute(
-          {text.data(), text.size()}, s.h))
-    return false;  // SIGNAL did not fail: should not happen
-  uint64_t err_no = 0;
-  (void)mysql_service_mysql_stmt_diagnostics->error_number(s.h, &err_no);
-  if (err_no != static_cast<uint64_t>(e.sql_errno)) {
+  bool raised;
+  {
+    Statement s;
+    s.h = new_statement(false, 500);
+    if (s.h == nullptr) return false;
+    if (!mysql_service_mysql_stmt_execute_direct->execute(
+            {text.data(), text.size()}, s.h))
+      return false;  // SIGNAL did not fail: should not happen
+    uint64_t err_no = 0;
+    mysql_cstring_with_length msg{"", 0};
+    (void)mysql_service_mysql_stmt_diagnostics->error_number(s.h, &err_no);
+    (void)mysql_service_mysql_stmt_diagnostics->error(s.h, &msg);
+    // The refusal of SQL in a function has the same number as the error
+    // the routine got for its own statement: the message tells them apart.
+    raised = err_no == static_cast<uint64_t>(e.sql_errno) &&
+             (err_no != ER_STMT_EXECUTION_NOT_ALLOWED_WITHIN_SP_OR_TRG_OR_UDF ||
+              std::string(msg.str, msg.length) == e.message);
+  }  // closed while its error is in the diagnostics area
+  if (!raised) {
     // In a function SQL is not allowed, so SIGNAL is not either; or the
     // SIGNAL itself failed (e.g. a message that is not UTF-8 or too long):
     // the caller reports the error as a routine error instead.
     m_pending = true;
     clear_pending_error();
-    return false;
   }
-  return true;  // the SIGNAL error is in the diagnostics area
+  return raised;  // if raised, the SIGNAL error is in the diagnostics area
 }
 
 }  // namespace mle_component

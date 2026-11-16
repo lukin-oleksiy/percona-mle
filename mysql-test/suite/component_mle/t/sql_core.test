@@ -170,7 +170,7 @@ CALL e_bad_state();
 CREATE FUNCTION f_sql() RETURNS INT LANGUAGE JAVA AS $$
 return ((Long) MleSql.execute(MleSql.newStatementId(), "SELECT 1", null, false, 0).rows().get(0)[0]).intValue();
 $$;
---error ER_STMT_EXECUTION_NOT_ALLOWED_WITHIN_SP_OR_TRG_OR_UDF
+--error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT f_sql();
 --echo # a function throwing an SqlError: SIGNAL is not possible there
 CREATE FUNCTION f_throw() RETURNS INT LANGUAGE JAVA AS $$

@@ -82,6 +82,14 @@ SELECT mle_session_state('is_active') AS is_active,
   mle_session_state('stdout') = '' AS stdout_empty;
 --error ER_UDF_ERROR
 SELECT mle_set_session_state('{"integer_type": "HUGE"}');
+--echo # An unknown key is an error (the SQL API spells it integerType).
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('{"integerType": "BIGINT"}');
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('{"integer_type": "BIGINT", "extra": "x"}');
+--echo # A ':' inside a value is not a key.
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('{"integer_type": "a:b"}');
 SELECT mle_set_session_state('{"integer_type": "BIGINT", "decimal_type": "number"}');
 CREATE FUNCTION kinds(i INT, d DECIMAL(5,2)) RETURNS VARCHAR(40) LANGUAGE JAVASCRIPT
   AS $$ return typeof i + ' ' + typeof d $$;

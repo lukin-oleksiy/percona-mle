@@ -39,9 +39,44 @@ AS $$ return geo.Shapes.diagonal(w, h); $$;
 SELECT java_diag(5, 10);
 java_diag(5, 10)
 11.180339887498949
-# A Java routine uses Java libraries only (checked when it is compiled).
-CREATE FUNCTION java_uses_js() RETURNS INT LANGUAGE JAVA USING (jsmath) AS $$ return 1; $$;
-ERROR HY000: Java> library test.jsmath is a JavaScript library: Java routines use Java libraries (other languages through Mle.context())
+# A Java routine compiles its Java libraries in; JavaScript and Python
+# libraries (in USING, or of its own schema) come from Mle.importLibrary.
+CREATE FUNCTION java_uses_js(n INT) RETURNS INT LANGUAGE JAVA USING (jsmath) AS $$
+org.graalvm.polyglot.Value m = Mle.importLibrary("test.jsmath");
+return m.invokeMember("square", n).asInt() + m.getMember("default").getMember("offset").asInt();
+$$;
+CREATE FUNCTION java_uses_py() RETURNS TEXT LANGUAGE JAVA AS $$
+org.graalvm.polyglot.Value stats = Mle.importLibrary("/test/pystats");
+return "mean " + stats.invokeMember("mean", java.util.List.of(1, 2, 3, 6)).asDouble();
+$$;
+SELECT java_uses_js(7), java_uses_py();
+java_uses_js(7)	java_uses_py()
+149	mean 3.0
+# Another schema's library needs USING; a bad name is refused.
+CREATE DATABASE other_lib;
+CREATE LIBRARY other_lib.tiny LANGUAGE JAVASCRIPT AS $$ export const v = 42 $$;
+CREATE FUNCTION java_other(using_it INT) RETURNS INT LANGUAGE JAVA AS $$
+return Mle.importLibrary("other_lib.tiny").getMember("v").asInt();
+$$;
+SELECT java_other(0);
+ERROR HY000: Java> java.lang.IllegalArgumentException: /other_lib/tiny: library other_lib.tiny is not importable from test.java_other (import it with USING, or use a library of the routine's schema) (java_other, line 2)
+CREATE FUNCTION java_other_using() RETURNS INT LANGUAGE JAVA USING (other_lib.tiny) AS $$
+return Mle.importLibrary("other_lib.tiny").getMember("v").asInt();
+$$;
+SELECT java_other_using();
+java_other_using()
+42
+CREATE FUNCTION java_bad_name() RETURNS INT LANGUAGE JAVA AS $$
+return Mle.importLibrary("nodot").getMember("v").asInt();
+$$;
+SELECT java_bad_name();
+ERROR HY000: Java> java.lang.IllegalArgumentException: a library is 'schema.name' or '/schema/name', not 'nodot' (java_bad_name, line 2)
+DROP FUNCTION java_uses_js;
+DROP FUNCTION java_uses_py;
+DROP FUNCTION java_other;
+DROP FUNCTION java_other_using;
+DROP FUNCTION java_bad_name;
+DROP DATABASE other_lib;
 # JavaScript uses a Java library too (its classes; see polyglot_reach).
 CREATE FUNCTION js_uses_java() RETURNS DOUBLE LANGUAGE JAVASCRIPT USING (geo)
 AS $$ return geo.Shapes.diagonal(3, 4) $$;

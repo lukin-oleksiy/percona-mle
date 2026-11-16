@@ -311,10 +311,9 @@ final class JavaRoutines {
       } catch (IOException e) {
         throw new CompileException(e.getMessage() == null ? e.toString() : e.getMessage());
       }
-      if (!l.language().equals("java"))
-        throw new CompileException("library " + i.schema() + "." + i.name() + " is a "
-            + (l.language().equals("js") ? "JavaScript" : "Python")
-            + " library: Java routines use Java libraries (other languages through Mle.context())");
+      // A JavaScript or Python library in USING is not compiled in: the routine reaches it with
+      // Mle.importLibrary (USING is what lets it import a library of another schema).
+      if (!l.language().equals("java")) continue;
       libraries.add(new String[] {i.schema() + "." + i.name(), new String(l.body(), StandardCharsets.UTF_8)});
     }
     prepareWith(id, schema, routineName, entry, source, params, ret, libraries);

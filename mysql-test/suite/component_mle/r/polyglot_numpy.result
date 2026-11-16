@@ -1,0 +1,116 @@
+#
+# component_mle: numpy from JavaScript and Java (exp note 41). Arrays of
+# the other languages reach numpy (GraalPy alone gives them to Python as
+# foreign lists that numpy cannot read), and numpy's scalars are numbers
+# in the other languages.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+# 1. JavaScript: arrays, typed arrays, nested arrays; results are numbers.
+CREATE FUNCTION js_np() RETURNS JSON LANGUAGE JAVASCRIPT AS $$
+const np = importPython('numpy')
+const v = np.array([3, 4])
+return {
+sum: np.sum([1, 2, 3.5]),
+norm: np.linalg.norm([3, 4]),
+f32: np.array(new Float32Array([1.5, 2.5])).sum(),
+dtype_ints: np.array([1, 2]).dtype.name,
+dtype_f32: np.array(new Float32Array([1])).dtype.name,
+matrix_shape: np.array([[1, 2, 3], [4, 5, 6]]).shape.toString(),
+dot: np.dot([[1, 2], [3, 4]], [1, 1]).tolist(),
+mixed: np.array([1, 'a']).tolist(),
+typeof_sum: typeof np.sum([1, 2]),
+typeof_mean: typeof v.mean(),
+any: np.any([0, 1]),
+typeof_any: typeof np.any([0, 1]),
+pi: np.pi,
+item_still_works: np.sum([1, 2]).item()
+}
+$$;
+SELECT JSON_PRETTY(js_np()) AS js_numpy;
+js_numpy
+{
+  "pi": 3.141592653589793,
+  "any": true,
+  "dot": [
+    3,
+    7
+  ],
+  "f32": 4,
+  "sum": 6.5,
+  "norm": 5,
+  "mixed": [
+    "1",
+    "a"
+  ],
+  "dtype_f32": "float32",
+  "dtype_ints": "int64",
+  "typeof_any": "boolean",
+  "typeof_sum": "number",
+  "typeof_mean": "number",
+  "matrix_shape": "2,3",
+  "item_still_works": 3
+}
+# Other modules get Python lists (not numpy arrays).
+CREATE FUNCTION js_builtins() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+const py = importPython('builtins'), stats = importPython('statistics')
+return [py.sum([1, 2, 3]), py.sorted([3, 1, 2]).toString(), stats.median([5, 1, 3]), py.type(py.list([1])).__name__].join(' | ')
+$$;
+SELECT js_builtins();
+js_builtins()
+6 | 1,2,3 | 3 | list
+# A copy: changing the numpy array does not change the JavaScript one.
+CREATE FUNCTION js_copy() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+const np = importPython('numpy')
+const f = new Float32Array([1, 2])
+const a = np.array(f)
+a.__setitem__(0, 9)
+return f[0] + ' ' + a.tolist()[0]
+$$;
+SELECT js_copy();
+js_copy()
+1 9
+# 2. Java: primitive arrays, 2-D arrays, Lists; results are numbers.
+CREATE FUNCTION java_np() RETURNS TEXT LANGUAGE JAVA AS $$
+org.graalvm.polyglot.Value np = Mle.importPython("numpy");
+double norm = np.getMember("linalg").invokeMember("norm", (Object) new double[] {3, 4}).asDouble();
+float f32 = np.invokeMember("sum", (Object) new float[] {1.5f, 2.5f}).asFloat();
+long ints = np.invokeMember("sum", java.util.List.of(1, 2, 3)).asLong();
+String shape = np.invokeMember("array", (Object) new double[][] {{1, 2}, {3, 4}, {5, 6}}).getMember("shape").toString();
+String dtype = np.invokeMember("array", (Object) new int[] {1, 2}).getMember("dtype").toString();
+double mean = np.invokeMember("mean", (Object) new long[] {1, 2, 3, 4}).asDouble();
+return "norm " + norm + ", f32 " + f32 + ", ints " + ints + ", shape " + shape + ", dtype " + dtype + ", mean " + mean;
+$$;
+SELECT java_np();
+java_np()
+norm 5.0, f32 4.0, ints 6, shape (3, 2), dtype dtype('int32'), mean 2.5
+# 3. Python code: np.array of an array from a JavaScript library.
+CREATE LIBRARY jsnums LANGUAGE JAVASCRIPT AS $$
+export function series(n) { return Array.from({ length: n }, (_, i) => i * 0.5) }
+export function rows() { return [[1, 2], [3, 4]] }
+$$;
+SELECT py_from_js();
+py_from_js()
+5.0 float64 (2, 2) [0.0, 0.5, 1.0]
+# 4. A large typed array goes in one copy (it took about a second element
+#    by element).
+CREATE FUNCTION js_big(n INT) RETURNS DOUBLE LANGUAGE JAVASCRIPT AS $$
+const np = importPython('numpy')
+const f = new Float32Array(n).fill(0.5)
+const t = Date.now()
+const s = np.sum(f)
+if (Date.now() - t > 200) throw new Error('slow: ' + (Date.now() - t) + ' ms')
+return s
+$$;
+SELECT js_big(100000);
+js_big(100000)
+50000
+DROP FUNCTION js_np;
+DROP FUNCTION js_builtins;
+DROP FUNCTION js_copy;
+DROP FUNCTION java_np;
+DROP FUNCTION py_from_js;
+DROP FUNCTION js_big;
+DROP LIBRARY jsnums;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

@@ -47,6 +47,17 @@ public final class Mle {
   }
 
   /**
+   * A database library (CREATE LIBRARY) of any language, by {@code "schema.name"} or
+   * {@code "/schema/name"}: a Python library as its module, a JavaScript library as its module
+   * namespace, a Java library as its classes. As for the other languages' imports, a library of
+   * another schema must be in the routine's USING clause. E.g.
+   * {@code Mle.importLibrary("app.stats").invokeMember("mean", list)}.
+   */
+  public static org.graalvm.polyglot.Value importLibrary(String library) {
+    return SqlBridge.importLibrary(library);
+  }
+
+  /**
    * The worker's polyglot Context (JS and Python), for calls from Java routines into the other
    * languages, e.g. {@code Mle.context().eval("python", "import numpy; numpy.dot")}. Must be used
    * on the routine's thread.

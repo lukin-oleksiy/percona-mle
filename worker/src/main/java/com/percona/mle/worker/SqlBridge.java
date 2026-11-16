@@ -93,6 +93,16 @@ public final class SqlBridge {
     return dispatcher().polyglot().importJs(name);
   }
 
+  /** Mle.importLibrary: "schema.name" or "/schema/name", as Python's import_library. */
+  public static org.graalvm.polyglot.Value importLibrary(String library) {
+    String p = library.replaceAll("^/+|/+$", "").replace('/', '.');
+    int dot = p.indexOf('.');
+    if (dot <= 0 || dot == p.length() - 1 || p.indexOf('.', dot + 1) >= 0)
+      throw new IllegalArgumentException("a library is 'schema.name' or '/schema/name', not '" + library + "'");
+    Polyglot polyglot = dispatcher().polyglot();
+    return polyglot.context().asValue(polyglot.libraryModule(p.substring(0, dot), p.substring(dot + 1), false));
+  }
+
   public static org.graalvm.polyglot.Context context() {
     Dispatcher d = dispatcher;
     if (d == null) throw new IllegalStateException("MLE worker not running");
