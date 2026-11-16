@@ -89,7 +89,12 @@ final class JavaRoutines {
       int[] outs, Values.ParamType[] types) {}
 
   /** Routine name and form by routine loader name, for stack frames. */
-  record Origin(String name, boolean bodyForm) {}
+  record Origin(String name, boolean bodyForm, String[] lines) {
+    /** Source line n (from 1) of the routine as written, for tracebacks; "" if unknown. */
+    String line(int n) {
+      return n >= 1 && n <= lines.length ? Dispatcher.Frame.line(lines[n - 1]) : "";
+    }
+  }
 
   static final Map<String, Origin> origins = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -350,7 +355,8 @@ final class JavaRoutines {
     }
     Map<String, byte[]> classes = compile(unit, prefix, bodyForm ? name : null, libraries);
     RoutineLoader loader = new RoutineLoader(id, apiLoader, classes);
-    Origin origin = new Origin(name, bodyForm);
+    // The unit's line n is line n of the source as written (the body form's prefix is on line 1).
+    Origin origin = new Origin(name, bodyForm, source.split("\n", -1));
     origins.put(LOADER_PREFIX + id, origin);
 
     String className;

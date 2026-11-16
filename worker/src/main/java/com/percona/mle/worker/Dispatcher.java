@@ -50,7 +50,14 @@ final class Dispatcher {
   private static final long IDLE_GC_NS = 200_000_000L;
   private final ThreadWatch threads = new ThreadWatch();
 
-  record Frame(String function, String file, int line, int column, int endColumn) {}
+  /** text: the frame's source line (trimmed, at most 200 characters), for tracebacks. */
+  record Frame(String function, String file, int line, int column, int endColumn, String text) {
+    static String line(String s) {
+      if (s == null) return "";
+      s = s.strip();
+      return s.length() <= 200 ? s : s.substring(0, 200) + "...";
+    }
+  }
 
   record ErrorInfo(String language, String message, List<Frame> frames, int sqlErrno, String sqlState) {}
 
@@ -444,7 +451,8 @@ final class Dispatcher {
           function = e.getMethodName().equals("call") ? "" : e.getMethodName();
           file = o.name();
         }
-        frames.add(new Frame(function, file, Math.max(0, e.getLineNumber()), 0, 0));
+        int line = Math.max(0, e.getLineNumber());
+        frames.add(new Frame(function, file, line, 0, 0, o == null ? "" : o.line(line)));
       }
       if (frames.size() == Wire.MAX_STACK_FRAMES) break;
     }
@@ -534,6 +542,7 @@ final class Dispatcher {
       w.u32(f.line());
       w.u32(f.column());
       w.u32(f.endColumn());
+      w.str(f.text());
     }
     w.u32(error.sqlErrno());
     w.str(error.sqlState() == null ? "" : error.sqlState());

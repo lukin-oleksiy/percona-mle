@@ -79,7 +79,7 @@ SELECT db1.myfunc(1), db1.myfunc(10);
 db1.myfunc(1)	db1.myfunc(10)
 85	94
 SELECT db1.myfunc2(1), db1.myfunc2(10);
-ERROR HY000: JavaScript> ReferenceError: mylib is not defined
+ERROR HY000: JavaScript> ReferenceError: mylib is not defined (myfunc2, line 1)
 #
 # 4. Library code runs when imported, not at CREATE; syntax is checked at
 #    CREATE.
@@ -113,7 +113,7 @@ Got one of the listed errors
 CREATE LIBRARY other.secret LANGUAGE JAVASCRIPT AS $$ export const value = 'from other' $$;
 CREATE FUNCTION peek() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$ return (await import('/other/secret')).value $$;
 SELECT peek();
-ERROR HY000: JavaScript> Error: Error reading module '/other/secret' imported from peek: library other.secret is not importable from test.peek (import it with USING, or use a library of the routine's schema)
+ERROR HY000: JavaScript> Error: Error reading module '/other/secret' imported from peek: library other.secret is not importable from test.peek (import it with USING, or use a library of the routine's schema) (peek, line 1)
 CREATE FUNCTION peek_using() RETURNS TEXT LANGUAGE JAVASCRIPT USING (other.secret)
 AS $$ return secret.value + ' / ' + (await import('/other/secret')).value $$;
 SELECT peek_using();

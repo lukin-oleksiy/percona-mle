@@ -17,6 +17,7 @@ SHOW GLOBAL VARIABLES WHERE Variable_name LIKE 'mle.%'
   AND Variable_name NOT IN ('mle.dir', 'mle.java_home');
 Variable_name	Value
 mle.cgroup_base	AUTO
+mle.console	OFF
 mle.heap_max	536870912
 mle.interrupt_grace_ms	1000
 mle.languages	JAVASCRIPT,PYTHON,JAVA

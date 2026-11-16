@@ -51,7 +51,7 @@ PermissionError
 # Not installed: an error of the language.
 CREATE FUNCTION js_missing() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return require('left-pad')('x', 3) $$;
 SELECT js_missing();
-ERROR HY000: JavaScript> TypeError: Cannot load module: 'left-pad'
+ERROR HY000: JavaScript> TypeError: Cannot load module: 'left-pad' (js_missing, line 1)
 # mle_packages_refresh(): only with SYSTEM_VARIABLES_ADMIN, and not
 # while sessions hold workers.
 SELECT mle_packages_refresh();

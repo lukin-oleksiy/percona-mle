@@ -100,10 +100,10 @@ INSERT INTO t1 VALUES (20, 'outer');
 CALL js_rollback(21);
 COMMIT;
 CALL js_fail(30);
-ERROR HY000: JavaScript> Error: failed after the insert
+ERROR HY000: JavaScript> Error: failed after the insert (js_fail, line 1)
 START TRANSACTION;
 CALL js_fail(40);
-ERROR HY000: JavaScript> Error: failed after the insert
+ERROR HY000: JavaScript> Error: failed after the insert (js_fail, line 1)
 ROLLBACK;
 SELECT * FROM t1 ORDER BY id;
 id	v

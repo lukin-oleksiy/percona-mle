@@ -1,0 +1,92 @@
+--echo #
+--echo # component_mle: debugging routines (exp note 39). A runtime error names
+--echo # where it happened; mle_session_state('traceback') shows the frames in
+--echo # the language's own form with their source lines; 'last_output' is what
+--echo # the last call printed; mle.console = WARNINGS adds a call's output and a
+--echo # failure's traceback to the statement's warnings.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+
+--write_file $MYSQLTEST_VARDIR/tmp/debugging.sql
+CREATE FUNCTION py_div(a INT) RETURNS INT LANGUAGE PYTHON AS $$
+    def helper(v):
+        return 10 // v
+    print('before, a =', a)
+    return helper(a - a)
+$$;
+CREATE FUNCTION js_div(a INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+  function helper(v) { return v.missing.field }
+  console.log('before, a =', a)
+  return helper({})
+$$;
+CREATE FUNCTION java_div(a INT) RETURNS INT LANGUAGE JAVA AS $$
+  int[] arr = new int[2];
+  System.out.println("before, a = " + a);
+  return arr[a + 5];
+$$;
+CREATE FUNCTION py_talk(n INT) RETURNS INT LANGUAGE PYTHON AS $$
+    import sys
+    for i in range(n):
+        print('step', i, 'square', i * i)
+    print('done', file=sys.stderr)
+    return n
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/debugging.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/debugging.sql
+
+--connect (con1, localhost, root,,test)
+--echo # 1. The error message names the routine, the line and the function.
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_div(1);
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_div(1);
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT java_div(1);
+
+--echo # 2. The traceback in each language's form, with source lines.
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_div(1);
+SELECT mle_session_state('traceback') AS traceback;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_div(1);
+SELECT mle_session_state('traceback') AS traceback;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT java_div(1);
+SELECT mle_session_state('traceback') AS traceback;
+--echo # Oracle's stack_trace stays as it was.
+SELECT mle_session_state('stack_trace') AS stack_trace;
+
+--echo # 3. last_output: only what the last call printed (stdout: the session's).
+SELECT py_talk(2);
+SELECT mle_session_state('last_output') AS last_output;
+SELECT LENGTH(mle_session_state('stdout')) > LENGTH(mle_session_state('last_output')) AS stdout_has_more;
+
+--echo # 4. mle.console = WARNINGS: the output and the traceback as warnings.
+SELECT @@session.mle.console;
+SET SESSION mle.console = WARNINGS;
+SELECT py_talk(3);
+SHOW WARNINGS;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_div(1);
+SHOW WARNINGS;
+--echo # Only what the call printed: py_talk(0) writes only to stderr.
+SELECT py_talk(0);
+SHOW WARNINGS;
+SET SESSION mle.console = DEFAULT;
+--error ER_WRONG_VALUE_FOR_VAR
+SET SESSION mle.console = 'loud';
+
+--disconnect con1
+--connection default
+DROP FUNCTION py_div;
+DROP FUNCTION js_div;
+DROP FUNCTION java_div;
+DROP FUNCTION py_talk;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

@@ -33,7 +33,7 @@ constexpr size_t kMinStr = 4;                        // empty string
 constexpr size_t kMinParamType = 1 + 1 + 4 + 4 + 4 + kMinStr;  // tag .. name
 constexpr size_t kMinParam = kMinStr + 1 + kMinParamType;
 constexpr size_t kMinColumn = 7 * kMinStr + kMinParamType + 4;
-constexpr size_t kMinFrame = 2 * kMinStr + 4 + 4 + 4;
+constexpr size_t kMinFrame = 3 * kMinStr + 4 + 4 + 4;
 constexpr size_t kMinWarning = 4 + 4 + kMinStr;
 constexpr size_t kMinOutParam = 4 + kMinValue;
 constexpr size_t kTemporalSize = 2 + 1 + 1 + 4 + 1 + 1 + 4 + 1;
@@ -119,6 +119,7 @@ void put_error(Writer &w, const Error &e) {
     w.u32(f.line);
     w.u32(f.column);
     w.u32(f.end_column);
+    w.str(f.text);
   }
   w.u32(e.sql_errno);
   w.str(e.sqlstate);
@@ -133,7 +134,7 @@ bool get_error(Reader &r, Error *e) {
   e->stack.resize(n);
   for (StackFrame &f : e->stack)
     if (!r.str(&f.function) || !r.str(&f.file) || !r.u32(&f.line) ||
-        !r.u32(&f.column) || !r.u32(&f.end_column))
+        !r.u32(&f.column) || !r.u32(&f.end_column) || !r.str(&f.text))
       return false;
   if (!r.u32(&e->sql_errno) || !r.str(&e->sqlstate)) return false;
   if (!valid_sqlstate(e->sqlstate)) return r.fail("bad SQLSTATE");

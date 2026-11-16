@@ -34,7 +34,7 @@ pc1: a warning
 
 # A runtime error keeps its stack trace (Oracle: <js> name:line:columns).
 CALL pc2();
-ERROR HY000: JavaScript> TypeError: Cannot read property 'boom' of null
+ERROR HY000: JavaScript> TypeError: Cannot read property 'boom' of null (pc2, line 4)
 SELECT mle_session_state('stack_trace') AS stack_trace;
 stack_trace
 <js> pc2:4:1-6

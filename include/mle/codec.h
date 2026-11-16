@@ -169,6 +169,8 @@ struct StackFrame {
   uint32_t line = 0;
   uint32_t column = 0;
   uint32_t end_column = 0;
+  /** The frame's source line (trimmed), for tracebacks; may be empty. */
+  std::string text;
   bool operator==(const StackFrame &) const = default;
 };
 

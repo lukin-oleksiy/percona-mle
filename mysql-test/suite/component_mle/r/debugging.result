@@ -1,0 +1,113 @@
+#
+# component_mle: debugging routines (exp note 39). A runtime error names
+# where it happened; mle_session_state('traceback') shows the frames in
+# the language's own form with their source lines; 'last_output' is what
+# the last call printed; mle.console = WARNINGS adds a call's output and a
+# failure's traceback to the statement's warnings.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+# 1. The error message names the routine, the line and the function.
+SELECT py_div(1);
+ERROR HY000: Python> ZeroDivisionError: integer division or modulo by zero (py_div, line 3, in helper)
+SELECT js_div(1);
+ERROR HY000: JavaScript> TypeError: Cannot read property 'field' of undefined (js_div, line 2, in helper)
+SELECT java_div(1);
+ERROR HY000: Java> java.lang.ArrayIndexOutOfBoundsException: Index 6 out of bounds for length 2 (java_div, line 4)
+# 2. The traceback in each language's form, with source lines.
+SELECT py_div(1);
+ERROR HY000: Python> ZeroDivisionError: integer division or modulo by zero (py_div, line 3, in helper)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+Traceback (most recent call last):
+  File "py_div", line 5, in <routine>
+    return helper(a - a)
+  File "py_div", line 3, in helper
+    return 10 // v
+ZeroDivisionError: integer division or modulo by zero
+
+SELECT js_div(1);
+ERROR HY000: JavaScript> TypeError: Cannot read property 'field' of undefined (js_div, line 2, in helper)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+TypeError: Cannot read property 'field' of undefined
+    at helper (js_div:2:31)
+        function helper(v) { return v.missing.field }
+    at js_div:4:10
+        return helper({})
+
+SELECT java_div(1);
+ERROR HY000: Java> java.lang.ArrayIndexOutOfBoundsException: Index 6 out of bounds for length 2 (java_div, line 4)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+java.lang.ArrayIndexOutOfBoundsException: Index 6 out of bounds for length 2
+    at java_div:4
+        return arr[a + 5];
+
+# Oracle's stack_trace stays as it was.
+SELECT mle_session_state('stack_trace') AS stack_trace;
+stack_trace
+<java> java_div:4
+
+# 3. last_output: only what the last call printed (stdout: the session's).
+SELECT py_talk(2);
+py_talk(2)
+2
+SELECT mle_session_state('last_output') AS last_output;
+last_output
+step 0 square 0
+step 1 square 1
+done
+
+SELECT LENGTH(mle_session_state('stdout')) > LENGTH(mle_session_state('last_output')) AS stdout_has_more;
+stdout_has_more
+1
+# 4. mle.console = WARNINGS: the output and the traceback as warnings.
+SELECT @@session.mle.console;
+@@session.mle.console
+OFF
+SET SESSION mle.console = WARNINGS;
+SELECT py_talk(3);
+py_talk(3)
+3
+Warnings:
+Warning	6000	py_talk: step 0 square 0
+Warning	6000	py_talk: step 1 square 1
+Warning	6000	py_talk: step 2 square 4
+Warning	6000	py_talk stderr: done
+SHOW WARNINGS;
+Level	Code	Message
+Warning	6000	py_talk: step 0 square 0
+Warning	6000	py_talk: step 1 square 1
+Warning	6000	py_talk: step 2 square 4
+Warning	6000	py_talk stderr: done
+SELECT py_div(1);
+ERROR HY000: Python> ZeroDivisionError: integer division or modulo by zero (py_div, line 3, in helper)
+SHOW WARNINGS;
+Level	Code	Message
+Warning	6000	py_div: before, a = 1
+Error	6113	Python> ZeroDivisionError: integer division or modulo by zero (py_div, line 3, in helper)
+Warning	6000	py_div traceback: Traceback (most recent call last):
+Warning	6000	py_div traceback:   File "py_div", line 5, in <routine>
+Warning	6000	py_div traceback:     return helper(a - a)
+Warning	6000	py_div traceback:   File "py_div", line 3, in helper
+Warning	6000	py_div traceback:     return 10 // v
+Warning	6000	py_div traceback: ZeroDivisionError: integer division or modulo by zero
+# Only what the call printed: py_talk(0) writes only to stderr.
+SELECT py_talk(0);
+py_talk(0)
+0
+Warnings:
+Warning	6000	py_talk stderr: done
+SHOW WARNINGS;
+Level	Code	Message
+Warning	6000	py_talk stderr: done
+SET SESSION mle.console = DEFAULT;
+SET SESSION mle.console = 'loud';
+ERROR 42000: Variable 'mle.console' can't be set to the value of 'loud'
+DROP FUNCTION py_div;
+DROP FUNCTION js_div;
+DROP FUNCTION java_div;
+DROP FUNCTION py_talk;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

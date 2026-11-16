@@ -198,7 +198,7 @@ CREATE PROCEDURE e_bad_state() LANGUAGE JAVA AS $$
 throw new MleSqlException(1000, "00000", "not an error state");
 $$;
 CALL e_bad_state();
-ERROR HY000: Java> not an error state
+ERROR HY000: Java> not an error state (e_bad_state, line 2)
 CREATE FUNCTION f_sql() RETURNS INT LANGUAGE JAVA AS $$
 return ((Long) MleSql.execute(MleSql.newStatementId(), "SELECT 1", null, false, 0).rows().get(0)[0]).intValue();
 $$;
@@ -209,7 +209,7 @@ CREATE FUNCTION f_throw() RETURNS INT LANGUAGE JAVA AS $$
 throw new MleSqlException(1000, "45000", "from a function");
 $$;
 SELECT f_throw();
-ERROR HY000: Java> from a function
+ERROR HY000: Java> from a function (f_throw, line 2)
 SELECT 'session fine' AS after_errors;
 after_errors
 session fine

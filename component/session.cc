@@ -30,6 +30,7 @@
 #include <mysql/components/services/bits/mysql_thd_attributes_bits.h>
 #include <mysql/components/services/mysql_library.h>
 #include <mysql/components/services/mysql_runtime_error_service.h>
+#include <mysql/components/services/mysql_runtime_warning.h>
 #include <mysql/components/services/mysql_system_variable.h>
 #include <mysql/components/services/dynamic_privilege.h>
 #include <mysql/components/services/mysql_thd_attributes.h>
@@ -42,6 +43,7 @@
 #include "mle_component.h"
 
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_error);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_runtime_warning);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_library);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_current_thread_reader);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_store);
@@ -201,6 +203,50 @@ void append_capped(std::string *buffer, const std::string &more) {
   apart; internal errors are ER_LANGUAGE_COMPONENT_INTERNAL (6111), with the
   details in the error log only.
 */
+/** A frame of the routine's body itself, not of a function in it. */
+bool body_frame(const mle::StackFrame &f) {
+  // ":=>": the wrapper function around a JavaScript body.
+  return f.function.empty() || f.function.rfind("__mle", 0) == 0 ||
+         f.function.rfind(":", 0) == 0 || f.function == "<module>" ||
+         f.function == f.file;
+}
+
+/** " (routine, line N, in function)" at the innermost frame; "" without one. */
+std::string error_location(const mle::Error &e) {
+  if (e.stack.empty() || e.stack.front().file.empty()) return "";
+  const mle::StackFrame &f = e.stack.front();
+  std::string s = " (" + f.file;
+  if (f.line > 0) s += ", line " + std::to_string(f.line);
+  if (!body_frame(f)) s += ", in " + f.function;
+  return s + ")";
+}
+
+/**
+  The error as its language shows it, with the frames' source lines: Python's
+  "Traceback (most recent call last)", "at function (routine:line:column)"
+  for JavaScript and Java.
+*/
+std::string traceback_text(const mle::Error &e, const std::string &language) {
+  std::string t;
+  if (language == "python") {
+    t = "Traceback (most recent call last):\n";
+    for (auto it = e.stack.rbegin(); it != e.stack.rend(); ++it) {
+      t += "  File \"" + it->file + "\", line " + std::to_string(it->line) + ", in " +
+           (body_frame(*it) ? std::string("<routine>") : it->function) + "\n";
+      if (!it->text.empty()) t += "    " + it->text + "\n";
+    }
+    return t + e.message + "\n";
+  }
+  t = e.message + "\n";
+  for (const mle::StackFrame &f : e.stack) {
+    std::string where = f.file + ":" + std::to_string(f.line);
+    if (f.column > 0) where += ":" + std::to_string(f.column);
+    t += "    at " + (body_frame(f) ? where : f.function + " (" + where + ")") + "\n";
+    if (!f.text.empty()) t += "        " + f.text + "\n";
+  }
+  return t;
+}
+
 void engine_error(std::string why) {
   // The host's reasons name "the MLE worker"; after "MLE> " once is enough.
   constexpr std::string_view kWorker = "the MLE worker";
@@ -473,6 +519,7 @@ bool Session::parse(Routine &routine) {
 
 bool Session::execute(Routine &routine) {
   m_stack.clear();  // Oracle: the trace of the last call only
+  m_traceback.clear();
   std::vector<Value> args = std::move(m_args);  // reused; a nested call allocates
   if (!routine.read_args(&args)) return false;
   const std::string who = principal();  // a copy: nested calls change it
@@ -493,6 +540,11 @@ bool Session::execute(Routine &routine) {
   }
   --g_counters.threads;
   keep_console(result);
+  // mle.console = WARNINGS: read only when there is something to show.
+  m_console_now = (s != Status::kOk || !result.console_out.empty() ||
+                   !result.console_err.empty()) &&
+                  console_warnings(m_thd);
+  if (m_console_now) console_to_warnings(routine, result);
   // A call killed meanwhile reports the KILL even if the routine then ended
   // normally (e.g. an inner SLEEP returned early and the worker finished
   // before the interrupt reached it).
@@ -516,7 +568,40 @@ void Session::forget(const Routine &routine) {
   }
 }
 
+namespace {
+constexpr size_t kMaxConsoleWarnings = 100;  // per call; the rest: last_output
+}  // namespace
+
+void Session::console_to_warnings(const Routine &routine, const ResultMsg &result) {
+  lines_to_warnings(result.console_out, routine.name);
+  lines_to_warnings(result.console_err, routine.name + " stderr");
+}
+
+void Session::lines_to_warnings(const std::string &text, const std::string &prefix) {
+  size_t n = 0, start = 0;
+  while (start < text.size()) {
+    size_t end = text.find('\n', start);
+    if (end == std::string::npos) end = text.size();
+    if (n < kMaxConsoleWarnings) {
+      std::string line = prefix + ": " + text.substr(start, end - start);
+      if (line.size() > 500) line = line.substr(0, 497) + "...";
+      mysql_service_mysql_runtime_warning->emit(m_thd, ER_LANGUAGE_COMPONENT, line.c_str());
+    }
+    ++n;
+    start = end + 1;
+  }
+  if (n > kMaxConsoleWarnings) {
+    const std::string more = prefix + ": ... " + std::to_string(n - kMaxConsoleWarnings) +
+                             " more lines: mle_session_state('last_output')";
+    mysql_service_mysql_runtime_warning->emit(m_thd, ER_LANGUAGE_COMPONENT, more.c_str());
+  }
+}
+
 void Session::keep_console(const ResultMsg &result) {
+  m_last_out.clear();
+  m_last_err.clear();
+  append_capped(&m_last_out, result.console_out);
+  append_capped(&m_last_err, result.console_err);
   if (result.console_cleared) {
     m_out.clear();
     m_err.clear();
@@ -563,8 +648,11 @@ void Session::report(const std::string &principal, Status status,
                                  ? routine.display_language()
                                  : display_language(e->language);
       keep_stack_trace(*e, routine);
-      my_error(ER_LANGUAGE_COMPONENT_RUNTIME, MYF(0), language,
-               e->message.c_str());
+      // Where it happened, at the innermost frame of the routine's code
+      // (exp note 39); the frames: mle_session_state('traceback'/'stack_trace').
+      const std::string message = e->message + error_location(*e);
+      my_error(ER_LANGUAGE_COMPONENT_RUNTIME, MYF(0), language, message.c_str());
+      if (m_console_now) lines_to_warnings(m_traceback, routine.name + " traceback");
       const auto it = m_workers.find(principal);
       if (it != m_workers.end() &&
           (!it->second.worker || !it->second.worker->usable())) {
@@ -624,6 +712,7 @@ void Session::keep_stack_trace(const mle::Error &e, const Routine &routine) {
   // Oracle: "<js> pc2:3:6-54", one line per frame.
   const std::string language =
       e.language.empty() ? routine.prepare.language : e.language;
+  m_traceback = traceback_text(e, language);
   m_stack.clear();
   for (const mle::StackFrame &f : e.stack) {
     m_stack += "<" + language + "> " + f.file + ":" + std::to_string(f.line);
@@ -648,6 +737,9 @@ std::optional<std::string> Session::state(const Session *s,
   if (key == "stdout") return s != nullptr ? s->m_out : "";
   if (key == "stderr") return s != nullptr ? s->m_err : "";
   if (key == "stack_trace") return s != nullptr ? s->m_stack : "";
+  if (key == "traceback") return s != nullptr ? s->m_traceback : "";
+  if (key == "last_output")
+    return s != nullptr ? s->m_last_out + s->m_last_err : "";
   if (key == "stored_functions")
     return count(MYSQL_STORED_PROGRAM_DATA_QUERY_TYPE_FUNCTION);
   if (key == "stored_procedures")

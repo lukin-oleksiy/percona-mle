@@ -94,7 +94,7 @@ static final long rows = ((Number) Mle.session().runSql("SELECT COUNT(*) FROM wr
 r[0] = C.rows;
 $$;
 CALL wr1.init_once(@r);
-ERROR HY000: Java> java.lang.ExceptionInInitializerError; caused by com.percona.mle.api.MleSqlException: Table 'wr1.later' doesn't exist
+ERROR HY000: Java> java.lang.ExceptionInInitializerError; caused by com.percona.mle.api.MleSqlException: Table 'wr1.later' doesn't exist (init_once, line 5)
 CREATE TABLE wr1.later (k INT);
 INSERT INTO wr1.later VALUES (1), (2);
 CALL wr1.init_once(@r);

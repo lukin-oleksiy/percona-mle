@@ -145,7 +145,7 @@ console.error(`This is message #${i} to stderr.`);
 }
 $$;
 CALL pc2();
-ERROR HY000: JavaScript> TypeError: (intermediate value).lob is not a function
+ERROR HY000: JavaScript> TypeError: (intermediate value).lob is not a function (pc2, line 3)
 CALL mle_states();
 is_active	stdout	stderr	stack_trace	stored_functions	stored_procedures	stored_programs
 1	This is message #1 to stdout.
@@ -182,7 +182,7 @@ SELECT recursive_sum(1), recursive_sum(2), recursive_sum(20), recursive_sum(100)
 recursive_sum(1)	recursive_sum(2)	recursive_sum(20)	recursive_sum(100)
 1	3	210	5050
 SELECT recursive_sum(1000);
-ERROR HY000: JavaScript> Maximum frame limit of 1000 exceeded. Frames on stack: 1001.
+ERROR HY000: JavaScript> Maximum frame limit of 1000 exceeded. Frames on stack: 1001. (recursive_sum, line 2, in sum)
 #
 # myfunc (27.3.4): "var x" in the body hides the argument: NaN.
 #

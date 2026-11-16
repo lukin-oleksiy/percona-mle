@@ -104,7 +104,7 @@ Error: boom 1
     at inner (SQL FUNCTION test.v8_err:1:27)
     at SQL FUNCTION test.v8_err:1:53
 SELECT mle_err(1);
-ERROR HY000: JavaScript> Error: boom 1
+ERROR HY000: JavaScript> Error: boom 1 (mle_err, line 1, in inner)
 SELECT mle_session_state('stack_trace') AS mle_stack_trace;
 mle_stack_trace
 <js> mle_err:1:27-48
@@ -163,7 +163,7 @@ js_lang_500	mle_500
 SELECT v8_deep(1000000);
 ERROR HY000: RangeError: Maximum call stack size exceeded
 SELECT mle_deep(1000000);
-ERROR HY000: JavaScript> Maximum frame limit of 1000 exceeded. Frames on stack: 1001.
+ERROR HY000: JavaScript> Maximum frame limit of 1000 exceeded. Frames on stack: 1001. (mle_deep, line 1, in f)
 DROP FUNCTION v8_args;
 DROP FUNCTION mle_args;
 DROP FUNCTION v8_ret_dt;

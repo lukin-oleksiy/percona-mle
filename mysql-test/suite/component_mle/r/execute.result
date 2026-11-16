@@ -154,13 +154,13 @@ SELECT @b, @c;
 #
 CREATE FUNCTION js_throw() RETURNS INT LANGUAGE JAVASCRIPT AS $$ throw new Error('boom') $$;
 SELECT js_throw();
-ERROR HY000: JavaScript> Error: boom
+ERROR HY000: JavaScript> Error: boom (js_throw, line 1)
 CREATE FUNCTION py_throw() RETURNS INT LANGUAGE PYTHON AS $$ return 1 / 0 $$;
 SELECT py_throw();
-ERROR HY000: Python> ZeroDivisionError: division by zero
+ERROR HY000: Python> ZeroDivisionError: division by zero (py_throw, line 1)
 CREATE FUNCTION java_throw() RETURNS INT LANGUAGE JAVA AS $$ throw new IllegalStateException("no"); $$;
 SELECT java_throw();
-ERROR HY000: Java> java.lang.IllegalStateException: no
+ERROR HY000: Java> java.lang.IllegalStateException: no (java_throw, line 1)
 # Syntax errors fail CREATE.
 CREATE FUNCTION js_bad() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 +; $$;
 ERROR HY000: JavaScript> SyntaxError: js_bad:1:11 Expected an operand but found ;
@@ -191,7 +191,7 @@ SELECT recursive_sum(998);
 recursive_sum(998)
 498501
 SELECT recursive_sum(999);
-ERROR HY000: JavaScript> Maximum frame limit of 1000 exceeded. Frames on stack: 1001.
+ERROR HY000: JavaScript> Maximum frame limit of 1000 exceeded. Frames on stack: 1001. (recursive_sum, line 2, in sum)
 # Reserved parameter names (6115) and unsupported types (6117).
 CREATE FUNCTION js_kw(console INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
 ERROR HY000: JavaScript> The identifier 'console' is not valid.

@@ -651,6 +651,7 @@ final class Polyglot {
     routines.clear();
     prefixes.clear();
     pythonSources.clear();
+    SOURCE_LINES.clear();
     vectorBuffers.clear();
   }
 
@@ -689,10 +690,12 @@ final class Polyglot {
         fn = c.eval(Source.newBuilder("js", wrapped, name + ".js").uri(uri).buildLiteral());
       } else if (bodyForm) {
         pythonSources.add(name);
+        SOURCE_LINES.put(name, source.split("\n", -1));
         String[] names = params.stream().map(JavaRoutines.Param::name).toArray(String[]::new);
         fn = pythonBodyLoader().execute(source, name, names, outs.length > 0, mleApi);
       } else {
         pythonSources.add(name + ".py");
+        SOURCE_LINES.put(name + ".py", source.split("\n", -1));
         fn = h.loader().execute(source, name, entry, mleApi);
       }
     } catch (PolyglotException e) {
@@ -1049,6 +1052,12 @@ final class Polyglot {
     return prefix == null ? column : Math.max(1, column - prefix);
   }
 
+  /**
+   * Python routines' source lines by source name, for tracebacks (exp note 39): their code is
+   * compiled by Python from a string, so the frames' sources carry no characters.
+   */
+  private static final Map<String, String[]> SOURCE_LINES = new java.util.concurrent.ConcurrentHashMap<>();
+
   /** The guest frames of e (up to the protocol's limit), innermost first. */
   static List<Dispatcher.Frame> frames(PolyglotException e) {
     List<Dispatcher.Frame> frames = new java.util.ArrayList<>();
@@ -1060,8 +1069,20 @@ final class Polyglot {
       String root = f.getRootName() == null ? "" : f.getRootName();
       if (root.equals(JsOracle.WRAPPER)) continue;  // ours, not the routine's
       int line = loc.getStartLine();
+      String text = "";
+      try {
+        if (src.hasCharacters() && line >= 1 && line <= src.getLineCount())
+          text = src.getCharacters(line).toString();
+      } catch (RuntimeException ignored) {
+        // no text: the location alone
+      }
+      if (text.isEmpty()) {
+        String[] lines = SOURCE_LINES.get(src.getName());
+        if (lines != null && line >= 1 && line <= lines.length) text = lines[line - 1];
+      }
       frames.add(new Dispatcher.Frame(root, src.getName(), line, bodyColumn(src, line, loc.getStartColumn()),
-          loc.getEndLine() == line ? bodyColumn(src, line, loc.getEndColumn()) : loc.getEndColumn()));
+          loc.getEndLine() == line ? bodyColumn(src, line, loc.getEndColumn()) : loc.getEndColumn(),
+          Dispatcher.Frame.line(text)));
       if (frames.size() == Wire.MAX_STACK_FRAMES) break;
     }
     return frames;

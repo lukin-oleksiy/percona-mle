@@ -221,7 +221,12 @@ Registered g_registered[] = {
     {"sql_statements_max", false}, {"sql_chunk_rows", false},
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
     {"package_dir", false}, {"pool_prewarm", false}, {"worker", false},
-    {"vector_threads", false}};
+    {"vector_threads", false}, {"console", false}};
+
+/** mle.console (session): OFF, or WARNINGS (exp note 39). */
+const char *g_console_values[] = {"OFF", "WARNINGS", nullptr};
+TYPE_LIB g_console_typelib = {2, "mle_console", g_console_values, nullptr};
+ulong g_console = 0;
 
 void mark(const char *name) {
   for (auto &r : g_registered)
@@ -257,6 +262,17 @@ std::string default_dir() {
 }  // namespace
 
 bool register_settings() {
+  ENUM_CHECK_ARG(enum) console;
+  console.def_val = 0;
+  console.typelib = &g_console_typelib;
+  if (reg("console", PLUGIN_VAR_ENUM | PLUGIN_VAR_THDLOCAL,
+          "Debugging aid, per session: OFF, or WARNINGS to add what each "
+          "routine call prints (print, console.log, System.out/err) and a "
+          "failed call's traceback to the statement's warnings (SHOW "
+          "WARNINGS).",
+          nullptr, nullptr, &console, &g_console))
+    return true;
+
   INTEGRAL_CHECK_ARG(ulonglong) memory_max;
   memory_max.def_val = 2ULL << 30;
   memory_max.min_val = kMemoryMaxMin;
@@ -629,6 +645,16 @@ std::string language_names(unsigned bits) {
   add(kPython, "Python");
   add(kJava, "Java");
   return names;
+}
+
+bool console_warnings(MYSQL_THD thd) {
+  char buffer[16];
+  void *value = buffer;
+  size_t length = sizeof(buffer) - 1;
+  if (mysql_service_mysql_system_variable_reader->get(thd, "SESSION", kName, "console",
+                                                      &value, &length))
+    return false;
+  return length == 8 && strncasecmp(static_cast<const char *>(value), "WARNINGS", 8) == 0;
 }
 
 }  // namespace mle_component

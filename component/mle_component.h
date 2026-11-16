@@ -101,6 +101,9 @@ Settings current_settings();
 void set_installed_languages(unsigned bits);
 /** Bits of mle.languages that are installed. */
 unsigned enabled_languages();
+
+/** mle.console = WARNINGS in this session (exp note 39). */
+bool console_warnings(MYSQL_THD thd);
 /** mle.max_workers, mle.spin_us, mle.interrupt_grace_ms. */
 uint32_t max_workers();
 /** An account as 'user'@'host' (quotes doubled): the key of workers. */

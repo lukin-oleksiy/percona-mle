@@ -165,6 +165,16 @@ class Session {
   std::string m_err;
   /** Oracle's stack_trace: the frames of the last call's runtime error. */
   std::string m_stack;
+  /** The same error as a traceback in its language's form, with source lines (exp note 39). */
+  std::string m_traceback;
+  /** What the last call printed (mle_session_state('last_output')). */
+  std::string m_last_out;
+  std::string m_last_err;
+  /** mle.console = WARNINGS for the call being reported (read once per call). */
+  bool m_console_now = false;
+  /** mle.console: the lines a call printed, as warnings. */
+  void console_to_warnings(const Routine &routine, const mle::ResultMsg &result);
+  void lines_to_warnings(const std::string &text, const std::string &prefix);
   /** Routine id -> its type (stored_functions / stored_procedures). */
   std::map<uint64_t, uint16_t> m_programs;
 };
