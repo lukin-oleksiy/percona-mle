@@ -353,6 +353,7 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   options.name = kWorkerClass;
   options.memory_max = s.memory_max;
   options.heap = std::to_string(s.heap_max >> 20) + "m";
+  options.malloc_mmap_threshold = s.malloc_mmap_threshold;
   options.pool_size = s.pool_size;
   options.vector_threads = s.vector_threads;
   // Pool workers start Java (javac) and JavaScript, which are cheap; GraalPy

@@ -83,6 +83,10 @@ struct JvmClassOptions {
   uint32_t pool_size = 0;
   /** BLAS threads per worker; many sessions each have a worker. */
   int blas_threads = 1;
+  /** glibc's mmap threshold for the worker (GLIBC_TUNABLES), fixed so that
+      freed large blocks (numpy arrays) go back to the system at once (exp
+      note 45); 0: glibc's adaptive default. */
+  uint64_t malloc_mmap_threshold = 0;
   /** Threads of the vector helper (com.percona.mle.api.Vectors, exp note
       33): at most this many per call, never more than the CPUs. */
   uint32_t vector_threads = 4;

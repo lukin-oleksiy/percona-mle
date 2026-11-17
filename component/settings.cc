@@ -67,6 +67,7 @@ constexpr const char kAllLanguageNames[] = "JAVASCRIPT,PYTHON,JAVA";
 /* Variable values (written by the server). */
 ulonglong g_memory_max = 0;
 ulonglong g_heap_max = 0;
+ulonglong g_malloc_mmap_threshold = 0;
 uint g_pool_size = 0;
 uint g_vector_threads = 4;
 uint g_max_workers = 0;
@@ -153,6 +154,7 @@ void update_shaping(MYSQL_THD thd, SYS_VAR *, void *val_ptr,
 
 constexpr const char kMemoryMax[] = "memory_max";
 constexpr const char kHeapMax[] = "heap_max";
+constexpr const char kMallocMmapThreshold[] = "malloc_mmap_threshold";
 constexpr const char kPoolSize[] = "pool_size";
 /** mle.pool_prewarm's default (exp note 35): the vector helper warmed up. */
 constexpr const char kPoolPrewarm[] = "vectors";
@@ -163,6 +165,8 @@ constexpr ulonglong kMemoryMaxMin = 256 * kMiB;
 constexpr ulonglong kMemoryMaxMax = 1ULL << 40;
 constexpr ulonglong kHeapMaxMin = 64 * kMiB;
 constexpr ulonglong kHeapMaxMax = 64ULL << 30;
+/** glibc's largest mmap threshold on 64-bit systems (HEAP_MAX_SIZE / 2). */
+constexpr ulonglong kMallocMmapThresholdMax = 32 * kMiB;
 constexpr ulonglong kPoolSizeMax = 64;
 constexpr ulonglong kVectorThreadsMax = 256;
 
@@ -221,7 +225,8 @@ Registered g_registered[] = {
     {"sql_statements_max", false}, {"sql_chunk_rows", false},
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
     {"package_dir", false}, {"pool_prewarm", false}, {"worker", false},
-    {"vector_threads", false}, {"console", false}};
+    {"vector_threads", false}, {"console", false},
+    {"malloc_mmap_threshold", false}};
 
 /** mle.console (session): OFF, or WARNINGS (exp note 39). */
 const char *g_console_values[] = {"OFF", "WARNINGS", nullptr};
@@ -296,6 +301,26 @@ bool register_settings() {
           "no session holds a worker; restarts the engine.",
           check_shaping<ulonglong, kHeapMax, kHeapMaxMin, kHeapMaxMax>,
           update_shaping<ulonglong, kHeapMax>, &heap_max, &g_heap_max))
+    return true;
+
+  // Exp note 45: glibc raises its mmap threshold after frees (up to 32 MiB),
+  // so numpy's large arrays then come from malloc's heap and freed ones are
+  // kept there; a worker building 16 MB arrays call after call reached its
+  // limit and was killed. Fixed, every freed large array goes back at once.
+  ulonglong_check_arg_s malloc_mmap_threshold;
+  malloc_mmap_threshold.def_val = kMiB;
+  malloc_mmap_threshold.min_val = 0;
+  malloc_mmap_threshold.max_val = kMallocMmapThresholdMax;
+  malloc_mmap_threshold.blk_sz = 0;
+  if (reg("malloc_mmap_threshold", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
+          "Allocations of at least this many bytes in MLE workers get their "
+          "own memory mapping, returned to the system when freed (glibc's "
+          "mmap threshold, fixed); 0: glibc's adaptive default. Can be "
+          "changed while no session holds a worker; restarts the engine.",
+          check_shaping<ulonglong, kMallocMmapThreshold, 0,
+                        kMallocMmapThresholdMax>,
+          update_shaping<ulonglong, kMallocMmapThreshold>,
+          &malloc_mmap_threshold, &g_malloc_mmap_threshold))
     return true;
 
   INTEGRAL_CHECK_ARG(uint) pool_size;
@@ -534,6 +559,7 @@ Settings current_settings() {
   Settings s;
   s.memory_max = g_memory_max;
   s.heap_max = g_heap_max;
+  s.malloc_mmap_threshold = g_malloc_mmap_threshold;
   s.pool_size = g_pool_size;
   s.vector_threads = g_vector_threads;
   s.cgroup_base = text(g_cgroup_base);

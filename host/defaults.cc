@@ -122,6 +122,9 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
 
   c.env = {"OPENBLAS_NUM_THREADS=" + std::to_string(o.blas_threads),
            "OMP_NUM_THREADS=" + std::to_string(o.blas_threads)};
+  if (o.malloc_mmap_threshold > 0)
+    c.env.push_back("GLIBC_TUNABLES=glibc.malloc.mmap_threshold=" +
+                    std::to_string(o.malloc_mmap_threshold));
   c.exec_paths = {dir_of(layout.worker_exe), layout.java_home};
   c.read_paths = {dir_of(layout.worker_jar), layout.resource_cache};
   if (!layout.python_venv.empty()) c.read_paths.push_back(layout.python_venv);
