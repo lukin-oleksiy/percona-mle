@@ -239,6 +239,31 @@ SET GLOBAL mle.sql_result_max = 100000;
 CALL big(@r);
 ERROR HY000: Result size limit exceeded.
 SET GLOBAL mle.sql_result_max = DEFAULT;
+# With a parameter: the same (no cursor, so no temporary table of its own;
+# the recursive query makes the same ones either way), and the same limit.
+CREATE PROCEDURE big_param(OUT r TEXT) LANGUAGE JAVA AS $$
+long id = MleSql.newStatementId();
+MleSql.Reply x = MleSql.execute(id,
+"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < ?) " +
+"SELECT n, REPEAT('x', 100) FROM c", new Object[] {50000}, false, 0);
+int rows = x.rows().size(), chunks = 1;
+while (x.moreRows()) {
+x = MleSql.fetch(id, 0);
+rows += x.rows().size();
+chunks++;
+}
+r[0] = "rows=" + rows + " chunks=" + chunks;
+$$;
+CALL big(@r);
+CALL big_param(@r);
+SELECT @r;
+@r
+rows=50000 chunks=50
+temporary tables: the same with a parameter
+SET GLOBAL mle.sql_result_max = 100000;
+CALL big_param(@r);
+ERROR HY000: Result size limit exceeded.
+SET GLOBAL mle.sql_result_max = DEFAULT;
 SET GLOBAL mle.sql_statements_max = 2;
 CREATE PROCEDURE many(OUT r TEXT) LANGUAGE JAVA AS $$
 MleSql.prepare(MleSql.newStatementId(), "SELECT 1", false);
@@ -320,6 +345,7 @@ DROP PROCEDURE e_bad_state;
 DROP FUNCTION f_sql;
 DROP FUNCTION f_throw;
 DROP PROCEDURE big;
+DROP PROCEDURE big_param;
 DROP PROCEDURE many;
 DROP PROCEDURE keep;
 DROP PROCEDURE read_secret;

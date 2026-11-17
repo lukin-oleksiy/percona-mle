@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -42,6 +44,36 @@ int64_t now_ns() {
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
+
+/** MLE_SQL_TRACE in mysqld's environment: one line per top-level CALL on
+    stderr (the error log) with the time of each stage of the routine's SQL
+    (exp note 44, step 0). Off: no clock reads. */
+bool sql_trace_enabled() {
+  static const bool on = [] {
+    const char *v = getenv("MLE_SQL_TRACE");
+    return v != nullptr && *v != '\0' && strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+/** The stages of one top-level CALL's SQL, in nanoseconds. */
+struct SqlTrace {
+  bool on = false;
+  int64_t worker = 0;  // waiting for the worker (it decodes, runs guest code)
+  int64_t sql = 0;     // the SQL hook: execute, read rows into Values
+  int64_t exec = 0;    // of which the server's execution (exec_us)
+  int64_t encode = 0;  // Values into the reply buffer
+  int64_t send = 0;    // the reply into the arena (and its chunks)
+  uint64_t requests = 0, rows = 0, bytes = 0;
+  void print(int64_t total) const {
+    fprintf(stderr,
+            "MLE SQL trace: requests %llu rows %llu bytes %llu | worker %.3f "
+            "sql %.3f (execute %.3f) encode %.3f send %.3f | total %.3f ms\n",
+            (unsigned long long)requests, (unsigned long long)rows,
+            (unsigned long long)bytes, worker / 1e6, sql / 1e6, exec / 1e6,
+            encode / 1e6, send / 1e6, total / 1e6);
+  }
+};
 
 void cpu_relax() {
 #if defined(__x86_64__)
@@ -362,6 +394,9 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
   DepthGuard guard(&m_depth, &m_running);
   const uint32_t depth = m_depth - 1;
   std::string why;
+  SqlTrace trace;
+  trace.on = op == wire::Op::kCall && depth == 0 && sql_trace_enabled();
+  const int64_t trace_start = trace.on ? now_ns() : 0;
 
   auto broke = [&](const std::string &what) {
     return fail(Status::kProtocolError,
@@ -398,7 +433,9 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
   if (w != Wait::kMessage) return lost(w);
   while (true) {
     Message m;
+    const int64_t t_wait = trace.on ? now_ns() : 0;
     w = receive(&m, &hooks, timeout_ms, &why);
+    if (trace.on) trace.worker += now_ns() - t_wait;
     if (w != Wait::kMessage) return lost(w);
     if (m.h.depth != depth || m.h.call_seq != m_seq)
       return broke(std::string(op_name(m.h.op)) + " for the wrong call");
@@ -427,6 +464,7 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
              "the MLE worker was retired after running out of memory or "
              "stack, or leaving threads running",
              nullptr);
+      if (trace.on) trace.print(now_ns() - trace_start);
       return static_cast<Status>(m.h.status);
     }
 
@@ -434,14 +472,30 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
       SqlMsg sql;
       if (!decode(m.body, &sql, &why)) return broke("bad SQL: " + why);
       SqlResultMsg r;
+      int64_t t = trace.on ? now_ns() : 0;
       hooks.sql(sql, &r);  // may run nested calls on this worker
+      if (trace.on) {
+        const int64_t t2 = now_ns();
+        trace.sql += t2 - t;
+        trace.exec += int64_t(r.exec_us) * 1000;
+        trace.requests++;
+        if (!r.columns.empty()) trace.rows += r.rows.size() / r.columns.size();
+        t = t2;
+      }
       if (!m_usable) return died(error);
       // A routine that keeps the worker busy with SQL never lets the wait
       // reach a tick: check for KILL after every statement too.
       if (check_kill(&hooks) == Wait::kKilled) return lost(Wait::kKilled);
       std::string reply;
       encode(r, &reply);
+      if (trace.on) {
+        const int64_t t2 = now_ns();
+        trace.encode += t2 - t;
+        trace.bytes += reply.size();
+        t = t2;
+      }
       w = send(wire::Op::kSqlResult, reply, &hooks, &why);
+      if (trace.on) trace.send += now_ns() - t;
       if (w != Wait::kMessage) return lost(w);
       continue;
     }

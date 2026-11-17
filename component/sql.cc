@@ -200,10 +200,18 @@ void SqlRunner::handle(const mle::SqlMsg &request, SqlResultMsg *result) {
 
 namespace {
 
-/** A new statement handle with our attributes; nullptr on failure. */
-my_h_statement new_statement(bool to_client, size_t capacity) {
+/** A new statement handle with our attributes; nullptr on failure. A
+    prepared one (parameters, session.prepare) runs without a cursor (exp
+    note 44): execution collects the whole result, within `capacity`, with no
+    temporary table and no row-by-row fetches, like a direct statement. A
+    server without the statement service's "use_cursor" attribute keeps the
+    cursor, rows up to mle.sql_row_max. */
+my_h_statement new_statement(bool to_client, size_t capacity,
+                             bool prepared = false) {
   my_h_statement h = nullptr;
   if (mysql_service_mysql_stmt_factory->init(&h)) return nullptr;
+  if (prepared && !to_client && set_attribute(h, "use_cursor", false))
+    capacity = sql_row_max();
   // S-3: the value must be a mysql_cstring_with_length (a char* crashes).
   const mysql_cstring_with_length utf8mb4 = cstr("utf8mb4");
   bool failed = set_attribute(h, "charset_name", utf8mb4) ||
@@ -355,9 +363,9 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
       (request.flags & mle::wire::kPassResultToClient) != 0;
   const bool with_params = !request.params.empty();
   auto s = std::make_unique<Statement>();
-  // S-11: a direct statement buffers its whole result (buffer_capacity
-  // bytes); a prepared one uses a cursor, buffer_capacity per fetched row.
-  s->h = new_statement(to_client, with_params ? sql_row_max() : sql_result_max());
+  // S-11: the server buffers the whole result (buffer_capacity bytes), with
+  // or without parameters (no cursor: new_statement).
+  s->h = new_statement(to_client, sql_result_max(), with_params);
   if (s->h == nullptr)
     return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
                      "cannot create a statement");
@@ -391,7 +399,7 @@ void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
   const bool to_client =
       (request.flags & mle::wire::kPassResultToClient) != 0;
   auto s = std::make_unique<Statement>();
-  s->h = new_statement(to_client, sql_row_max());
+  s->h = new_statement(to_client, sql_result_max(), true);
   if (s->h == nullptr)
     return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
                      "cannot create a statement");

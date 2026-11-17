@@ -401,8 +401,8 @@ bool register_settings() {
   result_max.max_val = 1ULL << 40;
   result_max.blk_sz = 0;
   if (reg("sql_result_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
-          "Largest result in bytes of a statement a routine runs without "
-          "parameters (the server buffers it whole). Oracle: 1 MB.",
+          "Largest result in bytes of a statement a routine runs (the "
+          "server buffers it whole). Oracle: 1 MB.",
           nullptr, nullptr, &result_max, &g_sql_result_max))
     return true;
   ulonglong_check_arg_s row_max;
@@ -411,8 +411,9 @@ bool register_settings() {
   row_max.max_val = 1ULL << 40;
   row_max.blk_sz = 0;
   if (reg("sql_row_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
-          "Largest row in bytes of a prepared statement a routine runs (rows "
-          "are fetched one by one from a cursor). Oracle: 1 MB.",
+          "Largest row in bytes of a prepared statement on a server that "
+          "cannot run it without a cursor (rows are then fetched one by "
+          "one). Oracle: 1 MB.",
           nullptr, nullptr, &row_max, &g_sql_row_max))
     return true;
   uint_check_arg_s statements_max;

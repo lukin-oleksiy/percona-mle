@@ -204,6 +204,39 @@ SET GLOBAL mle.sql_result_max = 100000;
 --error ER_RESULT_SIZE_LIMIT_EXCEEDED
 CALL big(@r);
 SET GLOBAL mle.sql_result_max = DEFAULT;
+--echo # With a parameter: the same (no cursor, so no temporary table of its own;
+--echo # the recursive query makes the same ones either way), and the same limit.
+CREATE PROCEDURE big_param(OUT r TEXT) LANGUAGE JAVA AS $$
+long id = MleSql.newStatementId();
+MleSql.Reply x = MleSql.execute(id,
+    "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < ?) " +
+    "SELECT n, REPEAT('x', 100) FROM c", new Object[] {50000}, false, 0);
+int rows = x.rows().size(), chunks = 1;
+while (x.moreRows()) {
+  x = MleSql.fetch(id, 0);
+  rows += x.rows().size();
+  chunks++;
+}
+r[0] = "rows=" + rows + " chunks=" + chunks;
+$$;
+let $tmp0 = query_get_value(SHOW SESSION STATUS LIKE 'Created_tmp_tables', Value, 1);
+CALL big(@r);
+let $tmp1 = query_get_value(SHOW SESSION STATUS LIKE 'Created_tmp_tables', Value, 1);
+CALL big_param(@r);
+let $tmp2 = query_get_value(SHOW SESSION STATUS LIKE 'Created_tmp_tables', Value, 1);
+SELECT @r;
+--expr $direct = $tmp1 - $tmp0
+--expr $with_param = $tmp2 - $tmp1
+if ($direct == $with_param) {
+  --echo temporary tables: the same with a parameter
+}
+if ($direct != $with_param) {
+  --echo temporary tables: direct $direct, with a parameter $with_param
+}
+SET GLOBAL mle.sql_result_max = 100000;
+--error ER_RESULT_SIZE_LIMIT_EXCEEDED
+CALL big_param(@r);
+SET GLOBAL mle.sql_result_max = DEFAULT;
 SET GLOBAL mle.sql_statements_max = 2;
 CREATE PROCEDURE many(OUT r TEXT) LANGUAGE JAVA AS $$
 MleSql.prepare(MleSql.newStatementId(), "SELECT 1", false);
@@ -296,6 +329,7 @@ DROP PROCEDURE e_bad_state;
 DROP FUNCTION f_sql;
 DROP FUNCTION f_throw;
 DROP PROCEDURE big;
+DROP PROCEDURE big_param;
 DROP PROCEDURE many;
 DROP PROCEDURE keep;
 DROP PROCEDURE read_secret;
