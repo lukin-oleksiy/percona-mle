@@ -47,7 +47,7 @@ struct Settings {
   uint64_t memory_max = 2ULL << 30;
   uint64_t heap_max = 512ULL << 20;
   /** glibc's mmap threshold in workers; 0: glibc's adaptive default. */
-  uint64_t malloc_mmap_threshold = 1ULL << 20;
+  uint64_t malloc_mmap_threshold = 4ULL << 20;
   uint32_t pool_size = 2;
   /** Threads of the vector helper (com.percona.mle.api.Vectors) per worker. */
   uint32_t vector_threads = 4;

@@ -16,7 +16,7 @@ GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *
 SELECT @@mle.memory_max / 1024 / 1024 / 1024 AS memory_max_gib,
 @@mle.malloc_mmap_threshold AS malloc_mmap_threshold;
 memory_max_gib	malloc_mmap_threshold
-2.000000000000	1048576
+2.000000000000	4194304
 SELECT py_churn(12) AS churn;
 churn
 12 rounds, total 132
@@ -39,7 +39,7 @@ TypeError
 # 0 leaves glibc's adaptive default; at most 32 MiB.
 SELECT worker_tunables();
 worker_tunables()
-glibc.malloc.mmap_threshold=1048576
+glibc.malloc.mmap_threshold=4194304
 SET GLOBAL mle.malloc_mmap_threshold = 33554433;
 ERROR 42000: Variable 'mle.malloc_mmap_threshold' can't be set to the value of '33554433'
 SET GLOBAL mle.malloc_mmap_threshold = 0;

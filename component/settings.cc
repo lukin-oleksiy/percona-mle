@@ -307,8 +307,10 @@ bool register_settings() {
   // so numpy's large arrays then come from malloc's heap and freed ones are
   // kept there; a worker building 16 MB arrays call after call reached its
   // limit and was killed. Fixed, every freed large array goes back at once.
+  // 4 MiB, not lower: smaller arrays stay in malloc's reused heap (a fresh
+  // mapping per call cost Python P2's 1.5 MB matrix 1.2 ms, exp note 46).
   ulonglong_check_arg_s malloc_mmap_threshold;
-  malloc_mmap_threshold.def_val = kMiB;
+  malloc_mmap_threshold.def_val = 4 * kMiB;
   malloc_mmap_threshold.min_val = 0;
   malloc_mmap_threshold.max_val = kMallocMmapThresholdMax;
   malloc_mmap_threshold.blk_sz = 0;
