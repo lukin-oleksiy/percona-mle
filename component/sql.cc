@@ -30,6 +30,7 @@
 #include <mysql/components/services/mysql_thd_attributes.h>
 #include <mysqld_error.h>
 
+#include "mle/worker.h"
 #include "mle_component.h"
 #include "routine.h"
 
@@ -123,6 +124,10 @@ struct SqlRunner::Statement {
   std::vector<Reader> readers;
   /** One row read ahead (to know whether more rows follow). */
   std::vector<Value> lookahead;
+  /** A row fetched but not sent yet (the direct path's read-ahead: the
+      server keeps it until the next fetch). At most one of lookahead and
+      pending is set. */
+  my_h_row pending = nullptr;
 
   ~Statement() {
     if (h != nullptr) (void)mysql_service_mysql_stmt_factory->close(h);
@@ -173,10 +178,16 @@ void SqlRunner::statement_error(Statement &s, SqlResultMsg *result) {
   m_pending_sqlstate = result->sqlstate;
 }
 
-void SqlRunner::handle(const mle::SqlMsg &request, SqlResultMsg *result) {
+void SqlRunner::handle(const mle::SqlMsg &request, SqlResultMsg *result,
+                       mle::DirectReply *direct) {
   // The worker sent another request: it went on after an error it got, so
   // that error must not stay in the caller's diagnostics area.
   clear_pending_error();
+  struct Scope {
+    mle::DirectReply **slot;
+    ~Scope() { *slot = nullptr; }
+  } scope{&m_direct};
+  m_direct = direct;
   switch (request.action) {
     case SqlAction::kExecute:
       return execute_text(request, result);
@@ -471,16 +482,7 @@ void SqlRunner::fetch(const mle::SqlMsg &request, SqlResultMsg *result) {
   *result = SqlResultMsg();
   result->kind = SqlResultKind::kRows;
   result->columns = s.columns;
-  if (read_rows(s, max_rows, result)) return statement_error(s, result);
-  if (!s.rows_open) {
-    // Drained: its warnings; is there another result set?
-    read_warnings(s.h, result);
-    bool more = false;
-    if (!mysql_service_mysql_stmt_result->next_result(s.h, &more) && more)
-      s.next_pending = true;
-    result->more_results = s.next_pending;
-    if (!s.prepared && !s.next_pending) close(request.stmt_id);
-  }
+  rows(request.stmt_id, s, max_rows, result);
 }
 
 void SqlRunner::next_result(const mle::SqlMsg &request, SqlResultMsg *result) {
@@ -498,6 +500,7 @@ void SqlRunner::next_result(const mle::SqlMsg &request, SqlResultMsg *result) {
       }
       s.rows_open = false;
       s.lookahead.clear();
+      s.pending = nullptr;
     }
     if (mysql_service_mysql_stmt_result->next_result(s.h, &more) || !more) {
       *result = SqlResultMsg();
@@ -630,18 +633,36 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
     s.readers.push_back(r);
   }
   s.rows_open = true;
+  s.pending = nullptr;
   result->kind = SqlResultKind::kRows;
   result->columns = s.columns;
-  if (read_rows(s, max_rows, result)) return statement_error(s, result);
-  if (!s.rows_open) {
-    // The result set is complete: its warnings are known.
-    read_warnings(s.h, result);
-    bool more = false;
-    if (!mysql_service_mysql_stmt_result->next_result(s.h, &more) && more)
-      s.next_pending = true;
-    result->more_results = s.next_pending;
-    if (!s.prepared && !s.next_pending) close(id);
+  rows(id, s, max_rows, result);
+}
+
+void SqlRunner::rows(uint64_t id, Statement &s, uint32_t max_rows,
+                     SqlResultMsg *result) {
+  if (m_direct != nullptr) {
+    switch (write_rows(id, s, max_rows, result)) {
+      case Direct::kWritten:
+        return;
+      case Direct::kError:
+        return statement_error(s, result);
+      case Direct::kNotHere:
+        break;
+    }
   }
+  if (read_rows(s, max_rows, result)) return statement_error(s, result);
+  if (!s.rows_open) finish_result_set(id, s, result);
+}
+
+void SqlRunner::finish_result_set(uint64_t id, Statement &s,
+                                  SqlResultMsg *result) {
+  read_warnings(s.h, result);
+  bool more = false;
+  if (!mysql_service_mysql_stmt_result->next_result(s.h, &more) && more)
+    s.next_pending = true;
+  result->more_results = s.next_pending;
+  if (!s.prepared && !s.next_pending) close(id);
 }
 
 namespace {
@@ -736,7 +757,173 @@ bool read_row(my_h_row row, const std::vector<Reader> &readers,
   return true;
 }
 
+/** One row by the column readers, written as read_row's Values would be
+    encoded (Writer::value), without them; false on a getter failure. The
+    caller checks w->overflow(). */
+bool write_row(my_h_row row, const std::vector<Reader> &readers,
+               mle::Writer *w) {
+  for (uint32_t i = 0; i < readers.size(); i++) {
+    bool is_null = false;
+    bool failed = false;
+    switch (readers[i]) {
+      case Reader::kSigned: {
+        int64_t x = 0;
+        failed = mysql_service_mysql_stmt_get_integer->get(row, i, &x, &is_null);
+        if (!failed && !is_null) w->i64_value(x);
+        break;
+      }
+      case Reader::kUnsigned:
+      case Reader::kUnsignedSmall: {
+        uint64_t x = 0;
+        failed = mysql_service_mysql_stmt_get_unsigned_integer->get(row, i, &x,
+                                                                    &is_null);
+        if (failed || is_null) break;
+        if (readers[i] == Reader::kUnsigned)
+          w->u64_value(x);
+        else
+          w->i64_value(static_cast<int64_t>(x));
+        break;
+      }
+      case Reader::kDouble: {
+        double x = 0;
+        failed = mysql_service_mysql_stmt_get_double->get(row, i, &x, &is_null);
+        if (!failed && !is_null) w->f64_value(x);
+        break;
+      }
+      case Reader::kDate:
+      case Reader::kTime:
+      case Reader::kDatetime:
+      case Reader::kTimestamp: {
+        mle_time t{};
+        failed = mysql_service_mysql_stmt_get_time->get(row, i, &t, &is_null);
+        if (failed || is_null) break;
+        mle::Temporal tm;
+        tm.year = static_cast<uint16_t>(t.year);
+        tm.month = static_cast<uint8_t>(t.month);
+        tm.day = static_cast<uint8_t>(t.day);
+        tm.hour = t.hour;
+        tm.minute = static_cast<uint8_t>(t.minute);
+        tm.second = static_cast<uint8_t>(t.second);
+        tm.microsecond = static_cast<uint32_t>(t.second_part);
+        tm.negative = t.neg;
+        w->temporal_value(readers[i] == Reader::kDate   ? Tag::kDate
+                          : readers[i] == Reader::kTime ? Tag::kTime
+                          : readers[i] == Reader::kDatetime ? Tag::kDatetime
+                                                            : Tag::kTimestamp,
+                          tm);
+        break;
+      }
+      default: {
+        mysql_cstring_with_length s{nullptr, 0};
+        failed = mysql_service_mysql_stmt_get_string->get(row, i, &s, &is_null);
+        if (failed || is_null) break;
+        const std::string_view text(s.str, s.length);
+        switch (readers[i]) {
+          case Reader::kVector:
+            // The server's bytes, once, into the arena.
+            w->vector_value(s.str,
+                            static_cast<uint32_t>(s.length / sizeof(float)));
+            break;
+          case Reader::kDecimal:
+            w->text_value(Tag::kDecimal, text);
+            break;
+          case Reader::kJson:
+            w->text_value(Tag::kJson, text);
+            break;
+          case Reader::kBytes:
+            w->text_value(Tag::kBytes, text);
+            break;
+          case Reader::kBit: {
+            uint64_t x = 0;  // big-endian bytes
+            for (unsigned char c : text) x = (x << 8) | c;
+            w->u64_value(x);
+            break;
+          }
+          default:
+            w->text_value(Tag::kString, text);
+        }
+      }
+    }
+    if (failed) return false;
+    if (is_null) w->null_value();
+  }
+  return true;
+}
+
 }  // namespace
+
+SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s,
+                                        uint32_t max_rows,
+                                        SqlResultMsg *result) {
+  // The statement has run (no cursor: exp note 44), so its warnings are
+  // final: room for them at the end of the chunk is kept from the start.
+  SqlResultMsg diag;
+  read_warnings(s.h, &diag);
+  size_t tail = 1 + 1 + 4 + 8;
+  for (const mle::Warning &x : diag.warnings)
+    tail += 4 + 4 + 4 + x.message.size();
+  if (tail >= m_direct->capacity) return Direct::kNotHere;
+
+  m_direct->posts_at_start = *m_direct->posts;
+  mle::Writer w(m_direct->data, m_direct->capacity - tail);
+  const size_t count_at = mle::put_rows_head(w, s.columns);
+  if (w.overflow()) return Direct::kNotHere;
+  uint32_t rows = 0;
+  bool more = false;
+  if (!s.lookahead.empty()) {  // read ahead by the Value path
+    for (const Value &v : s.lookahead) w.value(v);
+    if (w.overflow()) return Direct::kNotHere;
+    s.lookahead.clear();
+    rows++;
+  }
+  while (true) {
+    my_h_row row = s.pending;
+    s.pending = nullptr;
+    if (row == nullptr) {
+      if (mysql_service_mysql_stmt_result->fetch(s.h, &row)) return Direct::kError;
+      if (row == nullptr) {
+        s.rows_open = false;
+        break;
+      }
+    }
+    if (rows >= max_rows) {
+      s.pending = row;
+      more = true;
+      break;
+    }
+    const size_t at = w.position();
+    if (!write_row(row, s.readers, &w)) return Direct::kError;
+    if (w.overflow()) {
+      w.set_position(at);
+      s.pending = row;
+      // One row larger than the arena: the Value path sends it.
+      if (rows == 0) return Direct::kNotHere;
+      more = true;
+      break;
+    }
+    rows++;
+  }
+  w.patch_u32(count_at, rows);
+  bool more_results = false;
+  if (!s.rows_open) {
+    bool next = false;
+    if (!mysql_service_mysql_stmt_result->next_result(s.h, &next) && next)
+      s.next_pending = true;
+    more_results = s.next_pending;
+  }
+  w.set_capacity(m_direct->capacity);  // the tail's room
+  static const std::vector<mle::Warning> kNone;
+  mle::put_rows_tail(w, more, more_results,
+                     s.rows_open ? kNone : diag.warnings, result->exec_us);
+  if (w.overflow()) {  // cannot happen: the room was kept
+    sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
+              "an SQL result did not fit the room kept for it");
+    return Direct::kWritten;
+  }
+  m_direct->length = w.position();
+  if (!s.rows_open && !s.prepared && !s.next_pending) close(id);
+  return Direct::kWritten;
+}
 
 bool SqlRunner::read_rows(Statement &s, uint32_t max_rows,
                           SqlResultMsg *result) {
@@ -749,6 +936,12 @@ bool SqlRunner::read_rows(Statement &s, uint32_t max_rows,
   if (!s.lookahead.empty()) {
     for (Value &v : s.lookahead) result->rows.push_back(std::move(v));
     s.lookahead.clear();
+    rows++;
+  }
+  if (s.pending != nullptr) {
+    const my_h_row row = s.pending;
+    s.pending = nullptr;
+    if (!read_row(row, s.readers, &result->rows, &bytes)) return true;
     rows++;
   }
   while (rows < max_rows && bytes < kChunkBytes) {

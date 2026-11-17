@@ -151,7 +151,12 @@ class Hooks : public mle::CallHooks {
 
   /** SQL from the routine (Phase 5): the call's statements (sql.cc). */
   void sql(const mle::SqlMsg &m, mle::SqlResultMsg *r) override {
-    if (m_sql != nullptr) return m_sql->handle(m, r);
+    sql_into(m, r, nullptr);
+  }
+  /** The same; rows may go straight into the mailbox arena (exp note 44). */
+  void sql_into(const mle::SqlMsg &m, mle::SqlResultMsg *r,
+                mle::DirectReply *direct) override {
+    if (m_sql != nullptr) return m_sql->handle(m, r, direct);
     sql_error(r, ER_LANGUAGE_COMPONENT_INTERNAL, m_no_sql);
   }
 

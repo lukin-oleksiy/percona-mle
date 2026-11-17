@@ -496,6 +496,96 @@ TEST(MleCodec, SqlResultRoundTrip) {
   EXPECT_EQ(message_round_trip(empty), empty);
 }
 
+// Exp note 44, step 2: a result's rows written in parts straight into a
+// fixed buffer (the mailbox arena) by the typed writers, as the component
+// does, give the bytes encode(SqlResultMsg) gives.
+void put_typed(Writer &w, const Value &v) {
+  switch (v.tag()) {
+    case Tag::kNull:
+      return w.null_value();
+    case Tag::kI64:
+      return w.i64_value(v.as_i64());
+    case Tag::kU64:
+      return w.u64_value(v.as_u64());
+    case Tag::kF64:
+      return w.f64_value(v.as_f64());
+    case Tag::kDecimal:
+    case Tag::kString:
+    case Tag::kBytes:
+    case Tag::kJson:
+      return w.text_value(v.tag(), v.as_text());
+    case Tag::kDate:
+    case Tag::kTime:
+    case Tag::kDatetime:
+    case Tag::kTimestamp:
+      return w.temporal_value(v.tag(), v.as_temporal());
+    case Tag::kVector:
+      return w.vector_value(v.as_vector().data(),
+                            static_cast<uint32_t>(v.as_vector().size()));
+    default:  // kF32: not in SQL results (FLOAT columns arrive as F64)
+      return w.value(v);
+  }
+}
+
+TEST(MleCodec, RowsWrittenInPartsMatchEncode) {
+  const std::vector<Value> values = all_kinds_of_values();
+  SqlResultMsg m;
+  m.kind = SqlResultKind::kRows;
+  for (size_t i = 0; i < values.size(); i++) {
+    ParamType t;
+    t.tag = values[i].tag() == Tag::kNull ? Tag::kString : values[i].tag();
+    m.columns.push_back(Column("c" + std::to_string(i), "t", t));
+  }
+  // Two rows; the second shifted by one, so its vectors start at other
+  // offsets (their padding differs).
+  for (const Value &v : values) m.rows.push_back(v);
+  for (size_t i = 0; i < values.size(); i++)
+    m.rows.push_back(values[(i + 1) % values.size()]);
+  m.more = true;
+  m.warnings = {{1, 1265, "Data truncated for column 'c' at row 1"}};
+  m.exec_us = 7;
+  std::string expected;
+  encode(m, &expected);
+
+  std::vector<char> buf(expected.size());
+  Writer w(buf.data(), buf.size());
+  const size_t count_at = put_rows_head(w, m.columns);
+  for (const Value &v : m.rows) put_typed(w, v);
+  w.patch_u32(count_at, 2);
+  put_rows_tail(w, m.more, m.more_results, m.warnings, m.exec_us);
+  ASSERT_FALSE(w.overflow());
+  ASSERT_EQ(w.position(), expected.size());
+  EXPECT_EQ(std::string(buf.data(), w.position()), expected);
+
+  SqlResultMsg back;
+  std::string error;
+  ASSERT_TRUE(decode(expected, &back, &error)) << error;
+  EXPECT_EQ(back, m);
+}
+
+TEST(MleCodec, FixedBufferOverflowRollsBack) {
+  char buf[64];
+  Writer w(buf, sizeof buf);
+  w.u32(7);
+  const size_t at = w.position();
+  const std::vector<float> big(100, 1.0f);  // 400 bytes: does not fit
+  w.vector_value(big.data(), 100);
+  EXPECT_TRUE(w.overflow());
+  w.u8(1);  // still overflowing until rolled back
+  EXPECT_TRUE(w.overflow());
+  w.set_position(at);
+  EXPECT_FALSE(w.overflow());
+  EXPECT_EQ(w.position(), at);
+  const std::vector<float> small(4, 2.0f);
+  w.vector_value(small.data(), 4);
+  ASSERT_FALSE(w.overflow());
+  // u32 7, then the vector: tag, dims, padding to 16, 16 bytes of floats.
+  EXPECT_EQ(w.position(), 4 + 1 + 4 + 7 + 16);
+  float back[4];
+  memcpy(back, buf + 16, sizeof back);
+  EXPECT_EQ(back[3], 2.0f);
+}
+
 TEST(MleCodec, SmallMessagesRoundTrip) {
   EXPECT_EQ(message_round_trip(DropMsg{99}), DropMsg{99});
 }

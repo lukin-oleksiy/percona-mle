@@ -30,11 +30,14 @@
   call's statements and closes what is left when the call ends, so no
   statement outlives its call or crosses to another principal.
 
-  Results (S-11): a statement run directly buffers its whole result in the
-  server (at most mle.sql_result_max bytes) and is sent to the worker at
-  once; a prepared statement uses a cursor (one row per fetch, at most
-  mle.sql_row_max bytes) and is streamed in chunks of mle.sql_chunk_rows.
-  passResultToClient sends the result sets to the client instead.
+  Results (S-11, exp note 44): the server buffers a statement's whole
+  result (at most mle.sql_result_max bytes; prepared statements too, without
+  a cursor), and it goes to the worker in chunks of at most
+  mle.sql_chunk_rows rows that fit the mailbox arena. A chunk is written
+  straight into the arena from the server's rows (no Values, no encoding
+  buffer); a single row larger than the arena goes as Values in a message
+  split into arena-sized parts. passResultToClient sends the result sets
+  to the client instead.
 
   Errors (S-3): an inner statement's error stays in the caller's
   diagnostics area and goes to the worker. If the routine goes on (it
@@ -54,6 +57,10 @@
 
 #include "mle/codec.h"
 
+namespace mle {
+struct DirectReply;
+}
+
 namespace mle_component {
 
 class SqlRunner {
@@ -63,8 +70,10 @@ class SqlRunner {
   SqlRunner(const SqlRunner &) = delete;
   SqlRunner &operator=(const SqlRunner &) = delete;
 
-  /** Serves one SQL request of the worker. */
-  void handle(const mle::SqlMsg &request, mle::SqlResultMsg *result);
+  /** Serves one SQL request of the worker. With direct, a chunk of rows
+      may be written into the mailbox arena instead of result. */
+  void handle(const mle::SqlMsg &request, mle::SqlResultMsg *result,
+              mle::DirectReply *direct = nullptr);
 
   /** The routine returned: a caught statement error must not stay in the
       diagnostics area. */
@@ -102,8 +111,22 @@ class SqlRunner {
       closes a drained statement run from text. */
   void reply(uint64_t id, Statement &s, uint32_t max_rows, uint64_t exec_us,
              mle::SqlResultMsg *result);
+  /** The next chunk of rows of the current result set (result: kind,
+      columns and exec_us set): into the arena when it can, else as Values
+      in result; closes a drained statement run from text. */
+  void rows(uint64_t id, Statement &s, uint32_t max_rows,
+            mle::SqlResultMsg *result);
+  enum class Direct { kWritten, kError, kNotHere };
+  /** The chunk straight into m_direct's arena. kNotHere (nothing taken
+      from the statement but a row kept for the next chunk): the head or
+      one row does not fit; kError: the server failed (read its error). */
+  Direct write_rows(uint64_t id, Statement &s, uint32_t max_rows,
+                    mle::SqlResultMsg *result);
   /** Rows of the current result set into result (at most max_rows). */
   bool read_rows(Statement &s, uint32_t max_rows, mle::SqlResultMsg *result);
+  /** The result set is drained: its warnings, whether another follows;
+      closes a statement run from text that has no more. */
+  void finish_result_set(uint64_t id, Statement &s, mle::SqlResultMsg *result);
   void statement_error(Statement &s, mle::SqlResultMsg *result);
   /** A new statement the server refused: its error (statement_error), the
       statement closed, the refusal of SQL in a function explained. */
@@ -119,6 +142,8 @@ class SqlRunner {
   bool refused_here(mle::SqlResultMsg *result);
 
   MYSQL_THD m_thd;
+  /** The arena for the request being served (handle), or nullptr. */
+  mle::DirectReply *m_direct = nullptr;
   std::map<uint64_t, std::unique_ptr<Statement>> m_statements;
   bool m_context_checked = false;
   bool m_refused = false;

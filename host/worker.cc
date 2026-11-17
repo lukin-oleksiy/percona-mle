@@ -201,7 +201,10 @@ WorkerStats Worker::stats() const {
 void Worker::post(wire::Op op, uint32_t flags, const char *data, size_t len,
                   uint64_t total) {
   wire::RegionHeader *h = m_process->header();
-  if (len > 0) memcpy(m_process->arena(), data, len);
+  // A DirectReply is already in the arena.
+  if (len > 0 && data != reinterpret_cast<const char *>(m_process->arena()))
+    memcpy(m_process->arena(), data, len);
+  m_posts++;
   wire::MessageHeader m{};
   m.op = static_cast<uint32_t>(op);
   m.flags = flags;
@@ -472,8 +475,15 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
       SqlMsg sql;
       if (!decode(m.body, &sql, &why)) return broke("bad SQL: " + why);
       SqlResultMsg r;
+      // A result's rows may be written straight into the arena (exp note
+      // 44, step 2): the request was decoded above, so it may be
+      // overwritten.
+      DirectReply direct;
+      direct.data = reinterpret_cast<char *>(m_process->arena());
+      direct.capacity = m_process->arena_size();
+      direct.posts = &m_posts;
       int64_t t = trace.on ? now_ns() : 0;
-      hooks.sql(sql, &r);  // may run nested calls on this worker
+      hooks.sql_into(sql, &r, &direct);  // may run nested calls on this worker
       if (trace.on) {
         const int64_t t2 = now_ns();
         trace.sql += t2 - t;
@@ -486,6 +496,19 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
       // A routine that keeps the worker busy with SQL never lets the wait
       // reach a tick: check for KILL after every statement too.
       if (check_kill(&hooks) == Wait::kKilled) return lost(Wait::kKilled);
+      if (direct.length > 0) {
+        // Nested calls (which use the arena) only run before the rows are
+        // written: during the statement's execution.
+        if (direct.posts_at_start != m_posts || direct.length > direct.capacity)
+          return fail(Status::kInternal,
+                      "a direct SQL result was overwritten in the mailbox",
+                      error);
+        if (trace.on) trace.bytes += direct.length;
+        post(wire::Op::kSqlResult, 0, direct.data, direct.length,
+             direct.length);
+        if (trace.on) trace.send += now_ns() - t;
+        continue;
+      }
       std::string reply;
       encode(r, &reply);
       if (trace.on) {

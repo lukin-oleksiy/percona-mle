@@ -315,49 +315,83 @@ void Writer::str(std::string_view s) {
   raw(s.data(), s.size());
 }
 
+void Writer::zeros(size_t n) {
+  static const char kZeros[wire::kVectorAlignment] = {};
+  raw(kZeros, n);
+}
+
+void Writer::i64_value(int64_t v) {
+  u8(static_cast<uint8_t>(Tag::kI64));
+  u64(static_cast<uint64_t>(v));
+}
+
+void Writer::u64_value(uint64_t v) {
+  u8(static_cast<uint8_t>(Tag::kU64));
+  u64(v);
+}
+
+void Writer::f64_value(double v) {
+  u8(static_cast<uint8_t>(Tag::kF64));
+  f64(v);
+}
+
+void Writer::text_value(Tag tag, std::string_view s) {
+  u8(static_cast<uint8_t>(tag));
+  str(s);
+}
+
+void Writer::temporal_value(Tag tag, const Temporal &t) {
+  u8(static_cast<uint8_t>(tag));
+  u16(t.year);
+  u8(t.month);
+  u8(t.day);
+  u32(t.hour);
+  u8(t.minute);
+  u8(t.second);
+  u32(t.microsecond);
+  u8(t.negative ? 1 : 0);
+}
+
+void Writer::vector_value(const void *data, uint32_t dims) {
+  u8(static_cast<uint8_t>(Tag::kVector));
+  u32(dims);
+  zeros(vector_padding(position()));
+  raw(data, size_t{dims} * sizeof(float));
+}
+
 void Writer::value(const Value &v) {
-  u8(static_cast<uint8_t>(v.tag()));
   switch (v.tag()) {
     case Tag::kNull:
+      null_value();
       break;
     case Tag::kI64:
-      u64(static_cast<uint64_t>(v.as_i64()));
+      i64_value(v.as_i64());
       break;
     case Tag::kU64:
-      u64(v.as_u64());
+      u64_value(v.as_u64());
       break;
     case Tag::kF64:
-      f64(v.as_f64());
+      f64_value(v.as_f64());
       break;
     case Tag::kF32:
+      u8(static_cast<uint8_t>(Tag::kF32));
       f32(v.as_f32());
       break;
     case Tag::kDecimal:
     case Tag::kString:
     case Tag::kBytes:
     case Tag::kJson:
-      str(v.as_text());
+      text_value(v.tag(), v.as_text());
       break;
     case Tag::kDate:
     case Tag::kTime:
     case Tag::kDatetime:
-    case Tag::kTimestamp: {
-      const Temporal &t = v.as_temporal();
-      u16(t.year);
-      u8(t.month);
-      u8(t.day);
-      u32(t.hour);
-      u8(t.minute);
-      u8(t.second);
-      u32(t.microsecond);
-      u8(t.negative ? 1 : 0);
+    case Tag::kTimestamp:
+      temporal_value(v.tag(), v.as_temporal());
       break;
-    }
     case Tag::kVector: {
       const auto &f = v.as_vector();
-      u32(static_cast<uint32_t>(f.size()));
-      m_out->append(vector_padding(m_out->size()), '\0');
-      raw(f.data(), f.size() * sizeof(float));
+      vector_value(f.data(), static_cast<uint32_t>(f.size()));
       break;
     }
   }
@@ -759,31 +793,48 @@ void encode(const SqlResultMsg &m, std::string *out) {
       w.u64(m.exec_us);
       return;
     case SqlResultKind::kRows: {
-      w.u32(static_cast<uint32_t>(m.columns.size()));
-      for (const Column &c : m.columns) {
-        w.str(c.name);
-        w.str(c.table);
-        put_param_type(w, c.type);
-        w.str(c.org_name);
-        w.str(c.schema);
-        w.str(c.org_table);
-        w.str(c.charset);
-        w.str(c.collation);
-        w.u32(c.flags);
-      }
+      out->clear();  // put_rows_head writes the kind too
+      Writer h(out);
+      const size_t count_at = put_rows_head(h, m.columns);
       const size_t ncols = m.columns.size();
-      w.u32(static_cast<uint32_t>(ncols == 0 ? 0 : m.rows.size() / ncols));
+      const uint32_t rows =
+          static_cast<uint32_t>(ncols == 0 ? 0 : m.rows.size() / ncols);
+      memcpy(out->data() + count_at, &rows, sizeof rows);
       // Rows with VECTORs or long text make bodies of many MB: one
       // allocation instead of a growing string's copies and page faults.
       out->reserve(out->size() + encoded_size(m.rows) + 64);
-      for (const Value &v : m.rows) w.value(v);
-      w.u8(m.more ? 1 : 0);
-      w.u8(m.more_results ? 1 : 0);
-      put_warnings(w, m.warnings);
-      w.u64(m.exec_us);
+      for (const Value &v : m.rows) h.value(v);
+      put_rows_tail(h, m.more, m.more_results, m.warnings, m.exec_us);
       return;
     }
   }
+}
+
+size_t put_rows_head(Writer &w, const std::vector<Column> &columns) {
+  w.u8(static_cast<uint8_t>(SqlResultKind::kRows));
+  w.u32(static_cast<uint32_t>(columns.size()));
+  for (const Column &c : columns) {
+    w.str(c.name);
+    w.str(c.table);
+    put_param_type(w, c.type);
+    w.str(c.org_name);
+    w.str(c.schema);
+    w.str(c.org_table);
+    w.str(c.charset);
+    w.str(c.collation);
+    w.u32(c.flags);
+  }
+  const size_t count_at = w.position();
+  w.u32(0);  // the row count, patched by the caller
+  return count_at;
+}
+
+void put_rows_tail(Writer &w, bool more, bool more_results,
+                   const std::vector<Warning> &warnings, uint64_t exec_us) {
+  w.u8(more ? 1 : 0);
+  w.u8(more_results ? 1 : 0);
+  put_warnings(w, warnings);
+  w.u64(exec_us);
 }
 
 bool decode(std::string_view body, SqlResultMsg *m, std::string *error) {

@@ -33,6 +33,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -47,13 +48,17 @@ namespace mle {
 using wire::ParamMode;
 using wire::SqlResultKind;
 
-/** Appends wire encodings to a byte string. Offsets (for VECTOR alignment)
-    are relative to the start of the string, which is the message start. */
+/** Appends wire encodings to a byte string, or writes them into a fixed
+    buffer (the mailbox arena: exp note 44, step 2). Offsets (for VECTOR
+    alignment) are relative to the start of the string or buffer, which is
+    the message start. In a fixed buffer, a write that does not fit sets
+    overflow() and writes nothing; set_position() rolls back. */
 class Writer {
  public:
   explicit Writer(std::string *out) : m_out(out) {}
+  Writer(char *buffer, size_t capacity) : m_buf(buffer), m_cap(capacity) {}
 
-  void u8(uint8_t v) { m_out->push_back(static_cast<char>(v)); }
+  void u8(uint8_t v) { raw(&v, sizeof v); }
   void u16(uint16_t v) { raw(&v, sizeof v); }
   void u32(uint32_t v) { raw(&v, sizeof v); }
   void u64(uint64_t v) { raw(&v, sizeof v); }
@@ -61,12 +66,46 @@ class Writer {
   void f64(double v) { raw(&v, sizeof v); }
   void str(std::string_view s);
   void value(const Value &v);
+  /** Values without an mle::Value, encoded exactly as value() encodes them. */
+  void null_value() { u8(static_cast<uint8_t>(Tag::kNull)); }
+  void i64_value(int64_t v);
+  void u64_value(uint64_t v);
+  void f64_value(double v);
+  /** kDecimal, kString, kBytes or kJson. */
+  void text_value(Tag tag, std::string_view s);
+  /** kDate, kTime, kDatetime or kTimestamp. */
+  void temporal_value(Tag tag, const Temporal &t);
+  /** dims floats from data (any alignment), padded to kVectorAlignment. */
+  void vector_value(const void *data, uint32_t dims);
   void raw(const void *p, size_t n) {
-    m_out->append(static_cast<const char *>(p), n);
+    if (m_out != nullptr) {
+      m_out->append(static_cast<const char *>(p), n);
+    } else if (m_overflow || n > m_cap - m_len) {
+      m_overflow = true;
+    } else {
+      if (n > 0) memcpy(m_buf + m_len, p, n);
+      m_len += n;
+    }
   }
+  size_t position() const { return m_out != nullptr ? m_out->size() : m_len; }
+  /** Fixed buffer only: back to an earlier position, clearing overflow. */
+  void set_position(size_t pos) {
+    m_len = pos;
+    m_overflow = false;
+  }
+  /** Fixed buffer only: a new capacity (at least position()). */
+  void set_capacity(size_t capacity) { m_cap = capacity; }
+  /** Fixed buffer only: overwrite a u32 written earlier at pos. */
+  void patch_u32(size_t pos, uint32_t v) { memcpy(m_buf + pos, &v, sizeof v); }
+  bool overflow() const { return m_overflow; }
 
  private:
-  std::string *m_out;
+  void zeros(size_t n);
+  std::string *m_out = nullptr;
+  char *m_buf = nullptr;
+  size_t m_cap = 0;
+  size_t m_len = 0;
+  bool m_overflow = false;
 };
 
 /** Bounds-checked reader over one message body. All getters return false
@@ -328,6 +367,13 @@ void encode(const CallMsg &m, std::string *out);
 void encode(const ResultMsg &m, std::string *out);
 void encode(const SqlMsg &m, std::string *out);
 void encode(const SqlResultMsg &m, std::string *out);
+/** A kRows SQL_RESULT written in parts (exp note 44, step 2): the head (kind,
+    columns, a row count to patch at the returned position), the rows' values
+    (Writer::*_value), then the tail. encode(SqlResultMsg) uses the same
+    parts, so both give the same bytes. */
+size_t put_rows_head(Writer &w, const std::vector<Column> &columns);
+void put_rows_tail(Writer &w, bool more, bool more_results,
+                   const std::vector<Warning> &warnings, uint64_t exec_us);
 void encode(const DropMsg &m, std::string *out);
 void encode(const OptionsMsg &m, std::string *out);
 void encode(const ParseLibraryMsg &m, std::string *out);

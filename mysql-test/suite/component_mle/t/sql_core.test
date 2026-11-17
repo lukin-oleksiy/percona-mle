@@ -237,6 +237,47 @@ SET GLOBAL mle.sql_result_max = 100000;
 --error ER_RESULT_SIZE_LIMIT_EXCEEDED
 CALL big_param(@r);
 SET GLOBAL mle.sql_result_max = DEFAULT;
+--echo # Rows go into the mailbox as they are read (exp note 44); a row larger
+--echo # than the mailbox goes in a message of several parts, between others.
+CREATE PROCEDURE huge_row(OUT r TEXT) LANGUAGE JAVA AS $$
+long id = MleSql.newStatementId();
+MleSql.Reply x = MleSql.execute(id,
+    "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2000) " +
+    "SELECT n, IF(n = ?, REPEAT('y', 3000000), 'small'), " +
+    "STRING_TO_VECTOR(CONCAT('[', n, ',', -n, ',0.5]')) FROM c", new Object[] {3}, false, 0);
+long rows = 0, chars = 0, sum = 0, chunks = 1;
+while (true) {
+  for (Object[] row : x.rows()) {
+    rows++;
+    chars += ((String) row[1]).length();
+    float[] v = (float[]) row[2];
+    if (v[0] == ((Number) row[0]).longValue() && v[1] == -v[0] && v[2] == 0.5f) sum++;
+  }
+  if (!x.moreRows()) break;
+  x = MleSql.fetch(id, 0);
+  chunks++;
+}
+r[0] = "rows=" + rows + " chars=" + chars + " vectors_ok=" + sum + " chunks_more_than_2=" + (chunks > 2);
+$$;
+CALL huge_row(@r);
+SELECT @r;
+--echo # Warnings come with the last chunk, after many rows.
+CREATE PROCEDURE warn_rows(OUT r TEXT) LANGUAGE JAVA AS $$
+long id = MleSql.newStatementId();
+MleSql.Reply x = MleSql.execute(id,
+    "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < ?) " +
+    "SELECT n, CAST(CONCAT(n, 'x') AS SIGNED) FROM c", new Object[] {30000}, false, 0);
+long rows = x.rows().size(), early = x.warnings().size();
+while (x.moreRows()) {
+  x = MleSql.fetch(id, 0);
+  rows += x.rows().size();
+  if (x.moreRows()) early += x.warnings().size();
+}
+r[0] = "rows=" + rows + " warnings_before_last=" + early + " last=" + x.warnings().size() +
+    " first=" + x.warnings().get(0).message();
+$$;
+CALL warn_rows(@r);
+SELECT @r;
 SET GLOBAL mle.sql_statements_max = 2;
 CREATE PROCEDURE many(OUT r TEXT) LANGUAGE JAVA AS $$
 MleSql.prepare(MleSql.newStatementId(), "SELECT 1", false);
@@ -330,6 +371,8 @@ DROP FUNCTION f_sql;
 DROP FUNCTION f_throw;
 DROP PROCEDURE big;
 DROP PROCEDURE big_param;
+DROP PROCEDURE huge_row;
+DROP PROCEDURE warn_rows;
 DROP PROCEDURE many;
 DROP PROCEDURE keep;
 DROP PROCEDURE read_secret;

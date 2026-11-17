@@ -67,12 +67,32 @@ struct WorkerOptions {
 };
 
 /** Implemented by the caller (mysqld in the component, tests here). */
+/** The mailbox arena, for a reply written straight into it (exp note 44,
+    step 2): the SQL_RESULT's bytes, without a SqlResultMsg, its Values or
+    an encoding buffer. The writer sets posts_at_start to *posts when it
+    starts writing, and length when it is done; nothing may be posted to the
+    worker in between (that would overwrite the arena): the worker checks. */
+struct DirectReply {
+  char *data = nullptr;
+  size_t capacity = 0;
+  const uint64_t *posts = nullptr;
+  uint64_t posts_at_start = 0;
+  size_t length = 0;
+};
+
 class CallHooks {
  public:
   virtual ~CallHooks() = default;
   /** Runs a statement for the routine, on the calling thread, and fills
    *result. May call Worker::call again (a nested routine call). */
   virtual void sql(const SqlMsg &request, SqlResultMsg *result) = 0;
+  /** sql(), but a kRows result may instead be written into direct (its
+      length set). By default: sql(). */
+  virtual void sql_into(const SqlMsg &request, SqlResultMsg *result,
+                        DirectReply *direct) {
+    (void)direct;
+    sql(request, result);
+  }
   /** True once the session was killed or ran out of time; polled while
       waiting (every few milliseconds) and after each SQL request. */
   virtual bool killed() { return false; }
@@ -202,6 +222,8 @@ class Worker {
   uint32_t m_seen_h = 0;
   uint32_t m_depth = 0;
   uint64_t m_seq = 0;
+  /** Messages posted to the worker (DirectReply's check). */
+  uint64_t m_posts = 0;
   /** call_seq of the running top-level request, 0 when idle. */
   std::atomic<uint64_t> m_running{0};
   /** When the INTERRUPT went out for the running request (ms clock). */
