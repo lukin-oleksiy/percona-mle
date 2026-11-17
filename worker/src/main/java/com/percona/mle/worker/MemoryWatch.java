@@ -34,8 +34,14 @@ import java.util.concurrent.locks.LockSupport;
  * the last young GC it caused (or since the lowest size seen), it causes a young GC: it allocates
  * short-lived garbage until a weak reference to a fresh object is cleared. The JVM collects as it
  * always does when the young generation is full (~1 ms), which frees the numpy arrays that died
- * young. No System.gc(): a forced full GC took 125-190 ms (250-800 ms under load) and made one
- * call in ~25 of a 16 MB fetch_columns stream that slow (exp note 45: p99 138 -> 22 ms). Freed
+ * young. No System.gc() on the way: a forced full GC took 125-190 ms (250-800 ms under load) and
+ * made one call in ~25 of a 16 MB fetch_columns stream that slow (exp note 45: p99 138 -> 22 ms).
+ * Only as a last resort, when the size is still above 85 % of the limit after a young GC and has
+ * grown by a twentieth of the limit since the last full GC (or the lowest size seen), it forces a
+ * full GC: objects that reached the old generation hold their native memory until one runs, and
+ * the JVM starts one only when its heap is full (a worker running many small numpy arrays was
+ * killed without it, exp note 46). A call that holds much data steadily is not collected again
+ * and again; the P2-P4 benchmarks stay at about half of the limit and never get there. Freed
  * arrays reach the system at once because workers run with a fixed malloc mmap threshold
  * (mle.malloc_mmap_threshold), and the launcher sets the cgroup's memory.high to 90 % of
  * memory.max, so that the kernel throttles an allocating thread instead of killing the worker.
@@ -66,6 +72,8 @@ final class MemoryWatch implements Runnable {
   private static final byte[] BUFFER = new byte[8192];
   /** The resident size after the last young GC caused here, or the lowest seen since (bytes). */
   private long base = Long.MAX_VALUE;
+  /** The resident size after the last full GC forced here, or the lowest seen since (bytes). */
+  private long fullBase = Long.MAX_VALUE;
   /** Where the garbage of nudge() goes (a volatile store: it cannot be optimised away). */
   private static volatile Object sink;
 
@@ -135,12 +143,20 @@ final class MemoryWatch implements Runnable {
     long rss = rss();
     if (rss < 0) return;
     if (rss < base) base = rss;
+    if (rss < fullBase) fullBase = rss;
     if (rss - base <= limit / 20) return;
     // Counted first: the call's statistics (sent with its RESULT) must include it.
     GCS.incrementAndGet();
     nudge();
     long after = rss();
-    base = after < 0 ? rss : after;
+    if (after < 0) after = rss;
+    base = after;
+    if (after > limit / 100 * 85 && after - fullBase > limit / 20) {  // the last resort (see above)
+      GCS.incrementAndGet();
+      System.gc();
+      long full = rss();
+      base = fullBase = full < 0 ? after : full;
+    }
   }
 
   /**
