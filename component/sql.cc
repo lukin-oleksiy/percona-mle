@@ -128,6 +128,31 @@ struct SqlRunner::Statement {
       server keeps it until the next fetch). At most one of lookahead and
       pending is set. */
   my_h_row pending = nullptr;
+  /** The server holds the whole result (a direct statement, or a prepared
+      one without a cursor): every row handle of the current result set is
+      collected when it starts (so its row count is known, exp note 44 step
+      3) and stays valid until the statement is closed or run again. */
+  bool buffered = true;
+  std::vector<my_h_row> all;
+  size_t next = 0;
+  /** The current result set's row count; 0: unknown (a cursor). */
+  uint64_t total = 0;
+  /** The next chunk is the result set's first: a buffered result's
+      warnings are final, they go with it (and with the last), so that the
+      worker has them before it reads all rows. */
+  bool first = false;
+
+  /** The current result set's next row (nullptr at its end): a collected
+      handle, else the server's fetch; true on a server failure. */
+  bool next_row(my_h_row *row) {
+    if (next < all.size()) {
+      *row = all[next++];
+      return false;
+    }
+    // Collected ones used up: the server's fetch says the end (a buffered
+    // result), or gives the cursor's next row.
+    return mysql_service_mysql_stmt_result->fetch(h, row);
+  }
 
   ~Statement() {
     if (h != nullptr) (void)mysql_service_mysql_stmt_factory->close(h);
@@ -216,13 +241,15 @@ namespace {
     note 44): execution collects the whole result, within `capacity`, with no
     temporary table and no row-by-row fetches, like a direct statement. A
     server without the statement service's "use_cursor" attribute keeps the
-    cursor, rows up to mle.sql_row_max. */
+    cursor, rows up to mle.sql_row_max (*buffered = false). */
 my_h_statement new_statement(bool to_client, size_t capacity,
-                             bool prepared = false) {
+                             bool prepared = false, bool *buffered = nullptr) {
   my_h_statement h = nullptr;
   if (mysql_service_mysql_stmt_factory->init(&h)) return nullptr;
-  if (prepared && !to_client && set_attribute(h, "use_cursor", false))
+  if (prepared && !to_client && set_attribute(h, "use_cursor", false)) {
     capacity = sql_row_max();
+    if (buffered != nullptr) *buffered = false;
+  }
   // S-3: the value must be a mysql_cstring_with_length (a char* crashes).
   const mysql_cstring_with_length utf8mb4 = cstr("utf8mb4");
   bool failed = set_attribute(h, "charset_name", utf8mb4) ||
@@ -376,7 +403,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
   auto s = std::make_unique<Statement>();
   // S-11: the server buffers the whole result (buffer_capacity bytes), with
   // or without parameters (no cursor: new_statement).
-  s->h = new_statement(to_client, sql_result_max(), with_params);
+  s->h = new_statement(to_client, sql_result_max(), with_params, &s->buffered);
   if (s->h == nullptr)
     return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
                      "cannot create a statement");
@@ -410,7 +437,7 @@ void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
   const bool to_client =
       (request.flags & mle::wire::kPassResultToClient) != 0;
   auto s = std::make_unique<Statement>();
-  s->h = new_statement(to_client, sql_result_max(), true);
+  s->h = new_statement(to_client, sql_result_max(), true, &s->buffered);
   if (s->h == nullptr)
     return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
                      "cannot create a statement");
@@ -440,6 +467,9 @@ void SqlRunner::execute_prepared(const mle::SqlMsg &request,
   s.rows_open = false;
   s.next_pending = false;
   s.lookahead.clear();
+  s.pending = nullptr;
+  s.all.clear();  // the handles of the last execution's rows
+  s.next = 0;
   const uint64_t t0 = now_us();
   // Partial binding: the markers not given keep their values (S-11).
   if (bind_values(s.h, request.params) ||
@@ -482,6 +512,7 @@ void SqlRunner::fetch(const mle::SqlMsg &request, SqlResultMsg *result) {
   *result = SqlResultMsg();
   result->kind = SqlResultKind::kRows;
   result->columns = s.columns;
+  result->total_rows = s.total;
   rows(request.stmt_id, s, max_rows, result);
 }
 
@@ -496,7 +527,7 @@ void SqlRunner::next_result(const mle::SqlMsg &request, SqlResultMsg *result) {
     bool more = false;
     if (s.rows_open) {
       my_h_row row = nullptr;
-      while (!mysql_service_mysql_stmt_result->fetch(s.h, &row) && row != nullptr) {
+      while (!s.next_row(&row) && row != nullptr) {
       }
       s.rows_open = false;
       s.lookahead.clear();
@@ -634,10 +665,30 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
   }
   s.rows_open = true;
   s.pending = nullptr;
+  s.all.clear();
+  s.next = 0;
+  s.total = 0;
+  if (s.buffered) {
+    // The server has all rows already: their handles give the count, which
+    // lets the worker allocate the routine's array once (exp note 44).
+    my_h_row row = nullptr;
+    while (true) {
+      if (mysql_service_mysql_stmt_result->fetch(s.h, &row))
+        return statement_error(s, result);
+      if (row == nullptr) break;
+      s.all.push_back(row);
+    }
+    s.total = s.all.size();
+  }
   result->kind = SqlResultKind::kRows;
   result->columns = s.columns;
+  result->total_rows = s.total;
+  s.first = true;
   rows(id, s, max_rows, result);
+  s.first = false;
 }
+
+
 
 void SqlRunner::rows(uint64_t id, Statement &s, uint32_t max_rows,
                      SqlResultMsg *result) {
@@ -652,7 +703,10 @@ void SqlRunner::rows(uint64_t id, Statement &s, uint32_t max_rows,
     }
   }
   if (read_rows(s, max_rows, result)) return statement_error(s, result);
-  if (!s.rows_open) finish_result_set(id, s, result);
+  if (!s.rows_open)
+    finish_result_set(id, s, result);
+  else if (s.buffered && s.first)
+    read_warnings(s.h, result);
 }
 
 void SqlRunner::finish_result_set(uint64_t id, Statement &s,
@@ -866,7 +920,7 @@ SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s,
 
   m_direct->posts_at_start = *m_direct->posts;
   mle::Writer w(m_direct->data, m_direct->capacity - tail);
-  const size_t count_at = mle::put_rows_head(w, s.columns);
+  const size_t count_at = mle::put_rows_head(w, s.columns, s.total);
   if (w.overflow()) return Direct::kNotHere;
   uint32_t rows = 0;
   bool more = false;
@@ -880,7 +934,7 @@ SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s,
     my_h_row row = s.pending;
     s.pending = nullptr;
     if (row == nullptr) {
-      if (mysql_service_mysql_stmt_result->fetch(s.h, &row)) return Direct::kError;
+      if (s.next_row(&row)) return Direct::kError;
       if (row == nullptr) {
         s.rows_open = false;
         break;
@@ -913,8 +967,9 @@ SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s,
   }
   w.set_capacity(m_direct->capacity);  // the tail's room
   static const std::vector<mle::Warning> kNone;
-  mle::put_rows_tail(w, more, more_results,
-                     s.rows_open ? kNone : diag.warnings, result->exec_us);
+  const bool warnings = !s.rows_open || (s.buffered && s.first);
+  mle::put_rows_tail(w, more, more_results, warnings ? diag.warnings : kNone,
+                     result->exec_us);
   if (w.overflow()) {  // cannot happen: the room was kept
     sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
               "an SQL result did not fit the room kept for it");
@@ -946,7 +1001,7 @@ bool SqlRunner::read_rows(Statement &s, uint32_t max_rows,
   }
   while (rows < max_rows && bytes < kChunkBytes) {
     my_h_row row = nullptr;
-    if (mysql_service_mysql_stmt_result->fetch(s.h, &row)) return true;
+    if (s.next_row(&row)) return true;
     if (row == nullptr) {
       s.rows_open = false;
       return false;
@@ -956,7 +1011,7 @@ bool SqlRunner::read_rows(Statement &s, uint32_t max_rows,
   }
   // The chunk is full: is there one more row?
   my_h_row row = nullptr;
-  if (mysql_service_mysql_stmt_result->fetch(s.h, &row)) return true;
+  if (s.next_row(&row)) return true;
   if (row == nullptr) {
     s.rows_open = false;
     return false;

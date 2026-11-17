@@ -44,10 +44,25 @@ public final class SqlBridge {
     return d.sqlRequest(action, id, text, params, flags, maxRows);
   }
 
-  /** com.percona.mle.sql: a request whose rows keep raw values (see Dispatcher#sqlRequest). */
+  /**
+   * com.percona.mle.sql: a request whose rows keep raw values (see Dispatcher#sqlRequest);
+   * vectorBuffers: VECTORs as ByteBuffers, not float[]; sink: the rows go to it, not into the reply.
+   */
   public static com.percona.mle.api.MleSql.Reply requestRaw(int action, long id, String text, Object[] params,
-      int flags, int maxRows) {
-    return dispatcher().sqlRequest(action, id, text, params, flags, maxRows, true);
+      int flags, int maxRows, boolean vectorBuffers, com.percona.mle.sql.RowSink sink) {
+    return dispatcher().sqlRequest(action, id, text, params, flags, maxRows,
+        vectorBuffers ? Dispatcher.RAW_BUFFERS : Dispatcher.RAW, sink);
+  }
+
+  /** Statement id's unread rows are drained before another statement runs (Dispatcher#deferDrain). */
+  public static void deferDrain(long id, Runnable drain) {
+    dispatcher().deferDrain(id, drain);
+  }
+
+  /** Statement id's rows need no draining any more. */
+  public static void drained(long id) {
+    Dispatcher d = dispatcher;
+    if (d != null) d.drained(id);
   }
 
   /** The running top-level call's sequence number. */

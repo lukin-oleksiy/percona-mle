@@ -336,6 +336,8 @@ struct SqlResultMsg {
   uint64_t insert_id = 0;
   // kRows
   std::vector<Column> columns;
+  /** All rows of the result set, also those of other chunks; 0: unknown. */
+  uint64_t total_rows = 0;
   /** Row-major, rows x columns.size() values. */
   std::vector<Value> rows;
   bool more = false;
@@ -368,10 +370,11 @@ void encode(const ResultMsg &m, std::string *out);
 void encode(const SqlMsg &m, std::string *out);
 void encode(const SqlResultMsg &m, std::string *out);
 /** A kRows SQL_RESULT written in parts (exp note 44, step 2): the head (kind,
-    columns, a row count to patch at the returned position), the rows' values
+    columns, total rows, a row count to patch at the returned position), the rows' values
     (Writer::*_value), then the tail. encode(SqlResultMsg) uses the same
     parts, so both give the same bytes. */
-size_t put_rows_head(Writer &w, const std::vector<Column> &columns);
+size_t put_rows_head(Writer &w, const std::vector<Column> &columns,
+                     uint64_t total_rows);
 void put_rows_tail(Writer &w, bool more, bool more_results,
                    const std::vector<Warning> &warnings, uint64_t exec_us);
 void encode(const DropMsg &m, std::string *out);

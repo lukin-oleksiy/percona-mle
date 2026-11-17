@@ -485,6 +485,7 @@ TEST(MleCodec, SqlResultRoundTrip) {
     rows.rows.push_back(Value::u64(i));
     rows.rows.push_back(i % 7 == 0 ? Value::null() : Value::f64(1.0 / (i + 1)));
   }
+  rows.total_rows = 5000;
   rows.more = true;
   rows.more_results = true;
   rows.exec_us = 99;
@@ -541,6 +542,7 @@ TEST(MleCodec, RowsWrittenInPartsMatchEncode) {
   for (const Value &v : values) m.rows.push_back(v);
   for (size_t i = 0; i < values.size(); i++)
     m.rows.push_back(values[(i + 1) % values.size()]);
+  m.total_rows = 2;
   m.more = true;
   m.warnings = {{1, 1265, "Data truncated for column 'c' at row 1"}};
   m.exec_us = 7;
@@ -549,7 +551,7 @@ TEST(MleCodec, RowsWrittenInPartsMatchEncode) {
 
   std::vector<char> buf(expected.size());
   Writer w(buf.data(), buf.size());
-  const size_t count_at = put_rows_head(w, m.columns);
+  const size_t count_at = put_rows_head(w, m.columns, m.total_rows);
   for (const Value &v : m.rows) put_typed(w, v);
   w.patch_u32(count_at, 2);
   put_rows_tail(w, m.more, m.more_results, m.warnings, m.exec_us);
@@ -671,6 +673,7 @@ TEST(MleCodec, BadMessagesAreRejected) {
     w.u32(0);
     for (int i = 0; i < 6; i++) w.str("");  // type name .. collation
     w.u32(0);                               // flags
+    w.u64(1);           // total rows
     w.u32(0xFFFFFFFF);  // rows
     SqlResultMsg back;
     EXPECT_FALSE(decode(bytes, &back, &error));

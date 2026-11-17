@@ -261,20 +261,22 @@ r[0] = "rows=" + rows + " chars=" + chars + " vectors_ok=" + sum + " chunks_more
 $$;
 CALL huge_row(@r);
 SELECT @r;
---echo # Warnings come with the last chunk, after many rows.
+--echo # Warnings of a buffered result (final when it ran) come with its first
+--echo # chunk and its last, none in between; the first chunk has the total rows.
 CREATE PROCEDURE warn_rows(OUT r TEXT) LANGUAGE JAVA AS $$
 long id = MleSql.newStatementId();
 MleSql.Reply x = MleSql.execute(id,
     "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < ?) " +
     "SELECT n, CAST(CONCAT(n, 'x') AS SIGNED) FROM c", new Object[] {30000}, false, 0);
-long rows = x.rows().size(), early = x.warnings().size();
+long rows = x.rows().size(), total = x.totalRows(), between = 0;
+int first = x.moreRows() ? x.warnings().size() : -1;
 while (x.moreRows()) {
   x = MleSql.fetch(id, 0);
   rows += x.rows().size();
-  if (x.moreRows()) early += x.warnings().size();
+  if (x.moreRows()) between += x.warnings().size();
 }
-r[0] = "rows=" + rows + " warnings_before_last=" + early + " last=" + x.warnings().size() +
-    " first=" + x.warnings().get(0).message();
+r[0] = "rows=" + rows + " total=" + total + " first_chunk=" + first + " between=" + between +
+    " last=" + x.warnings().size() + " first=" + x.warnings().get(0).message();
 $$;
 CALL warn_rows(@r);
 SELECT @r;

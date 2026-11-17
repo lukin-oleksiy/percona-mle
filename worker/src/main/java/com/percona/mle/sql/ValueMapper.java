@@ -35,4 +35,9 @@ public interface ValueMapper {
    * String, byte[], float[], MleJson, LocalDate, LocalDateTime, Duration, Boolean, or null).
    */
   Object param(Object value);
+
+  /** Whether raw VECTOR values are little-endian ByteBuffers instead of float[] (JavaScript). */
+  default boolean vectorBuffers() {
+    return false;
+  }
 }

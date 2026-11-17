@@ -100,11 +100,15 @@ public final class SqlResult implements Iterable<Row> {
   private long execUs;
   private List<Warning> warnings = List.of();
   private boolean replaced;
+  /** The current result set's row count (0: not known), and its rows received so far. */
+  private long total;
+  private long received;
 
   /**
    * A statement run from text without parameters: mysqld buffered its whole result and sends it
-   * in chunks; all of them are fetched at once, so mysqld closes the statement before runSql
-   * returns and holds at most one buffered result (12 §11).
+   * in chunks. The rest is fetched when the routine reads it, or drained into the worker before
+   * the routine runs another statement (exp note 44 step 3), so mysqld holds at most one buffered
+   * result (12 §11).
    */
   private final boolean direct;
 
@@ -122,6 +126,7 @@ public final class SqlResult implements Iterable<Row> {
   }
 
   private void load(MleSql.Reply r) {
+    com.percona.mle.worker.SqlBridge.drained(id);  // a former result set's rows are skipped
     hasData = r.hasRows();
     set = hasData ? new Set(r.columns(), session.mapper(), options) : NO_COLUMNS;
     rows = r.rows();
@@ -132,17 +137,39 @@ public final class SqlResult implements Iterable<Row> {
     insertId = r.insertId();
     execUs = r.executionMicros();
     warnings = warnings(r);
-    if (direct && moreRows) {
-      List<Object[]> all = new ArrayList<>(rows);
-      while (moreRows) {
-        MleSql.Reply more = session.request(Session.FETCH, id, null, null, 0, 0);
-        all.addAll(more.rows());
-        moreRows = more.moreRows();
-        moreResults = more.moreResults();
-        if (!more.warnings().isEmpty()) warnings = warnings(more);
-      }
-      rows = all;
+    total = r.totalRows();
+    received = rows.size();
+    if (direct && moreRows) com.percona.mle.worker.SqlBridge.deferDrain(id, this::drain);
+  }
+
+  /** Another statement is about to run: the unread rows into the worker (see direct). */
+  private void drain() {
+    if (!moreRows || replaced) return;
+    List<Object[]> all = new ArrayList<>(Math.max(0, rows.size() - pos));
+    while (pos < rows.size()) all.add(take());
+    rows = all;
+    pos = 0;
+    while (moreRows) {
+      MleSql.Reply more = session.request(Session.FETCH, id, null, null, 0, 0);
+      all.addAll(more.rows());
+      fetched(more, more.rows().size());
     }
+  }
+
+  /** A FETCH reply of n rows arrived. */
+  private void fetched(MleSql.Reply r, int n) {
+    received += n;
+    moreRows = r.moreRows();
+    moreResults = r.moreResults();
+    if (!r.warnings().isEmpty()) warnings = warnings(r);
+    if (!moreRows) com.percona.mle.worker.SqlBridge.drained(id);
+  }
+
+  /** The rows of the current result set not read yet; -1 if not known (mysqld's cursor). */
+  public long remainingRows() {
+    long here = rows.size() - pos;
+    if (!moreRows) return here;
+    return total > 0 ? here + total - received : -1;
   }
 
   private static List<Warning> warnings(MleSql.Reply r) {
@@ -155,6 +182,7 @@ public final class SqlResult implements Iterable<Row> {
 
   /** A new execution of the prepared statement replaced these results. */
   void replace() {
+    if (moreRows) com.percona.mle.worker.SqlBridge.drained(id);
     replaced = true;
     rows = List.of();
     moreRows = false;
@@ -186,9 +214,7 @@ public final class SqlResult implements Iterable<Row> {
       MleSql.Reply r = session.request(Session.FETCH, id, null, null, 0, 0);
       rows = r.rows();
       pos = 0;
-      moreRows = r.moreRows();
-      moreResults = r.moreResults();
-      if (!r.warnings().isEmpty()) warnings = warnings(r);
+      fetched(r, rows.size());
     }
     return new Row(set, take());
   }
@@ -206,9 +232,27 @@ public final class SqlResult implements Iterable<Row> {
       MleSql.Reply r = session.request(Session.FETCH, id, null, null, 0, 0);
       rows = r.rows();
       pos = 0;
-      moreRows = r.moreRows();
-      moreResults = r.moreResults();
-      if (!r.warnings().isEmpty()) warnings = warnings(r);
+      fetched(r, rows.size());
+    }
+  }
+
+  /**
+   * The remaining rows of the current result set into sink (see RowSink): the rows already here
+   * as they are, the later chunks while they are decoded from the mailbox (exp note 44 step 3).
+   */
+  public void fetchRemainingRaw(RowSink sink) {
+    live();
+    while (pos < rows.size()) sink.row(take());
+    rows = List.of();
+    pos = 0;
+    final int[] n = new int[1];
+    RowSink counting = v -> {
+      n[0]++;
+      sink.row(v);
+    };
+    while (moreRows) {
+      n[0] = 0;
+      fetched(session.fetchInto(id, counting), n[0]);
     }
   }
 
@@ -306,6 +350,7 @@ public final class SqlResult implements Iterable<Row> {
 
   /** Ends the results; a statement run from text is closed in mysqld. */
   public void close() {
+    if (moreRows) com.percona.mle.worker.SqlBridge.drained(id);
     if (owned && (moreRows || moreResults) && !replaced) session.request(Session.CLOSE, id, null, null, 0, 0);
     rows = List.of();
     moreRows = false;

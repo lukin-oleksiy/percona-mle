@@ -214,6 +214,11 @@ final class JsSql implements GuestSql.Lang {
   // ------------------------------------------------------------ values
 
   @Override
+  public boolean vectorBuffers() {
+    return true;
+  }
+
+  @Override
   public Object value(Object raw, Column c, SqlOptions o) {
     return switch (raw) {
       case null -> null;
@@ -231,6 +236,9 @@ final class JsSql implements GuestSql.Lang {
       case String s -> s;
       case byte[] b -> bytes.execute(ByteBuffer.wrap(b));
       case MleJson j -> json.execute(j.text());
+      // VECTORs arrive as little-endian ByteBuffers (vectorBuffers): the Float32Array shares the
+      // buffer's memory, no copy (exp note 44 step 3)
+      case ByteBuffer b -> vector.execute(b);
       case float[] f -> {
         ByteBuffer bb = ByteBuffer.allocate(f.length * 4).order(ByteOrder.LITTLE_ENDIAN);
         bb.asFloatBuffer().put(f);

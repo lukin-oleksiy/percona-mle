@@ -328,62 +328,158 @@ final class PySql implements GuestSql.Lang {
   /**
    * fetch_columns (Phase 7, S-14): VECTOR columns as one n x d float32 numpy matrix, integer
    * and floating-point columns as numpy int64/float64 arrays (one copy each), other columns (or
-   * columns with NULLs) as lists of Python values; a dict by column label.
+   * columns with NULLs) as lists of Python values; a dict by column label. When the row count is
+   * known (mysqld buffered the result) the arrays are allocated first and each chunk is copied
+   * into them while it is decoded from the mailbox (exp note 44 step 3): no float[] per VECTOR.
    */
   @Override
   public Object columns(com.percona.mle.sql.SqlResult r, List<String> names) {
-    List<Object[]> rows = r.fetchRemainingRaw();
-    int n = rows.size();
+    long count = r.remainingRows();
+    if (count < 0 || count > Integer.MAX_VALUE) return columnsOfRows(r, names);
+    int n = (int) count;
+    Map<Integer, ColumnBuilder> byIndex = new java.util.LinkedHashMap<>();
+    for (String name : names) byIndex.computeIfAbsent(GuestSql.columnIndex(r, name), i -> new ColumnBuilder(r, i, n));
+    ColumnBuilder[] builders = byIndex.values().toArray(new ColumnBuilder[0]);
+    int[] at = new int[1];
+    r.fetchRemainingRaw(row -> {
+      if (at[0] >= n) throw new IllegalStateException("more rows than the result announced");
+      for (ColumnBuilder b : builders) b.add(at[0], row[b.index]);
+      at[0]++;
+    });
+    if (at[0] != n) throw new IllegalStateException("fewer rows than the result announced");
     Value dict = helper("dict").execute();
-    for (String name : names) {
-      int i = GuestSql.columnIndex(r, name);
-      dict.putHashEntry(name, column(r, rows, i, n));
-    }
+    for (String name : names) dict.putHashEntry(name, byIndex.get(GuestSql.columnIndex(r, name)).finish());
     return dict;
   }
 
-  @SuppressWarnings("restricted")  // the arrays' own memory, as numpy reports it
-  private Object column(com.percona.mle.sql.SqlResult r, List<Object[]> rows, int i, int n) {
-    boolean vectors = n > 0, longs = n > 0, doubles = n > 0;
-    int dims = -1;
-    for (Object[] row : rows) {
-      Object v = row[i];
-      vectors &= v instanceof float[] f && (dims < 0 || f.length == dims);
-      if (v instanceof float[] f && dims < 0) dims = f.length;
-      longs &= v instanceof Long;
-      doubles &= v instanceof Double || v instanceof Float || v instanceof Long;
+  /** One column of fetch_columns, filled row by row: a numpy array while it can be, else a list. */
+  private final class ColumnBuilder {
+    private static final int UNDECIDED = 0, MATRIX = 1, LONGS = 2, DOUBLES = 3, LIST = 4;
+    final int index;
+    private final int n;
+    private final com.percona.mle.sql.Column column;
+    private final SqlOptions options;
+    private int kind;
+    private int dims;
+    private Value array;
+    private java.lang.foreign.MemorySegment m;
+    private List<Object> values;
+
+    ColumnBuilder(com.percona.mle.sql.SqlResult r, int index, int n) {
+      this.index = index;
+      this.n = n;
+      this.column = r.getColumns().get(index);
+      this.options = r.getOptions();
+      this.kind = n == 0 ? LIST : UNDECIDED;
+      if (n == 0) values = List.of();
     }
-    try {
-      if (vectors) {
-        Value t = helper("numpy_matrix").execute(n, dims);
-        java.lang.foreign.MemorySegment m = java.lang.foreign.MemorySegment.ofAddress(t.getArrayElement(1).asLong())
-            .reinterpret((long) n * dims * 4);
-        long at = 0;
-        for (Object[] row : rows) {
-          java.lang.foreign.MemorySegment.copy(java.lang.foreign.MemorySegment.ofArray((float[]) row[i]), 0, m, at,
-              dims * 4L);
-          at += dims * 4L;
+
+    @SuppressWarnings("restricted")  // the arrays' own memory, as numpy reports it
+    void add(int k, Object v) {
+      if (kind == UNDECIDED) start(v);
+      switch (kind) {
+        case MATRIX -> {
+          java.lang.foreign.MemorySegment src = segment(v);
+          if (src != null && src.byteSize() == dims * 4L) {
+            java.lang.foreign.MemorySegment.copy(src, 0, m, (long) k * dims * 4, dims * 4L);
+            return;
+          }
         }
-        return t.getArrayElement(0);
-      }
-      if (longs || doubles) {
-        Value t = helper("numpy_numbers").execute(n, longs ? "i" : "f");
-        java.lang.foreign.MemorySegment m = java.lang.foreign.MemorySegment.ofAddress(t.getArrayElement(1).asLong())
-            .reinterpret(n * 8L);
-        for (int k = 0; k < n; k++) {
-          Object v = rows.get(k)[i];
-          if (longs) m.setAtIndex(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, k, (Long) v);
-          else m.setAtIndex(java.lang.foreign.ValueLayout.JAVA_DOUBLE_UNALIGNED, k, ((Number) v).doubleValue());
+        case LONGS -> {
+          if (v instanceof Long l) {
+            m.setAtIndex(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, k, l);
+            return;
+          }
         }
-        return t.getArrayElement(0);
+        case DOUBLES -> {
+          if (v instanceof Double || v instanceof Float || v instanceof Long) {
+            m.setAtIndex(java.lang.foreign.ValueLayout.JAVA_DOUBLE_UNALIGNED, k, ((Number) v).doubleValue());
+            return;
+          }
+        }
+        default -> {
+          values.add(listValue(v));
+          return;
+        }
       }
-    } catch (PolyglotException e) {
-      if (!String.valueOf(e.getMessage()).contains("No module named")) throw e;  // no numpy: lists
+      toList(k);  // a NULL, or another dimension: rare
+      values.add(listValue(v));
     }
-    List<Object> values = new java.util.ArrayList<>(n);
-    com.percona.mle.sql.Column c = r.getColumns().get(i);
-    for (Object[] row : rows) values.add(row[i] == null ? null : value(row[i], c, r.getOptions()));
-    return list(values);
+
+    /** The first row decides; without numpy, lists. */
+    @SuppressWarnings("restricted")
+    private void start(Object v) {
+      try {
+        if (segment(v) instanceof java.lang.foreign.MemorySegment s) {
+          dims = (int) (s.byteSize() / 4);
+          Value t = helper("numpy_matrix").execute(n, dims);
+          m = java.lang.foreign.MemorySegment.ofAddress(t.getArrayElement(1).asLong()).reinterpret((long) n * dims * 4);
+          array = t.getArrayElement(0);
+          kind = MATRIX;
+          return;
+        }
+        if (v instanceof Long || v instanceof Double || v instanceof Float) {
+          boolean longs = v instanceof Long;
+          Value t = helper("numpy_numbers").execute(n, longs ? "i" : "f");
+          m = java.lang.foreign.MemorySegment.ofAddress(t.getArrayElement(1).asLong()).reinterpret(n * 8L);
+          array = t.getArrayElement(0);
+          kind = longs ? LONGS : DOUBLES;
+          return;
+        }
+      } catch (PolyglotException e) {
+        if (!String.valueOf(e.getMessage()).contains("No module named")) throw e;  // no numpy: lists
+      }
+      kind = LIST;
+      values = new java.util.ArrayList<>(n);
+    }
+
+    /** The first k values, copied into the array so far, as a list from now on. */
+    private void toList(int k) {
+      values = new java.util.ArrayList<>(n);
+      for (int j = 0; j < k; j++)
+        values.add(listValue(switch (kind) {
+          case MATRIX -> m.asSlice((long) j * dims * 4, dims * 4L).toArray(java.lang.foreign.ValueLayout.JAVA_FLOAT_UNALIGNED);
+          case LONGS -> m.getAtIndex(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, j);
+          default -> m.getAtIndex(java.lang.foreign.ValueLayout.JAVA_DOUBLE_UNALIGNED, j);
+        }));
+      kind = LIST;
+      array = null;
+      m = null;
+    }
+
+    private Object listValue(Object v) {
+      if (v instanceof java.lang.foreign.MemorySegment s) v = s.toArray(java.lang.foreign.ValueLayout.JAVA_FLOAT_UNALIGNED);
+      return v == null ? null : value(v, column, options);
+    }
+
+    Object finish() {
+      return kind == LIST ? list(values) : array;
+    }
+  }
+
+  /** A VECTOR value from a RowSink (float[] or the mailbox's bytes), or null for anything else. */
+  private static java.lang.foreign.MemorySegment segment(Object v) {
+    return v instanceof java.lang.foreign.MemorySegment s ? s
+        : v instanceof float[] f ? java.lang.foreign.MemorySegment.ofArray(f) : null;
+  }
+
+  /** fetch_columns when the row count is not known (mysqld's cursor): rows first, then columns. */
+  private Object columnsOfRows(com.percona.mle.sql.SqlResult r, List<String> names) {
+    List<Object[]> rows = r.fetchRemainingRaw();
+    int n = rows.size();
+    Map<Integer, ColumnBuilder> byIndex = new java.util.HashMap<>();
+    Value dict = helper("dict").execute();
+    for (String name : names) {
+      int i = GuestSql.columnIndex(r, name);
+      ColumnBuilder b = byIndex.get(i);
+      if (b == null) {
+        b = new ColumnBuilder(r, i, n);
+        for (int k = 0; k < n; k++) b.add(k, rows.get(k)[i]);
+        byIndex.put(i, b);
+      }
+      dict.putHashEntry(name, b.finish());
+    }
+    return dict;
   }
 
   // ------------------------------------------------------------ values

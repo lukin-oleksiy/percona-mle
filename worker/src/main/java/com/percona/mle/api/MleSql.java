@@ -46,11 +46,12 @@ public final class MleSql {
    * One reply: a result set (hasRows, with the first rows; moreRows: {@link #fetch} for more) or
    * an OK (affected rows, insert id); moreResults: {@link #nextResult} for the next result set.
    * Values: Long, BigInteger (BIGINT UNSIGNED), Double, BigDecimal, String, byte[], LocalDate,
-   * LocalDateTime, Duration, MleJson, float[] (VECTOR) or null.
+   * LocalDateTime, Duration, MleJson, float[] (VECTOR) or null. totalRows: the rows of the whole
+   * result set, also those of later fetches (0: not known, e.g. mysqld reads them with a cursor).
    */
   public record Reply(long statementId, boolean hasRows, List<Column> columns, List<Object[]> rows,
       boolean moreRows, boolean moreResults, long affectedRows, long insertId, List<Warning> warnings,
-      int parameterCount, long executionMicros) {}
+      int parameterCount, long executionMicros, long totalRows) {}
 
   private static final int EXECUTE = 0;
   private static final int PREPARE = 1;

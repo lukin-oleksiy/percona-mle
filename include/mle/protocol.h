@@ -67,7 +67,7 @@ constexpr int kControlFd = 4;
 
 /** "MLE1" read as a little-endian u32. */
 constexpr uint32_t kMagic = 0x31454c4d;
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 
 constexpr size_t kCacheLine = 64;
 /** Size of RegionHeader; the arena starts here (page aligned). */
@@ -136,9 +136,12 @@ enum class Op : uint32_t {
       kOk:    u64 affected rows, u64 last insert id, warnings,
               u8 more result sets, u32 parameter count (PREPARE),
               u64 execution microseconds;
-      kRows:  u32 n + n x Column, u32 rows + rows x columns x value,
-              u8 more rows, u8 more result sets, warnings,
-              u64 execution microseconds.
+      kRows:  u32 n + n x Column, u64 total rows of the result set (0 =
+              unknown: a server cursor; v2, exp note 44 step 3),
+              u32 rows + rows x columns x value,
+              u8 more rows, u8 more result sets, warnings (in a result
+              set's last chunk; a buffered one's, with total rows, also in
+              its first), u64 execution microseconds.
       warnings = u32 n + n x (u32 level, u32 code, str message). */
   kSqlResult = 6,
   /** Unused (P5: FETCH is an SqlAction). */

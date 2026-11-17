@@ -795,7 +795,7 @@ void encode(const SqlResultMsg &m, std::string *out) {
     case SqlResultKind::kRows: {
       out->clear();  // put_rows_head writes the kind too
       Writer h(out);
-      const size_t count_at = put_rows_head(h, m.columns);
+      const size_t count_at = put_rows_head(h, m.columns, m.total_rows);
       const size_t ncols = m.columns.size();
       const uint32_t rows =
           static_cast<uint32_t>(ncols == 0 ? 0 : m.rows.size() / ncols);
@@ -810,7 +810,8 @@ void encode(const SqlResultMsg &m, std::string *out) {
   }
 }
 
-size_t put_rows_head(Writer &w, const std::vector<Column> &columns) {
+size_t put_rows_head(Writer &w, const std::vector<Column> &columns,
+                     uint64_t total_rows) {
   w.u8(static_cast<uint8_t>(SqlResultKind::kRows));
   w.u32(static_cast<uint32_t>(columns.size()));
   for (const Column &c : columns) {
@@ -824,6 +825,7 @@ size_t put_rows_head(Writer &w, const std::vector<Column> &columns) {
     w.str(c.collation);
     w.u32(c.flags);
   }
+  w.u64(total_rows);
   const size_t count_at = w.position();
   w.u32(0);  // the row count, patched by the caller
   return count_at;
@@ -867,7 +869,7 @@ bool decode(std::string_view body, SqlResultMsg *m, std::string *error) {
                   !r.str(&c.charset) || !r.str(&c.collation) ||
                   !r.u32(&c.flags))
                 return false;
-            if (!r.u32(&nrows)) return false;
+            if (!r.u64(&x->total_rows) || !r.u32(&nrows)) return false;
             const uint64_t nvalues = uint64_t{nrows} * ncols;
             if (ncols == 0 && nrows != 0) return r.fail("rows without columns");
             if (nvalues > r.remaining() / kMinValue)

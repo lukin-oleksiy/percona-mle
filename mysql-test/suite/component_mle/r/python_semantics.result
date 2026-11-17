@@ -44,13 +44,43 @@ CALL py_columns(@r);
 SELECT @r;
 @r
 ndarray (4, 3) float32 | int64 [1, 2, 3, 4] | float64 [0.5, 1.5, 2.5, 3.5] | ['a', None, 'c', 'd'] | top [1, 2]
-#    A result in several chunks (mle.sql_chunk_rows = 2): a statement
-#    without parameters is fetched whole within run_sql, with its warnings.
+#    A result in several chunks (mle.sql_chunk_rows = 2): the rows of a
+#    statement without parameters are fetched as they are read (its
+#    warnings come at once), the later chunks straight into the arrays.
 SET GLOBAL mle.sql_chunk_rows = 2;
 CALL py_columns(@r);
 SELECT @r;
 @r
 ndarray (4, 3) float32 | int64 [1, 2, 3, 4] | float64 [0.5, 1.5, 2.5, 3.5] | ['a', None, 'c', 'd'] | top [1, 2]
+#    Exp note 44 step 3: fetch_columns with a parameter, of a prepared
+#    statement run twice, after fetch_one, a NULL in a later chunk (that
+#    column becomes a list), of no rows; two direct statements interleaved
+#    (the first is drained when the second runs); results left unread,
+#    also by nested calls. JavaScript: VECTORs of rows over chunks.
+CREATE TABLE docs_null (id INT PRIMARY KEY, n BIGINT, embedding VECTOR(3));
+INSERT INTO docs_null VALUES (1, 10, STRING_TO_VECTOR('[1, 0, 0]')),
+(2, 20, STRING_TO_VECTOR('[0, 1, 0]')), (3, NULL, NULL),
+(4, 40, STRING_TO_VECTOR('[0, 0, 1]'));
+CALL py_columns_more(@r);
+SELECT @r;
+@r
+param (3, 3) [2, 3, 4] [[0.9, 0.1, 0.0], [0.0, 0.0, 1.0], [0.0, 0.2, 0.9]]
+prepared (4, 3) [1, 2, 3, 4]
+prepared (3, 3) [1, 2, 3]
+null ndarray [10, 20, None, 40] list [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], None, [0.0, 0.0, 1.0]]
+rest after 1: [2, 3, 4] (3, 3)
+empty {'id': [], 'embedding': []}
+interleaved 1 [2, 3, 4] [4, 3, 2, 1]
+after unread 4
+CALL js_vec_chunks(@r);
+SELECT @r;
+@r
+1:42 0 0, 2:0.9 0.1 0, 3:0 0 1, 4:0 0.2 0.9 | same object true true | columns 0 0 1, 0 0.20000000298023224 0.8999999761581421
+CALL py_leave(1);
+DROP PROCEDURE py_columns_more;
+DROP PROCEDURE py_leave;
+DROP PROCEDURE js_vec_chunks;
+DROP TABLE docs_null;
 CREATE PROCEDURE js_chunks(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
 let res = session.runSql("SELECT id, CAST(CONCAT(id, 'x') AS UNSIGNED) AS n FROM docs ORDER BY id")
 let w = res.getWarningsCount()

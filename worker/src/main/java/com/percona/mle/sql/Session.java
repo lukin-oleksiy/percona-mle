@@ -55,7 +55,12 @@ public final class Session {
   }
 
   MleSql.Reply request(int action, long id, String text, Object[] params, int flags, int maxRows) {
-    return SqlBridge.requestRaw(action, id, text, params, flags, maxRows);
+    return SqlBridge.requestRaw(action, id, text, params, flags, maxRows, mapper.vectorBuffers(), null);
+  }
+
+  /** The next rows of statement id into sink (not into the reply's rows). */
+  MleSql.Reply fetchInto(long id, RowSink sink) {
+    return SqlBridge.requestRaw(FETCH, id, null, null, 0, 0, mapper.vectorBuffers(), sink);
   }
 
   /** The options of a statement: o over this call's session options over the defaults. */

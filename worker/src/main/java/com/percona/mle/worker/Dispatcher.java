@@ -19,7 +19,11 @@ package com.percona.mle.worker;
 
 import com.percona.mle.api.MleSql;
 import com.percona.mle.api.MleSqlException;
+import com.percona.mle.sql.RowSink;
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
 import org.graalvm.polyglot.PolyglotException;
@@ -327,6 +331,7 @@ final class Dispatcher {
       } finally {
         currentRoutine = outerRoutine;
       }
+      closeDeferred(top);
       boolean interrupted = top && control.end();
       if (top) polyglot.settleInterrupt(control.takeInterrupter());
       if (top && !tainted && threads.strangersNow()) tainted = true;  // retired, not kept
@@ -569,22 +574,31 @@ final class Dispatcher {
     return ++nextStatementId;
   }
 
+  /** How sqlRequest gives row values: Java values (MleSql), or raw for com.percona.mle.sql. */
+  static final int JAVA_VALUES = 0;
+  /** Raw: DATE/TIME/DATETIME/TIMESTAMP as Values.Temporal, VECTOR as float[]. */
+  static final int RAW = 1;
+  /** Raw, VECTOR as a little-endian heap ByteBuffer (JavaScript shares its memory: one copy). */
+  static final int RAW_BUFFERS = 2;
+
   /**
    * One SQL request to the host (Phase 5 protocol: action, statement id, text, parameters,
    * flags); throws MleSqlException for an SQL error.
    */
   MleSql.Reply sqlRequest(int action, long id, String text, Object[] params, int flags, int maxRows) {
-    return sqlRequest(action, id, text, params, flags, maxRows, false);
+    return sqlRequest(action, id, text, params, flags, maxRows, JAVA_VALUES, null);
   }
 
   /**
-   * raw: row values stay as read (DATE/TIME/DATETIME/TIMESTAMP as Values.Temporal, VECTOR as
-   * float[]) for the language mappers of com.percona.mle.sql.
+   * form: JAVA_VALUES, RAW or RAW_BUFFERS. sink: the rows go to it while the reply is decoded,
+   * not into Reply.rows (exp note 44 step 3): raw values with VECTORs as MemorySegment views of the
+   * mailbox, valid only during the sink's call.
    */
   MleSql.Reply sqlRequest(int action, long id, String text, Object[] params, int flags, int maxRows,
-      boolean raw) {
+      int form, RowSink sink) {
     if (Thread.currentThread() != thread)
       throw new IllegalStateException("SQL must be run on the routine's thread");
+    drainDeferred(id);
     try {
       w.reset();
       w.u8(action);
@@ -602,13 +616,59 @@ final class Dispatcher {
     mb.send(Wire.SQL, Wire.OK, depth, seq, w);
     while (true) {
       Mailbox.Message m = mb.receive();
-      if (m.op() == Wire.SQL_RESULT && m.depth() == depth) return sqlReply(id, new MessageReader(m.body()), raw);
+      if (m.op() == Wire.SQL_RESULT && m.depth() == depth)
+        return sqlReply(id, new MessageReader(m.body()), form, sink);
       boolean nested = m.op() == Wire.CALL || m.op() == Wire.PREPARE || m.op() == Wire.DROP;
       if (nested && m.depth() == depth + 1 && m.depth() <= maxDepth) {
         handle(m);
         continue;
       }
       throw new IllegalStateException("unexpected message " + m.op() + " at depth " + m.depth() + " during SQL");
+    }
+  }
+
+  // A statement run from text without parameters whose rows are not all read yet (exp note 44
+  // step 3): mysqld buffers the whole result, so before any other statement runs its rows are
+  // drained into the worker (mysqld holds at most one buffered result, 12 §11). One at a time.
+  private Runnable deferred;
+  private long deferredId;
+  private long deferredSeq;
+  private int deferredDepth;
+
+  /** Statement id's rows are drained by drain before the next request for another statement. */
+  void deferDrain(long id, Runnable drain) {
+    drainDeferred(id);
+    deferred = drain;
+    deferredId = id;
+    deferredSeq = seq;
+    deferredDepth = depth;
+  }
+
+  /** Statement id needs no draining any more (read to the end, or closed). */
+  void drained(long id) {
+    if (deferred != null && deferredId == id) deferred = null;
+  }
+
+  private void drainDeferred(long forId) {
+    if (deferred == null || deferredId == forId) return;
+    Runnable d = deferred;
+    deferred = null;
+    if (deferredSeq == seq) d.run();  // statements of an earlier call are closed by the host
+  }
+
+  /**
+   * At the end of a call: the host closes the statements of a top-level call; a nested call's
+   * unread result is closed now, so that a loop of nested calls does not pile results up in mysqld.
+   */
+  private void closeDeferred(boolean top) {
+    if (deferred == null || deferredDepth < depth) return;
+    long id = deferredId;
+    deferred = null;
+    if (top || deferredSeq != seq) return;
+    try {
+      sqlRequest(5 /* CLOSE */, id, null, null, 0, 0);
+    } catch (MleSqlException e) {
+      // already closed (an error in the statement); nothing to give back
     }
   }
 
@@ -622,7 +682,7 @@ final class Dispatcher {
     return control.isInterrupted();
   }
 
-  private static MleSql.Reply sqlReply(long id, MessageReader r, boolean raw) {
+  private static MleSql.Reply sqlReply(long id, MessageReader r, int form, RowSink sink) {
     int kind = r.u8();
     switch (kind) {
       case Wire.SQL_ERROR -> {
@@ -640,7 +700,7 @@ final class Dispatcher {
         long execUs = r.u64();
         r.finish();
         return new MleSql.Reply(id, false, List.of(), List.of(), false, moreResults, affected, insertId, warnings,
-            paramCount, execUs);
+            paramCount, execUs, 0);
       }
       case Wire.SQL_ROWS -> {
         int ncols = r.count();
@@ -652,15 +712,18 @@ final class Dispatcher {
           columns.add(new MleSql.Column(name, table, t.sqlName(), t.unsigned(), t.length(), (int) t.scale(),
               r.str(), r.str(), r.str(), r.str(), r.str(), (int) r.u32()));
         }
+        long total = r.u64();
         long nrows = r.u32();
-        List<Object[]> rows = new ArrayList<>((int) Math.min(nrows, 1 << 16));
+        List<Object[]> rows = sink != null ? List.of() : new ArrayList<>((int) Math.min(nrows, 1 << 16));
+        Object[] row = sink != null ? new Object[ncols] : null;
         for (long i = 0; i < nrows; i++) {
-          Object[] row = new Object[ncols];
+          if (sink == null) row = new Object[ncols];
           for (int c = 0; c < ncols; c++) {
             Object v = Values.read(r);
-            row[c] = !raw ? Values.toJava(v) : v instanceof Values.VectorRef ref ? ref.toArray() : v;
+            row[c] = v instanceof Values.VectorRef ref ? vector(ref, form, sink != null) : form == JAVA_VALUES ? Values.toJava(v) : v;
           }
-          rows.add(row);
+          if (sink != null) sink.row(row);
+          else rows.add(row);
         }
         boolean more = r.flag();
         boolean moreResults = r.flag();
@@ -668,10 +731,19 @@ final class Dispatcher {
         long execUs = r.u64();
         r.finish();
         return new MleSql.Reply(id, true, List.copyOf(columns), rows, more, moreResults, 0, 0, warnings, 0,
-            execUs);
+            execUs, total);
       }
       default -> throw new IllegalStateException("bad SQL result kind " + kind);
     }
+  }
+
+  /** A VECTOR of a result as sqlRequest's form asks (view: the mailbox's bytes, for a sink). */
+  private static Object vector(Values.VectorRef ref, int form, boolean view) {
+    if (view) return ref.data();
+    if (form != RAW_BUFFERS) return ref.toArray();
+    ByteBuffer b = ByteBuffer.allocate((int) ref.data().byteSize()).order(ByteOrder.LITTLE_ENDIAN);
+    MemorySegment.ofBuffer(b).copyFrom(ref.data());
+    return b;
   }
 
   private static List<MleSql.Warning> warnings(MessageReader r) {

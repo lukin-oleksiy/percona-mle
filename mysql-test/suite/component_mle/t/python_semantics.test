@@ -106,11 +106,75 @@ SELECT @r;
 --echo #    columns with NULLs as lists; a cosine top-k with one matrix product.
 CALL py_columns(@r);
 SELECT @r;
---echo #    A result in several chunks (mle.sql_chunk_rows = 2): a statement
---echo #    without parameters is fetched whole within run_sql, with its warnings.
+--echo #    A result in several chunks (mle.sql_chunk_rows = 2): the rows of a
+--echo #    statement without parameters are fetched as they are read (its
+--echo #    warnings come at once), the later chunks straight into the arrays.
 SET GLOBAL mle.sql_chunk_rows = 2;
 CALL py_columns(@r);
 SELECT @r;
+--echo #    Exp note 44 step 3: fetch_columns with a parameter, of a prepared
+--echo #    statement run twice, after fetch_one, a NULL in a later chunk (that
+--echo #    column becomes a list), of no rows; two direct statements interleaved
+--echo #    (the first is drained when the second runs); results left unread,
+--echo #    also by nested calls. JavaScript: VECTORs of rows over chunks.
+CREATE TABLE docs_null (id INT PRIMARY KEY, n BIGINT, embedding VECTOR(3));
+INSERT INTO docs_null VALUES (1, 10, STRING_TO_VECTOR('[1, 0, 0]')),
+  (2, 20, STRING_TO_VECTOR('[0, 1, 0]')), (3, NULL, NULL),
+  (4, 40, STRING_TO_VECTOR('[0, 0, 1]'));
+--write_file $MYSQLTEST_VARDIR/tmp/py7more.sql
+CREATE PROCEDURE py_leave(IN k INT) LANGUAGE PYTHON AS $$
+    session.run_sql('SELECT id, embedding FROM docs WHERE id > ? ORDER BY id', [k - k])
+    session.run_sql('SELECT id, embedding FROM docs ORDER BY id').fetch_one()
+$$;
+CREATE PROCEDURE py_columns_more(OUT r TEXT) LANGUAGE PYTHON AS $$
+    def vecs(m):
+        return [[round(x, 2) for x in row] for row in m.tolist()]
+    out = []
+    c = session.run_sql('SELECT id, embedding FROM docs WHERE id > ? ORDER BY id', [1]).fetch_columns()
+    out.append('param %s %s %s' % (c['embedding'].shape, c['id'].tolist(), vecs(c['embedding'])))
+    p = session.prepare('SELECT id, embedding FROM docs WHERE id <= ? ORDER BY id')
+    for k in (4, 3):
+        c = p.bind(k).execute().fetch_columns('id', 'embedding')
+        out.append('prepared %s %s' % (c['embedding'].shape, c['id'].tolist()))
+    c = session.run_sql('SELECT id, n, embedding FROM docs_null ORDER BY id').fetch_columns()
+    out.append('null %s %s %s %s' % (type(c['id']).__name__, c['n'], type(c['embedding']).__name__,
+        [None if v is None else [round(x, 2) for x in v.tolist()] for v in c['embedding']]))
+    res = session.run_sql('SELECT id, embedding FROM docs ORDER BY id')
+    one = res.fetch_one().id
+    c = res.fetch_columns()
+    out.append('rest after %s: %s %s' % (one, c['id'].tolist(), c['embedding'].shape))
+    out.append('empty %s' % (session.run_sql('SELECT id, embedding FROM docs WHERE id > 9').fetch_columns(),))
+    a = session.run_sql('SELECT id FROM docs ORDER BY id')
+    first = a.fetch_one().id
+    b = session.run_sql('SELECT id FROM docs ORDER BY id DESC')
+    out.append('interleaved %s %s %s' % (first, [x.id for x in a], [x.id for x in b]))
+    session.run_sql('SELECT id, embedding FROM docs')
+    for k in range(3):
+        session.run_sql('CALL py_leave(?)', [k])
+    out.append('after unread %s' % session.run_sql('SELECT COUNT(*) AS n FROM docs').fetch_one().n)
+    r = '\n'.join(out)
+$$;
+CREATE PROCEDURE js_vec_chunks(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const rows = session.runSql("SELECT id, embedding FROM docs ORDER BY id").fetchAll()
+  const v0 = rows[0].embedding
+  v0[0] = 42
+  r = rows.map(x => x.id + ':' + Array.from(x.embedding, f => Math.round(f * 100) / 100).join(' ')).join(', ') +
+      ' | same object ' + (rows[0].embedding === v0) + ' ' + (v0 instanceof Float32Array) +
+      ' | columns ' + session.runSql("SELECT embedding FROM docs WHERE id > ? ORDER BY id", [2])
+        .fetchColumns().embedding.map(v => Array.from(v).join(' ')).join(', ')
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/py7more.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/py7more.sql
+CALL py_columns_more(@r);
+SELECT @r;
+CALL js_vec_chunks(@r);
+SELECT @r;
+CALL py_leave(1);
+DROP PROCEDURE py_columns_more;
+DROP PROCEDURE py_leave;
+DROP PROCEDURE js_vec_chunks;
+DROP TABLE docs_null;
 CREATE PROCEDURE js_chunks(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
   let res = session.runSql("SELECT id, CAST(CONCAT(id, 'x') AS UNSIGNED) AS n FROM docs ORDER BY id")
   let w = res.getWarningsCount()
