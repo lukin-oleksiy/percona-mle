@@ -83,6 +83,12 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
       "-Djava.class.path=" + layout.worker_jar,
       "-Dpolyglot.engine.userResourceCache=" + layout.resource_cache,
       "-XX:+UseSerialGC",
+      // Java code is compiled by C2; GraalJS and GraalPy keep Graal (libgraal)
+      // through Truffle. Under concurrent load libgraal kept compiling the
+      // workers' Java code (35-55 CPU-s per 10 s over 8 workers, more than
+      // the routines): with C2, P4 at 8 clients -17 % p50, -47 % server CPU
+      // per query, workers ~45 MiB smaller (exp note 49).
+      "-XX:-UseJVMCICompiler",
       // A small initial heap that grows as needed (the JVM's default
       // ratios keep allocation-heavy code fast); the worker trims it with a
       // full GC whenever it is parked: after start (pool) and after RESET

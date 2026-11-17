@@ -94,7 +94,7 @@ ADD_CUSTOM_COMMAND(OUTPUT ${MLE_PYTHON_VENV_STAMP}
 # matter for the cache must match the worker's (defaults.cc).
 SET(MLE_AOT_CACHE ${CMAKE_CURRENT_BINARY_DIR}/mle.aot)
 SET(MLE_AOT_JVM_OPTIONS
-  -XX:+UseSerialGC --enable-native-access=ALL-UNNAMED
+  -XX:+UseSerialGC -XX:-UseJVMCICompiler --enable-native-access=ALL-UNNAMED
   --add-modules=jdk.incubator.vector
   --add-exports=java.base/jdk.internal.vm=ALL-UNNAMED
   -Dpolyglot.engine.userResourceCache=${MLE_RESOURCE_CACHE}

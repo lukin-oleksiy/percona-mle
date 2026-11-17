@@ -91,7 +91,11 @@ final class Values {
   /** A VECTOR in the message body; valid only until the next message is posted. */
   record VectorRef(MemorySegment data, int dims) {
     float[] toArray() {
-      return data.toArray(ValueLayout.JAVA_FLOAT_UNALIGNED);
+      // Not MemorySegment.toArray: it looks up the array class's simple name on every call
+      // (reflection data; ~4.5 % of a worker decoding 16 MB of VECTORs, exp note 49).
+      float[] a = new float[dims];
+      MemorySegment.copy(data, ValueLayout.JAVA_FLOAT_UNALIGNED, 0, a, 0, dims);
+      return a;
     }
   }
 
