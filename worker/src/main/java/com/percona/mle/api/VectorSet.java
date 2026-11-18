@@ -24,20 +24,27 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Vectors read with {@link Vectors#load} and their ids, kept in Java (JavaScript and Python
- * routines search them without copying the rows). Lives as long as the routine keeps it; nothing
- * is kept between calls. Cosine norms are computed once per set.
+ * Vectors read with {@link Vectors#load} and their ids (and labels), kept in Java (JavaScript and
+ * Python routines search them without copying the rows). Lives as long as the routine keeps it;
+ * nothing is kept between calls. Cosine norms are computed once per set.
+ *
+ * <p>Besides nearest neighbours (exp note 53): {@link #mmr} (diverse top k), {@link #within}
+ * (threshold search), {@link #pairs}, {@link #groups} and {@link #dedup} (near duplicates),
+ * {@link #mean} and {@link #meanOf} (centroids, profiles), {@link #kmeans}, {@link #classify}
+ * (k nearest neighbours' vote) and {@link #truncate} (Matryoshka embeddings).
  */
 public final class VectorSet {
   private final float[][] rows;
   private final long[] ids;
+  private final String[] labels;
   private final int skipped;
   private float[] inverseNorms;
   private Map<Long, Integer> byId;
 
-  private VectorSet(float[][] rows, long[] ids, int skipped) {
+  private VectorSet(float[][] rows, long[] ids, String[] labels, int skipped) {
     this.rows = rows;
     this.ids = ids;
+    this.labels = labels;
     this.skipped = skipped;
   }
 
@@ -45,15 +52,17 @@ public final class VectorSet {
     if (sql == null) throw new IllegalArgumentException("the query must not be null");
     List<float[]> vectors = new ArrayList<>();
     List<Long> idList = new ArrayList<>();
+    List<String> labelList = new ArrayList<>();
     int skipped = 0, d = -1, n = 0;
-    boolean withIds = false;
+    boolean withIds = false, withLabels = false;
     for (Row row : Mle.session().runSql(sql, params == null ? new Object[0] : params)) {
       int columns = row.getLength();
       if (n == 0 && skipped == 0) {
-        if (columns < 1 || columns > 2)
+        if (columns < 1 || columns > 3)
           throw new IllegalArgumentException(
-              "the query must return (id, vector) or (vector), not " + columns + " columns");
-        withIds = columns == 2;
+              "the query must return (id, vector, label), (id, vector) or (vector), not " + columns + " columns");
+        withIds = columns >= 2;
+        withLabels = columns == 3;
       }
       Object v = row.get(withIds ? 1 : 0);
       long id = withIds ? id(row.get(0), n + skipped) : n + skipped;
@@ -70,11 +79,17 @@ public final class VectorSet {
             + " dimensions, the first has " + d);
       vectors.add(f);
       idList.add(id);
+      if (withLabels) {
+        Object l = row.get(2);
+        labelList.add(l == null ? null : l instanceof byte[] b ? new String(b, java.nio.charset.StandardCharsets.UTF_8)
+            : String.valueOf(l));
+      }
       n++;
     }
     long[] ids = new long[n];
     for (int i = 0; i < n; i++) ids[i] = idList.get(i);
-    return new VectorSet(vectors.toArray(new float[0][]), ids, skipped);
+    return new VectorSet(vectors.toArray(new float[0][]), ids,
+        withLabels ? labelList.toArray(new String[0]) : null, skipped);
   }
 
   private static long id(Object v, int row) {
@@ -108,6 +123,11 @@ public final class VectorSet {
     return rows[i].clone();
   }
 
+  /** The label of the i-th vector (the third column of the load query; null without one). */
+  public String label(int i) {
+    return labels == null ? null : labels[i];
+  }
+
   /** The position of the vector with this id, or -1. */
   public int indexOf(long id) {
     if (byId == null) {
@@ -136,7 +156,7 @@ public final class VectorSet {
    * {@link #nearest(float[], int, Vectors.Metric)} for a JavaScript or Python query (Float32Array,
    * numpy array, list).
    */
-  public Matches nearest(org.graalvm.polyglot.Value query, int k, String metric) {
+  public Matches nearest(Object query, int k, String metric) {
     return nearest(GuestVectors.vector(query, "the query"), k, Vectors.Metric.of(metric));
   }
 
@@ -178,6 +198,178 @@ public final class VectorSet {
   /** {@link #related(int, Vectors.Metric)} with the metric by name. */
   public Matches[] related(int k, String metric) {
     return related(k, Vectors.Metric.of(metric));
+  }
+
+  // ------------------------------------------------------- exp note 53
+
+  /**
+   * Maximal marginal relevance, cosine: the fetchK vectors nearest to query, then k of them picked
+   * one at a time for relevance and against redundancy with those already picked (lambda 1: plain
+   * relevance; 0: maximal diversity; 0.5 to 0.8 is usual). Scores: the cosine with the query, in
+   * pick order.
+   */
+  public Matches mmr(float[] query, int k, double lambda, int fetchK) {
+    VectorEngine.checkQuery(query, dimensions(), "the query");
+    VectorEngine.checkK(k);
+    if (fetchK < k) throw new IllegalArgumentException("fetchK (" + fetchK + ") must be at least k (" + k + ")");
+    Matches c = nearest(query, fetchK, Vectors.Metric.COSINE);
+    return VectorOps.mmr(query, rows, terms(VectorEngine.COSINE), k, lambda, c.indexes(), c.scores(), ids);
+  }
+
+  /** {@link #mmr(float[], int, double, int)} with fetchK = 4 k. */
+  public Matches mmr(float[] query, int k, double lambda) {
+    return mmr(query, k, lambda, (int) Math.min(Integer.MAX_VALUE, 4L * k));
+  }
+
+  /** {@link #mmr(float[], int, double, int)} for a JavaScript or Python query. */
+  public Matches mmr(Object query, int k, double lambda, int fetchK) {
+    return mmr(GuestVectors.vector(query, "the query"), k, lambda, fetchK);
+  }
+
+  /** {@link #mmr(float[], int, double)} for a JavaScript or Python query. */
+  public Matches mmr(Object query, int k, double lambda) {
+    return mmr(GuestVectors.vector(query, "the query"), k, lambda);
+  }
+
+  /**
+   * Every vector at least threshold similar to query (cosine, dot), or at most threshold away
+   * (euclidean), best first.
+   */
+  public Matches within(float[] query, double threshold, String metric) {
+    VectorEngine.checkQuery(query, dimensions(), "the query");
+    int m = VectorEngine.code(Vectors.Metric.of(metric));
+    return VectorOps.within(query, rows, terms(m), m, threshold, ids);
+  }
+
+  /** {@link #within(float[], double, String)} for a JavaScript or Python query. */
+  public Matches within(Object query, double threshold, String metric) {
+    return within(GuestVectors.vector(query, "the query"), threshold, metric);
+  }
+
+  /**
+   * The pairs of vectors at least threshold similar (at most threshold apart), best first, at most
+   * maxPairs of them (the best): near duplicates, paraphrases. All pairs are compared once (SIMD,
+   * threads).
+   */
+  public Pairs pairs(double threshold, String metric, int maxPairs) {
+    int m = VectorEngine.code(Vectors.Metric.of(metric));
+    return VectorOps.pairs(rows, terms(m), m, threshold, maxPairs, ids);
+  }
+
+  /** {@link #pairs(double, String, int)} with at most 100,000 pairs. */
+  public Pairs pairs(double threshold, String metric) {
+    return pairs(threshold, metric, 100_000);
+  }
+
+  /**
+   * Groups of vectors linked by pairs at least threshold similar (connected components; single
+   * linkage), of at least minSize vectors, largest first.
+   */
+  public Groups groups(double threshold, String metric, int minSize) {
+    int m = VectorEngine.code(Vectors.Metric.of(metric));
+    return VectorOps.groups(rows, terms(m), m, threshold, minSize, ids);
+  }
+
+  /** {@link #groups(double, String, int)} with groups of at least 2 (near duplicates). */
+  public Groups groups(double threshold, String metric) {
+    return groups(threshold, metric, 2);
+  }
+
+  /**
+   * The ids to keep when near duplicates go: one vector of each group (the first loaded) and every
+   * vector without a near duplicate, in set order.
+   */
+  public long[] dedup(double threshold, String metric) {
+    int m = VectorEngine.code(Vectors.Metric.of(metric));
+    return VectorOps.dedup(rows, terms(m), m, threshold, ids);
+  }
+
+  /** The mean of all vectors (a centroid). */
+  public float[] mean() {
+    return VectorOps.combine(rows, null, null, true);
+  }
+
+  /** The mean of the vectors with these ids (a user profile from the items they liked). */
+  public float[] meanOf(long[] ids) {
+    return VectorOps.combine(rows, positions(ids), null, true);
+  }
+
+  /** The weighted mean of the vectors with these ids (weights: one per id, e.g. ratings or recency). */
+  public float[] meanOf(long[] ids, float[] weights) {
+    return VectorOps.combine(rows, positions(ids), weights, true);
+  }
+
+  /** {@link #meanOf(long[])} for JavaScript or Python ids. */
+  public float[] meanOf(Object ids) {
+    return meanOf(GuestVectors.longs(ids, "the ids"));
+  }
+
+  /** {@link #meanOf(long[], float[])} for JavaScript or Python ids and weights. */
+  public float[] meanOf(Object ids, Object weights) {
+    return meanOf(GuestVectors.longs(ids, "the ids"), GuestVectors.vector(weights, "the weights"));
+  }
+
+  private int[] positions(long[] ids) {
+    if (ids == null) throw new IllegalArgumentException("the ids must not be null");
+    int[] p = new int[ids.length];
+    for (int i = 0; i < p.length; i++)
+      if ((p[i] = indexOf(ids[i])) < 0) throw new IllegalArgumentException("no vector with id " + ids[i]);
+    return p;
+  }
+
+  /**
+   * k-means into k clusters ('euclidean', or 'cosine' for spherical k-means), at most
+   * maxIterations updates, seeded with java.util.Random(seed): the same input gives the same
+   * clusters.
+   */
+  public Clusters kmeans(int k, String metric, int maxIterations, long seed) {
+    if (rows.length == 0) throw new IllegalArgumentException("the set is empty");
+    int m = VectorEngine.code(Vectors.Metric.of(metric));
+    return VectorOps.kmeans(rows, terms(m), ids, k, m, maxIterations, seed);
+  }
+
+  /** {@link #kmeans(int, String, int, long)} with at most 100 updates and seed 42. */
+  public Clusters kmeans(int k, String metric) {
+    return kmeans(k, metric, 100, 42);
+  }
+
+  /**
+   * The label most common among the k vectors nearest to query (labels: the third column of the
+   * load query); a tie goes to the label of the nearer vector. Null labels do not vote; null when
+   * none votes.
+   */
+  public String classify(float[] query, int k, String metric) {
+    if (labels == null)
+      throw new IllegalArgumentException("the set has no labels: load (id, vector, label) rows");
+    Matches m = nearest(query, k, metric);
+    Map<String, int[]> votes = new java.util.LinkedHashMap<>();  // label -> {count}, nearest first
+    for (int i = 0; i < m.size(); i++) {
+      String l = labels[m.index(i)];
+      if (l != null) votes.computeIfAbsent(l, x -> new int[1])[0]++;
+    }
+    String best = null;
+    int most = 0;
+    for (Map.Entry<String, int[]> e : votes.entrySet())
+      if (e.getValue()[0] > most) {
+        most = e.getValue()[0];
+        best = e.getKey();
+      }
+    return best;
+  }
+
+  /** {@link #classify(float[], int, String)} for a JavaScript or Python query. */
+  public String classify(Object query, int k, String metric) {
+    return classify(GuestVectors.vector(query, "the query"), k, metric);
+  }
+
+  /**
+   * A set of the first dims dimensions of each vector, each scaled back to length 1 (Matryoshka
+   * embeddings: shorter vectors, faster search); same ids and labels.
+   */
+  public VectorSet truncate(int dims) {
+    float[][] t = new float[rows.length][];
+    for (int i = 0; i < t.length; i++) t[i] = Vectors.truncate(rows[i], dims);
+    return new VectorSet(t, ids, labels, skipped);
   }
 
   /** The per-row terms of a metric, computed once. */

@@ -27,7 +27,7 @@ package com.percona.mle.api;
  * dimension. Java routines call it directly; JavaScript and Python routines reach it with {@code
  * Java.type('com.percona.mle.api.Vectors')} / {@code java.type(...)} and name the metric as a
  * string ('cosine', 'dot', 'euclidean'). They pass a Float32Array, a numpy array, a list or an
- * array of numbers for a vector (the {@code Value} overloads; numbers are rounded to float), and
+ * array of numbers for a vector (the {@code Object} overloads; numbers are rounded to float), and
  * {@link #matrix} turns their 2-D arrays into rows for the batch methods. Their vectors are
  * copied when passed: for many rows use {@link #load}, which keeps them in Java.
  *
@@ -91,38 +91,38 @@ public final class Vectors {
   // ---------------------------------------- JavaScript and Python vectors
 
   /** A JavaScript or Python vector (Float32Array, numpy array, list) as float[]. */
-  public static float[] vector(org.graalvm.polyglot.Value v) {
+  public static float[] vector(Object v) {
     return GuestVectors.vector(v, "the vector");
   }
 
   /** JavaScript or Python rows (a 2-D numpy array, a list of vectors) as float[][]. */
-  public static float[][] matrix(org.graalvm.polyglot.Value rows) {
+  public static float[][] matrix(Object rows) {
     return GuestVectors.matrix(rows, "the rows");
   }
 
   /** {@link #dot(float[], float[])} for JavaScript and Python vectors. */
-  public static float dot(org.graalvm.polyglot.Value a, org.graalvm.polyglot.Value b) {
+  public static float dot(Object a, Object b) {
     return dot(GuestVectors.vector(a, "the first vector"), GuestVectors.vector(b, "the second vector"));
   }
 
   /** {@link #cosine(float[], float[])} for JavaScript and Python vectors. */
-  public static float cosine(org.graalvm.polyglot.Value a, org.graalvm.polyglot.Value b) {
+  public static float cosine(Object a, Object b) {
     return cosine(GuestVectors.vector(a, "the first vector"), GuestVectors.vector(b, "the second vector"));
   }
 
   /** {@link #distance(float[], float[])} for JavaScript and Python vectors. */
-  public static float distance(org.graalvm.polyglot.Value a, org.graalvm.polyglot.Value b) {
+  public static float distance(Object a, Object b) {
     return distance(GuestVectors.vector(a, "the first vector"), GuestVectors.vector(b, "the second vector"));
   }
 
   /** {@link #nearest(float[], float[][], int, Metric)} for a JavaScript or Python query and rows. */
-  public static Matches nearest(org.graalvm.polyglot.Value query, org.graalvm.polyglot.Value rows, int k,
+  public static Matches nearest(Object query, Object rows, int k,
       String metric) {
     return nearest(GuestVectors.vector(query, "the query"), GuestVectors.matrix(rows, "the rows"), k, metric);
   }
 
   /** {@link #related(float[][], int, Metric)} for JavaScript or Python rows. */
-  public static Matches[] related(org.graalvm.polyglot.Value rows, int k, String metric) {
+  public static Matches[] related(Object rows, int k, String metric) {
     return related(GuestVectors.matrix(rows, "the rows"), k, metric);
   }
 
@@ -165,6 +165,248 @@ public final class Vectors {
   /** {@link #related(float[][], int, Metric)} with the metric by name. */
   public static Matches[] related(float[][] rows, int k, String metric) {
     return related(rows, k, Metric.of(metric));
+  }
+
+  // ------------------------------------------- arithmetic (exp note 53)
+
+  /** a + b (a new vector). */
+  public static float[] add(float[] a, float[] b) {
+    same(a, b);
+    float[] r = new float[a.length];
+    for (int i = 0; i < r.length; i++) r[i] = a[i] + b[i];
+    return r;
+  }
+
+  /** a - b (a new vector). */
+  public static float[] subtract(float[] a, float[] b) {
+    same(a, b);
+    float[] r = new float[a.length];
+    for (int i = 0; i < r.length; i++) r[i] = a[i] - b[i];
+    return r;
+  }
+
+  /** v * factor (a new vector). */
+  public static float[] scale(float[] v, double factor) {
+    if (v == null) throw new IllegalArgumentException("the vector must not be null");
+    float[] r = new float[v.length];
+    for (int i = 0; i < r.length; i++) r[i] = (float) (v[i] * factor);
+    return r;
+  }
+
+  /** The Euclidean length of v. */
+  public static float norm(float[] v) {
+    if (v == null) throw new IllegalArgumentException("the vector must not be null");
+    return (float) Math.sqrt(VectorEngine.dot(v, v));
+  }
+
+  /** The Manhattan (L1) distance between a and b: the sum of |a[i] - b[i]|. */
+  public static float manhattan(float[] a, float[] b) {
+    same(a, b);
+    double s = 0;
+    for (int i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+    return (float) s;
+  }
+
+  /**
+   * The first dims dimensions of v, scaled to length 1 (a new vector): Matryoshka embeddings
+   * (OpenAI dimensions, sentence-transformers truncate_dim) keep their meaning in a prefix, but the
+   * prefix must be normalized again for cosine and dot.
+   */
+  public static float[] truncate(float[] v, int dims) {
+    if (v == null) throw new IllegalArgumentException("the vector must not be null");
+    if (dims < 1 || dims > v.length)
+      throw new IllegalArgumentException("dims must be in [1, " + v.length + "], not " + dims);
+    return normalize(java.util.Arrays.copyOf(v, dims));
+  }
+
+  /** Scales every row to length 1 in place (zero rows stay zero); returns rows. */
+  public static float[][] normalizeAll(float[][] rows) {
+    VectorEngine.dimension(rows);
+    float[] lanes = new float[VectorEngine.L];
+    for (float[] r : rows) {
+      float inv = VectorEngine.inverseNorm(r, lanes);
+      for (int i = 0; i < r.length; i++) r[i] *= inv;
+    }
+    return rows;
+  }
+
+  /** The mean of the rows (a centroid; mean pooling of token embeddings). */
+  public static float[] mean(float[][] rows) {
+    VectorEngine.dimension(rows);
+    return VectorOps.combine(rows, null, null, true);
+  }
+
+  /** The weighted mean of the rows (weights: one per row; mean pooling with an attention mask). */
+  public static float[] mean(float[][] rows, float[] weights) {
+    VectorEngine.dimension(rows);
+    return VectorOps.combine(rows, null, weights, true);
+  }
+
+  /** The sum of the rows. */
+  public static float[] sum(float[][] rows) {
+    VectorEngine.dimension(rows);
+    return VectorOps.combine(rows, null, null, false);
+  }
+
+  // ------------------------------------- matrices, MMR, groups (exp note 53)
+
+  /** Row i of a with row i of b, for every i: one score each (a and b have as many rows). */
+  public static float[] pairwise(float[][] a, float[][] b, String metric) {
+    int d = VectorEngine.dimension(a);
+    if (VectorEngine.dimension(b) != d && a.length > 0 && b.length > 0)
+      throw new IllegalArgumentException("the rows have " + d + " and " + b[0].length + " dimensions");
+    return VectorOps.pairwise(a, b, VectorEngine.code(Metric.of(metric)));
+  }
+
+  /**
+   * Every row of a with every row of b: scores[i][j] (at most 25 million; for the best of each row
+   * use nearest, for the close pairs pairs).
+   */
+  public static float[][] similarity(float[][] a, float[][] b, String metric) {
+    int d = VectorEngine.dimension(a);
+    if (VectorEngine.dimension(b) != d && a.length > 0 && b.length > 0)
+      throw new IllegalArgumentException("the rows have " + d + " and " + b[0].length + " dimensions");
+    return VectorOps.similarity(a, b, VectorEngine.code(Metric.of(metric)));
+  }
+
+  /**
+   * Maximal marginal relevance over candidate rows (e.g. the top 20 of a search), cosine: k of
+   * them picked one at a time for relevance to query and against redundancy with those already
+   * picked (lambda 1: plain relevance; 0: maximal diversity; 0.5 to 0.8 is usual). Scores: the
+   * cosine with the query, in pick order.
+   */
+  public static Matches mmr(float[] query, float[][] rows, int k, double lambda) {
+    int d = VectorEngine.dimension(rows);
+    VectorEngine.checkQuery(query, d, "the query");
+    return VectorOps.mmr(query, rows, null, k, lambda, null, null, null);
+  }
+
+  /** Rows at least threshold similar to query (cosine, dot) or at most threshold away (euclidean), best first. */
+  public static Matches within(float[] query, float[][] rows, double threshold, String metric) {
+    int d = VectorEngine.dimension(rows);
+    VectorEngine.checkQuery(query, d, "the query");
+    int m = VectorEngine.code(Metric.of(metric));
+    return VectorOps.within(query, rows, null, m, threshold, null);
+  }
+
+  /** The (at most maxPairs best) pairs of rows at least threshold similar / at most threshold apart. */
+  public static Pairs pairs(float[][] rows, double threshold, String metric, int maxPairs) {
+    VectorEngine.dimension(rows);
+    int m = VectorEngine.code(Metric.of(metric));
+    return VectorOps.pairs(rows, null, m, threshold, maxPairs, null);
+  }
+
+  /** Groups of rows linked by close pairs (connected components), of at least minSize rows. */
+  public static Groups groups(float[][] rows, double threshold, String metric, int minSize) {
+    VectorEngine.dimension(rows);
+    int m = VectorEngine.code(Metric.of(metric));
+    return VectorOps.groups(rows, null, m, threshold, minSize, null);
+  }
+
+  /** The positions of the rows to keep without near duplicates (the first of each group). */
+  public static long[] dedup(float[][] rows, double threshold, String metric) {
+    VectorEngine.dimension(rows);
+    int m = VectorEngine.code(Metric.of(metric));
+    return VectorOps.dedup(rows, null, m, threshold, null);
+  }
+
+  /** k-means of the rows: see {@link VectorSet#kmeans(int, String, int, long)}. */
+  public static Clusters kmeans(float[][] rows, int k, String metric, int maxIterations, long seed) {
+    if (VectorEngine.dimension(rows) == 0 && rows.length == 0) throw new IllegalArgumentException("no rows");
+    return VectorOps.kmeans(rows, null, null, k, VectorEngine.code(Metric.of(metric)), maxIterations, seed);
+  }
+
+  // -------------------------- the same for JavaScript and Python (exp note 53)
+
+  /** {@link #add(float[], float[])} for JavaScript and Python vectors. */
+  public static float[] add(Object a, Object b) {
+    return add(GuestVectors.vector(a, "the first vector"), GuestVectors.vector(b, "the second vector"));
+  }
+
+  /** {@link #subtract(float[], float[])} for JavaScript and Python vectors. */
+  public static float[] subtract(Object a, Object b) {
+    return subtract(GuestVectors.vector(a, "the first vector"), GuestVectors.vector(b, "the second vector"));
+  }
+
+  /** {@link #scale(float[], double)} for a JavaScript or Python vector. */
+  public static float[] scale(Object v, double factor) {
+    return scale(GuestVectors.vector(v, "the vector"), factor);
+  }
+
+  /** {@link #norm(float[])} for a JavaScript or Python vector. */
+  public static float norm(Object v) {
+    return norm(GuestVectors.vector(v, "the vector"));
+  }
+
+  /** {@link #manhattan(float[], float[])} for JavaScript and Python vectors. */
+  public static float manhattan(Object a, Object b) {
+    return manhattan(GuestVectors.vector(a, "the first vector"), GuestVectors.vector(b, "the second vector"));
+  }
+
+  /** {@link #truncate(float[], int)} for a JavaScript or Python vector. */
+  public static float[] truncate(Object v, int dims) {
+    return truncate(GuestVectors.vector(v, "the vector"), dims);
+  }
+
+  /** {@link #normalizeAll(float[][])} for JavaScript or Python rows (normalized copies). */
+  public static float[][] normalizeAll(Object rows) {
+    return normalizeAll(GuestVectors.matrix(rows, "the rows"));
+  }
+
+  /** {@link #mean(float[][])} for JavaScript or Python rows. */
+  public static float[] mean(Object rows) {
+    return mean(GuestVectors.matrix(rows, "the rows"));
+  }
+
+  /** {@link #mean(float[][], float[])} for JavaScript or Python rows and weights. */
+  public static float[] mean(Object rows, Object weights) {
+    return mean(GuestVectors.matrix(rows, "the rows"), GuestVectors.vector(weights, "the weights"));
+  }
+
+  /** {@link #sum(float[][])} for JavaScript or Python rows. */
+  public static float[] sum(Object rows) {
+    return sum(GuestVectors.matrix(rows, "the rows"));
+  }
+
+  /** {@link #pairwise(float[][], float[][], String)} for JavaScript or Python rows. */
+  public static float[] pairwise(Object a, Object b, String metric) {
+    return pairwise(GuestVectors.matrix(a, "the first rows"), GuestVectors.matrix(b, "the second rows"), metric);
+  }
+
+  /** {@link #similarity(float[][], float[][], String)} for JavaScript or Python rows. */
+  public static float[][] similarity(Object a, Object b, String metric) {
+    return similarity(GuestVectors.matrix(a, "the first rows"), GuestVectors.matrix(b, "the second rows"), metric);
+  }
+
+  /** {@link #mmr(float[], float[][], int, double)} for a JavaScript or Python query and rows. */
+  public static Matches mmr(Object query, Object rows, int k, double lambda) {
+    return mmr(GuestVectors.vector(query, "the query"), GuestVectors.matrix(rows, "the rows"), k, lambda);
+  }
+
+  /** {@link #within(float[], float[][], double, String)} for a JavaScript or Python query and rows. */
+  public static Matches within(Object query, Object rows, double threshold,
+      String metric) {
+    return within(GuestVectors.vector(query, "the query"), GuestVectors.matrix(rows, "the rows"), threshold, metric);
+  }
+
+  /** {@link #pairs(float[][], double, String, int)} for JavaScript or Python rows. */
+  public static Pairs pairs(Object rows, double threshold, String metric, int maxPairs) {
+    return pairs(GuestVectors.matrix(rows, "the rows"), threshold, metric, maxPairs);
+  }
+
+  /** {@link #groups(float[][], double, String, int)} for JavaScript or Python rows. */
+  public static Groups groups(Object rows, double threshold, String metric, int minSize) {
+    return groups(GuestVectors.matrix(rows, "the rows"), threshold, metric, minSize);
+  }
+
+  /** {@link #dedup(float[][], double, String)} for JavaScript or Python rows. */
+  public static long[] dedup(Object rows, double threshold, String metric) {
+    return dedup(GuestVectors.matrix(rows, "the rows"), threshold, metric);
+  }
+
+  /** {@link #kmeans(float[][], int, String, int, long)} for JavaScript or Python rows. */
+  public static Clusters kmeans(Object rows, int k, String metric, int maxIterations, long seed) {
+    return kmeans(GuestVectors.matrix(rows, "the rows"), k, metric, maxIterations, seed);
   }
 
   // ---------------------------------------------------------------- from SQL

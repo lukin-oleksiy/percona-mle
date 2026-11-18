@@ -30,12 +30,14 @@ import org.graalvm.polyglot.Value;
 final class GuestVectors {
   private GuestVectors() {}
 
-  static float[] vector(Value v, String what) {
+  static float[] vector(Object o, String what) {
+    if (o instanceof float[] f) return f;
+    Value v = value(o);
     if (v == null || v.isNull()) throw new IllegalArgumentException(what + " must not be null");
     if (v.isHostObject()) {
-      Object o = v.asHostObject();
-      if (o instanceof float[] f) return f;
-      if (o instanceof double[] d) {
+      Object h = v.asHostObject();
+      if (h instanceof float[] hf) return hf;
+      if (h instanceof double[] d) {
         float[] f = new float[d.length];
         for (int i = 0; i < d.length; i++) f[i] = (float) d[i];
         return f;
@@ -58,9 +60,11 @@ final class GuestVectors {
     return f;
   }
 
-  static float[][] matrix(Value v, String what) {
+  static float[][] matrix(Object o, String what) {
+    if (o instanceof float[][] m) return m;
+    Value v = value(o);
     if (v == null || v.isNull()) throw new IllegalArgumentException(what + " must not be null");
-    if (v.isHostObject() && v.asHostObject() instanceof float[][] m) return m;
+    if (v.isHostObject() && v.asHostObject() instanceof float[][] hm) return hm;
     int[] shape = numpyShape(v);
     if (shape != null) {
       if (shape.length != 2)
@@ -75,6 +79,64 @@ final class GuestVectors {
     if (n > Integer.MAX_VALUE) throw new IllegalArgumentException(what + " has too many vectors");
     float[][] m = new float[(int) n][];
     for (int i = 0; i < m.length; i++) m[i] = vector(v.getArrayElement(i), what + " row " + i);
+    return m;
+  }
+
+  /**
+   * A guest argument as a Value. The API's guest overloads take Object, not Value: a Java array a
+   * routine got from the helper (VectorSet.vector, Clusters.centroid) then picks the float[]
+   * overload (more specific), where float[] and Value were ambiguous to the host interop; guest
+   * values still pick Object (exp note 53).
+   */
+  static Value value(Object o) {
+    if (o == null) return null;
+    return o instanceof Value v ? v : Value.asValue(o);
+  }
+
+  /** JavaScript or Python integers (array, list, numpy array) or a Java long[] / int[] as long[]. */
+  static long[] longs(Object o, String what) {
+    Value v = value(o);
+    if (v == null || v.isNull()) throw new IllegalArgumentException(what + " must not be null");
+    if (v.isHostObject()) {
+      Object h = v.asHostObject();
+      if (h instanceof long[] l) return l.clone();
+      if (h instanceof int[] i) {
+        long[] l = new long[i.length];
+        for (int j = 0; j < i.length; j++) l[j] = i[j];
+        return l;
+      }
+    }
+    Value a = numpyShape(v) != null ? v.invokeMember("tolist") : v;
+    if (!a.hasArrayElements()) throw new IllegalArgumentException(what + " is not an array: " + describe(v));
+    long n = a.getArraySize();
+    if (n > Integer.MAX_VALUE - 8) throw new IllegalArgumentException(what + " is too long");
+    long[] l = new long[(int) n];
+    for (int i = 0; i < l.length; i++) {
+      Value e = a.getArrayElement(i);
+      if (e.fitsInLong()) l[i] = e.asLong();
+      else if (e.isNumber() && e.fitsInDouble() && e.asDouble() == Math.rint(e.asDouble())
+          && Math.abs(e.asDouble()) < 0x1p53)
+        l[i] = (long) e.asDouble();
+      else
+        throw new IllegalArgumentException(what + ": element " + i + " is not an integer: " + describe(e));
+    }
+    return l;
+  }
+
+  /** A JavaScript or Python array of Matches (or a Java Matches[]). */
+  static Matches[] matchesArray(Object o) {
+    if (o instanceof Matches[] m) return m;
+    Value v = value(o);
+    if (v == null || v.isNull()) throw new IllegalArgumentException("the lists must not be null");
+    if (v.isHostObject() && v.asHostObject() instanceof Matches[] hm) return hm;
+    if (!v.hasArrayElements()) throw new IllegalArgumentException("the lists must be an array of Matches");
+    Matches[] m = new Matches[(int) v.getArraySize()];
+    for (int i = 0; i < m.length; i++) {
+      Value e = v.getArrayElement(i);
+      if (!e.isHostObject() || !(e.asHostObject() instanceof Matches x))
+        throw new IllegalArgumentException("list " + i + " is not a Matches: " + describe(e));
+      m[i] = x;
+    }
     return m;
   }
 

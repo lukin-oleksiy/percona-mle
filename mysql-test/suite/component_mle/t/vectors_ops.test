@@ -1,0 +1,473 @@
+--echo #
+--echo # component_mle: the vector helper's jobs of exp note 53 (what people most
+--echo # often do with numpy on embeddings): arithmetic, mean, pairwise scores and
+--echo # matrices, threshold search, MMR, similar pairs, groups, dedup, k-means,
+--echo # k-NN vote, Matryoshka truncation, rank fusion; against references in
+--echo # double precision, independent of threads; from Java, JavaScript, Python.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE ops_items (id BIGINT PRIMARY KEY, v VECTOR(16), label VARCHAR(10));
+--write_file $MYSQLTEST_VARDIR/tmp/vectors_ops.sql
+-- 6 blobs of 4 close vectors (ids 10 b + j, label 'b<b>') and 6 random ones (ids 100..105,
+-- label 'noise'); java.util.Random(5), the same on every platform.
+CREATE PROCEDURE fill_ops() LANGUAGE JAVA AS $$
+Random r = new Random(5);
+PreparedStatement p = Mle.session().prepare("INSERT INTO ops_items VALUES (?, ?, ?)");
+for (int b = 1; b <= 6; b++) {
+  float[] c = new float[16];
+  for (int i = 0; i < 16; i++) c[i] = (float) r.nextGaussian();
+  for (int j = 1; j <= 4; j++) {
+    float[] v = new float[16];
+    for (int i = 0; i < 16; i++) v[i] = c[i] + 0.05f * (float) r.nextGaussian();
+    p.bind((long) (10 * b + j), v, "b" + b).execute();
+  }
+}
+for (int j = 0; j < 6; j++) {
+  float[] v = new float[16];
+  for (int i = 0; i < 16; i++) v[i] = (float) r.nextGaussian();
+  p.bind((long) (100 + j), v, "noise").execute();
+}
+$$;
+-- Every job against a reference in double precision. 'ok <digest>' or the first failure; the
+-- digest covers the results that must not depend on the number of threads.
+CREATE FUNCTION ops_selfcheck() RETURNS TEXT LANGUAGE JAVA AS $$
+Random r = new Random(11);
+StringBuilder fail = new StringBuilder();
+long[] digest = {17};
+String[] metrics = {"cosine", "dot", "euclidean"};
+java.util.function.BiFunction<Integer, Integer, float[][]> random = (n, d) -> {
+  float[][] m = new float[n][d];
+  for (float[] v : m) for (int i = 0; i < d; i++) v[i] = (float) r.nextGaussian();
+  return m;
+};
+interface Score { double of(float[] a, float[] b, String m); }
+Score ref = (a, b, m) -> {
+  double dot = 0, aa = 0, bb = 0, dd = 0;
+  for (int i = 0; i < a.length; i++) {
+    dot += (double) a[i] * b[i]; aa += (double) a[i] * a[i]; bb += (double) b[i] * b[i];
+    double x = (double) a[i] - b[i]; dd += x * x;
+  }
+  return switch (m) {
+    case "dot" -> dot;
+    case "cosine" -> aa > 0 && bb > 0 ? dot / Math.sqrt(aa) / Math.sqrt(bb) : 0;
+    default -> Math.sqrt(dd);
+  };
+};
+interface Check { void that(boolean ok, String what); }
+Check check = (ok, what) -> { if (!ok && fail.length() == 0) fail.append(what); };
+java.util.function.Consumer<Float> dg = x -> digest[0] = digest[0] * 31 + Float.floatToIntBits(x);
+java.util.function.IntConsumer di = x -> digest[0] = digest[0] * 31 + x;
+
+// pairwise and similarity, every size class (a zero row, dimensions that do not fill a vector).
+for (int d : new int[] {1, 5, 13, 48, 769}) {
+  double tol = 1e-4 * Math.max(1, Math.sqrt(d));
+  float[][] a = random.apply(7, d), b = random.apply(7, d), c = random.apply(9, d);
+  Arrays.fill(a[2], 0f);
+  for (String m : metrics) {
+    float[] p = Vectors.pairwise(a, b, m);
+    for (int i = 0; i < 7; i++) check.that(Math.abs(p[i] - ref.of(a[i], b[i], m)) <= tol, "pairwise d=" + d + " " + m);
+    float[][] s = Vectors.similarity(a, c, m);
+    check.that(s.length == 7 && s[0].length == 9, "similarity shape");
+    for (int i = 0; i < 7; i++)
+      for (int j = 0; j < 9; j++) check.that(Math.abs(s[i][j] - ref.of(a[i], c[j], m)) <= tol, "similarity d=" + d + " " + m);
+  }
+}
+{  // a matrix split over threads
+  float[][] a = random.apply(300, 64), b = random.apply(2000, 64);
+  for (String m : metrics) {
+    float[][] s = Vectors.similarity(a, b, m);
+    for (int i = 0; i < 300; i += 37)
+      for (int j = 0; j < 2000; j += 191) {
+        check.that(Math.abs(s[i][j] - ref.of(a[i], b[j], m)) <= 1e-3, "big similarity " + m);
+        dg.accept(s[i][j]);
+      }
+  }
+}
+
+// within: the threshold between the 20th and 21st best; rows near it may go either way.
+for (int[] nd : new int[][] {{500, 24}, {6000, 768}}) {
+  float[][] rows = random.apply(nd[0], nd[1]);
+  float[] q = random.apply(1, nd[1])[0];
+  double tol = 1e-4 * Math.max(1, Math.sqrt(nd[1]));
+  for (String m : metrics) {
+    double sign = m.equals("euclidean") ? -1 : 1;
+    double[] s = new double[rows.length];
+    for (int j = 0; j < rows.length; j++) s[j] = sign * ref.of(q, rows[j], m);
+    double[] sorted = s.clone();
+    Arrays.sort(sorted);
+    double t = (sorted[sorted.length - 20] + sorted[sorted.length - 21]) / 2;
+    Matches w = Vectors.within(q, rows, sign * t, m);
+    Set<Integer> got = new HashSet<>();
+    double last = Double.POSITIVE_INFINITY;
+    for (int i = 0; i < w.size(); i++) {
+      int j = w.index(i);
+      got.add(j);
+      check.that(s[j] >= t - tol && s[j] <= last + tol, "within " + m + " n=" + nd[0] + " row " + j);
+      check.that(Math.abs(sign * w.score(i) - s[j]) <= tol, "within score " + m);
+      last = s[j];
+      di.accept(j);
+    }
+    for (int j = 0; j < rows.length; j++) if (s[j] >= t + tol) check.that(got.contains(j), "within misses row " + j + " " + m);
+    check.that(w.distance() == m.equals("euclidean"), "within distance flag");
+  }
+}
+
+// pairs: against all pairs; at most maxPairs = the first of all of them; split over threads.
+{
+  float[][] rows = random.apply(600, 64);
+  double tol = 1e-3;
+  for (String m : metrics) {
+    double sign = m.equals("euclidean") ? -1 : 1;
+    List<Double> all = new ArrayList<>();
+    for (int a = 0; a < rows.length; a++) for (int b = a + 1; b < rows.length; b++) all.add(sign * ref.of(rows[a], rows[b], m));
+    all.sort(Comparator.reverseOrder());
+    double t = (all.get(149) + all.get(150)) / 2;
+    Pairs p = Vectors.pairs(rows, sign * t, m, 1_000_000);
+    check.that(Math.abs(p.size() - 150) <= 3, "pairs " + m + ": " + p.size());
+    double last = Double.POSITIVE_INFINITY;
+    for (int i = 0; i < p.size(); i++) {
+      double s = sign * ref.of(rows[p.first(i)], rows[p.second(i)], m);
+      check.that(p.first(i) < p.second(i) && s >= t - tol && s <= last + tol, "pairs order " + m);
+      check.that(Math.abs(sign * p.score(i) - s) <= tol, "pairs score " + m);
+      last = s;
+      di.accept(p.first(i)); di.accept(p.second(i));
+    }
+    Pairs top = Vectors.pairs(rows, sign * t, m, 40);
+    check.that(top.size() == 40, "pairs top 40 " + m);
+    for (int i = 0; i < 40; i++)
+      check.that(top.first(i) == p.first(i) && top.second(i) == p.second(i) && top.score(i) == p.score(i), "pairs top " + m);
+  }
+  // 8300 rows: two chunks of the kernel.
+  float[][] tall = random.apply(8300, 8);
+  int want = 0;
+  for (int a = 0; a < tall.length; a++) for (int b = a + 1; b < tall.length; b++) if (ref.of(tall[a], tall[b], "euclidean") <= 0.6 - 1e-5) want++;
+  Pairs tp = Vectors.pairs(tall, 0.6, "euclidean", 1_000_000);
+  int sure = 0;
+  for (int i = 0; i < tp.size(); i++) {
+    double s = ref.of(tall[tp.first(i)], tall[tp.second(i)], "euclidean");
+    check.that(s <= 0.6 + 1e-5, "tall pairs");
+    if (s <= 0.6 - 1e-5) sure++;
+  }
+  check.that(sure == want && want > 10, "tall pairs: " + sure + " of " + want);
+}
+
+// groups, dedup, k-means, classify on blobs: 12 blobs of 5 close vectors, 20 random ones, mixed.
+{
+  int d = 32;
+  float[][] centres = random.apply(12, d);
+  List<float[]> list = new ArrayList<>();
+  List<Integer> blob = new ArrayList<>();
+  for (int b = 0; b < 12; b++)
+    for (int j = 0; j < 5; j++) {
+      float[] v = new float[d];
+      for (int i = 0; i < d; i++) v[i] = centres[b][i] + 0.05f * (float) r.nextGaussian();
+      list.add(v); blob.add(b);
+    }
+  for (float[] v : random.apply(20, d)) { list.add(v); blob.add(-1); }
+  Collections.shuffle(list, new Random(3));
+  Collections.shuffle(blob, new Random(3));
+  float[][] rows = list.toArray(new float[0][]);
+  for (String[] mt : new String[][] {{"cosine", "0.9"}, {"euclidean", "2.0"}, {"dot", "20"}}) {
+    if (mt[0].equals("dot")) continue;  // dot has no scale-free threshold for these
+    Groups g = Vectors.groups(rows, Double.parseDouble(mt[1]), mt[0], 2);
+    check.that(g.size() == 12, "groups " + mt[0] + ": " + g.size());
+    int prev = -1;
+    for (int x = 0; x < g.size(); x++) {
+      int[] mem = g.members(x);
+      check.that(mem.length == 5, "group size " + mem.length);
+      for (int i : mem) check.that(blob.get(i) == blob.get(mem[0]) && blob.get(i) >= 0, "group mixes blobs");
+      check.that(mem[0] > prev, "groups order");
+      prev = mem[0];
+    }
+    long[] keep = Vectors.dedup(rows, Double.parseDouble(mt[1]), mt[0]);
+    check.that(keep.length == 12 + 20, "dedup keeps " + keep.length);
+    Set<Integer> seen = new HashSet<>();
+    for (long k : keep) check.that(blob.get((int) k) < 0 || seen.add(blob.get((int) k)), "dedup keeps two of a blob");
+    for (int i = 0; i < rows.length; i++)
+      if (blob.get(i) >= 0 && !seen.contains(blob.get(i))) check.that(false, "dedup drops a blob");
+    // the first of each blob is kept
+    int[] first = new int[12];
+    Arrays.fill(first, -1);
+    for (int i = 0; i < rows.length; i++) if (blob.get(i) >= 0 && first[blob.get(i)] < 0) first[blob.get(i)] = i;
+    Set<Long> keepSet = new HashSet<>();
+    for (long k : keep) keepSet.add(k);
+    for (int f : first) check.that(keepSet.contains((long) f), "dedup keeps a later one");
+    check.that(Vectors.groups(rows, Double.parseDouble(mt[1]), mt[0], 1).size() == 32, "groups with singletons");
+  }
+  // k-means on the blobs only: one blob per cluster, for both metrics.
+  List<float[]> only = new ArrayList<>();
+  List<Integer> ob = new ArrayList<>();
+  for (int i = 0; i < rows.length; i++) if (blob.get(i) >= 0) { only.add(rows[i]); ob.add(blob.get(i)); }
+  float[][] br = only.toArray(new float[0][]);
+  for (String m : new String[] {"euclidean", "cosine"}) {
+    Clusters c = Vectors.kmeans(br, 12, m, 100, 42);
+    check.that(c.k() == 12, "kmeans k");
+    int[] owner = new int[12];
+    Arrays.fill(owner, -1);
+    for (int i = 0; i < br.length; i++) {
+      int x = c.cluster(i);
+      if (owner[x] < 0) owner[x] = ob.get(i);
+      check.that(owner[x] == ob.get(i), "kmeans " + m + " mixes blobs");
+      di.accept(x);
+    }
+    for (int s : c.sizes()) check.that(s == 5, "kmeans " + m + " sizes " + Arrays.toString(c.sizes()));
+    for (int i = 0; i < br.length; i++) check.that(c.assign(br[i]) == c.cluster(i), "kmeans assign");
+    double inertia = 0;
+    for (int i = 0; i < br.length; i++) {
+      double s = ref.of(br[i], c.centroid(c.cluster(i)), m);
+      check.that(Math.abs(s - c.score(i)) <= 1e-4, "kmeans score");
+      inertia += m.equals("euclidean") ? s * s : 1 - s;
+    }
+    check.that(Math.abs(inertia - c.inertia()) <= 1e-3, "kmeans inertia");
+    if (m.equals("cosine")) for (int x = 0; x < 12; x++) check.that(Math.abs(Vectors.norm(c.centroid(x)) - 1) < 1e-5, "unit centroid");
+  }
+}
+{  // k-means split over threads (assignment and update): the same with any number of threads
+  float[][] rows = random.apply(40000, 64);
+  for (String m : new String[] {"euclidean", "cosine"}) {
+    Clusters c = Vectors.kmeans(rows, 16, m, 20, 7);
+    for (int i = 0; i < rows.length; i += 101) di.accept(c.cluster(i));
+    for (int x = 0; x < 16; x++) for (float f : c.centroid(x)) dg.accept(f);
+    di.accept(c.iterations());
+    // every row is with its nearest centroid
+    for (int i = 0; i < rows.length; i += 997) {
+      int best = 0;
+      for (int x = 1; x < 16; x++) {
+        double s = ref.of(rows[i], c.centroid(x), m), sb = ref.of(rows[i], c.centroid(best), m);
+        if (m.equals("euclidean") ? s < sb : s > sb) best = x;
+      }
+      check.that(ref.of(rows[i], c.centroid(best), m) == ref.of(rows[i], c.centroid(c.cluster(i)), m)
+          || Math.abs(ref.of(rows[i], c.centroid(best), m) - ref.of(rows[i], c.centroid(c.cluster(i)), m)) < 1e-5,
+          "kmeans nearest " + m);
+    }
+  }
+}
+
+// mmr against a reference in double.
+{
+  float[][] rows = random.apply(40, 16);
+  float[] q = random.apply(1, 16)[0];
+  for (double lambda : new double[] {0, 0.3, 0.7, 1}) {
+    double[] rel = new double[40];
+    for (int j = 0; j < 40; j++) rel[j] = ref.of(q, rows[j], "cosine");
+    List<Integer> pick = new ArrayList<>();
+    double[] maxSim = new double[40];
+    Arrays.fill(maxSim, Double.NEGATIVE_INFINITY);
+    for (int step = 0; step < 10; step++) {
+      int best = -1;
+      double bs = 0;
+      for (int j = 0; j < 40; j++) {
+        if (pick.contains(j)) continue;
+        double v = step == 0 ? rel[j] : lambda * rel[j] - (1 - lambda) * maxSim[j];
+        if (best < 0 || v > bs) { best = j; bs = v; }
+      }
+      pick.add(best);
+      for (int j = 0; j < 40; j++) maxSim[j] = Math.max(maxSim[j], ref.of(rows[best], rows[j], "cosine"));
+    }
+    Matches got = Vectors.mmr(q, rows, 10, lambda);
+    check.that(got.size() == 10, "mmr size");
+    for (int i = 0; i < 10; i++) {
+      check.that(got.index(i) == pick.get(i), "mmr lambda=" + lambda + " pick " + i + ": " + got.index(i) + " want " + pick.get(i));
+      check.that(Math.abs(got.score(i) - rel[pick.get(i)]) < 1e-5, "mmr score");
+    }
+    if (lambda == 1) {
+      Matches n = Vectors.nearest(q, rows, 10, "cosine");
+      for (int i = 0; i < 10; i++) check.that(n.index(i) == got.index(i), "mmr lambda=1 is nearest");
+    }
+  }
+}
+
+// mean, weighted mean, sum, arithmetic, truncate.
+{
+  float[][] rows = random.apply(1000, 13);
+  float[] w = new float[1000];
+  for (int i = 0; i < w.length; i++) w[i] = r.nextFloat();
+  float[] mean = Vectors.mean(rows), wm = Vectors.mean(rows, w), sum = Vectors.sum(rows);
+  for (int i = 0; i < 13; i++) {
+    double s = 0, ws = 0, wt = 0;
+    for (int j = 0; j < 1000; j++) { s += rows[j][i]; ws += (double) w[j] * rows[j][i]; wt += w[j]; }
+    check.that(Math.abs(mean[i] - s / 1000) < 1e-6 && Math.abs(sum[i] - s) < 1e-3 && Math.abs(wm[i] - ws / wt) < 1e-6, "mean");
+  }
+  float[] a = rows[0], b = rows[1];
+  float[] ab = Vectors.subtract(Vectors.add(a, b), b);
+  for (int i = 0; i < 13; i++) check.that(Math.abs(ab[i] - a[i]) < 1e-5, "add, subtract");
+  check.that(Math.abs(Vectors.norm(Vectors.scale(a, 2)) - 2 * Vectors.norm(a)) < 1e-5, "scale, norm");
+  double l1 = 0;
+  for (int i = 0; i < 13; i++) l1 += Math.abs(a[i] - b[i]);
+  check.that(Math.abs(Vectors.manhattan(a, b) - l1) < 1e-4, "manhattan");
+  float[] t = Vectors.truncate(a, 5);
+  check.that(t.length == 5 && Math.abs(Vectors.norm(t) - 1) < 1e-6 && Math.abs(t[0] / t[1] - a[0] / a[1]) < 1e-4, "truncate");
+  float[][] nr = Vectors.normalizeAll(random.apply(5, 13));
+  for (float[] v : nr) check.that(Math.abs(Vectors.norm(v) - 1) < 1e-6, "normalizeAll");
+}
+return fail.length() > 0 ? "FAIL " + fail : "ok " + Long.toHexString(digest[0]);
+$$;
+-- The jobs on a VectorSet from SQL, in each language.
+CREATE PROCEDURE java_ops(OUT r TEXT) LANGUAGE JAVA AS $$
+VectorSet s = Vectors.load("SELECT id, v, label FROM ops_items ORDER BY id");
+float[] q = s.vector(s.indexOf(11));
+StringBuilder b = new StringBuilder();
+b.append("set: ").append(s).append('\n');
+b.append("within 0.9: ").append(Arrays.toString(s.within(q, 0.9, "cosine").ids())).append('\n');
+b.append("mmr 0.5: ").append(Arrays.toString(s.mmr(q, 4, 0.5, 30).ids())).append('\n');
+b.append("mmr 1: ").append(Arrays.toString(s.mmr(q, 4, 1.0).ids())).append('\n');
+Pairs p = s.pairs(0.95, "cosine", 5);
+b.append("pairs: ").append(p.size()).append(", first ").append(p.firstId(0)).append('-').append(p.secondId(0)).append('\n');
+b.append("groups: ").append(s.groups(0.9, "cosine")).append('\n');
+b.append("dedup: ").append(Arrays.toString(s.dedup(0.9, "cosine"))).append('\n');
+Clusters c = s.kmeans(6, "cosine", 50, 1);
+b.append("kmeans 6 over ").append(s.size()).append(": sizes ").append(Arrays.toString(c.sizes())).append('\n');
+float[] noisy = Vectors.add(s.vector(s.indexOf(42)), new float[] {0.03f, -0.02f, 0.01f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+b.append("classify: ").append(s.classify(noisy, 3, "cosine")).append('\n');
+float[] m = s.meanOf(new long[] {31, 32, 33, 34});
+b.append("profile of blob 3 nearest: ").append(Arrays.toString(s.nearest(m, 4, "cosine").ids())).append('\n');
+b.append("truncated: ").append(s.truncate(8)).append(" nearest ").append(Arrays.toString(s.truncate(8).nearest(Vectors.truncate(q, 8), 2, "cosine").ids()));
+r[0] = b.toString();
+$$;
+CREATE PROCEDURE js_ops(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors');
+  const M = Java.type('com.percona.mle.api.Matches');
+  const s = V.load('SELECT id, v, label FROM ops_items ORDER BY id');
+  const q = s.vector(s.indexOf(11));
+  const ids = m => Array.from(m.ids()).join(', ');
+  const out = [];
+  out.push(`within 0.9: [${ids(s.within(q, 0.9, 'cosine'))}]`);
+  out.push(`mmr 0.5: [${ids(s.mmr(q, 4, 0.5, 30))}]`);
+  out.push(`groups: ${s.groups(0.9, 'cosine')}`);
+  out.push(`dedup: [${Array.from(s.dedup(0.9, 'cosine')).join(', ')}]`);
+  out.push(`classify: ${s.classify(new Float32Array(s.vector(s.indexOf(42))), 3, 'cosine')}`);
+  out.push(`profile: [${ids(s.nearest(s.meanOf([31, 32, 33, 34]), 4, 'cosine'))}]`);
+  // Hybrid: a full-text style ranked list and a vector one, fused by rank and by score.
+  const text = M.of([33, 21, 11], [12.5, 7.25, 3.0]);
+  const vec = s.nearest(q, 3, 'cosine');
+  out.push(`fuse: ${M.fuse(60, [text, vec])}`.replace(/"score": [0-9.eE-]+/g, '"score": S'));
+  out.push(`blend: [${ids(M.blend([text, vec], [0.3, 0.7]))}]`);
+  const rows = [[1, 0], [0.9, 0.1], [0, 1]];
+  out.push(`inline: mean ${Array.from(V.mean(rows))} pairs ${V.pairs(rows, 0.9, 'cosine', 10)} mmr [${ids(V.mmr([1, 0], rows, 2, 0.5))}]`);
+  out.push(`truncate: ${Array.from(V.truncate(new Float32Array([3, 4, 12]), 2))}`);
+  r = out.join('\n');
+$$;
+CREATE PROCEDURE py_ops(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import java
+    import numpy as np
+    V = java.type('com.percona.mle.api.Vectors')
+    M = java.type('com.percona.mle.api.Matches')
+    s = V.load('SELECT id, v, label FROM ops_items ORDER BY id')
+    q = np.array(s.vector(s.indexOf(11)), dtype=np.float32)
+    ids = lambda m: ', '.join(str(i) for i in m.ids())
+    out = []
+    out.append('within 0.9: [%s]' % ids(s.within(q, 0.9, 'cosine')))
+    out.append('mmr 0.5: [%s]' % ids(s.mmr(q, 4, 0.5, 30)))
+    out.append('groups: %s' % s.groups(0.9, 'cosine'))
+    out.append('dedup: [%s]' % ', '.join(str(i) for i in s.dedup(0.9, 'cosine')))
+    out.append('classify: %s' % s.classify(np.array(s.vector(s.indexOf(42))), 3, 'cosine'))
+    out.append('profile: [%s]' % ids(s.nearest(s.meanOf([31, 32, 33, 34]), 4, 'cosine')))
+    text = M.of(np.array([33, 21, 11]), np.array([12.5, 7.25, 3.0]))
+    vec = s.nearest(q, 3, 'cosine')
+    out.append('blend: [%s]' % ids(M.blend([text, vec], [0.3, 0.7])))
+    rows = np.array([[1, 0], [0.9, 0.1], [0, 1]], dtype=np.float32)
+    c = V.kmeans(rows, 2, 'cosine', 10, 42)
+    out.append('kmeans: %s, assign [0.8, 0.2] -> %d' % (c, c.assign(np.array([0.8, 0.2]))))
+    sim = V.similarity(rows, rows, 'cosine')
+    out.append('similarity: %s' % np.round(np.array([list(x) for x in sim]), 3).tolist())
+    r = '\n'.join(out)
+$$;
+-- The user guide's hybrid search: full-text ranks and a diverse vector top k, fused.
+CREATE PROCEDURE hybrid(IN words TEXT, IN q VECTOR(16), OUT r TEXT) READS SQL DATA LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors')
+  const M = Java.type('com.percona.mle.api.Matches')
+  const text = session.runSql('SELECT id, MATCH(body) AGAINST (?) AS s FROM ops_docs WHERE MATCH(body) AGAINST (?) ' +
+                              'ORDER BY s DESC LIMIT 20', [words, words]).fetchAll()
+  const byText = M.of(text.map(x => x.id), text.map(x => x.s))
+  const byVector = V.load('SELECT id, v FROM ops_items').mmr(q, 3, 0.7)
+  r = String(M.fuse(60, [byText, byVector])).replace(/"score": [0-9.eE-]+/g, '"score": S')
+$$;
+CREATE PROCEDURE java_ops_errors(OUT r TEXT) LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+float[][] rows = {{1, 0}, {0, 1}, {1, 1}};
+Runnable[] cases = {
+  () -> Vectors.kmeans(rows, 2, "dot", 10, 1),
+  () -> Vectors.kmeans(rows, 4, "cosine", 10, 1),
+  () -> Vectors.mmr(new float[] {1, 0}, rows, 2, 1.5),
+  () -> Vectors.pairs(rows, 0.5, "cosine", 0),
+  () -> Vectors.within(new float[] {1, 0}, rows, -1, "euclidean"),
+  () -> Vectors.pairwise(rows, new float[][] {{1, 0}}, "dot"),
+  () -> Vectors.similarity(new float[5001][1], new float[5001][1], "dot"),
+  () -> Vectors.truncate(new float[] {1, 2}, 3),
+  () -> Vectors.mean(new float[0][]),
+  () -> Vectors.mean(rows, new float[] {0, 0, 0}),
+  () -> Matches.blend(new Matches[] {Matches.of(new long[] {1}, new float[] {1})}, new double[] {1, 2}),
+  () -> Vectors.load("SELECT id, v FROM ops_items").classify(new float[16], 3, "cosine"),
+  () -> Vectors.load("SELECT id, v FROM ops_items").meanOf(new long[] {11, 999}),
+  () -> Vectors.load("SELECT id, v FROM ops_items").mmr(new float[16], 5, 0.5, 4),
+};
+for (Runnable c : cases) {
+  try { c.run(); b.append("no error\n"); }
+  catch (IllegalArgumentException e) { b.append(e.getMessage()).append('\n'); }
+}
+r[0] = b.toString().trim();
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/vectors_ops.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/vectors_ops.sql
+--source include/wait_until_count_sessions.inc
+
+--connect (con1, localhost, root,,test)
+CALL fill_ops();
+--echo # 1. Against the references; with mle.vector_threads = 4.
+--let $d4 = `SELECT ops_selfcheck()`
+--replace_regex /ok [0-9a-f]+/ok DIGEST/
+--eval SELECT IF('$d4' LIKE 'ok %', 'ok', '$d4') AS selfcheck
+
+--echo # 2. On a VectorSet from SQL: Java, JavaScript, Python.
+CALL java_ops(@j);
+SELECT @j AS java;
+CALL js_ops(@js);
+SELECT @js AS js;
+CALL py_ops(@py);
+SELECT @py AS python;
+
+--echo # Hybrid search (the user guide's example).
+CREATE TABLE ops_docs (id BIGINT PRIMARY KEY, body TEXT, FULLTEXT (body)) ENGINE=InnoDB;
+INSERT INTO ops_docs VALUES (11, 'red apples and green pears'), (33, 'apples in autumn'),
+  (52, 'trains and timetables'), (101, 'apple pie recipe with apples');
+SELECT v INTO @q FROM ops_items WHERE id = 12;
+CALL hybrid('apples', @q, @r);
+SELECT @r AS hybrid;
+DROP TABLE ops_docs;
+--echo # 3. Errors.
+CALL java_ops_errors(@r);
+SELECT @r AS java;
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+
+--echo # 4. mle.vector_threads = 1: the same results.
+SET GLOBAL mle.vector_threads = 1;
+--connect (con1, localhost, root,,test)
+--let $d1 = `SELECT ops_selfcheck()`
+--replace_regex /ok [0-9a-f]+/ok DIGEST/
+--eval SELECT IF('$d1' LIKE 'ok %', 'ok', '$d1') AS selfcheck
+--let $assert_text = The same results with 1 thread as with 4
+--let $assert_cond = "$d1" = "$d4"
+--source include/assert.inc
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.vector_threads = DEFAULT;
+
+DROP TABLE ops_items;
+DROP PROCEDURE fill_ops;
+DROP FUNCTION ops_selfcheck;
+DROP PROCEDURE java_ops;
+DROP PROCEDURE js_ops;
+DROP PROCEDURE py_ops;
+DROP PROCEDURE java_ops_errors;
+DROP PROCEDURE hybrid;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

@@ -588,13 +588,143 @@ final class VectorEngine {
       id = new long[m];
       for (int i = 0; i < m; i++) id[i] = ids[index[i]];
     }
-    return new Matches(index, score, id);
+    return new Matches(index, score, id, metric == EUCLIDEAN);
+  }
+
+  // ------------------------------------------------ every score (exp note 53)
+
+  /** The score of a key: the distance for EUCLIDEAN (key -|q - r|²), the key itself otherwise. */
+  static float score(float key, int metric) {
+    return metric == EUCLIDEAN ? (float) Math.sqrt(-key) : key;
+  }
+
+  /** The key of a threshold in the metric's unit: a similarity, or a distance for EUCLIDEAN. */
+  static float keyOf(double threshold, int metric) {
+    if (metric != EUCLIDEAN) return (float) threshold;
+    if (!(threshold >= 0)) throw new IllegalArgumentException("a distance threshold must be at least 0, not " + threshold);
+    return (float) -(threshold * threshold);
+  }
+
+  /** Every row's key for query q (higher is better), split over threads like nearest(). */
+  static float[] keys(float[] q, float[][] rows, float[] rowTerm, int metric) {
+    final int n = rows.length;
+    final float[] out = new float[n];
+    final float qInv = metric == COSINE ? inverseNorm(q, new float[L]) : 0f;
+    final int parts = parts((long) n * q.length, n);
+    if (parts > 1)
+      run(parts, true, p -> keys(q, rows, rowTerm, metric, qInv, (int) ((long) n * p / parts),
+          (int) ((long) n * (p + 1) / parts), out));
+    else
+      run((n + SLICE - 1) / SLICE, false, sl -> keys(q, rows, rowTerm, metric, qInv, sl * SLICE,
+          Math.min(n, (sl + 1) * SLICE), out));
+    return out;
+  }
+
+  /** Keys of rows [lo, hi) for q into out; checks for KILL every 4096 rows. */
+  static void keys(float[] q, float[][] rows, float[] rowTerm, int metric, float qInv, int lo, int hi, float[] out) {
+    final float[] lanes = new float[L], square = new float[1];
+    for (int j = lo; j < hi; j++) {
+      if ((j - lo & 4095) == 0) stopIfKilled();
+      if (metric == EUCLIDEAN) {
+        out[j] = -rowDistanceSquared(q, rows[j], lanes);
+      } else if (metric == DOT) {
+        out[j] = rowDot(q, rows[j], lanes);
+      } else if (rowTerm != null) {
+        out[j] = rowDot(q, rows[j], lanes) * qInv * rowTerm[j];
+      } else {
+        float dot = rowDotSquare(q, rows[j], lanes, square);
+        out[j] = dot * qInv * (square[0] > 0 ? (float) (1 / Math.sqrt(square[0])) : 0f);
+      }
+    }
+  }
+
+  /** Receives pairs (a < b) found by {@link #pairs}; called under the sink's lock. */
+  interface PairSink {
+    /** Takes count pairs; returns the key below which no more pairs are wanted (it only rises). */
+    float take(int[] a, int[] b, float[] key, int count);
+  }
+
+  /**
+   * Every pair a < b of rows with key >= keyMin, to the sink: the related() kernel (each pair once,
+   * register tiles, threads), each task buffering its pairs. The pairs reach the sink in an order
+   * that depends on the threads; sinks give a result that does not (a total order, or components).
+   */
+  static void pairs(float[][] rows, float[] rowTerm, int metric, float keyMin, PairSink sink) {
+    final int n = rows.length;
+    if (n < 2) return;
+    final int d = rows[0].length;
+    final float[] rt = rowTerm != null ? rowTerm : rowTerms(rows, metric);
+    final float[] cut = {keyMin};  // under the sink's lock; read racily (it only rises)
+    final int rb = Math.max(4, Math.min(128, (n + 4 * THREADS - 1) / (4 * THREADS) + 3 & ~3));
+    final boolean parallel = (long) n * n / 2 * d >= PARALLEL_MIN;
+    final float[][] pk = new float[(Math.min(n, CHUNK) + NR - 1) / NR][d * NR];
+    final float[] zero = new float[d];
+    for (int c0 = 0; c0 < n; c0 += CHUNK) {
+      final int c1 = Math.min(n, c0 + CHUNK), panels = (c1 - c0 + NR - 1) / NR, start = c0;
+      final int tasks = Math.min((n + rb - 1) / rb, (c1 - 1 + rb - 1) / rb);
+      if (tasks == 0) continue;
+      run(panels, parallel, p -> pack(rows, start, c1, p, pk[p], d));
+      run(tasks, parallel, t -> {
+        final float[] tile = new float[4 * NR];
+        final int cap = 8192;
+        final int[] ba = new int[cap], bb = new int[cap];
+        final float[] bk = new float[cap];
+        int m = 0;
+        float min;
+        synchronized (sink) {
+          min = cut[0];
+        }
+        final int lo = t * rb, hi = Math.min(n, lo + rb);
+        for (int p = Math.max(0, (lo + 1 - start) / NR); p < panels; p++) {
+          stopIfKilled();
+          final float[] panel = pk[p];
+          final int j0 = start + p * NR, cols = Math.min(NR, c1 - j0);
+          for (int a = lo; a < hi; a += 4) {
+            if (j0 + cols - 1 <= a) break;
+            if (metric == EUCLIDEAN)
+              tileDistance(rows[a], a + 1 < hi ? rows[a + 1] : zero, a + 2 < hi ? rows[a + 2] : zero,
+                  a + 3 < hi ? rows[a + 3] : zero, panel, d, tile);
+            else
+              tile(rows[a], a + 1 < hi ? rows[a + 1] : zero, a + 2 < hi ? rows[a + 2] : zero,
+                  a + 3 < hi ? rows[a + 3] : zero, panel, d, tile);
+            for (int r = 0; r < 4 && a + r < hi; r++) {
+              final int qa = a + r;
+              for (int c = Math.max(0, qa + 1 - j0); c < cols; c++) {
+                final int j = j0 + c;
+                final float v = tile[r * NR + c];
+                final float key = switch (metric) {
+                  case COSINE -> v * (rt[qa] * rt[j]);
+                  case EUCLIDEAN -> -v;
+                  default -> v;
+                };
+                if (key >= min) {
+                  ba[m] = qa;
+                  bb[m] = j;
+                  bk[m] = key;
+                  if (++m == cap) {
+                    synchronized (sink) {
+                      cut[0] = Math.max(cut[0], sink.take(ba, bb, bk, m));
+                      min = cut[0];
+                    }
+                    m = 0;
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (m > 0)
+          synchronized (sink) {
+            cut[0] = Math.max(cut[0], sink.take(ba, bb, bk, m));
+          }
+      });
+    }
   }
 
   // ---------------------------------------------------------------- threads
 
   /** How many parts work of this size is split into (1: on the calling thread). */
-  private static int parts(long work, int n) {
+  static int parts(long work, int n) {
     if (THREADS <= 1 || work < 2 * PARALLEL_MIN) return 1;
     return (int) Math.max(1, Math.min(Math.min(THREADS, work / PARALLEL_MIN), n));
   }
@@ -621,7 +751,7 @@ final class VectorEngine {
   }
 
   /** Inside a task (on the pool or the calling thread): a killed call stops here. */
-  private static void stopIfKilled() {
+  static void stopIfKilled() {
     if (killed()) throw cancelled();
   }
 

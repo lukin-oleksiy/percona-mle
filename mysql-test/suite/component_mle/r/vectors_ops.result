@@ -1,0 +1,100 @@
+#
+# component_mle: the vector helper's jobs of exp note 53 (what people most
+# often do with numpy on embeddings): arithmetic, mean, pairwise scores and
+# matrices, threshold search, MMR, similar pairs, groups, dedup, k-means,
+# k-NN vote, Matryoshka truncation, rank fusion; against references in
+# double precision, independent of threads; from Java, JavaScript, Python.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE ops_items (id BIGINT PRIMARY KEY, v VECTOR(16), label VARCHAR(10));
+CALL fill_ops();
+# 1. Against the references; with mle.vector_threads = 4.
+SELECT IF('ok DIGEST' LIKE 'ok %', 'ok', 'ok DIGEST') AS selfcheck;
+selfcheck
+ok
+# 2. On a VectorSet from SQL: Java, JavaScript, Python.
+CALL java_ops(@j);
+SELECT @j AS java;
+java
+set: VectorSet(30 vectors of 16 dimensions)
+within 0.9: [11, 14, 13, 12]
+mmr 0.5: [11, 14, 105, 103]
+mmr 1: [11, 14, 13, 12]
+pairs: 5, first 12-14
+groups: [[11, 12, 13, 14], [21, 22, 23, 24], [31, 32, 33, 34], [41, 42, 43, 44], [51, 52, 53, 54], [61, 62, 63, 64]]
+dedup: [11, 21, 31, 41, 51, 61, 100, 101, 102, 103, 104, 105]
+kmeans 6 over 30: sizes [4, 9, 7, 4, 4, 2]
+classify: b4
+profile of blob 3 nearest: [32, 34, 33, 31]
+truncated: VectorSet(30 vectors of 8 dimensions) nearest [11, 14]
+CALL js_ops(@js);
+SELECT @js AS js;
+js
+within 0.9: [11, 14, 13, 12]
+mmr 0.5: [11, 14, 105, 103]
+groups: [[11, 12, 13, 14], [21, 22, 23, 24], [31, 32, 33, 34], [41, 42, 43, 44], [51, 52, 53, 54], [61, 62, 63, 64]]
+dedup: [11, 21, 31, 41, 51, 61, 100, 101, 102, 103, 104, 105]
+classify: b4
+profile: [32, 34, 33, 31]
+fuse: [{"id": 11, "score": S}, {"id": 33, "score": S}, {"id": 14, "score": S}, {"id": 21, "score": S}, {"id": 13, "score": S}]
+blend: [11, 14, 33, 21, 13]
+inline: mean 0.6333333253860474,0.36666667461395264 pairs [{"first": 0, "second": 1, "score": 0.9938837}] mmr [0, 1]
+truncate: 0.6000000238418579,0.800000011920929
+CALL py_ops(@py);
+SELECT @py AS python;
+python
+within 0.9: [11, 14, 13, 12]
+mmr 0.5: [11, 14, 105, 103]
+groups: [[11, 12, 13, 14], [21, 22, 23, 24], [31, 32, 33, 34], [41, 42, 43, 44], [51, 52, 53, 54], [61, 62, 63, 64]]
+dedup: [11, 21, 31, 41, 51, 61, 100, 101, 102, 103, 104, 105]
+classify: b4
+profile: [32, 34, 33, 31]
+blend: [11, 14, 33, 21, 13]
+kmeans: {"k": 2, "iterations": 1, "inertia": 0.0030603408813476562, "sizes": [1, 2]}, assign [0.8, 0.2] -> 1
+similarity: [[1.0, 0.994, 0.0], [0.994, 1.0, 0.11], [0.0, 0.11, 1.0]]
+# Hybrid search (the user guide's example).
+CREATE TABLE ops_docs (id BIGINT PRIMARY KEY, body TEXT, FULLTEXT (body)) ENGINE=InnoDB;
+INSERT INTO ops_docs VALUES (11, 'red apples and green pears'), (33, 'apples in autumn'),
+(52, 'trains and timetables'), (101, 'apple pie recipe with apples');
+SELECT v INTO @q FROM ops_items WHERE id = 12;
+CALL hybrid('apples', @q, @r);
+SELECT @r AS hybrid;
+hybrid
+[{"id": 11, "score": S}, {"id": 12, "score": S}, {"id": 14, "score": S}, {"id": 33, "score": S}, {"id": 13, "score": S}, {"id": 101, "score": S}]
+DROP TABLE ops_docs;
+# 3. Errors.
+CALL java_ops_errors(@r);
+SELECT @r AS java;
+java
+k-means needs 'euclidean' or 'cosine', not 'dot'
+k must be in [1, 3] (the rows), not 4
+lambda must be in [0, 1], not 1.5
+maxPairs must be at least 1, not 0
+a distance threshold must be at least 0, not -1.0
+3 rows and 1 rows: pairwise needs as many
+5001 x 5001 scores is more than 25000000: use nearest() for the best k of each row, or pairs() for the pairs above a threshold
+dims must be in [1, 2], not 3
+no rows to average
+the weights sum to 0
+1 lists but 2 weights
+the set has no labels: load (id, vector, label) rows
+no vector with id 999
+fetchK (4) must be at least k (5)
+# 4. mle.vector_threads = 1: the same results.
+SET GLOBAL mle.vector_threads = 1;
+SELECT IF('ok DIGEST' LIKE 'ok %', 'ok', 'ok DIGEST') AS selfcheck;
+selfcheck
+ok
+include/assert.inc [The same results with 1 thread as with 4]
+SET GLOBAL mle.vector_threads = DEFAULT;
+DROP TABLE ops_items;
+DROP PROCEDURE fill_ops;
+DROP FUNCTION ops_selfcheck;
+DROP PROCEDURE java_ops;
+DROP PROCEDURE js_ops;
+DROP PROCEDURE py_ops;
+DROP PROCEDURE java_ops_errors;
+DROP PROCEDURE hybrid;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

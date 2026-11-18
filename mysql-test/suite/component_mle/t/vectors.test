@@ -178,7 +178,7 @@ Runnable[] cases = {
   () -> Vectors.dot(new float[3], new float[4]),
   () -> Vectors.nearest(new float[3], new float[][] {new float[3], new float[2]}, 1, Vectors.Metric.DOT),
   () -> Vectors.nearest(new float[3], new float[][] {new float[3]}, 0, Vectors.Metric.DOT),
-  () -> Vectors.load("SELECT id, v, 1 FROM items"),
+  () -> Vectors.load("SELECT id, v, 1, 2 FROM items"),
   () -> Vectors.load("SELECT v, id FROM items"),
   () -> Vectors.load("SELECT id, v FROM items").nearestTo(999, 1, "dot"),
 };
