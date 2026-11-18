@@ -30,7 +30,8 @@ import java.util.Locale;
  */
 public final class SqlOptions {
   /** The option names. */
-  public static final List<String> NAMES = List.of("passResultToClient", "charsetName", "integerType", "decimalType");
+  public static final List<String> NAMES = List.of("passResultToClient", "charsetName", "integerType", "decimalType",
+      "batchRewrite");
 
   public static final List<String> INTEGER_TYPES = List.of("UNSAFE_STRING", "UNSAFE_BIGINT", "STRING", "BIGINT");
   public static final List<String> DECIMAL_TYPES = List.of("STRING", "NUMBER");
@@ -39,6 +40,7 @@ public final class SqlOptions {
   private String charsetName;
   private String integerType;
   private String decimalType;
+  private Boolean batchRewrite;
 
   public SqlOptions() {}
 
@@ -47,6 +49,7 @@ public final class SqlOptions {
     charsetName = o.charsetName;
     integerType = o.integerType;
     decimalType = o.decimalType;
+    batchRewrite = o.batchRewrite;
   }
 
   public SqlOptions passResultToClient(boolean v) {
@@ -75,6 +78,15 @@ public final class SqlOptions {
     return this;
   }
 
+  /**
+   * executeMany may run an INSERT or REPLACE of one row of values as multi-row statements (exp note 52);
+   * true by default.
+   */
+  public SqlOptions batchRewrite(boolean v) {
+    batchRewrite = v;
+    return this;
+  }
+
   /** Sets an option by name from a Boolean or String. */
   public SqlOptions set(String name, Object value) {
     switch (name) {
@@ -85,6 +97,10 @@ public final class SqlOptions {
       case "charsetName" -> charsetName(String.valueOf(value));
       case "integerType" -> integerType(String.valueOf(value));
       case "decimalType" -> decimalType(String.valueOf(value));
+      case "batchRewrite" -> {
+        if (!(value instanceof Boolean b)) throw new IllegalArgumentException("batchRewrite must be a boolean");
+        batchRewrite(b);
+      }
       default -> throw new IllegalArgumentException("unknown option '" + name + "'");
     }
     return this;
@@ -98,6 +114,10 @@ public final class SqlOptions {
 
   public boolean passResultToClient() {
     return passResultToClient != null && passResultToClient;
+  }
+
+  public boolean batchRewrite() {
+    return batchRewrite == null || batchRewrite;
   }
 
   public String charsetName() {
@@ -121,6 +141,7 @@ public final class SqlOptions {
       case "charsetName" -> charsetName();
       case "integerType" -> integerType;
       case "decimalType" -> decimalType;
+      case "batchRewrite" -> batchRewrite();
       default -> throw new IllegalArgumentException("unknown option '" + name + "'");
     };
   }
@@ -132,6 +153,7 @@ public final class SqlOptions {
     if (charsetName != null) r.charsetName = charsetName;
     if (integerType != null) r.integerType = integerType;
     if (decimalType != null) r.decimalType = decimalType;
+    if (batchRewrite != null) r.batchRewrite = batchRewrite;
     return r;
   }
 }

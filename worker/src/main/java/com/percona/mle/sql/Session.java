@@ -152,12 +152,39 @@ public final class Session {
    * it (exp note 51).
    */
   public SqlResult executeMany(String sql, List<?> rows) {
-    PreparedStatement p = prepare(sql, internal());
+    return executeMany(sql, rows, null);
+  }
+
+  /** executeMany with statement options (batchRewrite: false runs the rows one statement each). */
+  public SqlResult executeMany(String sql, List<?> rows, SqlOptions options) {
+    PreparedStatement p = prepare(sql, new SqlOptions().passResultToClient(false).over(options));
     try {
       return p.executeMany(rows);
     } finally {
       p.deallocate();
     }
+  }
+
+  /** Engine lookups of exp note 52, by schema and table: kept for the worker (a lookup costs ~0.3 ms). */
+  private final java.util.Map<String, Boolean> innodb = new java.util.HashMap<>();
+
+  /**
+   * Whether schema.table (schema null: the current database, the running routine's schema) is an
+   * InnoDB base table (exp note 52: a failing multi-row statement must leave nothing behind). Looked
+   * up once per worker and table; fresh: look up again (before replaying a failed chunk, in case the
+   * table changed engine since).
+   */
+  boolean innodb(String schema, String table, boolean fresh) {
+    String s = schema != null ? schema : SqlBridge.routineSchema();
+    String key = s == null ? null : s + '\0' + table;
+    Boolean b = key == null || fresh ? null : innodb.get(key);
+    if (b == null) {
+      List<Object> e = column("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) "
+          + "AND TABLE_NAME = ? AND TABLE_TYPE = 'BASE TABLE'", schema, table);
+      b = e.size() == 1 && "InnoDB".equalsIgnoreCase(String.valueOf(e.get(0)));
+      if (key != null) innodb.put(key, b);
+    }
+    return b;
   }
 
   /** A row of a batch as values: an Object[] or a List (guest rows arrive as Object[]). */
@@ -171,7 +198,7 @@ public final class Session {
     SqlOptions o = effective(options);
     long id = SqlBridge.newStatementId();
     MleSql.Reply r = request(PREPARE, id, sql, null, o.passResultToClient() ? TO_CLIENT : 0, 0);
-    return new PreparedStatement(this, id, o, r.parameterCount());
+    return new PreparedStatement(this, id, sql, o, r.parameterCount());
   }
 
   /** Sets defaults for the statements of the rest of this routine call (unset ones are kept). */

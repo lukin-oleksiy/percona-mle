@@ -245,7 +245,8 @@ final class GuestSql {
           yield r == null ? null : new GResult(this, r);
         }
         case "prepare" -> new GPrepared(this, s.prepare(str(a, 0), lang.options(arg(a, 1))));
-        case "executeMany", "executemany" -> new GResult(this, s.executeMany(str(a, 0), rows(arg(a, 1))));
+        case "executeMany", "executemany" ->
+            new GResult(this, s.executeMany(str(a, 0), rows(arg(a, 1)), lang.options(arg(a, 2))));
         case "setOptions" -> {
           SqlOptions o = lang.options(arg(a, 0));
           if (o != null) s.setOptions(o);

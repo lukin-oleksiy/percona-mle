@@ -59,6 +59,12 @@ public final class SqlBridge {
     return dispatcher().sqlRequest(6, id, null, params, 0, 0, Dispatcher.RAW, null, rowWidth);
   }
 
+  /** The running routine's schema (the current database while it runs), or null. */
+  public static String routineSchema() {
+    Dispatcher d = dispatcher;
+    return d == null ? null : d.routineSchema();
+  }
+
   /** The bytes of parameters a batch message may carry (one mailbox arena, with room to spare). */
   public static int batchBytes() {
     return dispatcher().arenaSize() / 4 * 3;

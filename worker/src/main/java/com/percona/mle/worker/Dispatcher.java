@@ -89,6 +89,14 @@ final class Dispatcher {
     return currentRoutine;
   }
 
+  /** Each prepared routine's schema (the current database while it runs): exp note 52's engine cache. */
+  private final java.util.Map<Long, String> schemas = new java.util.HashMap<>();
+
+  /** The running routine's schema, or null. */
+  String routineSchema() {
+    return schemas.get(currentRoutine);
+  }
+
   /** The current nesting depth (0: a top-level request). */
   int depth() {
     return depth;
@@ -147,11 +155,13 @@ final class Dispatcher {
           r.finish();
           java.drop(id);
           polyglot.drop(id);
+          schemas.remove(id);
           result(Wire.OK, null, null, null);
         }
         case Wire.RESET -> {
           java.reset();
           polyglot.reset();
+          schemas.clear();
           // A worker with a thread a routine left is not kept for reuse (the host retires it).
           if (!tainted && threads.strangers()) tainted = true;
           // The host took the memory watcher's count with the session's statistics.
@@ -246,6 +256,7 @@ final class Dispatcher {
     String schema = r.str();
     boolean check = r.flag();
     r.finish();
+    schemas.put(id, schema);
 
     // Java routines need the JVM build (23); mysqld refuses them earlier (the worker's READY).
     boolean javaRoutine = language.equals("java") && !Polyglot.nativeImage();

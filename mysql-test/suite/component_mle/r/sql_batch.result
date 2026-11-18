@@ -8,6 +8,9 @@
 INSTALL COMPONENT "file://component_mle";
 GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
 CREATE TABLE b (id INT PRIMARY KEY, name VARCHAR(20), x DOUBLE, v VECTOR(3), d DATE);
+CREATE TABLE rw (id INT PRIMARY KEY, a VARCHAR(20), x DOUBLE,
+ts DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)) ENGINE=InnoDB;
+CREATE TABLE rw_my (id INT PRIMARY KEY, a VARCHAR(20), x DOUBLE) ENGINE=MyISAM;
 # 1. JavaScript: types, NULLs, VECTORs, dates; an error at row 1 keeps
 #    row 0 (id 10); a wrong row width; an empty batch; a SELECT is
 #    refused after its first row; UPDATE counts; errors that are not
@@ -35,13 +38,51 @@ CALL java_batch(@r);
 SELECT @r;
 @r
 affected 12000 | count 12000 sum 7.1994E7 | error 1062 row 10000 | kept 10000 | deallocated: the prepared statement was deallocated
-# 4. In a function SQL is refused, executeMany too.
+# 4. Multi-row statements (exp note 52): an INSERT or REPLACE of one row of
+#    values into an InnoDB table, 16 rows or more, runs in statements of
+#    up to 1,000 rows (Com_insert + Com_replace count the statements),
+#    for 256 rows or more; not for smaller batches, batch_rewrite off, MyISAM, expressions in the
+#    row, ? outside the row, several rows, the SET form, a backslash. An
+#    error at row 1500 of a 2000-row batch: the row's index, rows 0-1499
+#    written (the failing chunk replayed row by row), nothing after.
+CALL py_rewrite(@r);
+SELECT @r;
+@r
+2500 rows: affected 2500, statements 3
+255 rows: affected 255, statements 255
+256 rows: affected 256, statements 1
+1001 rows: affected 1001, statements 2
+batch_rewrite off: affected 300, statements 300
+MyISAM: affected 300, statements 300
+NOW() in the row: affected 300, statements 300
+? in the update: affected 598, statements 300
+alias update: affected 598, statements 1
+comments, strings: affected 300, statements 1
+quoted names: affected 300, statements 1
+REPLACE: affected 300, statements 1
+INSERT IGNORE: affected 200, statements 1
+two rows already: affected 600, statements 300
+SET form: affected 300, statements 300
+backslash: affected 300, statements 300
+error at row 1500: error 1062 row 1500, statements 503
+kept 1500 rows, up to id 51499
+distinct timestamps of the 2500 rows <= 3: True
+rw2 InnoDB: affected 300, statements 1
+rw2 now MyISAM, error at row 400: error 1062 row 0, statements 1
+rw2 kept 400 rows
+CALL js_rewrite_off(@r);
+SELECT @r;
+@r
+statements 300
+# 5. In a function SQL is refused, executeMany too.
 SELECT js_batch_f();
 ERROR HY000: JavaScript> SQL statements are not allowed in stored functions and triggers: use a stored procedure (js_batch_f, line 2)
 DROP PROCEDURE js_batch;
 DROP PROCEDURE py_batch;
 DROP PROCEDURE java_batch;
 DROP FUNCTION js_batch_f;
-DROP TABLE b;
+DROP PROCEDURE py_rewrite;
+DROP PROCEDURE js_rewrite_off;
+DROP TABLE b, rw, rw_my;
 REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_mle";

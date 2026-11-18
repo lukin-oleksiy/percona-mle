@@ -11,6 +11,9 @@
 INSTALL COMPONENT "file://component_mle";
 GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
 CREATE TABLE b (id INT PRIMARY KEY, name VARCHAR(20), x DOUBLE, v VECTOR(3), d DATE);
+CREATE TABLE rw (id INT PRIMARY KEY, a VARCHAR(20), x DOUBLE,
+  ts DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)) ENGINE=InnoDB;
+CREATE TABLE rw_my (id INT PRIMARY KEY, a VARCHAR(20), x DOUBLE) ENGINE=MyISAM;
 --connect (con1, localhost, root,,test)
 
 --write_file $MYSQLTEST_VARDIR/tmp/batch.sql
@@ -84,6 +87,68 @@ CREATE PROCEDURE java_batch(OUT r TEXT) LANGUAGE JAVA AS $$
   }
   r[0] = b.toString();
 $$;
+CREATE PROCEDURE py_rewrite(OUT r TEXT) LANGUAGE PYTHON AS $$
+    def statements():
+        return sum(int(session.run_sql("SHOW SESSION STATUS LIKE '" + n + "'").fetch_one()[1])
+                   for n in ('Com_insert', 'Com_replace'))
+    def rows(start, n, w=3):
+        return [[start + i, 'a%d' % i, i * 0.5, i][:w] for i in range(n)]
+    out = []
+    def run(label, sql, data, opts=None):
+        before = statements()
+        try:
+            res = session.execute_many(sql, data, opts) if opts else session.execute_many(sql, data)
+            got = 'affected %d' % res.get_affected_items_count()
+        except SqlError as e:
+            got = 'error %d row %s' % (e.code, e.row)
+        out.append('%s: %s, statements %d' % (label, got, statements() - before))
+    ins = "INSERT INTO rw (id, a, x) VALUES (?, ?, ?)"
+    run('2500 rows', ins, rows(1, 2500))
+    run('255 rows', ins, rows(3001, 255))
+    run('256 rows', ins, rows(3301, 256))
+    run('1001 rows', ins, rows(4001, 1001))
+    run('batch_rewrite off', ins, rows(6001, 300), {'batch_rewrite': False})
+    run('MyISAM', "INSERT INTO rw_my (id, a, x) VALUES (?, ?, ?)", rows(1, 300))
+    run('NOW() in the row', "INSERT INTO rw (id, a, x, ts) VALUES (?, ?, ?, NOW(6))", rows(7001, 300))
+    run('? in the update', "INSERT INTO rw (id, a, x) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE x = ?", rows(1, 300, 4))
+    run('alias update', "INSERT INTO rw (id, a, x) VALUES (?, ?, ?) AS n ON DUPLICATE KEY UPDATE x = n.x + 1",
+        rows(1, 300))
+    run('comments, strings', "INSERT /* VALUES (?) */ INTO rw (id, a, x) VALUES (?, 'it''s (?), VALUES', ?) -- (?)",
+        [[8001 + i, i] for i in range(300)])
+    run('quoted names', "INSERT INTO `test`.`rw` (`id`, a, x) VALUES (?, ?, ?)", rows(9001, 300))
+    run('REPLACE', "REPLACE INTO rw (id, a, x) VALUES (?, ?, ?)", rows(9001, 300))
+    run('INSERT IGNORE', "INSERT IGNORE INTO rw (id, a, x) VALUES (?, ?, ?)", rows(9201, 300))
+    run('two rows already', "INSERT INTO rw (id, a, x) VALUES (?, ?, ?), (?, ?, ?)",
+        [r + s for r, s in zip(rows(10001, 300), rows(10401, 300))])
+    run('SET form', "INSERT INTO rw SET id = ?, a = ?, x = ?", rows(11001, 300))
+    run('backslash', "INSERT INTO rw (id, a, x) VALUES (?, 'a\\\\b', ?)", [[12001 + i, i] for i in range(300)])
+    bad = rows(50000, 2000)
+    bad[1500][0] = 1
+    run('error at row 1500', ins, bad)
+    kept = session.run_sql("SELECT COUNT(*) AS n, MAX(id) AS m FROM rw WHERE id >= 50000").fetch_one()
+    out.append('kept %d rows, up to id %d' % (kept.n, kept.m))
+    ts = session.run_sql("SELECT COUNT(DISTINCT ts) AS n FROM rw WHERE id BETWEEN 1 AND 2500").fetch_one().n
+    out.append('distinct timestamps of the 2500 rows <= 3: %s' % (ts <= 3))
+    # The engine is kept for the worker: a table that became MyISAM since is looked up again when a
+    # chunk fails, and the chunk is not replayed (MyISAM kept the rows before the error).
+    session.run_sql("CREATE TABLE rw2 (id INT PRIMARY KEY, a VARCHAR(20), x DOUBLE) ENGINE=InnoDB")
+    ins2 = "INSERT INTO rw2 (id, a, x) VALUES (?, ?, ?)"
+    run('rw2 InnoDB', ins2, rows(1, 300))
+    session.run_sql("ALTER TABLE rw2 ENGINE=MyISAM")
+    bad2 = rows(1000, 600)
+    bad2[400][0] = 1
+    run('rw2 now MyISAM, error at row 400', ins2, bad2)
+    out.append('rw2 kept %d rows' % session.run_sql("SELECT COUNT(*) AS n FROM rw2 WHERE id >= 1000").fetch_one().n)
+    session.run_sql("DROP TABLE rw2")
+    r = '\n'.join(out)
+$$;
+CREATE PROCEDURE js_rewrite_off(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const rows = []
+  for (let i = 0; i < 300; i++) rows.push([20001 + i, 'j', i])
+  const before = Number(session.runSql("SHOW SESSION STATUS LIKE 'Com_insert'").fetchOne()[1])
+  session.executeMany("INSERT INTO rw (id, a, x) VALUES (?, ?, ?)", rows, {batchRewrite: false})
+  r = 'statements ' + (Number(session.runSql("SHOW SESSION STATUS LIKE 'Com_insert'").fetchOne()[1]) - before)
+$$;
 CREATE FUNCTION js_batch_f() RETURNS INT LANGUAGE JAVASCRIPT AS $$
   return session.executeMany("INSERT INTO b (id) VALUES (?)", [[7]]).getAffectedItemsCount()
 $$;
@@ -110,7 +175,19 @@ SELECT @r;
 CALL java_batch(@r);
 SELECT @r;
 
---echo # 4. In a function SQL is refused, executeMany too.
+--echo # 4. Multi-row statements (exp note 52): an INSERT or REPLACE of one row of
+--echo #    values into an InnoDB table, 16 rows or more, runs in statements of
+--echo #    up to 1,000 rows (Com_insert + Com_replace count the statements),
+--echo #    for 256 rows or more; not for smaller batches, batch_rewrite off, MyISAM, expressions in the
+--echo #    row, ? outside the row, several rows, the SET form, a backslash. An
+--echo #    error at row 1500 of a 2000-row batch: the row's index, rows 0-1499
+--echo #    written (the failing chunk replayed row by row), nothing after.
+CALL py_rewrite(@r);
+SELECT @r;
+CALL js_rewrite_off(@r);
+SELECT @r;
+
+--echo # 5. In a function SQL is refused, executeMany too.
 --error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT js_batch_f();
 
@@ -121,6 +198,8 @@ DROP PROCEDURE js_batch;
 DROP PROCEDURE py_batch;
 DROP PROCEDURE java_batch;
 DROP FUNCTION js_batch_f;
-DROP TABLE b;
+DROP PROCEDURE py_rewrite;
+DROP PROCEDURE js_rewrite_off;
+DROP TABLE b, rw, rw_my;
 REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_mle";
