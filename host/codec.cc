@@ -758,6 +758,7 @@ void encode(const SqlMsg &m, std::string *out) {
   put_values(w, m.params);
   w.u8(m.flags);
   w.u32(m.max_rows);
+  w.u32(m.row_width);
 }
 
 bool decode(std::string_view body, SqlMsg *m, std::string *error) {
@@ -767,8 +768,12 @@ bool decode(std::string_view body, SqlMsg *m, std::string *error) {
     if (action > wire::kMaxSqlAction) return r.fail("bad SQL action");
     x->action = static_cast<wire::SqlAction>(action);
     if (!r.u64(&x->stmt_id) || !r.str(&x->statement) ||
-        !get_values(r, &x->params) || !r.u8(&x->flags) || !r.u32(&x->max_rows))
+        !get_values(r, &x->params) || !r.u8(&x->flags) || !r.u32(&x->max_rows) ||
+        !r.u32(&x->row_width))
       return false;
+    if (x->action == wire::SqlAction::kExecuteMany &&
+        (x->row_width == 0 || x->params.size() % x->row_width != 0))
+      return r.fail("a batch's parameters are not whole rows");
     if ((x->flags & ~wire::kKnownSqlFlags) != 0) return r.fail("unknown SQL flags");
     return true;
   });
@@ -783,6 +788,7 @@ void encode(const SqlResultMsg &m, std::string *out) {
       w.u32(m.sql_errno);
       w.str(m.sqlstate);
       w.str(m.message);
+      w.u32(m.failed_row);
       return;
     case SqlResultKind::kOk:
       w.u64(m.affected_rows);
@@ -848,7 +854,7 @@ bool decode(std::string_view body, SqlResultMsg *m, std::string *error) {
           case static_cast<uint8_t>(SqlResultKind::kError):
             x->kind = SqlResultKind::kError;
             if (!r.u32(&x->sql_errno) || !r.str(&x->sqlstate) ||
-                !r.str(&x->message))
+                !r.str(&x->message) || !r.u32(&x->failed_row))
               return false;
             return valid_sqlstate(x->sqlstate) || r.fail("bad SQLSTATE");
           case static_cast<uint8_t>(SqlResultKind::kOk):

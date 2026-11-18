@@ -440,11 +440,27 @@ TEST(MleCodec, SqlRoundTrip) {
   EXPECT_EQ(message_round_trip(fetch), fetch);
   std::string bytes, error;
   encode(fetch, &bytes);
-  bytes[0] = 6;  // no such action
+  bytes[0] = 7;  // no such action
   SqlMsg back;
   EXPECT_FALSE(decode(bytes, &back, &error));
   encode(fetch, &bytes);
-  bytes[bytes.size() - 5] = 2;  // unknown flag
+  bytes[bytes.size() - 9] = 2;  // unknown flag
+  EXPECT_FALSE(decode(bytes, &back, &error));
+
+  // A batch (v3, exp note 51): rows of row_width values one after another.
+  SqlMsg many;
+  many.action = wire::SqlAction::kExecuteMany;
+  many.stmt_id = 78;
+  many.params = std::vector<Value>{Value::i64(1), Value::vector({1, 2}), Value::i64(2),
+                                   Value::null()};
+  many.row_width = 2;
+  EXPECT_EQ(message_round_trip(many), many);
+  many.row_width = 3;  // 4 values are not whole rows of 3
+  encode(many, &bytes);
+  EXPECT_FALSE(decode(bytes, &back, &error));
+  EXPECT_NE(error.find("whole rows"), std::string::npos) << error;
+  many.row_width = 0;
+  encode(many, &bytes);
   EXPECT_FALSE(decode(bytes, &back, &error));
 }
 
@@ -454,6 +470,8 @@ TEST(MleCodec, SqlResultRoundTrip) {
   err.sql_errno = 1062;
   err.sqlstate = "23000";
   err.message = "Duplicate entry '1' for key 't.PRIMARY'";
+  EXPECT_EQ(message_round_trip(err), err);
+  err.failed_row = 41;
   EXPECT_EQ(message_round_trip(err), err);
 
   SqlResultMsg ok;

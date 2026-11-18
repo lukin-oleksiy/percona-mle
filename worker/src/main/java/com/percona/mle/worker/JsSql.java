@@ -93,6 +93,7 @@ final class JsSql implements GuestSql.Lang {
             Object.defineProperty(this, '$mle$sql', { value: true });
             this.sqlState = state;
             this.code = error_number === undefined || error_number === null ? 1644 : Number(error_number);
+            this.row = null;  // executeMany: the failing row (exp note 51)
           }
           toString() {
             return 'SqlError: Error code: ' + this.code + ' Error state: ' + this.sqlState
@@ -122,7 +123,11 @@ final class JsSql implements GuestSql.Lang {
         for (const [k, v] of [['session', B.session], ['mysql', mysql], ['SqlError', SqlError]])
           Object.defineProperty(globalThis, k, { value: v, writable: false, configurable: false });
         return {
-          throwSql: (code, state, message) => { throw new SqlError(state, message, code); },
+          throwSql: (code, state, message, row) => {
+            const e = new SqlError(state, message, code);
+            if (row >= 0) e.row = row;
+            throw e;
+          },
           throwError: (message, type) => { throw type ? new TypeError(message) : new Error(message); },
           array: (a) => { const n = a.length, r = new Array(n); for (let i = 0; i < n; i++) r[i] = a[i]; return r; },
           bigint: (s) => BigInt(s),
@@ -169,7 +174,7 @@ final class JsSql implements GuestSql.Lang {
   @Override
   public RuntimeException sqlError(MleSqlException e) {
     try {
-      h.getMember("throwSql").execute(e.getErrorCode(), e.getSqlState(), e.getMessage());
+      h.getMember("throwSql").execute(e.getErrorCode(), e.getSqlState(), e.getMessage(), e.getRow());
     } catch (PolyglotException p) {
       return p;
     }

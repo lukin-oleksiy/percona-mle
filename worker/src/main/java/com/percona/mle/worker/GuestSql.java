@@ -180,6 +180,21 @@ final class GuestSql {
     return v;
   }
 
+  /** The rows of executeMany (exp note 51): a guest array of arrays (lists or tuples in Python). */
+  static List<Object[]> rows(Value v) {
+    if (v == null || v.isNull() || !v.hasArrayElements() || v.isString())
+      throw new IllegalArgumentException("executeMany takes a list of rows, each a list of values");
+    long n = v.getArraySize();
+    List<Object[]> rows = new ArrayList<>((int) Math.min(n, 1 << 16));
+    for (long i = 0; i < n; i++) {
+      Value r = v.getArrayElement(i);
+      if (r == null || r.isNull() || !r.hasArrayElements() || r.isString())
+        throw new IllegalArgumentException("row " + i + " of executeMany is not a list of values");
+      rows.add(elements(r));
+    }
+    return rows;
+  }
+
   /** The elements of a guest array (or one value as a single parameter). */
   static Object[] elements(Value v) {
     if (v == null) return new Object[0];
@@ -203,7 +218,8 @@ final class GuestSql {
   static final class GSession extends Methods {
     private static final Set<String> NAMES = Set.of("sql", "runSql", "prepare", "setOptions", "getOption",
         "getSchema", "getSchemas", "getDefaultSchema", "createSchema", "dropSchema", "quoteName",
-        "startTransaction", "commit", "rollback", "setSavepoint", "rollbackTo", "releaseSavepoint", "autocommit");
+        "startTransaction", "commit", "rollback", "setSavepoint", "rollbackTo", "releaseSavepoint", "autocommit",
+        "executeMany", "executemany");
     final Session s;
 
     GSession(Lang lang) {
@@ -229,6 +245,7 @@ final class GuestSql {
           yield r == null ? null : new GResult(this, r);
         }
         case "prepare" -> new GPrepared(this, s.prepare(str(a, 0), lang.options(arg(a, 1))));
+        case "executeMany", "executemany" -> new GResult(this, s.executeMany(str(a, 0), rows(arg(a, 1))));
         case "setOptions" -> {
           SqlOptions o = lang.options(arg(a, 0));
           if (o != null) s.setOptions(o);
@@ -427,7 +444,8 @@ final class GuestSql {
   }
 
   static final class GPrepared extends Methods {
-    private static final Set<String> NAMES = Set.of("bind", "execute", "deallocate", "getOption");
+    private static final Set<String> NAMES = Set.of("bind", "execute", "deallocate", "getOption", "executeMany",
+        "executemany");
     private final GSession session;
     private final PreparedStatement p;
 
@@ -457,6 +475,7 @@ final class GuestSql {
           p.deallocate();
           yield null;
         }
+        case "executeMany", "executemany" -> new GResult(session, p.executeMany(rows(arg(a, 0))));
         case "getOption" -> p.getOption(str(a, 0));
         default -> throw new IllegalStateException(name);
       };

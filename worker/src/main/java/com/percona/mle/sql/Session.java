@@ -147,6 +147,26 @@ public final class Session {
     return prepare(sql, null);
   }
 
+  /**
+   * Prepares sql, executes it once per row ({@link PreparedStatement#executeMany}) and deallocates
+   * it (exp note 51).
+   */
+  public SqlResult executeMany(String sql, List<?> rows) {
+    PreparedStatement p = prepare(sql, internal());
+    try {
+      return p.executeMany(rows);
+    } finally {
+      p.deallocate();
+    }
+  }
+
+  /** A row of a batch as values: an Object[] or a List (guest rows arrive as Object[]). */
+  Object[] row(Object row) {
+    if (row instanceof Object[] a) return a;
+    if (row instanceof List<?> l) return l.toArray();
+    throw new IllegalArgumentException("a row of executeMany must be a list of values, not " + row);
+  }
+
   public PreparedStatement prepare(String sql, SqlOptions options) {
     SqlOptions o = effective(options);
     long id = SqlBridge.newStatementId();

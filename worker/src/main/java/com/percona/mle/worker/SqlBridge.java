@@ -54,6 +54,16 @@ public final class SqlBridge {
         vectorBuffers ? Dispatcher.RAW_BUFFERS : Dispatcher.RAW, sink);
   }
 
+  /** EXECUTE_MANY of prepared statement id: params are rows of rowWidth values (exp note 51). */
+  public static com.percona.mle.api.MleSql.Reply requestMany(long id, Object[] params, int rowWidth) {
+    return dispatcher().sqlRequest(6, id, null, params, 0, 0, Dispatcher.RAW, null, rowWidth);
+  }
+
+  /** The bytes of parameters a batch message may carry (one mailbox arena, with room to spare). */
+  public static int batchBytes() {
+    return dispatcher().arenaSize() / 4 * 3;
+  }
+
   /** Statement id's unread rows are drained before another statement runs (Dispatcher#deferDrain). */
   public static void deferDrain(long id, Runnable drain) {
     dispatcher().deferDrain(id, drain);

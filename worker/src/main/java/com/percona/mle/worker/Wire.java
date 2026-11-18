@@ -28,7 +28,7 @@ final class Wire {
   static final int CONTROL_FD = 4;
 
   static final int MAGIC = 0x31454c4d;
-  static final int VERSION = 2;
+  static final int VERSION = 3;
   static final long HEADER_SIZE = 4096;
   static final int MAX_VECTOR_DIMENSIONS = 16383;
   static final int MAX_TIME_HOUR = 838;

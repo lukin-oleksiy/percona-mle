@@ -125,6 +125,7 @@ final class PySql implements GuestSql.Lang {
               self.sql_state = state
               self.sqlState = state
               self.code = 1644 if error_number is None else int(error_number)
+              self.row = None  # execute_many: the failing row (exp note 51)
               setattr(self, '$mle$sql', True)
 
           def __str__(self):
@@ -182,8 +183,11 @@ final class PySql implements GuestSql.Lang {
               # Body-form routines get fresh globals per call from a prepared dict (Phase 7).
               (fn.__mle_base__ if hasattr(fn, '__mle_base__') else fn.__globals__)[name] = value
 
-          def throw_sql(code, state, message):
-              raise SqlError(state, message, code)
+          def throw_sql(code, state, message, row=-1):
+              e = SqlError(state, message, code)
+              if row >= 0:
+                  e.row = row
+              raise e
 
           def throw_error(message, type_error):
               raise (TypeError if type_error else RuntimeError)(message)
@@ -257,7 +261,7 @@ final class PySql implements GuestSql.Lang {
   @Override
   public RuntimeException sqlError(MleSqlException e) {
     try {
-      throwSql.execute(e.getErrorCode(), e.getSqlState(), e.getMessage());
+      throwSql.execute(e.getErrorCode(), e.getSqlState(), e.getMessage(), e.getRow());
     } catch (PolyglotException p) {
       return p;
     }

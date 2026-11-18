@@ -25,11 +25,23 @@ public class MleSqlException extends RuntimeException {
 
   private final int errorCode;
   private final String sqlState;
+  private final long row;
 
   public MleSqlException(int errorCode, String sqlState, String message) {
+    this(errorCode, sqlState, message, -1);
+  }
+
+  /** row: the failing row of a batch (executeMany), from 0; -1 when the error is not about a row. */
+  public MleSqlException(int errorCode, String sqlState, String message, long row) {
     super(message);
     this.errorCode = errorCode;
     this.sqlState = sqlState;
+    this.row = row;
+  }
+
+  /** The failing row of a batch (executeMany), from 0; -1 when the error is not about a row of a batch. */
+  public long getRow() {
+    return row;
   }
 
   public int getErrorCode() {

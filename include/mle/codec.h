@@ -322,6 +322,8 @@ struct SqlMsg {
   std::vector<Value> params;
   uint8_t flags = 0;
   uint32_t max_rows = 0;
+  /** kExecuteMany: values per row of params. */
+  uint32_t row_width = 0;
   bool operator==(const SqlMsg &) const = default;
 };
 
@@ -331,6 +333,8 @@ struct SqlResultMsg {
   uint32_t sql_errno = 0;
   std::string sqlstate;
   std::string message;
+  /** The failing row of a batch (kExecuteMany), else wire::kNoRow. */
+  uint32_t failed_row = wire::kNoRow;
   // kOk
   uint64_t affected_rows = 0;
   uint64_t insert_id = 0;

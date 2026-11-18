@@ -1,0 +1,126 @@
+--echo #
+--echo # component_mle: executeMany (exp note 51): a prepared statement executed
+--echo # once per row of values, without a round trip per row; JavaScript,
+--echo # Python (execute_many, executemany) and Java. Stops at the first failing
+--echo # row (error.row / getRow()), the rows before it stay; statements that
+--echo # return rows are refused after the first row.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE b (id INT PRIMARY KEY, name VARCHAR(20), x DOUBLE, v VECTOR(3), d DATE);
+--connect (con1, localhost, root,,test)
+
+--write_file $MYSQLTEST_VARDIR/tmp/batch.sql
+CREATE PROCEDURE js_batch(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const s = session.prepare("INSERT INTO b VALUES (?, ?, ?, ?, ?)")
+  const res = s.executeMany([[1, 'a', 1.5, new Float32Array([1, 2, 3]), '2024-01-02'],
+                             [2, null, null, null, null],
+                             [3, 'c', -2, new Float32Array([0, 0, 1]), new Date(Date.UTC(2024, 0, 3))]])
+  let out = 'affected ' + res.getAffectedItemsCount()
+  try { s.executeMany([[10, 'x', 0, null, null], [1, 'dup', 0, null, null], [11, 'y', 0, null, null]]) }
+  catch (e) { out += ' | error ' + e.code + ' ' + e.sqlState + ' row ' + e.row + ' ' + (e instanceof SqlError) }
+  out += ' | ids ' + session.runSql("SELECT GROUP_CONCAT(id ORDER BY id) AS i FROM b").fetchOne().i
+  try { s.executeMany([[20, 'z']]) } catch (e) { out += ' | width ' + e.code + ' row ' + e.row }
+  out += ' | empty ' + s.executeMany([]).getAffectedItemsCount()
+  try { session.executeMany("SELECT ?", [[1], [2]]) } catch (e) { out += ' | select: ' + e.message + ', row ' + e.row }
+  try { session.executeMany("INSERT INTO b (id) VALUES (?)", 5) } catch (e) { out += ' | not rows: ' + e.message }
+  out += ' | update ' + session.executeMany("UPDATE b SET x = x + ? WHERE id = ?", [[1, 1], [1, 3], [1, 99]])
+    .getAffectedItemsCount()
+  out += ' | plain error row ' + (() => { try { session.runSql("SELECT * FROM nope") } catch (e) { return e.row } })()
+  r = out
+$$;
+CREATE PROCEDURE py_batch(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import numpy as np
+    rows = [(100 + i, 'p%d' % i, i * 0.5, np.array([i, i + 1, i + 2], dtype=np.float32), None) for i in range(5)]
+    out = ['affected %d' % session.execute_many("INSERT INTO b VALUES (?, ?, ?, ?, ?)", rows).get_affected_items_count()]
+    st = session.prepare("INSERT INTO b (id, name) VALUES (?, ?)")
+    out.append('executemany %d' % st.executemany([[200, 'q'], [201, 'q']]).get_affected_items_count())
+    try:
+        st.execute_many([[202, 'q'], [200, 'dup']])
+    except SqlError as e:
+        out.append('error %d row %s' % (e.code, e.row))
+    session.start_transaction()
+    try:
+        st.execute_many([[300, 'r'], [301, 'r'], [200, 'dup']])
+    except SqlError as e:
+        session.rollback()
+        out.append('rolled back at row %s' % e.row)
+    out.append(session.run_sql("SELECT GROUP_CONCAT(id ORDER BY id) AS i FROM b WHERE id >= 100").fetch_one().i)
+    out.append(session.run_sql("SELECT VECTOR_TO_STRING(v) AS v FROM b WHERE id = 103").fetch_one().v)
+    try:
+        session.execute_many("INSERT INTO b (id) VALUES (?)", [5, 6])
+    except Exception as e:
+        out.append('not rows: ' + type(e).__name__)
+    r = ' | '.join(out)
+$$;
+CREATE PROCEDURE java_batch(OUT r TEXT) LANGUAGE JAVA AS $$
+  Session s = Mle.session();
+  // 12,000 rows: more than one mailbox arena of parameters, so two messages
+  List<Object[]> rows = new ArrayList<>();
+  for (int i = 0; i < 12000; i++) rows.add(new Object[] {1000 + i, "j" + i, (double) i, new float[] {i, -i, 0.5f}, null});
+  SqlResult res = s.executeMany("INSERT INTO b VALUES (?, ?, ?, ?, ?)", rows);
+  StringBuilder b = new StringBuilder("affected " + res.getAffectedItemsCount());
+  Row c = s.runSql("SELECT COUNT(*), SUM(x), MAX(VECTOR_TO_STRING(v)) FROM b WHERE id >= 1000").fetchOne();
+  b.append(" | count ").append(c.get(0)).append(" sum ").append(c.get(1));
+  // an error in a later message: the global row index
+  List<Object[]> bad = new ArrayList<>();
+  for (int i = 0; i < 12000; i++) bad.add(new Object[] {100000 + i, "k", 0.0, null, null});
+  bad.set(10000, new Object[] {1000, "dup", 0.0, null, null});
+  PreparedStatement p = s.prepare("INSERT INTO b VALUES (?, ?, ?, ?, ?)");
+  try {
+    p.executeMany(bad);
+  } catch (MleSqlException e) {
+    b.append(" | error ").append(e.getErrorCode()).append(" row ").append(e.getRow());
+  }
+  b.append(" | kept ").append(s.runSql("SELECT COUNT(*) FROM b WHERE id >= 100000").fetchOne().get(0));
+  p.deallocate();
+  try {
+    p.executeMany(bad);
+  } catch (IllegalStateException e) {
+    b.append(" | deallocated: ").append(e.getMessage());
+  }
+  r[0] = b.toString();
+$$;
+CREATE FUNCTION js_batch_f() RETURNS INT LANGUAGE JAVASCRIPT AS $$
+  return session.executeMany("INSERT INTO b (id) VALUES (?)", [[7]]).getAffectedItemsCount()
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/batch.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/batch.sql
+
+--echo # 1. JavaScript: types, NULLs, VECTORs, dates; an error at row 1 keeps
+--echo #    row 0 (id 10); a wrong row width; an empty batch; a SELECT is
+--echo #    refused after its first row; UPDATE counts; errors that are not
+--echo #    about a batch row have row null.
+CALL js_batch(@r);
+SELECT @r;
+SELECT id, name, x, VECTOR_TO_STRING(v) AS v, d FROM b ORDER BY id;
+
+--echo # 2. Python: execute_many and executemany; an error at row 1; a rollback
+--echo #    in a transaction undoes the batch's rows.
+CALL py_batch(@r);
+SELECT @r;
+
+--echo # 3. Java: 12,000 rows over two messages; an error at row 10,000 of a
+--echo #    second batch (in its second message; the earlier 10,000 rows stay); a
+--echo #    deallocated statement.
+CALL java_batch(@r);
+SELECT @r;
+
+--echo # 4. In a function SQL is refused, executeMany too.
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_batch_f();
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP PROCEDURE js_batch;
+DROP PROCEDURE py_batch;
+DROP PROCEDURE java_batch;
+DROP FUNCTION js_batch_f;
+DROP TABLE b;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

@@ -596,6 +596,12 @@ final class Dispatcher {
    */
   MleSql.Reply sqlRequest(int action, long id, String text, Object[] params, int flags, int maxRows,
       int form, RowSink sink) {
+    return sqlRequest(action, id, text, params, flags, maxRows, form, sink, 0);
+  }
+
+  /** rowWidth: EXECUTE_MANY (exp note 51): params are rows of this many values; 0 otherwise. */
+  MleSql.Reply sqlRequest(int action, long id, String text, Object[] params, int flags, int maxRows,
+      int form, RowSink sink, int rowWidth) {
     if (Thread.currentThread() != thread)
       throw new IllegalStateException("SQL must be run on the routine's thread");
     drainDeferred(id);
@@ -608,6 +614,7 @@ final class Dispatcher {
       if (params != null) for (Object p : params) Values.writeParam(w, p);
       w.u8(flags);
       w.u32(maxRows);
+      w.u32(rowWidth);
     } catch (MessageWriter.TooLarge e) {
       // MySQL's error for a packet over max_allowed_packet, but not its SQLSTATE 08S01 (a lost
       // connection to pools and drivers): the session is fine.
@@ -672,6 +679,11 @@ final class Dispatcher {
     }
   }
 
+  /** The mailbox arena's size: a batch is sent in messages that fit it (exp note 51). */
+  int arenaSize() {
+    return mb.arenaSize;
+  }
+
   /** The top-level call's sequence number (per-call state of the SQL API). */
   long callSeq() {
     return seq;
@@ -689,7 +701,8 @@ final class Dispatcher {
         int errno = (int) r.u32();
         String sqlState = r.str();
         String message = r.str();
-        throw new MleSqlException(errno, sqlState, message);
+        long row = r.u32();
+        throw new MleSqlException(errno, sqlState, message, row == 0xFFFFFFFFL ? -1 : row);
       }
       case Wire.SQL_OK -> {
         long affected = r.u64();

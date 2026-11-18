@@ -67,7 +67,7 @@ constexpr int kControlFd = 4;
 
 /** "MLE1" read as a little-endian u32. */
 constexpr uint32_t kMagic = 0x31454c4d;
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 
 constexpr size_t kCacheLine = 64;
 /** Size of RegionHeader; the arena starts here (page aligned). */
@@ -127,12 +127,14 @@ enum class Op : uint32_t {
   /** w->h, only while the host waits for a CALL's RESULT. u8 SqlAction,
       u64 statement id (chosen by the worker, unique within the call),
       str statement text, u32 n + n x value (parameters), u8 SqlFlag bits,
-      u32 max rows per chunk (0 = host default). Statements live until
+      u32 max rows per chunk (0 = host default), u32 row width (kExecuteMany:
+      values per row; 0 otherwise; v3). Statements live until
       CLOSE, until they are drained (EXECUTE of text), or until the
       top-level CALL ends. Answered by kSqlResult. */
   kSql = 5,
   /** h->w. u8 SqlResultKind, then
-      kError: u32 errno, str sqlstate, str message;
+      kError: u32 errno, str sqlstate, str message, u32 failed row of a
+              batch (kNoRow: not a batch row; v3);
       kOk:    u64 affected rows, u64 last insert id, warnings,
               u8 more result sets, u32 parameter count (PREPARE),
               u64 execution microseconds;
@@ -308,8 +310,16 @@ enum class SqlAction : uint8_t {
   kNextResult = 4,
   /** Close the id (deallocate). */
   kClose = 5,
+  /** Execute the prepared id once per row of parameters (v3, exp note 51):
+      params holds the rows one after another, row_width values each. Stops
+      at the first failing row (kError with its index); else kOk with the
+      sum of the affected rows. Statements that return rows are refused
+      (after the first row). */
+  kExecuteMany = 6,
 };
-constexpr uint8_t kMaxSqlAction = 5;
+constexpr uint8_t kMaxSqlAction = 6;
+/** SqlResultMsg::failed_row when an error is not about a row of a batch. */
+constexpr uint32_t kNoRow = 0xFFFFFFFF;
 
 /** SqlMsg flags. */
 enum SqlFlag : uint8_t {

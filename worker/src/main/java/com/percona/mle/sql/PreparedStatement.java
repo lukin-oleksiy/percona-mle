@@ -74,6 +74,75 @@ public final class PreparedStatement {
     return last;
   }
 
+  /**
+   * Executes the statement once per row, each row giving every parameter marker a value (exp note
+   * 51): the rows travel to mysqld in as few messages as fit the mailbox, without a round trip per
+   * row. For statements that return no rows (INSERT, UPDATE, DELETE, REPLACE, ...): one that
+   * returns a result set is refused after its first row. Stops at the first failing row: the error
+   * ({@link MleSqlException#getRow()}) says which; the rows before it stay written (the transaction
+   * is the caller's; without one, autocommit commits every row). Returns the sum of the affected
+   * rows.
+   */
+  public SqlResult executeMany(List<?> rows) {
+    open();
+    if (last != null) last.replace();
+    last = null;
+    pending.clear();
+    long affected = 0, execUs = 0, done = 0;
+    List<MleSql.Warning> warnings = List.of();
+    int budget = com.percona.mle.worker.SqlBridge.batchBytes();
+    List<Object> batch = new ArrayList<>();
+    long bytes = 0;
+    int inBatch = 0;
+    for (int i = 0; i <= rows.size(); i++) {
+      Object[] row = null;
+      long size = 0;
+      if (i < rows.size()) {
+        row = session.params(session.row(rows.get(i)));
+        int n = row == null ? 0 : row.length;
+        if (n != parameterCount)
+          throw new MleSqlException(1210, "HY000", "Incorrect arguments to executeMany: row " + i + " has " + n
+              + " values for " + parameterCount + " parameter markers", i);
+        for (Object v : row) size += size(v);
+      }
+      if (inBatch > 0 && (row == null || bytes + size > budget)) {
+        MleSql.Reply r;
+        try {
+          r = com.percona.mle.worker.SqlBridge.requestMany(id, batch.toArray(), parameterCount);
+        } catch (MleSqlException e) {
+          throw e.getRow() < 0 ? e
+              : new MleSqlException(e.getErrorCode(), e.getSqlState(), e.getMessage(), done + e.getRow());
+        }
+        affected += r.affectedRows();
+        execUs += r.executionMicros();
+        warnings = r.warnings();
+        done += inBatch;
+        batch.clear();
+        bytes = 0;
+        inBatch = 0;
+      }
+      if (row != null) {
+        for (Object v : row) batch.add(v);
+        bytes += size;
+        inBatch++;
+      }
+    }
+    executed = executed || done > 0;
+    return new SqlResult(session, id, false, options,
+        new MleSql.Reply(id, false, List.of(), List.of(), false, false, affected, 0, warnings, 0, execUs, 0));
+  }
+
+  /** About the bytes value v takes in a message (to fill one mailbox arena per batch message). */
+  private static long size(Object v) {
+    return switch (v) {
+      case null -> 1;
+      case float[] f -> 16 + 4L * f.length;
+      case byte[] b -> 8 + b.length;
+      case String s -> 8 + 3L * s.length();
+      default -> 24;
+    };
+  }
+
   /** Closes the statement in mysqld. */
   public void deallocate() {
     if (deallocated) return;

@@ -105,6 +105,7 @@ class SqlRunner {
   void execute_text(const mle::SqlMsg &request, mle::SqlResultMsg *result);
   void prepare(const mle::SqlMsg &request, mle::SqlResultMsg *result);
   void execute_prepared(const mle::SqlMsg &request, mle::SqlResultMsg *result);
+  void execute_many(const mle::SqlMsg &request, mle::SqlResultMsg *result);
   void fetch(const mle::SqlMsg &request, mle::SqlResultMsg *result);
   void next_result(const mle::SqlMsg &request, mle::SqlResultMsg *result);
   /** After execute or next_result: the reply for the current result set;

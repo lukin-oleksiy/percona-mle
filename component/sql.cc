@@ -229,6 +229,8 @@ void SqlRunner::handle(const mle::SqlMsg &request, SqlResultMsg *result,
       *result = SqlResultMsg();
       result->kind = SqlResultKind::kOk;
       return;
+    case SqlAction::kExecuteMany:
+      return execute_many(request, result);
   }
 }
 
@@ -341,6 +343,14 @@ bool bind_value(my_h_statement h, uint32_t index, const Value &v) {
 bool bind_values(my_h_statement h, const std::vector<Value> &values) {
   for (uint32_t i = 0; i < values.size(); i++)
     if (bind_value(h, i, values[i])) return true;
+  return false;
+}
+
+/** values[from, from + n) to markers 0..n-1 (a row of a batch). */
+bool bind_row(my_h_statement h, const std::vector<Value> &values, size_t from,
+              uint32_t n) {
+  for (uint32_t i = 0; i < n; i++)
+    if (bind_value(h, i, values[from + i])) return true;
   return false;
 }
 
@@ -500,6 +510,63 @@ void read_warnings(my_h_statement h, SqlResultMsg *result) {
 }
 
 }  // namespace
+
+void SqlRunner::execute_many(const mle::SqlMsg &request,
+                             SqlResultMsg *result) {
+  // A batch (exp note 51): the prepared statement once per row, in the
+  // caller's session and transaction, without a round trip to the worker in
+  // between; stops at the first failing row, whose index the error carries
+  // (the rows before it stay: the transaction is the caller's).
+  const auto it = m_statements.find(request.stmt_id);
+  if (it == m_statements.end() || !it->second->prepared)
+    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
+                     "no prepared statement with this id");
+  Statement &s = *it->second;
+  if (s.to_client)
+    return sql_error(result, ER_WRONG_ARGUMENTS,
+                     "executeMany cannot send results to the client");
+  if (request.row_width != s.param_count)
+    return sql_error(result, ER_WRONG_ARGUMENTS,
+                     "each row of executeMany must have one value per "
+                     "parameter marker (" +
+                         std::to_string(s.param_count) + ")");
+  s.rows_open = false;
+  s.next_pending = false;
+  s.lookahead.clear();
+  s.pending = nullptr;
+  s.all.clear();
+  s.next = 0;
+  const uint32_t width = request.row_width;
+  const size_t rows = request.params.size() / width;
+  const uint64_t t0 = now_us();
+  uint64_t affected = 0;
+  for (size_t i = 0; i < rows; i++) {
+    if (bind_row(s.h, request.params, i * width, width) ||
+        mysql_service_mysql_stmt_execute->execute(s.h)) {
+      statement_error(s, result);
+      result->failed_row = static_cast<uint32_t>(i);
+      return;
+    }
+    uint32_t fields = 0;
+    (void)mysql_service_mysql_stmt_resultset_metadata->field_count(s.h,
+                                                                   &fields);
+    if (fields != 0) {
+      sql_error(result, ER_WRONG_ARGUMENTS,
+                "executeMany runs statements that return no rows; this one "
+                "returned a result set (its first row was executed)");
+      result->failed_row = static_cast<uint32_t>(i);
+      return;
+    }
+    uint64_t n = 0;
+    (void)mysql_service_mysql_stmt_diagnostics->affected_rows(s.h, &n);
+    affected += n;
+  }
+  *result = SqlResultMsg();
+  result->kind = SqlResultKind::kOk;
+  result->affected_rows = affected;
+  result->exec_us = now_us() - t0;
+  read_warnings(s.h, result);  // the last row's
+}
 
 void SqlRunner::fetch(const mle::SqlMsg &request, SqlResultMsg *result) {
   const auto it = m_statements.find(request.stmt_id);
