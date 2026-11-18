@@ -77,6 +77,7 @@ uint g_spin_us = 0;
 uint g_interrupt_grace_ms = 0;
 ulonglong g_sql_result_max = 0;
 ulonglong g_sql_row_max = 0;
+ulonglong g_sql_call_results_max = 0;
 uint g_sql_statements_max = 0;
 uint g_sql_chunk_rows = 0;
 char *g_languages = nullptr;
@@ -223,6 +224,7 @@ Registered g_registered[] = {
     {"languages", false},  {"cgroup_base", false}, {"dir", false},
     {"java_home", false},  {"sql_result_max", false}, {"sql_row_max", false},
     {"sql_statements_max", false}, {"sql_chunk_rows", false},
+    {"sql_call_results_max", false},
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
     {"package_dir", false}, {"pool_prewarm", false}, {"worker", false},
     {"vector_threads", false}, {"console", false},
@@ -443,6 +445,17 @@ bool register_settings() {
           "one). Oracle: 1 MB.",
           nullptr, nullptr, &row_max, &g_sql_row_max))
     return true;
+  ulonglong_check_arg_s call_results_max;
+  call_results_max.def_val = 0;
+  call_results_max.min_val = 0;
+  call_results_max.max_val = 1ULL << 42;
+  call_results_max.blk_sz = 0;
+  if (reg("sql_call_results_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
+          "Memory in bytes that the results of the statements a routine call "
+          "keeps open (nested calls included) may hold in the server before "
+          "another statement is refused. 0: four times mle.sql_result_max.",
+          nullptr, nullptr, &call_results_max, &g_sql_call_results_max))
+    return true;
   uint_check_arg_s statements_max;
   statements_max.def_val = 1024;
   statements_max.min_val = 1;
@@ -595,6 +608,11 @@ size_t worker_cache_size() { return g_worker_cache_size; }
 uint32_t worker_cache_timeout() { return g_worker_cache_timeout; }
 size_t sql_result_max() { return static_cast<size_t>(g_sql_result_max); }
 size_t sql_row_max() { return static_cast<size_t>(g_sql_row_max); }
+size_t sql_call_results_max() {
+  return static_cast<size_t>(g_sql_call_results_max != 0
+                                 ? g_sql_call_results_max
+                                 : 4 * g_sql_result_max);
+}
 size_t sql_statements_max() { return g_sql_statements_max; }
 uint32_t sql_chunk_rows() { return g_sql_chunk_rows; }
 int spin_us() { return static_cast<int>(g_spin_us); }

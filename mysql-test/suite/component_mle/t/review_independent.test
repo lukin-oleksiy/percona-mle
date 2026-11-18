@@ -1,0 +1,299 @@
+--echo #
+--echo # component_mle: regressions for the independent multi-model review
+--echo # (exp note 60): the findings that have no better home.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+
+--echo # C9: all of TIME's hour 838 passes (only 838:59:59 with a fraction is
+--echo # beyond the range), as arguments, results and SQL parameters.
+CREATE FUNCTION js_time(t TIME(6)) RETURNS TIME(6) LANGUAGE JAVASCRIPT AS $$ return t $$;
+CREATE FUNCTION py_time(t TIME(6)) RETURNS TIME(6) LANGUAGE PYTHON AS $$ return t $$;
+CREATE FUNCTION js_time_text() RETURNS TIME LANGUAGE JAVASCRIPT AS $$ return '838:30:00' $$;
+SELECT js_time('838:00:00') AS a, js_time('-838:59:58.999999') AS b, js_time('838:59:59') AS c,
+  py_time('838:30:00.5') AS d, py_time('-838:00:00') AS e, js_time_text() AS f;
+--write_file $MYSQLTEST_VARDIR/tmp/review_independent_1.sql
+CREATE PROCEDURE py_time_sql(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import datetime
+    row = session.run_sql("SELECT ? AS t, CAST(? AS CHAR) AS s",
+                          [datetime.timedelta(hours=838, minutes=10)] * 2).fetch_one()
+    r = '%s %s' % (row.t, row.s)
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review_independent_1.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_independent_1.sql
+CALL py_time_sql(@r);
+SELECT @r;
+
+--echo # C12: a negative TIME in a routine's SQL result keeps its sign.
+--write_file $MYSQLTEST_VARDIR/tmp/review_independent_2.sql
+CREATE PROCEDURE js_neg_time(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const row = session.runSql("SELECT TIME'-12:34:56.5' AS a, TIMEDIFF('00:00:01', '00:00:03') AS b, TIME'01:02:03' AS c").fetchOne()
+  r = [row.a, row.b, row.c].join(' ')
+$$;
+CREATE PROCEDURE py_neg_time(OUT r TEXT) LANGUAGE PYTHON AS $$
+    row = session.run_sql("SELECT TIME'-12:34:56.5' AS a, TIMEDIFF('00:00:01', '00:00:03') AS b").fetch_one()
+    r = '%s | %s' % (row.a, row.b)
+$$;
+CREATE PROCEDURE java_neg_time(OUT r TEXT) LANGUAGE JAVA AS $$
+  Row row = Mle.session().runSql("SELECT TIME'-12:34:56.5' AS a, TIMEDIFF('00:00:01', '00:00:03') AS b").fetchOne();
+  r[0] = row.get(0) + " " + row.get(1);
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review_independent_2.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_independent_2.sql
+CALL js_neg_time(@r);
+SELECT @r;
+CALL py_neg_time(@r);
+SELECT @r;
+CALL java_neg_time(@r);
+SELECT @r;
+
+--echo # C13: DECIMAL text is bounded before it is sent: digits beyond the 30th
+--echo # decimal place are rounded, more than 65 digits is an error of the
+--echo # routine; the worker stays (same pid).
+CREATE FUNCTION js_tiny() RETURNS DECIMAL(20,10) LANGUAGE JAVASCRIPT AS $$ return 1e-110 $$;
+CREATE FUNCTION js_huge() RETURNS DECIMAL(65,0) LANGUAGE JAVASCRIPT AS $$ return 1e101 $$;
+CREATE FUNCTION js_exp() RETURNS DECIMAL(65,0) LANGUAGE JAVASCRIPT AS $$ return '1e2000000000' $$;
+CREATE FUNCTION js_max() RETURNS DECIMAL(65,0) LANGUAGE JAVASCRIPT AS $$ return '9e64' $$;
+--write_file $MYSQLTEST_VARDIR/tmp/review_independent_3.sql
+CREATE PROCEDURE py_big_params(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import decimal
+    out = []
+    D = decimal.Decimal
+    for v in (2 ** 400, D('1e-110'), D('1e2000000000'), 10 ** 64, D('0.1234567890123456789012345678905')):
+        try:
+            out.append(str(session.run_sql("SELECT CAST(? AS CHAR) AS v", [v]).fetch_one().v))
+        except Exception as e:
+            out.append('refused')
+    r = ' | '.join(out)
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review_independent_3.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_independent_3.sql
+SET @pid = mle_debug_worker_pid();
+SELECT js_tiny(), js_max();
+--error ER_LANGUAGE_COMPONENT
+SELECT js_huge();
+--error ER_LANGUAGE_COMPONENT
+SELECT js_exp();
+CALL py_big_params(@r);
+SELECT @r;
+
+--echo # C10: a batch of many small rows is split by the number of values too
+--echo # (65,535 per message); C11: after a rewritten batch a partial bind does
+--echo # not inherit the values bound before it.
+CREATE TABLE u (id INT PRIMARY KEY, a INT, b INT);
+INSERT INTO u VALUES (1, 1, 1), (2, 2, 2), (29999, 3, 3);
+CREATE TABLE t11 (id INT PRIMARY KEY, a VARCHAR(10)) ENGINE=InnoDB;
+--write_file $MYSQLTEST_VARDIR/tmp/review_independent_4.sql
+CREATE PROCEDURE py_many_values(OUT r TEXT) LANGUAGE PYTHON AS $$
+    res = session.execute_many("UPDATE u SET a = ?, b = ? WHERE id = ?", [[None, None, i] for i in range(30000)])
+    r = 'affected %d, left %d' % (res.get_affected_items_count(),
+                                 session.run_sql("SELECT COUNT(a) AS n FROM u").fetch_one().n)
+$$;
+CREATE PROCEDURE js_too_many(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  try { session.runSql("SELECT 1", new Array(70000).fill(1)) } catch (e) { r = e.code + ' ' + e.message }
+$$;
+CREATE PROCEDURE js_rebind(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  const p = session.prepare("INSERT INTO t11 VALUES (?, ?)")
+  p.bind(1, 'before').execute()
+  const rows = []
+  for (let i = 0; i < 1000; i++) rows.push([1000 + i, 'batch'])
+  out.push(p.executeMany(rows).getAffectedItemsCount())
+  try { p.execute(); out.push('no bind ran') } catch (e) { out.push('no bind: ' + e.code) }
+  const q = session.prepare("INSERT INTO t11 VALUES (?, ?)")
+  q.bind(2, 'q before').execute()
+  rows.forEach((r) => { r[0] += 5000 })
+  q.executeMany(rows)
+  try { q.bind(6).execute(); out.push('partial bind ran') } catch (e) { out.push('partial bind: ' + e.code) }
+  rows.forEach((r) => { r[0] += 5000 })
+  p.bind(3, 'after').execute()
+  p.bind(4).execute()
+  // A short last chunk runs on the statement itself: its last row stays bound, as row by row.
+  rows.length = 0
+  for (let i = 0; i < 1003; i++) rows.push([3000 + i, 'tail'])
+  p.executeMany(rows)
+  p.bind(5).execute()
+  out.push(session.runSql("SELECT GROUP_CONCAT(CONCAT(id, ':', a) ORDER BY id) AS v FROM t11 WHERE id < 10").fetchOne().v)
+  r = out.join(' | ')
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review_independent_4.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_independent_4.sql
+CALL py_many_values(@r);
+SELECT @r;
+CALL js_too_many(@r);
+SELECT @r;
+CALL js_rebind(@r);
+SELECT @r;
+
+--echo # C14: a result of a statement with parameters that is read in part is
+--echo # drained before the next statement, as one without parameters: mysqld
+--echo # keeps one, not one per statement.
+CREATE TABLE big (n INT PRIMARY KEY);
+INSERT INTO big WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 50) SELECT n FROM c;
+SET GLOBAL mle.sql_chunk_rows = 10, mle.sql_statements_max = 8;
+--write_file $MYSQLTEST_VARDIR/tmp/review_independent_5.sql
+CREATE PROCEDURE js_partial(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  let sum = 0
+  const first = session.runSql("SELECT n FROM big WHERE n > ? ORDER BY n", [0])
+  sum += first.fetchOne().n
+  for (let i = 1; i <= 30; i++) sum += session.runSql("SELECT n FROM big WHERE n > ? ORDER BY n", [i]).fetchOne().n
+  // The first result is still readable (its rows are in the worker now).
+  r = sum + ' ' + first.fetchAll().length
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review_independent_5.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_independent_5.sql
+CALL js_partial(@r);
+SELECT @r;
+SET GLOBAL mle.sql_chunk_rows = DEFAULT, mle.sql_statements_max = DEFAULT;
+
+--echo # C15: session options belong to one routine call: a nested call's
+--echo # setOptions does not replace its caller's, and the next nested call
+--echo # does not inherit them.
+--write_file $MYSQLTEST_VARDIR/tmp/review_independent_6.sql
+CREATE PROCEDURE js_inner(set_it INT, OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  if (set_it) session.setOptions({ decimalType: mysql.DecimalType.NUMBER })
+  r = session.getOption('integerType') + '/' + session.getOption('decimalType')
+$$;
+CREATE PROCEDURE js_outer(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  session.setOptions({ integerType: 'BIGINT' })
+  const before = session.getOption('integerType') + '/' + session.getOption('decimalType')
+  session.runSql("CALL js_inner(1, @a)")
+  session.runSql("CALL js_inner(0, @b)")
+  const inner = session.runSql("SELECT @a AS a, @b AS b").fetchOne()
+  r = [before, inner.a, inner.b, session.getOption('integerType') + '/' + session.getOption('decimalType')].join(' | ')
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review_independent_6.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_independent_6.sql
+CALL js_outer(@r);
+SELECT @r;
+
+--echo # C5 (C24, C62): a failed multi-row chunk of executeMany is run again
+--echo # row by row only when that repeats nothing: not when the table has
+--echo # triggers (their writes to non-transactional tables stay), is hidden
+--echo # by a temporary table, or the error is not one of a row's values. The
+--echo # error then names the chunk.
+--echo # (The trigger's table would be a MyISAM one: the suite's server refuses
+--echo # that with GTIDs. The check is for any trigger.)
+CREATE TABLE audit (id INT) ENGINE=InnoDB;
+CREATE TABLE tt (id INT PRIMARY KEY, a VARCHAR(10)) ENGINE=InnoDB;
+CREATE TABLE tt2 (id INT PRIMARY KEY, a VARCHAR(10)) ENGINE=InnoDB;
+CREATE TRIGGER tt_ai AFTER INSERT ON tt FOR EACH ROW INSERT INTO audit VALUES (NEW.id);
+--write_file $MYSQLTEST_VARDIR/tmp/review_independent_7.sql
+CREATE PROCEDURE py_replay(tbl TEXT, OUT r TEXT) LANGUAGE PYTHON AS $$
+    rows = [[i, 'r'] for i in range(1000)]
+    rows[400] = [5, 'dup']
+    try:
+        session.execute_many("INSERT INTO " + tbl + " VALUES (?, ?)", rows)
+        r = 'no error'
+    except SqlError as e:
+        r = 'error %d row %s%s' % (e.code, e.row, ' (' + e.message.split(': ')[-1] if 'executeMany' in e.message else '')
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review_independent_7.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_independent_7.sql
+CALL py_replay('tt', @r);
+SELECT @r;
+SELECT (SELECT COUNT(*) FROM tt) AS rows_written, (SELECT COUNT(*) FROM audit) AS trigger_writes;
+DROP TRIGGER tt_ai;
+TRUNCATE audit;
+CALL py_replay('tt', @r);
+SELECT @r;
+SELECT COUNT(*) AS rows_written FROM tt;
+CREATE TEMPORARY TABLE tt2 (id INT PRIMARY KEY, a VARCHAR(10)) ENGINE=MEMORY;
+CALL py_replay('tt2', @r);
+SELECT @r;
+SELECT COUNT(*) AS rows_in_the_temporary_table FROM tt2;
+DROP TEMPORARY TABLE tt2;
+SELECT COUNT(*) AS rows_in_the_table FROM tt2;
+
+--echo # C4: the results that a call's open statements hold in mysqld have a
+--echo # budget (mle.sql_call_results_max; by default four times
+--echo # mle.sql_result_max), also across nested calls.
+SET GLOBAL mle.sql_call_results_max = 1048576;
+--write_file $MYSQLTEST_VARDIR/tmp/review_independent_8.sql
+CREATE PROCEDURE java_hold(n INT, OUT r TEXT) LANGUAGE JAVA AS $$
+  int opened = 0;
+  String error = "none";
+  java.util.List<Long> ids = new java.util.ArrayList<>();
+  try {
+    for (; opened < n; opened++) {
+      long id = MleSql.newStatementId();
+      ids.add(id);
+      MleSql.execute(id, "SELECT REPEAT('x', 10000) FROM big", null, false, 1);
+    }
+  } catch (MleSqlException e) {
+    error = e.getMessage();
+  }
+  // Closing them gives the room back.
+  for (long id : ids) MleSql.close(id);
+  long id = MleSql.newStatementId();
+  MleSql.execute(id, "SELECT REPEAT('x', 10000) FROM big", null, false, 1);
+  r[0] = (opened < n ? "refused before " + n : "all " + n + " opened") + ": " + error;
+$$;
+CREATE PROCEDURE js_nested_hold(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  // One result held here (a prepared statement's: kept until it is closed), then a nested
+  // call that opens two more: the second is refused, as a third would be at the top level.
+  const a = session.prepare("SELECT REPEAT('x', 10000) AS v FROM big").execute()
+  session.runSql("CALL java_hold(2, @inner)")
+  r = session.runSql("SELECT @inner AS v").fetchOne().v
+$$;
+CREATE PROCEDURE js_many_small(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const open = []
+  for (let i = 0; i < 100; i++) open.push(session.prepare("SELECT ? AS v").bind(i).execute())
+  r = open.length + ' small results open'
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review_independent_8.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_independent_8.sql
+CALL java_hold(2, @r);
+SELECT @r;
+CALL java_hold(50, @r);
+SELECT @r;
+CALL js_nested_hold(@r);
+SELECT @r;
+CALL js_many_small(@r);
+SELECT @r;
+SET GLOBAL mle.sql_call_results_max = DEFAULT;
+CALL java_hold(50, @r);
+SELECT @r;
+
+SELECT mle_debug_worker_pid() = @pid AS same_worker;
+
+--disconnect con1
+--connection default
+DROP TABLE u, t11, big, audit, tt, tt2;
+DROP PROCEDURE py_replay;
+DROP PROCEDURE java_hold;
+DROP PROCEDURE js_nested_hold;
+DROP PROCEDURE js_many_small;
+DROP FUNCTION js_time;
+DROP FUNCTION py_time;
+DROP FUNCTION js_time_text;
+DROP FUNCTION js_tiny;
+DROP FUNCTION js_huge;
+DROP FUNCTION js_exp;
+DROP FUNCTION js_max;
+DROP PROCEDURE py_time_sql;
+DROP PROCEDURE js_neg_time;
+DROP PROCEDURE py_neg_time;
+DROP PROCEDURE java_neg_time;
+DROP PROCEDURE py_big_params;
+DROP PROCEDURE py_many_values;
+DROP PROCEDURE js_too_many;
+DROP PROCEDURE js_rebind;
+DROP PROCEDURE js_partial;
+DROP PROCEDURE js_inner;
+DROP PROCEDURE js_outer;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

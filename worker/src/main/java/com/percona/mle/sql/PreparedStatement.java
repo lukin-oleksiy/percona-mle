@@ -113,8 +113,18 @@ public final class PreparedStatement {
   /** Chunks of a rewritten batch smaller than this (its last rows) run row by row. */
   static final int REWRITE_MIN_ROWS = 16;
   private static final int REWRITE_MAX_ROWS = 1000;
-  /** Errors that end the transaction or the statement for reasons other than the row (no replay). */
-  private static final Set<Integer> NO_REPLAY = Set.of(1205, 1213, 1317, 3024);
+  /** The values one message may carry (kMaxValues in protocol.h). */
+  private static final int MAX_VALUES = com.percona.mle.worker.SqlBridge.MAX_VALUES;
+  /**
+   * Errors a row's values cause (NULL in a NOT NULL column, duplicate key, out of range, truncated
+   * or incorrect value, too long, no default, division by zero, foreign key, no partition, CHECK,
+   * invalid JSON or VECTOR): only
+   * after these a failed chunk is replayed row by row to find the row. Any other error (a lock
+   * wait, a deadlock, KILL, a full lock table, ...) is reported for the chunk: the replay could not
+   * tell more and would run the rows again in a transaction that may be gone (independent review C24).
+   */
+  private static final Set<Integer> REPLAY = Set.of(1022, 1048, 1062, 1169, 1216, 1264, 1265, 1292, 1364, 1365,
+      1366, 1367, 1406, 1411, 1452, 1526, 1586, 1690, 3140, 3141, 3156, 3819, 6136, 6137, 6138);
 
   private boolean formChecked;
   private BatchRewrite.Form form;
@@ -138,15 +148,21 @@ public final class PreparedStatement {
 
   /**
    * The rows in chunks of the multi-row form (exp note 52): at most 1,000 rows, 65,535 parameters
-   * and one mailbox arena of parameters per statement. A chunk that fails (InnoDB rolls the whole
-   * statement back) is replayed row by row, which stops at the failing row with its index and writes
-   * the rows before it; errors that end the transaction are thrown with the chunk's first row.
+   * and one mailbox arena of parameters per statement. A chunk that fails because of a row's values
+   * (InnoDB rolls the whole statement back) is replayed row by row, which stops at the failing row
+   * with its index and writes the rows before it. It is not replayed when the failed statement may
+   * have left something behind or the error is not a row's (Session.replayable, REPLAY): the error
+   * then carries the chunk's first row and says that the chunk ran as one statement.
    */
   private SqlResult executeRewritten(List<?> rows, BatchRewrite.Form f) {
     if (last != null) last.replace();
     last = null;
     pending.clear();
-    int maxRows = Math.min(REWRITE_MAX_ROWS, 65535 / parameterCount);
+    int maxRows = Math.min(REWRITE_MAX_ROWS, MAX_VALUES / parameterCount);
+    // The chunks run on statements of their own: this one keeps the values bound before the batch,
+    // which a later partial bind must not inherit (independent review C11). Rows that run on this statement
+    // (a short last chunk, a replay) set the flag again and leave their last row bound.
+    executed = false;
     long budget = com.percona.mle.worker.SqlBridge.batchBytes();
     long affected = 0, execUs = 0;
     List<MleSql.Warning> warnings = List.of();
@@ -182,16 +198,19 @@ public final class PreparedStatement {
         execUs += r.executionMicros();
         warnings = r.warnings();
       } catch (MleSqlException e) {
-        // Replaying is only right if the failed statement left nothing behind: InnoDB, still (the
-        // engine lookup is kept for the worker, so look again).
-        if (NO_REPLAY.contains(e.getErrorCode()) || !session.innodb(f.schema(), f.table(), true))
-          throw new MleSqlException(e.getErrorCode(), e.getSqlState(), e.getMessage(), from);
+        // Replaying is only right if the failed statement left nothing behind (looked up now: the
+        // table may have changed since the batch was found eligible).
+        String why = !REPLAY.contains(e.getErrorCode()) ? "the error is not one of a row's values"
+            : session.replayable(f.schema(), f.table());
+        if (why != null)
+          throw new MleSqlException(e.getErrorCode(), e.getSqlState(), e.getMessage() + " (executeMany: rows "
+              + from + " to " + (from + k - 1) + " ran as one statement and are not run again row by row, so the "
+              + "failing row is not known: " + why + ")", from);
         SqlResult r = executeRows(rows.subList(from, from + k), from);  // throws at the failing row
         affected += r.getAffectedItemsCount();
         execUs += r.getExecutionMicros();
       }
     }
-    executed = true;
     return new SqlResult(session, id, false, options,
         new MleSql.Reply(id, false, List.of(), List.of(), false, false, affected, 0, warnings, 0, execUs, 0));
   }
@@ -240,7 +259,8 @@ public final class PreparedStatement {
               + " has " + n + " values for " + parameterCount + " parameter markers", offset + i);
         for (Object v : row) size += size(v);
       }
-      if (inBatch > 0 && (row == null || bytes + size > budget)) {
+      // A message carries at most MAX_VALUES values (the host's limit, independent review C10).
+      if (inBatch > 0 && (row == null || bytes + size > budget || batch.size() + parameterCount > MAX_VALUES)) {
         MleSql.Reply r;
         try {
           r = com.percona.mle.worker.SqlBridge.requestMany(id, batch.toArray(), parameterCount);
@@ -262,7 +282,7 @@ public final class PreparedStatement {
         inBatch++;
       }
     }
-    executed = executed || done > 0;
+    executed = executed || done > offset;  // rows ran on this statement: its last row stays bound
     return new SqlResult(session, id, false, options,
         new MleSql.Reply(id, false, List.of(), List.of(), false, false, affected, 0, warnings, 0, execUs, 0));
   }

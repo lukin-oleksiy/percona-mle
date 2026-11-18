@@ -137,10 +137,6 @@ struct SqlRunner::Statement {
   size_t next = 0;
   /** The current result set's row count; 0: unknown (a cursor). */
   uint64_t total = 0;
-  /** The next chunk is the result set's first: a buffered result's
-      warnings are final, they go with it (and with the last), so that the
-      worker has them before it reads all rows. */
-  bool first = false;
 
   /** The current result set's next row (nullptr at its end): a collected
       handle, else the server's fetch; true on a server failure. */
@@ -154,7 +150,13 @@ struct SqlRunner::Statement {
     return mysql_service_mysql_stmt_result->fetch(h, row);
   }
 
+  /** The bytes its buffered results hold in the server, counted in
+      *held_in (independent review C4). */
+  size_t held = 0;
+  size_t *held_in = nullptr;
+
   ~Statement() {
+    if (held_in != nullptr) *held_in -= held;
     if (h != nullptr) (void)mysql_service_mysql_stmt_factory->close(h);
   }
 };
@@ -168,7 +170,36 @@ void sql_error(SqlResultMsg *result, uint32_t sql_errno,
   result->message = message;
 }
 
-SqlRunner::SqlRunner(MYSQL_THD thd) : m_thd(thd) {}
+SqlRunner::SqlRunner(MYSQL_THD thd, size_t *results_held)
+    : m_thd(thd), m_results_held(results_held) {}
+
+bool SqlRunner::over_budget(const Statement *except, SqlResultMsg *result) {
+  const size_t others = *m_results_held - (except != nullptr ? except->held : 0);
+  if (others < sql_call_results_max()) return false;
+  sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
+            "the results of the open statements hold too much memory "
+            "(mle.sql_call_results_max): read or close them first");
+  return true;
+}
+
+void SqlRunner::count_results(Statement &s) {
+  // What the server really holds for all result sets of the execution
+  // (rows, metadata, overhead). A statement keeps its results until it is
+  // closed or executed again, read or not; mysqld's memory for them is
+  // outside the worker's limits, so the call has a budget for it. A server
+  // without the attribute: not counted (each result is still bounded by
+  // mle.sql_result_max).
+  size_t now = 0;
+#ifdef MYSQL_STMT_ATTR_RESULT_MEMORY
+  if (!s.to_client &&
+      mysql_service_mysql_stmt_attributes->get(
+          s.h, cstr(MYSQL_STMT_ATTR_RESULT_MEMORY), &now))
+    now = 0;
+#endif
+  s.held_in = m_results_held;
+  *m_results_held += now - s.held;
+  s.held = now;
+}
 
 SqlRunner::~SqlRunner() { m_statements.clear(); }
 
@@ -407,6 +438,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
   if (m_statements.size() >= sql_statements_max())
     return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
                      "too many open statements (mle.sql_statements_max)");
+  if (over_budget(nullptr, result)) return;
   const bool to_client =
       (request.flags & mle::wire::kPassResultToClient) != 0;
   const bool with_params = !request.params.empty();
@@ -431,6 +463,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
   }
   if (failed) return statement_failed(std::move(s), result);
   Statement &st = *s;
+  count_results(st);
   m_statements[request.stmt_id] = std::move(s);
   reply(request.stmt_id, st,
         request.max_rows != 0 ? request.max_rows : sql_chunk_rows(),
@@ -474,6 +507,7 @@ void SqlRunner::execute_prepared(const mle::SqlMsg &request,
   if (request.params.size() > s.param_count)
     return sql_error(result, ER_WRONG_ARGUMENTS,
                      "more values than parameter markers");
+  if (over_budget(&s, result)) return;  // its own results go when it runs
   s.rows_open = false;
   s.next_pending = false;
   s.lookahead.clear();
@@ -482,9 +516,10 @@ void SqlRunner::execute_prepared(const mle::SqlMsg &request,
   s.next = 0;
   const uint64_t t0 = now_us();
   // Partial binding: the markers not given keep their values (S-11).
-  if (bind_values(s.h, request.params) ||
-      mysql_service_mysql_stmt_execute->execute(s.h))
-    return statement_error(s, result);
+  const bool failed = bind_values(s.h, request.params) ||
+                      mysql_service_mysql_stmt_execute->execute(s.h);
+  count_results(s);
+  if (failed) return statement_error(s, result);
   reply(request.stmt_id, s,
         request.max_rows != 0 ? request.max_rows : sql_chunk_rows(),
         now_us() - t0, result);
@@ -536,6 +571,13 @@ void SqlRunner::execute_many(const mle::SqlMsg &request,
   s.pending = nullptr;
   s.all.clear();
   s.next = 0;
+  // However it ends: the statement's earlier results are gone, and what it
+  // holds now (a refused result set) is counted.
+  struct Counted {
+    SqlRunner *runner;
+    Statement &statement;
+    ~Counted() { runner->count_results(statement); }
+  } counted{this, s};
   const uint32_t width = request.row_width;
   const size_t rows = request.params.size() / width;
   const uint64_t t0 = now_us();
@@ -580,7 +622,7 @@ void SqlRunner::fetch(const mle::SqlMsg &request, SqlResultMsg *result) {
   result->kind = SqlResultKind::kRows;
   result->columns = s.columns;
   result->total_rows = s.total;
-  rows(request.stmt_id, s, max_rows, result);
+  rows(request.stmt_id, s, max_rows, /*first=*/false, result);
 }
 
 void SqlRunner::next_result(const mle::SqlMsg &request, SqlResultMsg *result) {
@@ -750,17 +792,16 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
   result->kind = SqlResultKind::kRows;
   result->columns = s.columns;
   result->total_rows = s.total;
-  s.first = true;
-  rows(id, s, max_rows, result);
-  s.first = false;
+  // rows() may close (destroy) s: nothing touches it afterwards (C6).
+  rows(id, s, max_rows, /*first=*/true, result);
 }
 
 
 
-void SqlRunner::rows(uint64_t id, Statement &s, uint32_t max_rows,
+void SqlRunner::rows(uint64_t id, Statement &s, uint32_t max_rows, bool first,
                      SqlResultMsg *result) {
   if (m_direct != nullptr) {
-    switch (write_rows(id, s, max_rows, result)) {
+    switch (write_rows(id, s, max_rows, first, result)) {
       case Direct::kWritten:
         return;
       case Direct::kError:
@@ -772,7 +813,7 @@ void SqlRunner::rows(uint64_t id, Statement &s, uint32_t max_rows,
   if (read_rows(s, max_rows, result)) return statement_error(s, result);
   if (!s.rows_open)
     finish_result_set(id, s, result);
-  else if (s.buffered && s.first)
+  else if (s.buffered && first)
     read_warnings(s.h, result);
 }
 
@@ -974,7 +1015,7 @@ bool write_row(my_h_row row, const std::vector<Reader> &readers,
 }  // namespace
 
 SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s,
-                                        uint32_t max_rows,
+                                        uint32_t max_rows, bool first,
                                         SqlResultMsg *result) {
   // The statement has run (no cursor: exp note 44), so its warnings are
   // final: room for them at the end of the chunk is kept from the start.
@@ -1034,7 +1075,7 @@ SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s,
   }
   w.set_capacity(m_direct->capacity);  // the tail's room
   static const std::vector<mle::Warning> kNone;
-  const bool warnings = !s.rows_open || (s.buffered && s.first);
+  const bool warnings = !s.rows_open || (s.buffered && first);
   mle::put_rows_tail(w, more, more_results, warnings ? diag.warnings : kNone,
                      result->exec_us);
   if (w.overflow()) {  // cannot happen: the room was kept

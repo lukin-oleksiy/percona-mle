@@ -412,6 +412,34 @@ TEST(MleLauncher, ConcurrentSessions) {
   EXPECT_EQ(stats_of(*l, 0).handed_out, uint64_t{kThreads * kPerThread});
 }
 
+// independent review C19: an answer that comes after its request timed out is
+// dropped by the next request, which then gets its own.
+TEST(MleLauncher, LateAnswersAreSkipped) {
+  LauncherConfig lc = config({test_class("t")});
+  lc.timeout_ms = 1000;
+  auto l = start(lc);
+  ASSERT_NE(l, nullptr);
+  std::string error;
+  std::vector<ClassStats> stats;
+  ASSERT_EQ(kill(l->info().pid, SIGSTOP), 0);
+  EXPECT_EQ(l->acquire("t", &error), nullptr);
+  EXPECT_EQ(error, "no answer from the launcher");
+  EXPECT_FALSE(l->stats(&stats, &error));
+  ASSERT_EQ(kill(l->info().pid, SIGCONT), 0);
+  // Both late answers (a worker and statistics) are in the socket by now
+  // or arrive while the next request waits.
+  auto w = l->acquire("t", &error);
+  ASSERT_NE(w, nullptr) << error;
+  ReadyMsg ready;
+  EXPECT_TRUE(wait_ready(*w, &ready, &error)) << error;
+  EXPECT_TRUE(l->stats(&stats, &error)) << error;
+  // The worker of the abandoned request was ended, ours is the only one.
+  const auto deadline = Clock::now() + std::chrono::seconds(5);
+  while (children_of(l->info().pid).size() > 1 && Clock::now() < deadline)
+    usleep(20000);
+  EXPECT_EQ(children_of(l->info().pid).size(), 1u);
+}
+
 // ---------------------------------------------------------------- death
 
 TEST(MleLauncher, LauncherDeathKillsWorkers) {

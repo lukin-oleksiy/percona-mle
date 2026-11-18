@@ -98,6 +98,28 @@ kept
 from Python
 from Java
 
+# mle_session_reset() also forgets the last call's traceback and output
+# (independent review C1).
+CALL pc2();
+ERROR HY000: JavaScript> TypeError: Cannot read property 'boom' of null (pc2, line 4)
+SELECT mle_session_state('traceback') <> '' AS traceback_before,
+mle_session_state('last_output') <> '' AS last_output_before;
+traceback_before	last_output_before
+1	1
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+SELECT mle_session_state('traceback') = '' AS traceback_reset,
+mle_session_state('last_output') = '' AS last_output_reset;
+traceback_reset	last_output_reset
+1	1
+CALL pc1();
+SELECT mle_session_reset('output');
+mle_session_reset('output')
+The session state is successfully reset.
+SELECT mle_session_state('last_output') = '' AS last_output_reset_by_output;
+last_output_reset_by_output
+1
 # Options can be set only without cached programs (Oracle: 1123).
 SELECT mle_set_session_state('{"integer_type": "BIGINT"}');
 ERROR HY000: Can't initialize function 'mle_set_session_state'; Cannot set options of an active session. Please reset the session first.

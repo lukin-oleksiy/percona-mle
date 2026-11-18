@@ -234,14 +234,21 @@ std::string error_location(const mle::Error &e) {
   "Traceback (most recent call last)", "at function (routine:line:column)"
   for JavaScript and Java.
 */
-std::string traceback_text(const mle::Error &e, const std::string &language) {
+std::string traceback_text(const mle::Error &e, const std::string &language,
+                           const std::string &routine, bool routine_text,
+                           bool other_text) {
+  // The source line of a frame: of the routine's code or of other code (a
+  // library's), for a reader who may see that code.
+  const auto shown = [&](const mle::StackFrame &f) {
+    return !f.text.empty() && (f.file == routine ? routine_text : other_text);
+  };
   std::string t;
   if (language == "python") {
     t = "Traceback (most recent call last):\n";
     for (auto it = e.stack.rbegin(); it != e.stack.rend(); ++it) {
       t += "  File \"" + it->file + "\", line " + std::to_string(it->line) + ", in " +
            (body_frame(*it) ? std::string("<routine>") : it->function) + "\n";
-      if (!it->text.empty()) t += "    " + it->text + "\n";
+      if (shown(*it)) t += "    " + it->text + "\n";
     }
     return t + e.message + "\n";
   }
@@ -250,7 +257,7 @@ std::string traceback_text(const mle::Error &e, const std::string &language) {
     std::string where = f.file + ":" + std::to_string(f.line);
     if (f.column > 0) where += ":" + std::to_string(f.column);
     t += "    at " + (body_frame(f) ? where : f.function + " (" + where + ")") + "\n";
-    if (!f.text.empty()) t += "        " + f.text + "\n";
+    if (shown(f)) t += "        " + f.text + "\n";
   }
   return t;
 }
@@ -380,15 +387,28 @@ std::string account_key(std::string_view user, std::string_view host) {
     if (c == '\'') key += c;
   }
   key += "'@'";
+  // Host names compare without case (a definer's host may be written in
+  // another case than the account's).
   for (char c : host) {
-    key += c;
+    key += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
     if (c == '\'') key += c;
   }
   key += '\'';
   return key;
 }
 
-std::string Session::principal() const {
+bool principal_has_account(std::string_view principal,
+                           std::string_view account) {
+  if (principal == account) return true;
+  const size_t n = account.size() + kCodeOf.size();
+  return principal.size() > n &&
+         ((principal.starts_with(account) &&
+           principal.substr(account.size(), kCodeOf.size()) == kCodeOf) ||
+          (principal.ends_with(account) &&
+           principal.substr(principal.size() - n, kCodeOf.size()) == kCodeOf));
+}
+
+std::string Session::principal(const Routine *routine) const {
   // Read on every call: a security context's address says nothing (a
   // COM_CHANGE_USER rewrites the session's context in place, a new routine
   // may get a dropped one's address).
@@ -400,7 +420,15 @@ std::string Session::principal() const {
       mysql_service_mysql_security_context_options->get(sctx, "priv_host",
                                                         &host))
     return "?";
-  return account_key({user.str, user.length}, {host.str, host.length});
+  std::string key =
+      account_key({user.str, user.length}, {host.str, host.length});
+  // A DEFINER routine runs as its definer: the keys are equal.
+  if (routine != nullptr && !routine->definer_key.empty() &&
+      routine->definer_key != key) {
+    key += kCodeOf;
+    key += routine->definer_key;
+  }
+  return key;
 }
 
 // ------------------------------------------------------------- workers
@@ -520,7 +548,7 @@ bool Session::prepare_in(const std::string &principal, Slot &slot,
 
 bool Session::parse(Routine &routine) {
   if (!check_create_privilege(m_thd, routine)) return false;
-  const std::string who = principal();
+  const std::string who = principal(&routine);
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr) return false;
   // CREATE: the worker also checks the code (exp note 39); its findings
@@ -568,14 +596,24 @@ void Session::check_findings_to_warnings(const Routine &routine) {
 
 bool Session::execute(Routine &routine) {
   m_stack.clear();  // Oracle: the trace of the last call only
-  m_traceback.clear();
+  m_trace.reset();
   std::vector<Value> args = std::move(m_args);  // reused; a nested call allocates
   if (!routine.read_args(&args)) return false;
-  const std::string who = principal();  // a copy: nested calls change it
+  const std::string who = principal(&routine);  // a copy: nested calls change it
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr || !prepare_in(who, *slot, routine)) return false;
 
-  SqlRunner sql(m_thd);  // the call's statements; closed when it returns
+  // Whose code runs, for what it evaluates with mle_eval(): restored when
+  // the call returns (a nested call has its own).
+  struct Running {
+    const Routine *&slot;
+    const Routine *saved;
+    ~Running() { slot = saved; }
+  } running{m_running_routine, m_running_routine};
+  m_running_routine = &routine;
+
+  // The call's statements; closed when it returns.
+  SqlRunner sql(m_thd, &m_results_held);
   Hooks hooks(m_thd, &sql, &routine);
   ResultMsg result;
   std::string error;
@@ -701,7 +739,15 @@ void Session::report(const std::string &principal, Status status,
       // (exp note 39); the frames: mle_session_state('traceback'/'stack_trace').
       const std::string message = e->message + error_location(*e);
       my_error(ER_LANGUAGE_COMPONENT_RUNTIME, MYF(0), language, message.c_str());
-      if (m_console_now) lines_to_warnings(m_traceback, routine.name + " traceback");
+      if (m_console_now) {
+        // The warnings go to the session's client, whoever's rights the
+        // routine runs with.
+        Security_context_handle client = nullptr;
+        if (mysql_service_mysql_thd_attributes->get(
+                m_thd, "main_security_context", &client))
+          client = nullptr;  // a server that does not tell: no source lines
+        lines_to_warnings(traceback_for(client), routine.name + " traceback");
+      }
       const auto it = m_workers.find(principal);
       if (it != m_workers.end() &&
           (!it->second.worker || !it->second.worker->usable())) {
@@ -761,7 +807,7 @@ void Session::keep_stack_trace(const mle::Error &e, const Routine &routine) {
   // Oracle: "<js> pc2:3:6-54", one line per frame.
   const std::string language =
       e.language.empty() ? routine.prepare.language : e.language;
-  m_traceback = traceback_text(e, language);
+  m_trace = Trace{e, language, routine.name, routine.definer_key};
   m_stack.clear();
   for (const mle::StackFrame &f : e.stack) {
     m_stack += "<" + language + "> " + f.file + ":" + std::to_string(f.line);
@@ -771,6 +817,31 @@ void Session::keep_stack_trace(const mle::Error &e, const Routine &routine) {
     }
     m_stack += "\n";
   }
+}
+
+std::string Session::traceback_for(void *sctx) const {
+  if (!m_trace) return "";
+  // MySQL shows a routine's definition to its definer and to holders of
+  // SHOW_ROUTINE (and of a global SELECT, which a component cannot ask
+  // about: such a reader sees no source lines here). A library has no
+  // definer to compare with.
+  bool routine_text = false, other_text = false;
+  const auto reader = static_cast<Security_context_handle>(sctx);
+  if (reader != nullptr) {
+    other_text = mysql_service_global_grants_check->has_global_grant(
+        reader, "SHOW_ROUTINE", strlen("SHOW_ROUTINE"));
+    routine_text = other_text || m_trace->author.empty();
+    MYSQL_LEX_CSTRING user{"", 0}, host{"", 0};
+    if (!routine_text &&
+        !mysql_service_mysql_security_context_options->get(reader, "priv_user",
+                                                           &user) &&
+        !mysql_service_mysql_security_context_options->get(reader, "priv_host",
+                                                           &host))
+      routine_text = account_key({user.str, user.length},
+                                 {host.str, host.length}) == m_trace->author;
+  }
+  return traceback_text(m_trace->error, m_trace->language, m_trace->routine,
+                        routine_text, other_text);
 }
 
 std::optional<std::string> Session::state(const Session *s,
@@ -786,7 +857,14 @@ std::optional<std::string> Session::state(const Session *s,
   if (key == "stdout") return s != nullptr ? s->m_out : "";
   if (key == "stderr") return s != nullptr ? s->m_err : "";
   if (key == "stack_trace") return s != nullptr ? s->m_stack : "";
-  if (key == "traceback") return s != nullptr ? s->m_traceback : "";
+  if (key == "traceback") {
+    if (s == nullptr) return "";
+    // For who reads it: the statement's current account.
+    Security_context_handle reader = nullptr;
+    if (mysql_service_mysql_thd_security_context->get(s->m_thd, &reader))
+      reader = nullptr;
+    return s->traceback_for(reader);
+  }
   if (key == "last_output")
     return s != nullptr ? s->m_last_out + s->m_last_err : "";
   if (key == "stored_functions")
@@ -804,8 +882,8 @@ long Session::worker_pid() {
 }
 
 void Session::reset_output(bool out, bool err) {
-  if (out) m_out.clear();
-  if (err) m_err.clear();
+  if (out) m_out.clear(), m_last_out.clear();
+  if (err) m_err.clear(), m_last_err.clear();
 }
 
 void Session::clear_state(bool reuse) {
@@ -814,9 +892,13 @@ void Session::clear_state(bool reuse) {
                           m_mark);
   m_workers.clear();
   m_programs.clear();
+  // Everything a later account could read with mle_session_state() (C1).
   m_stack.clear();
+  m_trace.reset();
   m_out.clear();
   m_err.clear();
+  m_last_out.clear();
+  m_last_err.clear();
   m_options = mle::OptionsMsg();
   m_options_bound = false;
 }
@@ -959,6 +1041,7 @@ std::optional<std::string> Session::eval(unsigned language,
   routine.language = language;
   routine.name = "mle_eval";
   routine.qualified_name = "mle_eval";
+  routine.definer_key = principal();  // the code is the caller's
   if (!has_global_privilege(m_thd, privilege_of(routine))) {
     my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), privilege_of(routine));
     return std::nullopt;
@@ -974,7 +1057,10 @@ std::optional<std::string> Session::eval(unsigned language,
   text.type_name = "LONGTEXT";
   m.returns = text;
 
-  const std::string who = principal();
+  // Called by a routine's SQL: the code is that routine's author's, and runs
+  // where that author's code runs (not in the worker of the account's own
+  // code, when the author is another account).
+  const std::string who = principal(m_running_routine);
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr || !prepare_in(who, *slot, routine)) {
     forget(routine);

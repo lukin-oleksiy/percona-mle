@@ -148,15 +148,25 @@ int apply_landlock(int abi, const ClassConfig &c, const std::string &leaf) {
   std::vector<std::string> hidden;
   for (const std::string &h : c.hidden_paths)
     if (const std::string r = real_path(h); !r.empty()) hidden.push_back(r);
+  // Fails closed (independent review C7): a path is allowed whole only
+  // when it is known to hold no hidden path. A symbolic link among the
+  // entries that leads to a directory holding one (back to an ancestor: a
+  // loop) is not followed, and neither is nesting beyond 32 levels: what
+  // is there stays unreadable rather than being allowed with the hidden
+  // path in it.
   std::function<void(const std::string &, uint64_t, int)> allow_hiding =
       [&](const std::string &path, uint64_t access, int depth) {
         const std::string r = real_path(path);
-        if (r.empty() || depth > 16) return allow(path, access);
+        if (r.empty()) return;  // nothing there (a dangling link)
         for (const std::string &h : hidden)
           if (r == h || below(r, h)) return;  // hidden itself
         bool contains = false;
         for (const std::string &h : hidden) contains = contains || below(h, r);
         if (!contains) return allow(r, access);
+        struct stat st;
+        if (depth > 32 ||
+            (depth > 0 && (lstat(path.c_str(), &st) != 0 || S_ISLNK(st.st_mode))))
+          return;
         DIR *d = opendir(r.c_str());
         if (d == nullptr) return;
         for (dirent *e = readdir(d); e != nullptr; e = readdir(d)) {

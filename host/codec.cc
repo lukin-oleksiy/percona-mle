@@ -273,9 +273,9 @@ bool is_valid_temporal(Tag tag, const Temporal &t) {
     case Tag::kTime: {
       if (t.year != 0 || t.month != 0 || t.day != 0 || !time_ok) return false;
       if (t.hour < wire::kMaxTimeHour) return true;
-      // 838:59:59.000000 is the largest TIME.
-      return t.hour == wire::kMaxTimeHour && t.minute == 59 && t.second == 59 &&
-             t.microsecond == 0;
+      // 838:59:59.000000 is the largest TIME: all of hour 838 up to it.
+      return t.hour == wire::kMaxTimeHour &&
+             !(t.minute == 59 && t.second == 59 && t.microsecond != 0);
     }
     default:
       return false;

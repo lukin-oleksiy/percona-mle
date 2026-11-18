@@ -65,7 +65,10 @@ namespace mle_component {
 
 class SqlRunner {
  public:
-  explicit SqlRunner(MYSQL_THD thd);
+  /** results_held: the bytes of results that the statements of the session's
+      calls in progress hold in the server (this call's and its callers':
+      one budget, mle.sql_call_results_max). */
+  SqlRunner(MYSQL_THD thd, size_t *results_held);
   ~SqlRunner();
   SqlRunner(const SqlRunner &) = delete;
   SqlRunner &operator=(const SqlRunner &) = delete;
@@ -102,6 +105,11 @@ class SqlRunner {
  private:
   struct Statement;
 
+  /** True (and the error in result) when the open statements other than
+      `except` hold mle.sql_call_results_max bytes of results already. */
+  bool over_budget(const Statement *except, mle::SqlResultMsg *result);
+  /** Statement s was executed: what its results hold now is counted. */
+  void count_results(Statement &s);
   void execute_text(const mle::SqlMsg &request, mle::SqlResultMsg *result);
   void prepare(const mle::SqlMsg &request, mle::SqlResultMsg *result);
   void execute_prepared(const mle::SqlMsg &request, mle::SqlResultMsg *result);
@@ -114,14 +122,17 @@ class SqlRunner {
              mle::SqlResultMsg *result);
   /** The next chunk of rows of the current result set (result: kind,
       columns and exec_us set): into the arena when it can, else as Values
-      in result; closes a drained statement run from text. */
-  void rows(uint64_t id, Statement &s, uint32_t max_rows,
+      in result; closes (destroys) a drained statement run from text.
+      first: the result set's first chunk: a buffered result's warnings are
+      final, they go with it (and with the last), so that the worker has
+      them before it reads all rows. */
+  void rows(uint64_t id, Statement &s, uint32_t max_rows, bool first,
             mle::SqlResultMsg *result);
   enum class Direct { kWritten, kError, kNotHere };
   /** The chunk straight into m_direct's arena. kNotHere (nothing taken
       from the statement but a row kept for the next chunk): the head or
       one row does not fit; kError: the server failed (read its error). */
-  Direct write_rows(uint64_t id, Statement &s, uint32_t max_rows,
+  Direct write_rows(uint64_t id, Statement &s, uint32_t max_rows, bool first,
                     mle::SqlResultMsg *result);
   /** Rows of the current result set into result (at most max_rows). */
   bool read_rows(Statement &s, uint32_t max_rows, mle::SqlResultMsg *result);
@@ -143,6 +154,7 @@ class SqlRunner {
   bool refused_here(mle::SqlResultMsg *result);
 
   MYSQL_THD m_thd;
+  size_t *m_results_held;
   /** The arena for the request being served (handle), or nullptr. */
   mle::DirectReply *m_direct = nullptr;
   std::map<uint64_t, std::unique_ptr<Statement>> m_statements;

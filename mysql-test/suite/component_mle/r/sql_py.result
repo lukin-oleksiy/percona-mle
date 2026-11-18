@@ -88,7 +88,7 @@ s: STRING: str 'héllo'
 b: BYTES: bytes b'\x00\xff'
 j: JSON: dict {'a': [1, 2]}
 dt: DATE: date datetime.date(2024, 1, 2)
-tm: TIME: timedelta datetime.timedelta(seconds=45296, microseconds=500000)
+tm: TIME: timedelta datetime.timedelta(days=-1, seconds=41103, microseconds=500000)
 ts: DATETIME: datetime datetime.datetime(2024, 1, 2, 3, 4, 5, 678000)
 vec: VECTOR: ndarray array([1. , 2.5], dtype=float32)
 nul: BYTES: ForeignNone None

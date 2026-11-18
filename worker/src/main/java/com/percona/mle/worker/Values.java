@@ -213,7 +213,7 @@ final class Values {
           w.u8(Wire.T_U64);
           w.u64(b.longValue());
         } else {
-          writeString(w, Wire.T_DECIMAL, b.toString());
+          writeString(w, Wire.T_DECIMAL, decimalText(new BigDecimal(b), "SQL"));
         }
       }
       case Double d -> {
@@ -224,7 +224,7 @@ final class Values {
         w.u8(Wire.T_F32);
         w.f32(f);
       }
-      case BigDecimal d -> writeString(w, Wire.T_DECIMAL, d.toPlainString());
+      case BigDecimal d -> writeString(w, Wire.T_DECIMAL, decimalText(d, "SQL"));
       case String s -> writeString(w, Wire.T_STRING, s);
       case MleJson j -> writeString(w, Wire.T_JSON, j.text());
       case byte[] b -> {
@@ -239,6 +239,30 @@ final class Values {
       case MemorySegment s -> writeVector(w, s);
       default -> throw new ConversionException("cannot pass a " + v.getClass().getName() + " to SQL");
     }
+  }
+
+  /** MySQL's DECIMAL limits: 65 digits, 30 of them after the point. */
+  private static final int DECIMAL_MAX_DIGITS = 65, DECIMAL_MAX_SCALE = 30;
+
+  /**
+   * d as DECIMAL text mysqld accepts (digits and a point, at most 100 characters: the host ends a
+   * worker that sends more, independent review C13). Digits after the 30th decimal place are rounded as
+   * MySQL rounds them; more than 65 digits before the point is an error. Nothing is expanded
+   * before it is known to be short ('1e2000000000' has a short BigDecimal and a huge plain text).
+   */
+  static String decimalText(BigDecimal d, String target) {
+    int scale = d.scale();
+    if (scale < 0 || scale > DECIMAL_MAX_SCALE || d.precision() > DECIMAL_MAX_DIGITS) {  // unusual
+      long integerDigits = (long) d.precision() - scale;
+      if (d.signum() == 0 || integerDigits < -DECIMAL_MAX_SCALE) return "0";
+      if (integerDigits > DECIMAL_MAX_DIGITS)
+        throw new ConversionException("value " + (d.precision() <= 40 ? d.toString() : "of " + integerDigits
+            + " digits") + " is out of range for " + (target.equals("SQL") ? "a DECIMAL parameter" : target));
+      if (scale > DECIMAL_MAX_SCALE) d = d.setScale(DECIMAL_MAX_SCALE, java.math.RoundingMode.HALF_UP);
+      if ((long) d.precision() - d.scale() > DECIMAL_MAX_DIGITS)  // rounded up to one digit more
+        throw new ConversionException("value is out of range for " + (target.equals("SQL") ? "a DECIMAL parameter" : target));
+    }
+    return d.toPlainString();
   }
 
   private static void i64(MessageWriter w, long v) {
@@ -290,7 +314,7 @@ final class Values {
         w.u8(Wire.T_F32);
         w.f32(toNumber(v, t).floatValue());
       }
-      case Wire.T_DECIMAL -> writeString(w, Wire.T_DECIMAL, toBigDecimal(v, t).toPlainString());
+      case Wire.T_DECIMAL -> writeString(w, Wire.T_DECIMAL, decimalText(toBigDecimal(v, t), t.sqlName()));
       case Wire.T_STRING -> {
         if (v instanceof byte[] || v instanceof float[]) throw cannot(v, t);
         writeString(w, Wire.T_STRING, String.valueOf(v));

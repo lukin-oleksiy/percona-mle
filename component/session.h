@@ -121,7 +121,12 @@ class Session {
 
   /** The account the current request runs as ('user'@'host', from the
       security context's contents on every call). */
-  std::string principal() const;
+  /** The worker's principal for the current security context; with a
+      routine whose code another account wrote (an INVOKER routine of
+      another definer), a principal of its own: code of different authors
+      never shares a worker, where it could change the language's shared
+      objects (JSON.parse, builtins, statics) under the other's code. */
+  std::string principal(const Routine *routine = nullptr) const;
   /** Releases the workers (kept for their principals if reuse) and forgets
       programs, console, stack trace, options. */
   void clear_state(bool reuse);
@@ -155,6 +160,11 @@ class Session {
       routine). A worker dropped by a nested request is kept here until the
       outermost one ends: outer requests still run in it. */
   size_t m_calls = 0;
+  /** The routine of the innermost call in progress (nullptr: none). */
+  const Routine *m_running_routine = nullptr;
+  /** The bytes of SQL results the calls in progress hold in the server
+      (SqlRunner; all nesting levels: one budget). */
+  size_t m_results_held = 0;
   std::vector<std::unique_ptr<mle::Worker>> m_retired;
 
   MYSQL_THD m_thd;
@@ -169,8 +179,21 @@ class Session {
   std::string m_err;
   /** Oracle's stack_trace: the frames of the last call's runtime error. */
   std::string m_stack;
-  /** The same error as a traceback in its language's form, with source lines (exp note 39). */
-  std::string m_traceback;
+  /** The same error, kept to show as a traceback in its language's form
+      (exp note 39). Its source lines are for those who may see the code:
+      decided for each reader (traceback_for, independent review C18). */
+  struct Trace {
+    mle::Error error;
+    std::string language;
+    /** The routine's name (its frames' file) and its code's author
+        (account_key(); empty: not known, e.g. while it is created). */
+    std::string routine;
+    std::string author;
+  };
+  std::optional<Trace> m_trace;
+  /** The traceback as the account of sctx may see it (nullptr: an unknown
+      reader, no source lines). */
+  std::string traceback_for(void *sctx) const;
   /** What the last call printed (mle_session_state('last_output')). */
   std::string m_last_out;
   std::string m_last_err;

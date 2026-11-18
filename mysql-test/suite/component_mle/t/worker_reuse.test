@@ -43,12 +43,12 @@ let $reuses = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_worker_reuses', Value
 let $more = `SELECT $reuses - $reuses0`;
 --echo reuses: $more
 
---echo # Another account does not get it (an INVOKER routine runs as u1).
+--echo # Another account does not get it: an INVOKER routine runs as u1, and,
+--echo # being root's code, in a worker of its own (independent review C3), not
+--echo # in the one for u1's own code (there is none yet).
 --connect (con3, localhost, u1,,test)
 SELECT js_inv(7);
-let $pid3 = `SELECT mle_debug_worker_pid()`;
-let $other = `SELECT $pid3 <> $pid2`;
---echo another process for u1: $other
+SELECT mle_debug_worker_pid() AS worker_for_own_code;
 --disconnect con3
 --disconnect con2
 --connection default

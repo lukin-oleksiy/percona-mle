@@ -18,6 +18,10 @@ CREATE FUNCTION py_mark(v TEXT) RETURNS TEXT SQL SECURITY INVOKER LANGUAGE PYTHO
     print('marked', v)
     return str(old)
 $$;
+CREATE FUNCTION py_fail() RETURNS TEXT SQL SECURITY INVOKER LANGUAGE PYTHON AS $$
+    print('root-printed')
+    raise ValueError('root-secret-error')
+$$;
 CREATE FUNCTION py_escape(pid INT, datafile TEXT, pluginfile TEXT) RETURNS TEXT LANGUAGE PYTHON AS $$
     import ctypes
     libc = ctypes.CDLL(None, use_errno=True)
@@ -87,7 +91,14 @@ SELECT py_mark('two') AS after_reset;
 --echo # A2/D2/D10: COM_CHANGE_USER: the new account gets its own worker and
 --echo # none of the old account's session state.
 SELECT py_mark('root-secret') AS root_marks;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_fail();
+SELECT mle_session_state('traceback') LIKE '%root-secret-error%' AS root_traceback,
+       mle_session_state('last_output') LIKE '%root-printed%' AS root_last_output;
 --change_user u2,,test
+--echo # independent review C1: nor the last call's traceback and output.
+SELECT mle_session_state('traceback') AS traceback_after_change_user,
+       mle_session_state('last_output') AS last_output_after_change_user;
 SELECT CURRENT_USER(), py_mark('u2') AS seen_by_u2;
 SELECT mle_session_state('stdout') AS console_after_change_user;
 --disconnect con1
@@ -169,6 +180,7 @@ SHOW WARNINGS;
 DROP PROCEDURE js_reset;
 DROP PROCEDURE js_throw;
 DROP FUNCTION py_mark;
+DROP FUNCTION py_fail;
 DROP FUNCTION py_escape;
 DROP FUNCTION js_using;
 DROP PROCEDURE js_outer;

@@ -66,11 +66,102 @@ final class LibraryFileSystem implements FileSystem {
   /** mysqld's answer to a LIBRARY request. */
   record Reply(int status, String language, String body, long hash, String message) {}
 
-  /** A library body the worker has; checked: the validation epoch it was last confirmed in. */
-  record Library(String language, byte[] body, long hash, long checked) {
+  /**
+   * A library body the worker has; checked: the validation epoch it was last confirmed in.
+   * generation and loadset: see {@link #generation}.
+   */
+  record Library(String language, byte[] body, long hash, long checked, long generation,
+      Map<String, Long> loadset) {
     Library confirmed(long epoch) {
-      return checked == epoch ? this : new Library(language, body, hash, epoch);
+      return checked == epoch ? this : new Library(language, body, hash, epoch, generation, loadset);
     }
+
+    /**
+     * What the caches of evaluated libraries go by (the module's path, the namespaces kept by
+     * Polyglot and PySql): the body's hash, and another value in every generation.
+     */
+    long stamp() {
+      return generation == 0 ? hash : hash ^ (generation * 0x9E3779B97F4A7C15L);
+    }
+  }
+
+  /**
+   * An evaluated library is kept (the language's module map, the namespaces): its imports of other
+   * libraries are bound to the modules they were then, and were confirmed with mysqld for the
+   * routine that ran then. Later calls confirm the library itself, and would never ask about what
+   * it imported: a changed or dropped library would stay behind an unchanged importer, and a
+   * routine would get, through an importer evaluated for another routine, a library mysqld
+   * refuses it (independent review C17).
+   *
+   * <p>So each library has a loadset: every library (with its hash) fetched in the top-level
+   * request that first evaluated it, from then on, and the loadsets of those: at least what it
+   * imports, directly or not. When a library is confirmed for a routine (once per epoch and
+   * routine, where mysqld is asked anyway), so is each member of its loadset, for the same
+   * routine. If one is refused or has changed, a new generation starts: every library gets a new
+   * stamp at its next use, so it is evaluated again, its imports are resolved and confirmed again
+   * (a refusal is then the import's error), and its loadset is collected again. Calls that change
+   * nothing pay nothing: no request to mysqld, no new evaluation.
+   */
+  private static long generation;
+  /** The loadsets still collecting: of libraries first evaluated in the running top-level request. */
+  private static final java.util.List<Map<String, Long>> open = new java.util.ArrayList<>();
+
+  /** A top-level request starts: the libraries evaluated in the last one have their loadsets. */
+  static void requestStart() {
+    if (!open.isEmpty()) open.clear();
+  }
+
+  /** Library l (key) is used: it belongs to the loadsets being collected, with its own. */
+  private static void touch(String key, Library l) {
+    for (Map<String, Long> s : open) {
+      if (s == l.loadset()) continue;
+      s.put(key, l.hash());
+      s.putAll(l.loadset());
+    }
+  }
+
+  /** l as a library of the current generation, to be evaluated again: a new stamp and loadset. */
+  private static Library renewed(String key, Library l) {
+    Library n = new Library(l.language(), l.body(), l.hash(), l.checked(), generation, new HashMap<>());
+    libraries.put(key, n);
+    touch(key, n);
+    open.add(n.loadset());
+    return n;
+  }
+
+  /** The libraries evaluated with l are confirmed for the running routine, or a generation starts. */
+  private static void confirmLoadset(Library l) {
+    for (Map.Entry<String, Long> e : java.util.List.copyOf(l.loadset().entrySet())) {
+      int slash = e.getKey().indexOf('/');
+      try {
+        if (fetch(e.getKey().substring(0, slash), e.getKey().substring(slash + 1)).hash() == e.getValue())
+          continue;
+      } catch (IOException refused) {
+        return;  // dropped, or not for this routine: fetch started a generation
+      }
+      newGeneration();
+      return;
+    }
+  }
+
+  /**
+   * What was evaluated is not to be used as it is. The confirmations go too: a routine confirmed
+   * for a library has had that library's loadset confirmed, and the loadsets are collected anew.
+   */
+  private static void newGeneration() {
+    generation++;
+    confirmed.clear();
+  }
+
+  /**
+   * Library schema/name is about to be evaluated (again, after an evaluation that failed): what it
+   * imports from here on belongs to its loadset.
+   */
+  static void evaluating(String schema, String name) {
+    Library l = libraries.get(schema + "/" + name);
+    if (l == null) return;
+    for (Map<String, Long> s : open) if (s == l.loadset()) return;
+    open.add(l.loadset());
   }
 
   /**
@@ -116,7 +207,11 @@ final class LibraryFileSystem implements FileSystem {
     String key = schema + "/" + name;
     Library known = libraries.get(key);
     String confirmation = (d == null ? 0 : d.routine()) + ":" + key;
-    if (known != null && known.checked() == epoch && confirmed.contains(confirmation)) return known;
+    if (known != null && known.checked() == epoch && confirmed.contains(confirmation)) {
+      if (known.generation() != generation) return renewed(key, known);
+      if (!open.isEmpty()) touch(key, known);
+      return known;
+    }
     if (d == null) throw new NoSuchFileException("/" + key, null, "no database libraries here");
     Reply r = d.libraryRequest(schema, name, known == null ? 0 : known.hash());
     switch (r.status()) {
@@ -124,16 +219,30 @@ final class LibraryFileSystem implements FileSystem {
         Library l = known.confirmed(epoch);
         libraries.put(key, l);
         confirmed.add(confirmation);
-        return l;
+        if (l.generation() == generation) {
+          touch(key, l);
+          confirmLoadset(l);
+        }
+        return l.generation() != generation ? renewed(key, l) : l;
       }
       case Wire.LIBRARY_BODY -> {
-        Library l = new Library(r.language(), r.body().getBytes(StandardCharsets.UTF_8), r.hash(), epoch);
+        Library l = new Library(r.language(), r.body().getBytes(StandardCharsets.UTF_8), r.hash(), epoch,
+            generation, new HashMap<>());
         libraries.put(key, l);
+        // A changed body: routines confirmed for the old one have its loadset to confirm.
+        if (known != null) confirmed.clear();
         confirmed.add(confirmation);
+        touch(key, l);
+        open.add(l.loadset());  // a new body: evaluated from here on
         return l;
       }
       default -> {
         libraries.remove(key);
+        // A library this worker had (evaluated ones may be bound to it, or were evaluated for
+        // another routine), or one refused while others are being evaluated (their evaluation
+        // fails): everything is evaluated again at its next use. Not for a library never seen
+        // (a routine that tries an optional import in every call changes nothing).
+        if (known != null || !open.isEmpty()) newGeneration();
         throw new NoSuchFileException("/" + key, null, r.message());
       }
     }
@@ -235,7 +344,7 @@ final class LibraryFileSystem implements FileSystem {
     Matcher m = virtualOf(path);
     if (m == null) return delegate.toRealPath(path, options);
     Library l = body(path);
-    return Path.of(ROOT, m.group(1), m.group(2) + "." + Long.toHexString(l.hash()) + ".mjs");
+    return Path.of(ROOT, m.group(1), m.group(2) + "." + Long.toHexString(l.stamp()) + ".mjs");
   }
 
   @Override

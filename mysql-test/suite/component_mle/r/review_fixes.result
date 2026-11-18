@@ -26,6 +26,17 @@ None
 SELECT py_mark('root-secret') AS root_marks;
 root_marks
 two
+SELECT py_fail();
+ERROR HY000: Python> ValueError: root-secret-error (py_fail, line 3)
+SELECT mle_session_state('traceback') LIKE '%root-secret-error%' AS root_traceback,
+mle_session_state('last_output') LIKE '%root-printed%' AS root_last_output;
+root_traceback	root_last_output
+1	1
+# independent review C1: nor the last call's traceback and output.
+SELECT mle_session_state('traceback') AS traceback_after_change_user,
+mle_session_state('last_output') AS last_output_after_change_user;
+traceback_after_change_user	last_output_after_change_user
+	
 SELECT CURRENT_USER(), py_mark('u2') AS seen_by_u2;
 CURRENT_USER()	seen_by_u2
 u2@localhost	None
@@ -107,6 +118,7 @@ Error	1644	it's a \back\slash 'quoted'
 DROP PROCEDURE js_reset;
 DROP PROCEDURE js_throw;
 DROP FUNCTION py_mark;
+DROP FUNCTION py_fail;
 DROP FUNCTION py_escape;
 DROP FUNCTION js_using;
 DROP PROCEDURE js_outer;

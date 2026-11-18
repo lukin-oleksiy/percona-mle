@@ -537,6 +537,9 @@ Routine *Routine::create(stored_program_handle sp) {
   r->name = get_string("sp_name");
   r->qualified_name = get_string("qualified_name");
   r->schema = get_string("database_name");
+  // Known once the host is: an anonymous definer has an empty user name.
+  if (const std::string host = get_string("sp_definer_host"); !host.empty())
+    r->definer_key = account_key(get_string("sp_definer_user"), host);
   for (uint32_t i = 0; i < n; i++) {
     ParamInfo p;
     const char *name = nullptr;

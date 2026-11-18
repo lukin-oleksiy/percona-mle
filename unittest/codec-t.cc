@@ -108,6 +108,10 @@ std::vector<Value> all_kinds_of_values() {
                       datetime(9999, 12, 31, 23, 59, 59, 999999)),
       Value::temporal(Tag::kTimestamp, datetime(1970, 1, 1, 0, 0, 1, 0)),
       Value::temporal(Tag::kTime, time_of(true, 838, 59, 59, 0)),
+      // All of hour 838 is in TIME's range (independent review C9).
+      Value::temporal(Tag::kTime, time_of(false, 838, 0, 0, 0)),
+      Value::temporal(Tag::kTime, time_of(true, 838, 30, 0, 123456)),
+      Value::temporal(Tag::kTime, time_of(false, 838, 59, 58, 999999)),
       Value::temporal(Tag::kTime, time_of(false, 0, 0, 0, 1)),
       Value::json(R"({"a":[1,2,{"b":null}],"c":"é"})"),
       Value::vector({}),

@@ -343,13 +343,25 @@ bool LauncherChannel::request(Msg type, uint64_t id, const std::string &body,
     }
     if (handle_async(*reply, *fds)) continue;
     Reader r(*reply);
-    uint8_t got;
+    uint8_t got = 0;
     uint64_t got_id = 0;
-    if (r.u8(&got) && got == static_cast<uint8_t>(reply_type) &&
-        (type == Msg::kConfig || (r.u64(&got_id) && got_id == id)))
+    const bool has_id =
+        r.u8(&got) && (got == static_cast<uint8_t>(Msg::kWorker) ||
+                       got == static_cast<uint8_t>(Msg::kStatsReply)) &&
+        r.u64(&got_id);
+    if (got == static_cast<uint8_t>(reply_type) &&
+        (type == Msg::kConfig || (has_id && got_id == id)))
       return true;
+    // The answer to a request that timed out earlier (ids only grow): drop
+    // it and keep waiting for ours, or every later request would read its
+    // predecessor's answer (independent review C19). A worker nobody waits for any
+    // more is ended through its pidfd (the last of its three descriptors).
+    const bool stale = type != Msg::kConfig && has_id && got_id < id;
+    if (stale && got == static_cast<uint8_t>(Msg::kWorker) && fds->size() == 3)
+      (void)pidfd_kill(fds->back());
     close_all(*fds);
     fds->clear();
+    if (stale) continue;
     *error = "unexpected message from the launcher";
     return false;
   }

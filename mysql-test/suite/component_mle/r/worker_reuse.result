@@ -30,11 +30,15 @@ js_add(2, 3)	py_leftover('two')
 5	found one
 same worker process: 1
 reuses: 1
-# Another account does not get it (an INVOKER routine runs as u1).
+# Another account does not get it: an INVOKER routine runs as u1, and,
+# being root's code, in a worker of its own (independent review C3), not
+# in the one for u1's own code (there is none yet).
 SELECT js_inv(7);
 js_inv(7)
 7
-another process for u1: 1
+SELECT mle_debug_worker_pid() AS worker_for_own_code;
+worker_for_own_code
+NULL
 # Back to back: once the ended session's worker no longer counts as held
 # (mle_workers), it is kept or still being reset, and the next session
 # waits for it rather than starting a new, cold one (exp note 34).

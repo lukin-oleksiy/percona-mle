@@ -1,0 +1,256 @@
+--echo #
+--echo # component_mle: regressions for the independent multi-model review
+--echo # (exp note 60), isolation: C3 (another account's code gets a worker of
+--echo # its own), C17 (libraries behind a kept library), C18 (source lines in
+--echo # tracebacks only for those who may see the code).
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE DATABASE s1;
+CREATE DATABASE s2;
+CREATE DATABASE s3;
+CREATE USER author@localhost, caller@localhost;
+GRANT CREATE ROUTINE, EXECUTE ON test.* TO author@localhost;
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO author@localhost;
+GRANT EXECUTE ON test.* TO caller@localhost;
+GRANT EXECUTE ON s2.* TO caller@localhost;
+GRANT EXECUTE ON s3.* TO caller@localhost;
+--echo # (The default connection stays without an MLE session, for UNINSTALL.)
+--connect (setup, localhost, root,,test)
+
+--echo #
+--echo # C3. An SQL SECURITY INVOKER routine runs with its caller's privileges,
+--echo # but not in the worker of the caller's own code: what it changes in the
+--echo # language (JSON.parse, Python's builtins) stays with its author's code.
+--echo #
+--connect (con_author, localhost, author,,test)
+CREATE FUNCTION evil_js(x INT) RETURNS INT SQL SECURITY INVOKER LANGUAGE JAVASCRIPT AS $$
+  JSON.parse = () => ({ hacked: true })
+  Array.prototype.join = () => 'hacked'
+  return x
+$$;
+CREATE FUNCTION evil_py(x INT) RETURNS INT SQL SECURITY INVOKER LANGUAGE PYTHON AS $$
+    import builtins
+    builtins.len = lambda v: 666
+    return x
+$$;
+CREATE PROCEDURE evil_eval() SQL SECURITY INVOKER LANGUAGE JAVASCRIPT AS $$
+  session.runSql("SELECT mle_eval('javascript', 'String.prototype.trim = () => \"hacked\"; 1')")
+$$;
+CREATE FUNCTION author_sees() RETURNS VARCHAR(100) SQL SECURITY INVOKER LANGUAGE JAVASCRIPT AS $$
+  return JSON.stringify(JSON.parse('{"a":1}'))
+$$;
+CREATE FUNCTION author_definer() RETURNS VARCHAR(100) LANGUAGE JAVASCRIPT AS $$
+  return JSON.stringify(JSON.parse('{"a":1}'))
+$$;
+--disconnect con_author
+--connect (con1, localhost, root,,test)
+CREATE FUNCTION own_js(j JSON) RETURNS VARCHAR(100) LANGUAGE JAVASCRIPT AS $$
+  return [JSON.stringify(j), JSON.stringify(JSON.parse('{"a":1}')), [1, 2].join('-')].join(' ')
+$$;
+CREATE FUNCTION own_py() RETURNS INT LANGUAGE PYTHON AS $$ return len('abc') $$;
+SELECT own_js('{"k": 2}') AS before_js, own_py() AS before_py;
+let $pid1 = `SELECT mle_debug_worker_pid()`;
+SELECT evil_js(1), evil_py(2);
+--echo # What the author's code evaluates with mle_eval() (as the caller, who
+--echo # may) is the author's code too.
+CALL evil_eval();
+SELECT mle_eval('javascript', '" x ".trim()') AS own_eval;
+--echo # The caller's own code is not affected, in this session ...
+SELECT own_js('{"k": 2}') AS after_js, own_py() AS after_py;
+--echo # ... while the author's code keeps what it did (its worker for this caller).
+SELECT author_sees() AS in_the_authors_worker;
+--echo # A DEFINER routine of the author runs as the author: not there either.
+SELECT author_definer() AS as_the_author;
+let $pid2 = `SELECT mle_debug_worker_pid()`;
+let $same = `SELECT $pid1 = $pid2`;
+--echo the caller's own worker is the same process: $same
+--disconnect con1
+--connection setup
+--echo # Both workers of root's session are kept: its own, and the one that ran
+--echo # the author's code for it; the author's own (author_definer) too.
+let $wait_condition = SELECT VARIABLE_VALUE = 3 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+--source include/wait_condition.inc
+--echo # ... and not in a later session that gets the kept workers.
+--connect (con2, localhost, root,,test)
+SELECT own_js('{"k": 3}') AS later_js, own_py() AS later_py;
+let $pid3 = `SELECT mle_debug_worker_pid()`;
+let $same = `SELECT $pid1 = $pid3`;
+--echo the kept worker was reused: $same
+SELECT author_sees() AS kept_authors_worker;
+--disconnect con2
+--connection setup
+let $wait_condition = SELECT VARIABLE_VALUE = 3 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+--source include/wait_condition.inc
+
+--echo #
+--echo # C18. A traceback shows source lines to those who may see the code:
+--echo # the routine's definer and holders of SHOW_ROUTINE; others get the
+--echo # frames only, in mle_session_state('traceback') and in the warnings.
+--echo #
+CREATE LIBRARY test.seclib LANGUAGE JAVASCRIPT AS $$
+  export function boom(v) { return v.missing.field /* library-secret */ }
+$$;
+CREATE FUNCTION js_secret(v INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+  function helper(v) { return v.missing.field /* routine-secret */ }
+  return helper(v)
+$$;
+CREATE FUNCTION js_lib_secret() RETURNS INT LANGUAGE JAVASCRIPT USING (test.seclib AS l) AS $$
+  return l.boom(null)
+$$;
+--write_file $MYSQLTEST_VARDIR/tmp/review_isolation_1.sql
+CREATE FUNCTION py_secret(v INT) RETURNS INT LANGUAGE PYTHON AS $$
+    def helper(v):
+        return 10 // v  # python-secret
+    return helper(v)
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review_isolation_1.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_isolation_1.sql
+--connect (con_author, localhost, author,,test)
+CREATE FUNCTION author_fails(v INT) RETURNS INT SQL SECURITY INVOKER LANGUAGE JAVASCRIPT AS $$
+  return v.missing.field /* author-secret */
+$$;
+--disconnect con_author
+
+--echo # root (SHOW_ROUTINE): everything.
+--connect (con1, localhost, root,,test)
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_secret(1);
+SELECT mle_session_state('traceback') AS traceback;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_lib_secret();
+SELECT mle_session_state('traceback') AS traceback;
+--disconnect con1
+
+--echo # An account with EXECUTE only: the frames, no source lines.
+--connect (con3, localhost, caller,,test)
+SET SESSION mle.console = WARNINGS;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_secret(1);
+SHOW WARNINGS;
+SELECT mle_session_state('traceback') AS traceback;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_secret(0);
+SELECT mle_session_state('traceback') AS traceback;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_lib_secret();
+SELECT mle_session_state('traceback') AS traceback;
+--echo # An INVOKER routine of another account: not its code either.
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT author_fails(1);
+SELECT mle_session_state('traceback') LIKE '%author-secret%' AS any_text;
+--disconnect con3
+
+--echo # The definer sees its own routine's lines, without SHOW_ROUTINE (and
+--echo # in the warnings).
+--connect (con_author, localhost, author,,test)
+SET SESSION mle.console = WARNINGS;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT author_fails(1);
+SHOW WARNINGS;
+SELECT mle_session_state('traceback') LIKE '%author-secret%' AS own_text;
+--disconnect con_author
+--connection setup
+
+--echo #
+--echo # C17. A library imported by a kept library: a changed or dropped one
+--echo # is not used any more, and one that mysqld refuses the routine is
+--echo # not reachable through an importer another routine evaluated.
+--echo #
+CREATE LIBRARY s1.inner_lib LANGUAGE JAVASCRIPT AS $$ export const x = 1 $$;
+CREATE LIBRARY s1.outer_lib LANGUAGE JAVASCRIPT AS $$
+  import { x } from '/s1/inner_lib'
+  export function get() { return x }
+$$;
+CREATE FUNCTION s1.f() RETURNS INT LANGUAGE JAVASCRIPT USING (s1.outer_lib AS o) AS $$ return o.get() $$;
+--write_file $MYSQLTEST_VARDIR/tmp/review_isolation_2.sql
+CREATE LIBRARY s1.py_inner LANGUAGE PYTHON AS $$
+x = 1
+$$;
+CREATE LIBRARY s1.py_outer LANGUAGE PYTHON AS $$
+inner = import_library('/s1/py_inner')
+def get():
+    return inner.x
+$$;
+CREATE FUNCTION s1.pf() RETURNS INT LANGUAGE PYTHON USING (s1.py_outer AS o) AS $$ return o.get() $$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/review_isolation_2.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_isolation_2.sql
+--connect (con1, localhost, root,,test)
+SELECT s1.f(), s1.pf();
+DROP LIBRARY s1.inner_lib;
+CREATE LIBRARY s1.inner_lib LANGUAGE JAVASCRIPT AS $$ export const x = 2 $$;
+DROP LIBRARY s1.py_inner;
+CREATE LIBRARY s1.py_inner LANGUAGE PYTHON AS $$
+x = 2
+$$;
+SELECT s1.f() AS changed_js, s1.pf() AS changed_py;
+SELECT s1.f() AS again_js, s1.pf() AS again_py;
+DROP LIBRARY s1.inner_lib;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT s1.f() AS dropped;
+CREATE LIBRARY s1.inner_lib LANGUAGE JAVASCRIPT AS $$ export const x = 3 $$;
+SELECT s1.f() AS created_again;
+--disconnect con1
+--connection setup
+let $wait_condition = SELECT VARIABLE_VALUE >= 1 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+--source include/wait_condition.inc
+DROP LIBRARY s1.inner_lib;
+CREATE LIBRARY s1.inner_lib LANGUAGE JAVASCRIPT AS $$ export const x = 4 $$;
+--connect (con1, localhost, root,,test)
+SELECT s1.f() AS changed_between_sessions;
+
+--echo # s2.r1 may import s2.secret (its schema's) through s1.bridge; s3.r2
+--echo # may not, also after s2.r1 evaluated the bridge in the same worker.
+CREATE LIBRARY s2.secret LANGUAGE JAVASCRIPT AS $$ export const value = 'of s2' $$;
+CREATE LIBRARY s1.bridge LANGUAGE JAVASCRIPT AS $$
+  import { value } from '/s2/secret'
+  export function get() { return value }
+$$;
+CREATE FUNCTION s2.r1() RETURNS VARCHAR(20) LANGUAGE JAVASCRIPT USING (s1.bridge AS b) AS $$ return b.get() $$;
+CREATE FUNCTION s3.r2() RETURNS VARCHAR(20) LANGUAGE JAVASCRIPT USING (s1.bridge AS b) AS $$ return b.get() $$;
+SELECT s2.r1();
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT s3.r2();
+SELECT s2.r1() AS still_works;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT s3.r2();
+--disconnect con1
+--connection setup
+
+--echo # C3: DROP USER of the author ends the kept workers that ran its code.
+let $cached = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_workers_cached', Value, 1);
+DROP USER author@localhost;
+let $now = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_workers_cached', Value, 1);
+let $fewer = `SELECT $now < $cached`;
+--echo fewer kept workers: $fewer
+
+DROP FUNCTION s1.f;
+DROP FUNCTION s1.pf;
+DROP FUNCTION s2.r1;
+DROP FUNCTION s3.r2;
+DROP DATABASE s1;
+DROP DATABASE s2;
+DROP DATABASE s3;
+DROP LIBRARY test.seclib;
+DROP FUNCTION evil_js;
+DROP FUNCTION evil_py;
+DROP PROCEDURE evil_eval;
+DROP FUNCTION author_sees;
+DROP FUNCTION author_definer;
+DROP FUNCTION author_fails;
+DROP FUNCTION own_js;
+DROP FUNCTION own_py;
+DROP FUNCTION js_secret;
+DROP FUNCTION js_lib_secret;
+DROP FUNCTION py_secret;
+DROP USER caller@localhost;
+--disconnect setup
+--connection default
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

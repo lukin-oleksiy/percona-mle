@@ -44,6 +44,10 @@ warns at startup that this variable is deprecated. The clients in the container 
 
 The package volume is read-only in the server container.
 
+`compose.yaml` is for development: its default passwords (root `mle`, app `app`) are well known, so it publishes the
+port on 127.0.0.1 only. To reach the server from other hosts, set `MYSQL_ROOT_PASSWORD` and `MLE_APP_PASSWORD`
+and then `MLE_BIND=0.0.0.0`.
+
 ## Requirements
 
 Linux host with Landlock ABI ≥ 6 (kernel 6.12+; tested on 7.0), cgroup v2, Docker 24+ (tested 29.4, rootless).

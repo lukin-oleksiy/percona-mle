@@ -105,10 +105,11 @@ public final class SqlResult implements Iterable<Row> {
   private long received;
 
   /**
-   * A statement run from text without parameters: mysqld buffered its whole result and sends it
-   * in chunks. The rest is fetched when the routine reads it, or drained into the worker before
-   * the routine runs another statement (exp note 44 step 3), so mysqld holds at most one buffered
-   * result (12 §11).
+   * A statement run from text, with or without parameters (not a prepared one): when mysqld
+   * buffered its whole result (it then says how many rows: total > 0; a cursor's result is not
+   * buffered and not drained) it sends it in chunks. The rest is fetched when the routine reads
+   * it, or drained into the worker before the routine runs another statement (exp note 44 step 3),
+   * so mysqld holds at most one such result (12 §11; with parameters too: independent review C14).
    */
   private final boolean direct;
 
@@ -139,7 +140,7 @@ public final class SqlResult implements Iterable<Row> {
     warnings = warnings(r);
     total = r.totalRows();
     received = rows.size();
-    if (direct && moreRows) com.percona.mle.worker.SqlBridge.deferDrain(id, this::drain);
+    if (direct && moreRows && total > 0) com.percona.mle.worker.SqlBridge.deferDrain(id, this::drain);
   }
 
   /** Another statement is about to run: the unread rows into the worker (see direct). */

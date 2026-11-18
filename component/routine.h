@@ -87,6 +87,10 @@ struct Routine {
   std::string qualified_name;
   /** The routine's schema (libraries of this schema may be imported). */
   std::string schema;
+  /** The account that wrote the code (the DEFINER), as account_key();
+      empty while the routine is created (the author is the current
+      account then) and on a server that does not tell. */
+  std::string definer_key;
   std::vector<ParamInfo> params;
   std::optional<ParamInfo> ret;
   /** PREPARE for the workers (body form: empty entry). */

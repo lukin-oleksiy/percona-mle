@@ -108,6 +108,13 @@ bool console_warnings(MYSQL_THD thd);
 uint32_t max_workers();
 /** An account as 'user'@'host' (quotes doubled): the key of workers. */
 std::string account_key(std::string_view user, std::string_view host);
+/** In a worker's principal, between the account it runs for and the other
+    account whose code it runs (an SQL SECURITY INVOKER routine of another
+    definer: independent review C3). */
+inline constexpr std::string_view kCodeOf = " running code of ";
+/** Whether the principal is the account's: runs for it or runs its code. */
+bool principal_has_account(std::string_view principal,
+                           std::string_view account);
 /** mysqld's plugin_dir and datadir: never readable by workers (keyring
     component configuration, data files). */
 std::vector<std::string> server_private_paths();
@@ -125,6 +132,8 @@ int interrupt_grace_ms();
 size_t sql_result_max();
 size_t sql_row_max();
 size_t sql_statements_max();
+/** mle.sql_call_results_max (0: four times mle.sql_result_max). */
+size_t sql_call_results_max();
 uint32_t sql_chunk_rows();
 
 /* status.cc: the mle_* status variables. */

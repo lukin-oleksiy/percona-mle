@@ -32,6 +32,8 @@ final class Wire {
   static final long HEADER_SIZE = 4096;
   static final int MAX_VECTOR_DIMENSIONS = 16383;
   static final int MAX_TIME_HOUR = 838;
+  /** The values of one list in a message (kMaxValues in protocol.h). */
+  static final int MAX_VALUES = 65535;
   static final int MAX_STACK_FRAMES = 1000;
   static final int VECTOR_ALIGNMENT = 16;
   /** Largest message the host accepts from the worker (protocol.h kMaxWorkerMessage). */

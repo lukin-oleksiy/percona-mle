@@ -59,6 +59,9 @@ public final class SqlBridge {
     return dispatcher().sqlRequest(6, id, null, params, 0, 0, Dispatcher.RAW, null, rowWidth);
   }
 
+  /** The values one SQL message may carry. */
+  public static final int MAX_VALUES = Wire.MAX_VALUES;
+
   /** The running routine's schema (the current database while it runs), or null. */
   public static String routineSchema() {
     Dispatcher d = dispatcher;
@@ -86,11 +89,14 @@ public final class SqlBridge {
     return dispatcher().callSeq();
   }
 
-  /** The running routine call: its top-level call and its nesting depth (a nested routine's
-      session options are its own). */
+  /** The running routine call (a nested routine's session options are its own): unique per call. */
   public static long callScope() {
-    Dispatcher d = dispatcher();
-    return d.callSeq() * 256 + d.depth();
+    return dispatcher().callScope();
+  }
+
+  /** The running routine call's nesting depth (0: called from the client's statement). */
+  public static int callDepth() {
+    return dispatcher().depth();
   }
 
   /** Whether the running call was killed. */

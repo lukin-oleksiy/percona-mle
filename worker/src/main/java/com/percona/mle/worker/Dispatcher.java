@@ -47,6 +47,9 @@ final class Dispatcher {
   private final int maxDepth;
   private int depth;
   private long seq;
+  /** The request being handled, unique in this worker (nested ones have their own): callScope(). */
+  private long scope;
+  private long scopes;
   private boolean tainted;
   /** RESET asked for a GC (memory back before the worker waits); run when idle, not on the way. */
   private boolean gcWhenIdle;
@@ -140,10 +143,13 @@ final class Dispatcher {
   private void handle(Mailbox.Message m) {
     int savedDepth = depth;
     long savedSeq = seq;
+    long savedScope = scope;
+    scope = ++scopes;
     depth = m.depth();
     if (depth == 0) {
       seq = m.callSeq();
       FrameLimit.reset();
+      LibraryFileSystem.requestStart();
     }
     try {
       switch (m.op()) {
@@ -177,6 +183,7 @@ final class Dispatcher {
     } finally {
       depth = savedDepth;
       seq = savedSeq;
+      scope = savedScope;
     }
   }
 
@@ -615,6 +622,10 @@ final class Dispatcher {
       int form, RowSink sink, int rowWidth) {
     if (Thread.currentThread() != thread)
       throw new IllegalStateException("SQL must be run on the routine's thread");
+    // More values than the host accepts in one message would end the worker (independent review C10).
+    if (params != null && params.length > Wire.MAX_VALUES)
+      throw new MleSqlException(1210, "HY000", "Incorrect arguments: " + params.length
+          + " values in one statement (at most " + Wire.MAX_VALUES + ")");
     drainDeferred(id);
     try {
       w.reset();
@@ -693,6 +704,11 @@ final class Dispatcher {
   /** The mailbox arena's size: a batch is sent in messages that fit it (exp note 51). */
   int arenaSize() {
     return mb.arenaSize;
+  }
+
+  /** The routine call being handled: no two calls share it, nested and sibling ones included. */
+  long callScope() {
+    return scope;
   }
 
   /** The top-level call's sequence number (per-call state of the SQL API). */

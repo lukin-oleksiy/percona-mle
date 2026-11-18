@@ -625,8 +625,10 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
   // Under g_mutex: whether the account was dropped or renamed since the
   // session began.
   const auto forgotten = [&principal, mark] {
-    const auto f = g_forgotten_at.find(principal);
-    return f != g_forgotten_at.end() && f->second > mark;
+    // Either account of the principal: whose worker it is, whose code ran.
+    for (const auto &[account, at] : g_forgotten_at)
+      if (at > mark && principal_has_account(principal, account)) return true;
+    return false;
   };
   {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -719,7 +721,7 @@ void engine_forget_account(const std::string &principal) {
     g_forgotten_at[principal] = ++g_forgets;
     prune_forgotten_locked();
     for (auto it = g_cache.begin(); it != g_cache.end();) {
-      if (it->principal == principal) {
+      if (principal_has_account(it->principal, principal)) {
         gone.push_back(std::move(it->worker));
         it = g_cache.erase(it);
       } else {

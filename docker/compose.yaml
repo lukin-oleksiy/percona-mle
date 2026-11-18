@@ -1,4 +1,7 @@
 # Percona Server + MLE for development (19-docker.md).
+# The passwords below are development defaults: the port is published on
+# 127.0.0.1 only. To publish it elsewhere, set real passwords first
+# (MYSQL_ROOT_PASSWORD, MLE_APP_PASSWORD) and MLE_BIND (e.g. 0.0.0.0).
 #   docker compose up -d                      # the server
 #   docker compose run --rm tools install python networkx
 #   docker compose exec mysql mysql -uroot -p -e "SELECT mle_packages_refresh()"
@@ -11,7 +14,7 @@ services:
       MLE_APP_USER: ${MLE_APP_USER:-app}
       MLE_APP_PASSWORD: ${MLE_APP_PASSWORD:-app}
     ports:
-      - "${MLE_PORT:-3306}:3306"
+      - "${MLE_BIND:-127.0.0.1}:${MLE_PORT:-3306}:3306"
     volumes:
       - mysql-data:/var/lib/mysql
       - mle-packages:/var/lib/mysql-mle-packages:ro

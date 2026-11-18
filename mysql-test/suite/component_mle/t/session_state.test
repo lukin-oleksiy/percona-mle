@@ -73,6 +73,19 @@ CALL py_print();
 CALL java_print();
 SELECT mle_session_state('stdout') AS stdout;
 
+--echo # mle_session_reset() also forgets the last call's traceback and output
+--echo # (independent review C1).
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CALL pc2();
+SELECT mle_session_state('traceback') <> '' AS traceback_before,
+  mle_session_state('last_output') <> '' AS last_output_before;
+SELECT mle_session_reset();
+SELECT mle_session_state('traceback') = '' AS traceback_reset,
+  mle_session_state('last_output') = '' AS last_output_reset;
+CALL pc1();
+SELECT mle_session_reset('output');
+SELECT mle_session_state('last_output') = '' AS last_output_reset_by_output;
+
 --echo # Options can be set only without cached programs (Oracle: 1123).
 --error ER_CANT_INITIALIZE_UDF
 SELECT mle_set_session_state('{"integer_type": "BIGINT"}');

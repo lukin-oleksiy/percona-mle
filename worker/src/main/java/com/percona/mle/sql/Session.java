@@ -42,8 +42,18 @@ public final class Session {
   static final int TO_CLIENT = 1;
 
   private final ValueMapper mapper;
-  private SqlOptions callOptions;
-  private long callOptionsSeq = -1;
+  /**
+   * The session options of the routine calls in progress, by nesting depth, each with the call it
+   * belongs to (SqlBridge.callScope()): a nested call's setOptions must not replace its caller's,
+   * and a call must not see those of an earlier one (independent review C15).
+   */
+  private SqlOptions[] callOptions = new SqlOptions[4];
+  private long[] callOptionsScope = new long[4];
+
+  private SqlOptions callOptions() {
+    int depth = SqlBridge.callDepth();
+    return depth < callOptions.length && callOptionsScope[depth] == SqlBridge.callScope() ? callOptions[depth] : null;
+  }
   private long savepoints;
 
   public Session(ValueMapper mapper) {
@@ -65,7 +75,7 @@ public final class Session {
 
   /** The options of a statement: o over this call's session options over the defaults. */
   SqlOptions effective(SqlOptions o) {
-    SqlOptions base = callOptionsSeq == SqlBridge.callScope() ? callOptions : null;
+    SqlOptions base = callOptions();
     SqlOptions merged = base == null ? mapper instanceof Defaults d ? d.defaults() : new SqlOptions()
         : base;
     return o == null ? merged.over(null) : o.over(merged);
@@ -119,7 +129,7 @@ public final class Session {
     Object[] values = params(params);
     MleSql.Reply r = request(EXECUTE, id, sql, values, o.passResultToClient() ? TO_CLIENT : 0, 0);
     return o.passResultToClient() ? null
-        : new SqlResult(this, id, true, values == null || values.length == 0, o, r);
+        : new SqlResult(this, id, true, true, o, r);
   }
 
   /** Runs a statement for its effect; its results are dropped. */
@@ -187,6 +197,38 @@ public final class Session {
     return b;
   }
 
+  /**
+   * Why a failed multi-row INSERT into schema.table must not be run again row by row, or null when
+   * it may: the failed statement left nothing behind only if the table is an InnoDB base table
+   * (still), is not hidden by a temporary table of that name (which information_schema does not
+   * show; a MEMORY or MyISAM one keeps the rows before the failing one), and has no trigger (a
+   * trigger's writes to non-transactional tables stay and would be repeated). Runs on the failure
+   * path only (independent review C5, C62). Triggers are seen as the routine's account sees them:
+   * information_schema shows them to accounts with the TRIGGER privilege on the table, so without
+   * it a table's triggers are not known here and the chunk is replayed.
+   */
+  String replayable(String schema, String table) {
+    String name = (schema == null ? "" : quote(schema) + ".") + quote(table);
+    try {
+      long id = SqlBridge.newStatementId();
+      MleSql.Reply r = SqlBridge.requestRaw(EXECUTE, id, "SHOW CREATE TABLE " + name, null, 0, 0, false, null);
+      if (r.moreRows() || r.moreResults()) request(CLOSE, id, null, null, 0, 0);
+      if (r.rows().isEmpty() || String.valueOf(r.rows().get(0)[1]).startsWith("CREATE TEMPORARY"))
+        return "the table is a temporary one";
+    } catch (MleSqlException e) {
+      return "the table's definition cannot be read";
+    }
+    if (!innodb(schema, table, true)) return "the table is not an InnoDB table";
+    List<Object> n = column("SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA = "
+        + "COALESCE(?, DATABASE()) AND EVENT_OBJECT_TABLE = ?", schema, table);
+    if (n.size() != 1 || ((Number) n.get(0)).longValue() != 0) return "the table has triggers";
+    return null;
+  }
+
+  private static String quote(String identifier) {
+    return '`' + identifier.replace("`", "``") + '`';
+  }
+
   /** A row of a batch as values: an Object[] or a List (guest rows arrive as Object[]). */
   Object[] row(Object row) {
     if (row instanceof Object[] a) return a;
@@ -203,9 +245,14 @@ public final class Session {
 
   /** Sets defaults for the statements of the rest of this routine call (unset ones are kept). */
   public void setOptions(SqlOptions options) {
-    SqlOptions base = callOptionsSeq == SqlBridge.callScope() ? callOptions : null;
-    callOptions = options.over(base);
-    callOptionsSeq = SqlBridge.callScope();
+    SqlOptions base = callOptions();
+    int depth = SqlBridge.callDepth();
+    if (depth >= callOptions.length) {
+      callOptions = java.util.Arrays.copyOf(callOptions, depth + 4);
+      callOptionsScope = java.util.Arrays.copyOf(callOptionsScope, depth + 4);
+    }
+    callOptions[depth] = options.over(base);
+    callOptionsScope[depth] = SqlBridge.callScope();
   }
 
   public Object getOption(String name) {

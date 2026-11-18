@@ -27,7 +27,6 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
-import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -864,12 +863,17 @@ final class Polyglot {
     }
     switch (l.language()) {
       case "js" -> {
-        return jsLibrary(schema, name, l.hash());
+        return jsLibrary(schema, name, l.stamp());
       }
       case "python" -> {
         pythonReady();
-        return pySql.loadLibrary.execute(schema + "." + name, l.hash(),
+        // PySql keeps evaluated ones by stamp: this says whether it evaluates now.
+        Long seen = pyLibraries.get(schema + "/" + name);
+        if (seen == null || seen != l.stamp()) LibraryFileSystem.evaluating(schema, name);
+        Object module = pySql.loadLibrary.execute(schema + "." + name, l.stamp(),
             new String(l.body(), java.nio.charset.StandardCharsets.UTF_8));
+        if (seen == null || seen != l.stamp()) pyLibraries.put(schema + "/" + name, l.stamp());
+        return module;
       }
       default -> {
         // A Java library: compiled once per version into its own class loader; the namespace's
@@ -878,6 +882,9 @@ final class Polyglot {
       }
     }
   }
+
+  /** Python libraries evaluated (in PySql's cache), by "schema/name": their stamps. */
+  private final Map<String, Long> pyLibraries = new HashMap<>();
 
   /** JavaScript libraries' module namespaces, by "schema/name": {hash, namespace}. */
   private final Map<String, Object[]> jsLibraries = new HashMap<>();
@@ -888,6 +895,7 @@ final class Polyglot {
     if (hit != null && (long) hit[0] == hash) return (Value) hit[1];
     // The virtual path, not Oracle's "/schema/name": a host directory of that name does not hide
     // the library. The module map keeps one instance per version for every importer.
+    LibraryFileSystem.evaluating(schema, name);
     Value ns = jsModule(LibraryFileSystem.ROOT + "/" + schema + "/" + name + ".mjs");
     jsLibraries.put(key, new Object[] {hash, ns});
     return ns;
@@ -907,7 +915,7 @@ final class Polyglot {
 
   private Object javaLibrary(String key, LibraryFileSystem.Library l) {
     Object[] hit = javaLibraries.get(key);
-    if (hit != null && (long) hit[0] == l.hash()) return hit[1];
+    if (hit != null && (long) hit[0] == l.stamp()) return hit[1];
     if (nativeImage())
       throw new IllegalArgumentException("Java library " + key + ": Java needs the JVM build of MLE");
     Map<String, Class<?>> classes;
@@ -920,7 +928,7 @@ final class Polyglot {
     Map<String, Object> members = new HashMap<>();
     classes.forEach((simple, cls) -> members.put(simple, c.asValue(cls).getMember("static")));
     Object ns = org.graalvm.polyglot.proxy.ProxyObject.fromMap(members);
-    javaLibraries.put(key, new Object[] {l.hash(), ns});
+    javaLibraries.put(key, new Object[] {l.stamp(), ns});
     return ns;
   }
 
@@ -1202,7 +1210,7 @@ final class Polyglot {
           continue;
         }
       }
-      Object v = hostForm(neutral[i], js);
+      Object v = hostForm(neutral[i], js, options.zone);
       args[i] = v == null || r.converters()[i] == null ? v : r.converters()[i].execute(v);
     }
     // USING (Phase 6): the libraries' current modules, bound before each call.
@@ -1287,7 +1295,7 @@ final class Polyglot {
   }
 
   /** The neutral value in the form the language's converter takes. */
-  private static Object hostForm(Object v, boolean js) {
+  private static Object hostForm(Object v, boolean js, java.time.ZoneId zone) {
     return switch (v) {
       case null -> null;
       // A JS number; beyond 2^53 a string (Oracle's UNSAFE_STRING default). Passed as a Long,
@@ -1314,10 +1322,12 @@ final class Polyglot {
           yield js ? formatTime(t) : (Object) (t.negative() ? -us : us);
         }
         case Wire.T_DATE -> js
-            ? (Object) (double) ((LocalDate) t.toJava()).atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
+            // In the session's time zone, as results are read back (toJava) and as the body form
+            // does (JsOracle.hostForm): an identity function returns its argument (independent review C16).
+            ? (Object) (double) ((LocalDate) t.toJava()).atStartOfDay(zone).toInstant().toEpochMilli()
             : t.toJava().toString();
         default -> js
-            ? (Object) (double) ((LocalDateTime) t.toJava()).toInstant(ZoneOffset.UTC).toEpochMilli()
+            ? (Object) (double) ((LocalDateTime) t.toJava()).atZone(zone).toInstant().toEpochMilli()
             : t.toJava().toString();
       };
       default -> v;  // Double, Float, String
