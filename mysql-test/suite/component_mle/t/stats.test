@@ -1,0 +1,216 @@
+--echo #
+--echo # component_mle: the statistics helper com.percona.mle.api.Stats (exp note
+--echo # 54): what MySQL has no SQL for (percentiles, median, mode, summary,
+--echo # histogram, correlation, covariance, linear regression with p-values,
+--echo # z-scores, outliers, ranks), on columns and on a Frame from SQL, per group;
+--echo # against values computed with numpy 2, pandas 3.1 and scipy 1.18; from Java,
+--echo # JavaScript and Python.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE sales (id INT PRIMARY KEY, region VARCHAR(8), price DOUBLE, qty INT);
+INSERT INTO sales VALUES (1, 'n', 10, 1), (2, 's', 12.5, 2), (3, 'n', 11, 3), (4, 'e', 30, 4), (5, 's', 9, 5),
+  (6, 'n', NULL, 6), (7, 'e', 31, 7), (8, 's', 14, 8), (9, 'n', 13.5, 9), (10, NULL, 7, 10);
+--write_file $MYSQLTEST_VARDIR/tmp/stats.sql
+-- Every function against the reference values (pandas: describe, skew, kurt, quantile, corr, cov;
+-- numpy: histogram, percentile; scipy.stats: mode, zscore, rankdata, linregress, spearmanr).
+-- 'ok' or the failures.
+CREATE FUNCTION stats_selfcheck() RETURNS TEXT LANGUAGE JAVA AS $$
+double N = Double.NaN;
+double[] a = {2.5, 3.1, N, 4.7, 3.1, 8.2, 1.0, 5.5, 3.1, 9.9, 6.4, 2.2, 7.7, 4.4, 3.3, 15.0, 0.5, 5.5, 6.1, 4.0};
+double[] b = {1.0, 2.0, 3.5, N, 2.9, 7.1, 0.4, 5.0, 3.3, 9.0, 6.6, 1.5, 8.0, 4.1, 2.7, 12.5, 1.1, 6.0, 5.2, 3.9};
+StringBuilder fail = new StringBuilder();
+interface Eq { void that(String what, double got, double want, double rel); }
+Eq eq = (what, got, want, rel) -> {
+  boolean ok = Double.isNaN(want) ? Double.isNaN(got) : Math.abs(got - want) <= rel * Math.max(1e-300, Math.abs(want));
+  if (!ok) fail.append(what).append(": ").append(got).append(" want ").append(want).append("; ");
+};
+Summary s = Stats.describe(a);
+eq.that("count", s.count(), 19, 0); eq.that("missing", s.missing(), 1, 0);
+eq.that("mean", s.mean(), 5.063157894736842, 1e-12); eq.that("std", s.std(), 3.420885286055479, 1e-12);
+eq.that("min", s.min(), 0.5, 0); eq.that("q1", s.q1(), 3.1, 1e-12); eq.that("median", s.median(), 4.4, 1e-12);
+eq.that("q3", s.q3(), 6.25, 1e-12); eq.that("max", s.max(), 15, 0);
+eq.that("skewness", s.skewness(), 1.4192951042960182, 1e-12); eq.that("kurtosis", s.kurtosis(), 2.8413906815155507, 1e-12);
+eq.that("q10", Stats.quantile(a, 0.1), 1.9600000000000002, 1e-12); eq.that("q90", Stats.quantile(a, 0.9), 8.54, 1e-12);
+double[] qs = Stats.quantiles(a, new double[] {0, 0.25, 1});
+eq.that("quantiles", qs[0] + 10 * qs[1] + 100 * qs[2], 0.5 + 31 + 1500, 1e-12);
+eq.that("median()", Stats.median(a), 4.4, 1e-12); eq.that("mode", Stats.mode(a), 3.1, 0);
+eq.that("iqr", Stats.iqr(a), 3.15, 1e-12);
+Histogram h = Stats.histogram(a, 5);
+double[] he = {0.5, 3.4, 6.3, 9.2, 12.1, 15.0};
+long[] hc = {8, 6, 3, 1, 1};
+for (int i = 0; i < 6; i++) eq.that("edge " + i, h.edges()[i], he[i], 1e-12);
+for (int i = 0; i < 5; i++) eq.that("count " + i, h.count(i), hc[i], 0);
+long[] he2 = Stats.histogramEdges(a, new double[] {0, 2, 5, 10}).counts();
+eq.that("edges counts", he2[0] * 100 + he2[1] * 10 + he2[2], 2 * 100 + 9 * 10 + 7, 0);
+double[] z = Stats.zscore(a);
+eq.that("z0", z[0], -0.7697990966716106, 1e-12); eq.that("z15", z[15], 2.984354608862424, 1e-12); eq.that("z2", z[2], N, 0);
+eq.that("outliers iqr", Arrays.toString(Stats.outliers(a, "iqr", 1.5)).equals("[15]") ? 1 : 0, 1, 0);
+eq.that("outliers z", Arrays.toString(Stats.outliers(a, "zscore", 2)).equals("[15]") ? 1 : 0, 1, 0);
+double[] rk = Stats.rank(a);
+double[] wr = {4, 6, N, 11, 6, 17, 2, 12.5, 6, 18, 15, 3, 16, 10, 8, 19, 1, 12.5, 14, 9};
+for (int i = 0; i < wr.length; i++) eq.that("rank " + i, rk[i], wr[i], 0);
+eq.that("pearson", Stats.correlation(a, b, "pearson"), 0.9778045698669945, 1e-12);
+eq.that("spearman", Stats.correlation(a, b, "spearman"), 0.9736193978525912, 1e-12);
+eq.that("covariance", Stats.covariance(a, b), 11.01421568627451, 1e-12);
+Regression r = Stats.linregress(a, b);
+eq.that("slope", r.slope(), 0.8894879773243707, 1e-12); eq.that("intercept", r.intercept(), 0.050658337490005145, 1e-10);
+eq.that("r", r.r(), 0.9778045698669946, 1e-12); eq.that("p", r.pValue(), 2.7626156016796566e-12, 1e-8);
+eq.that("stderr", r.stderr(), 0.047648748605479005, 1e-10); eq.that("intercept stderr", r.interceptStderr(), 0.29192393829743307, 1e-10);
+eq.that("n", r.n(), 18, 0);
+double[] x = new double[200], y = new double[200], y3 = new double[200];
+for (int i = 0; i < 200; i++) { x[i] = i; y[i] = Math.sin(i) * 3 + 0.05 * i; y3[i] = Math.sin(i) * 3 + 0.002 * i; }
+Regression r2 = Stats.linregress(x, y);
+eq.that("slope2", r2.slope(), 0.0495817328312027, 1e-10); eq.that("intercept2", r2.intercept(), 0.05520753800775502, 1e-9);
+eq.that("r2", r2.r(), 0.8038093693536956, 1e-10); eq.that("p2", r2.pValue(), 1.5301918509825556e-46, 1e-7);
+eq.that("stderr2", r2.stderr(), 0.0026077772509499023, 1e-9); eq.that("intercept stderr2", r2.interceptStderr(), 0.2999907427553929, 1e-9);
+Regression r3 = Stats.linregress(x, y3);
+eq.that("slope3", r3.slope(), 0.0015817328312026895, 1e-9); eq.that("r3", r3.r(), 0.04306524705828675, 1e-9);
+eq.that("p3", r3.pValue(), 0.5448480799718897, 1e-8);
+eq.that("spearman2", Stats.correlation(x, y, "spearman"), 0.8043936098402461, 1e-12);
+Summary big = Stats.describe(y);
+eq.that("big std", big.std(), 3.5701876246678204, 1e-10); eq.that("big skew", big.skewness(), 0.01636532643679002, 1e-7);
+eq.that("big kurt", big.kurtosis(), -0.6889214053675626, 1e-9); eq.that("big q37", Stats.quantile(y, 0.37), 3.6956739189683265, 1e-10);
+eq.that("predict", r2.predict(10), r2.intercept() + 10 * r2.slope(), 1e-15);
+// Small inputs: NaN where a value needs more values.
+Summary one = Stats.describe(new double[] {7});
+eq.that("one std", one.std(), N, 0); eq.that("one skew", one.skewness(), N, 0); eq.that("one median", one.median(), 7, 0);
+Summary none = Stats.describe(new double[] {N, N});
+eq.that("none count", none.count(), 0, 0); eq.that("none mean", none.mean(), N, 0); eq.that("none median", none.median(), N, 0);
+eq.that("flat corr", Stats.correlation(new double[] {1, 1, 1}, new double[] {1, 2, 3}, "pearson"), N, 0);
+eq.that("flat skew", Stats.describe(new double[] {2, 2, 2, 2}).skewness(), 0, 0);
+return fail.length() > 0 ? "FAIL " + fail : "ok";
+$$;
+CREATE PROCEDURE java_stats(OUT r TEXT) LANGUAGE JAVA AS $$
+Frame t = Stats.load("SELECT region, price, qty FROM sales ORDER BY id");
+Grouped g = t.groupBy("region");
+r[0] = String.join("\n",
+    t.size() + " rows, columns " + Arrays.toString(t.columns()) + ", region numeric " + t.numeric("region"),
+    "price: " + t.describe("price"),
+    "median per region: " + g.median("price"),
+    "q90 per region: " + g.quantile("price", 0.9),
+    "count per region: " + g.count(),
+    "corr(price, qty): " + t.correlation("price", "qty", "pearson"),
+    "matrix: " + t.correlationMatrix("spearman", "price", "qty"),
+    "outliers: " + t.select(t.outliers("price", "iqr", 1.5)),
+    "regression: " + t.linregress("qty", "price"));
+$$;
+CREATE PROCEDURE java_group_describe(OUT r TEXT) LANGUAGE JAVA AS $$
+r[0] = Stats.load("SELECT region, price FROM sales").groupBy("region").describe("price").toString();
+$$;
+CREATE PROCEDURE js_stats(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const S = Java.type('com.percona.mle.api.Stats');
+  const t = S.load('SELECT region, price, qty FROM sales ORDER BY id');
+  const out = [];
+  out.push(`median per region: ${t.groupBy('region').median('price')}`);
+  out.push(`describe array: ${S.describe([4, 1, null, 3, 2])}`);
+  out.push(`quantile Float64Array: ${S.quantile(new Float64Array([1, 2, 3, 4]), 0.25)}`);
+  out.push(`quantiles: ${Array.from(S.quantiles([1, 2, 3, 4], [0.5, 1]))}`);
+  out.push(`histogram: ${S.histogram([1, 2, 2, 3, 9], 4)}`);
+  const lr = S.linregress([1, 2, 3, 4], [2, 4.1, 5.9, 8.2]);
+  out.push(`linregress: slope ${lr.slope().toFixed(4)}, predict(5) ${lr.predict(5).toFixed(4)}, ` +
+           `predict([6, 7]) ${Array.from(lr.predict([6, 7])).map(v => v.toFixed(2))}`);
+  out.push(`column back: ${Array.from(t.column('qty')).slice(0, 3)}; rows[0]: ${JSON.stringify(Array.from(t.rows()[0]))}`);
+  out.push(`rank: ${Array.from(S.rank(t.column('price')))}`);
+  r = out.join('\n');
+$$;
+CREATE PROCEDURE py_stats(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import java
+    import numpy as np
+    S = java.type('com.percona.mle.api.Stats')
+    t = S.load('SELECT region, price, qty FROM sales ORDER BY id')
+    out = []
+    out.append('q90 per region: %s' % t.groupBy('region').quantile('price', 0.9))
+    x = np.array([4.0, 1.0, np.nan, 3.0, 2.0])
+    out.append('describe numpy: %s' % S.describe(x))
+    out.append('median list with None: %s' % S.median([4, None, 1, 3]))
+    out.append('outliers: %s' % list(S.outliers(np.array([1, 2, 2, 3, 2, 50], dtype=np.int64), 'iqr', 1.5)))
+    lr = S.linregress(np.arange(4.0), np.array([1.0, 3.0, 5.2, 6.8]))
+    out.append('linregress: %s' % lr)
+    out.append('predict: %s' % [round(v, 3) for v in lr.predict(np.array([4.0, 5.0]))])
+    out.append('spearman: %.6f' % S.correlation(t.column('price'), t.column('qty'), 'spearman'))
+    out.append('matrix: %s' % [[round(v, 4) for v in row] for row in S.correlationMatrix([t.column('price'), t.column('qty')], 'pearson')])
+    r = '\n'.join(out)
+$$;
+CREATE PROCEDURE java_stats_errors(OUT r TEXT) LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+double[] x = {1, 2, 3};
+Runnable[] cases = {
+  () -> Stats.quantile(x, 1.5),
+  () -> Stats.correlation(x, x, "kendall"),
+  () -> Stats.correlation(x, new double[2], "pearson"),
+  () -> Stats.linregress(new double[] {1, Double.NaN}, new double[] {1, 2}),
+  () -> Stats.linregress(new double[] {2, 2, 2}, x),
+  () -> Stats.histogram(x, 0),
+  () -> Stats.histogramEdges(x, new double[] {0, 2, 1}),
+  () -> Stats.outliers(x, "mad", 3),
+  () -> Stats.load("SELECT region, price FROM sales").column("region"),
+  () -> Stats.load("SELECT region, price FROM sales").median("cost"),
+  () -> Stats.load("SELECT region, price FROM sales").select(new int[] {99}),
+};
+for (Runnable c : cases) {
+  try { c.run(); b.append("no error\n"); }
+  catch (IllegalArgumentException e) { b.append(e.getMessage()).append('\n'); }
+}
+r[0] = b.toString().trim();
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/stats.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/stats.sql
+--source include/wait_until_count_sessions.inc
+
+--connect (con1, localhost, root,,test)
+--echo # 1. Against numpy, pandas and scipy.
+SELECT stats_selfcheck() AS selfcheck;
+
+--echo # 2. A Frame from SQL, per group; Java, JavaScript, Python.
+CALL java_stats(@j);
+SELECT @j AS java;
+CALL java_group_describe(@j);
+SELECT JSON_PRETTY(@j) AS describe_per_region;
+CALL js_stats(@js);
+SELECT @js AS js;
+CALL py_stats(@py);
+SELECT @py AS python;
+
+--echo # The user guide's examples.
+DELIMITER |;
+CREATE PROCEDURE price_medians(OUT r TEXT) READS SQL DATA LANGUAGE PYTHON AS $$
+    import java
+    Stats = java.type('com.percona.mle.api.Stats')
+    r = str(Stats.load('SELECT region, price FROM sales').groupBy('region').median('price'))
+$$|
+CREATE FUNCTION quick_stats() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  const S = Java.type('com.percona.mle.api.Stats')
+  const x = [4, 1, null, 3, 2, 50]
+  const lr = S.linregress([1, 2, 3, 4], [2, 4.1, 5.9, 8.2])
+  return `median ${S.median(x)}, iqr ${S.iqr(x)}, slope ${lr.slope().toFixed(2)} ` +
+         `(p ${lr.pValue().toPrecision(2)}), outliers [${Array.from(S.outliers(x, 'iqr', 1.5))}]`
+$$|
+DELIMITER ;|
+CALL price_medians(@r);
+SELECT @r;
+SELECT quick_stats() AS r;
+DROP PROCEDURE price_medians;
+DROP FUNCTION quick_stats;
+
+--echo # 3. Errors.
+CALL java_stats_errors(@r);
+SELECT @r AS java;
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+
+DROP TABLE sales;
+DROP FUNCTION stats_selfcheck;
+DROP PROCEDURE java_stats;
+DROP PROCEDURE java_group_describe;
+DROP PROCEDURE js_stats;
+DROP PROCEDURE py_stats;
+DROP PROCEDURE java_stats_errors;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

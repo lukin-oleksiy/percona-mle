@@ -1,0 +1,159 @@
+#
+# component_mle: the statistics helper com.percona.mle.api.Stats (exp note
+# 54): what MySQL has no SQL for (percentiles, median, mode, summary,
+# histogram, correlation, covariance, linear regression with p-values,
+# z-scores, outliers, ranks), on columns and on a Frame from SQL, per group;
+# against values computed with numpy 2, pandas 3.1 and scipy 1.18; from Java,
+# JavaScript and Python.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE sales (id INT PRIMARY KEY, region VARCHAR(8), price DOUBLE, qty INT);
+INSERT INTO sales VALUES (1, 'n', 10, 1), (2, 's', 12.5, 2), (3, 'n', 11, 3), (4, 'e', 30, 4), (5, 's', 9, 5),
+(6, 'n', NULL, 6), (7, 'e', 31, 7), (8, 's', 14, 8), (9, 'n', 13.5, 9), (10, NULL, 7, 10);
+# 1. Against numpy, pandas and scipy.
+SELECT stats_selfcheck() AS selfcheck;
+selfcheck
+ok
+# 2. A Frame from SQL, per group; Java, JavaScript, Python.
+CALL java_stats(@j);
+SELECT @j AS java;
+java
+10 rows, columns [region, price, qty], region numeric false
+price: {"count": 9, "missing": 1, "mean": 15.333333333333332, "std": 8.877640452282352, "min": 7, "q1": 10, "median": 12.5, "q3": 14, "max": 31, "skewness": 1.3559599790214218, "kurtosis": 0.3527375769337238}
+median per region: [{"region": null, "price": 7}, {"region": "e", "price": 30.5}, {"region": "n", "price": 11}, {"region": "s", "price": 12.5}]
+q90 per region: [{"region": null, "price": 7}, {"region": "e", "price": 30.9}, {"region": "n", "price": 13}, {"region": "s", "price": 13.7}]
+count per region: [{"region": null, "count": 1}, {"region": "e", "count": 2}, {"region": "n", "count": 4}, {"region": "s", "count": 3}]
+corr(price, qty): 0.009516011349182533
+matrix: [{"column": "price", "price": 1, "qty": 0.03333333333333333}, {"column": "qty", "price": 0.03333333333333333, "qty": 1}]
+outliers: [{"region": "e", "price": 30, "qty": 4}, {"region": "e", "price": 31, "qty": 7}]
+regression: {"slope": 0.026351351351351325, "intercept": 15.189864864864866, "r": 0.009516011349182533, "r2": 9.055447199777077E-5, "p": 0.9806156037045662, "stderr": 1.0465964462775244, "interceptStderr": 6.517345048704856, "n": 9}
+CALL java_group_describe(@j);
+SELECT JSON_PRETTY(@j) AS describe_per_region;
+describe_per_region
+[
+  {
+    "q1": 7,
+    "q3": 7,
+    "max": 7,
+    "min": 7,
+    "std": null,
+    "mean": 7,
+    "count": 1,
+    "median": 7,
+    "region": null,
+    "missing": 0,
+    "kurtosis": null,
+    "skewness": null
+  },
+  {
+    "q1": 30.25,
+    "q3": 30.75,
+    "max": 31,
+    "min": 30,
+    "std": 0.7071067811865476,
+    "mean": 30.5,
+    "count": 2,
+    "median": 30.5,
+    "region": "e",
+    "missing": 0,
+    "kurtosis": null,
+    "skewness": null
+  },
+  {
+    "q1": 10.5,
+    "q3": 12.25,
+    "max": 13.5,
+    "min": 10,
+    "std": 1.8027756377319946,
+    "mean": 11.5,
+    "count": 3,
+    "median": 11,
+    "region": "n",
+    "missing": 1,
+    "kurtosis": null,
+    "skewness": 1.1520696383139375
+  },
+  {
+    "q1": 10.75,
+    "q3": 13.25,
+    "max": 14,
+    "min": 9,
+    "std": 2.565800719723442,
+    "mean": 11.833333333333334,
+    "count": 3,
+    "median": 12.5,
+    "region": "s",
+    "missing": 0,
+    "kurtosis": null,
+    "skewness": -1.0902905798280051
+  }
+]
+CALL js_stats(@js);
+SELECT @js AS js;
+js
+median per region: [{"region": null, "price": 7}, {"region": "e", "price": 30.5}, {"region": "n", "price": 11}, {"region": "s", "price": 12.5}]
+describe array: {"count": 4, "missing": 1, "mean": 2.5, "std": 1.2909944487358056, "min": 1, "q1": 1.75, "median": 2.5, "q3": 3.25, "max": 4, "skewness": 0, "kurtosis": -1.200000000000001}
+quantile Float64Array: 1.75
+quantiles: 2.5,4
+histogram: {"edges": [1, 3, 5, 7, 9], "counts": [3, 1, 0, 1]}
+linregress: slope 2.0400, predict(5) 10.1500, predict([6, 7]) 12.19,14.23
+column back: 1,2,3; rows[0]: ["n",10,1]
+rank: 3,5,4,8,2,NaN,9,7,6,1
+CALL py_stats(@py);
+SELECT @py AS python;
+python
+q90 per region: [{"region": null, "price": 7}, {"region": "e", "price": 30.9}, {"region": "n", "price": 13}, {"region": "s", "price": 13.7}]
+describe numpy: {"count": 4, "missing": 1, "mean": 2.5, "std": 1.2909944487358056, "min": 1, "q1": 1.75, "median": 2.5, "q3": 3.25, "max": 4, "skewness": 0, "kurtosis": -1.200000000000001}
+median list with None: 3.0
+outliers: [5]
+linregress: {"slope": 1.9599999999999997, "intercept": 1.0600000000000005, "r": 0.9981310335652203, "r2": 0.9962655601659749, "p": 0.001868966434779743, "stderr": 0.08485281374238808, "interceptStderr": 0.15874507866387988, "n": 4}
+predict: [8.9, 10.86]
+spearman: 0.033333
+matrix: [[1.0, 0.0095], [0.0095, 1.0]]
+# The user guide's examples.
+CREATE PROCEDURE price_medians(OUT r TEXT) READS SQL DATA LANGUAGE PYTHON AS $$
+import java
+Stats = java.type('com.percona.mle.api.Stats')
+r = str(Stats.load('SELECT region, price FROM sales').groupBy('region').median('price'))
+$$|
+CREATE FUNCTION quick_stats() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+const S = Java.type('com.percona.mle.api.Stats')
+const x = [4, 1, null, 3, 2, 50]
+const lr = S.linregress([1, 2, 3, 4], [2, 4.1, 5.9, 8.2])
+return `median ${S.median(x)}, iqr ${S.iqr(x)}, slope ${lr.slope().toFixed(2)} ` +
+`(p ${lr.pValue().toPrecision(2)}), outliers [${Array.from(S.outliers(x, 'iqr', 1.5))}]`
+$$|
+CALL price_medians(@r);
+SELECT @r;
+@r
+[{"region": null, "price": 7}, {"region": "e", "price": 30.5}, {"region": "n", "price": 11}, {"region": "s", "price": 12.5}]
+SELECT quick_stats() AS r;
+r
+median 3, iqr 2, slope 2.04 (p 0.0010), outliers [5]
+DROP PROCEDURE price_medians;
+DROP FUNCTION quick_stats;
+# 3. Errors.
+CALL java_stats_errors(@r);
+SELECT @r AS java;
+java
+a quantile must be in [0, 1], not 1.5
+unknown method 'kendall' (pearson or spearman)
+the columns have 3 and 2 values
+a regression needs at least 2 pairs of values, not 1
+all x values are equal: the slope is undefined
+bins must be at least 1, not 0
+the edges must increase
+unknown method 'mad' (iqr or zscore)
+column 'region' is not numbers
+no column 'cost' (region, price)
+no row 99 (10 rows)
+DROP TABLE sales;
+DROP FUNCTION stats_selfcheck;
+DROP PROCEDURE java_stats;
+DROP PROCEDURE java_group_describe;
+DROP PROCEDURE js_stats;
+DROP PROCEDURE py_stats;
+DROP PROCEDURE java_stats_errors;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
