@@ -124,8 +124,15 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
       // The worker's memory watcher forces GCs below this limit (exp note 30).
       "-Dmle.memoryMax=" + std::to_string(o.memory_max),
       "-Dmle.vectorThreads=" + std::to_string(o.vector_threads)};
-  if (!layout.aot_cache.empty())
+  if (!layout.aot_cache.empty()) {
     c.args.push_back("-XX:AOTCache=" + layout.aot_cache);
+    // Map the cache at the address it was created for, so its pages stay
+    // clean and shared between workers: relocating it (the JDK's default
+    // since 21) dirtied ~100 MiB per worker. The JVM still relocates when
+    // that address is taken. Costs the cache's ASLR (exp note 62 §11).
+    c.args.push_back("-XX:+UnlockDiagnosticVMOptions");
+    c.args.push_back("-XX:ArchiveRelocationMode=0");
+  }
   if (!o.prewarm.empty()) c.args.push_back("-Dmle.prewarm=" + o.prewarm);
   if (!layout.python_venv.empty())
     c.args.push_back("-Dmle.python.venv=" + layout.python_venv);
