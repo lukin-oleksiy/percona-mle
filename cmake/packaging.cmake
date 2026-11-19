@@ -26,11 +26,15 @@
 #   percona-mle-python-runtime Python's standard library and the numpy venv (both builds) -> common
 #   percona-mle-python         GraalPy for the JVM build (jars)                      -> percona-mle, runtime
 #   percona-mle-python-native  the Python-only native build (-DMLE_PYTHON_NATIVE=ON) -> common, runtime
+#   percona-mle-cpython        the CPython worker (-DMLE_CPYTHON=ON, the default with Python 3.12+;
+#                              exp design note 62): Python only, on the distribution's
+#                              libpython, with numpy                                 -> common, libpython
 #   percona-mle-tools          mle_package (third-party packages; uses the JVM build)
 #   percona-mle-selinux        the SELinux policy module (RPM only; -DMLE_SELINUX=ON, the default
 #                              with selinux-policy-devel)                          <- common
 #
-# mle.worker = AUTO runs the JVM build when percona-mle is installed, else the native one.
+# mle.worker = AUTO runs the JVM build when percona-mle is installed, else the CPython worker, else
+# the native one.
 
 SET(MLE_VERSION "0.1.0" CACHE STRING "Version of the Percona MLE packages")
 SET(MLE_PACKAGE_RELEASE "1" CACHE STRING "Release of the Percona MLE packages")
@@ -62,6 +66,11 @@ ELSE()
 ENDIF()
 IF(MLE_PYTHON_NATIVE)
   LIST(APPEND CPACK_COMPONENTS_ALL MlePythonNative)
+ENDIF()
+GET_PROPERTY(MLE_PYTHON_SONAME GLOBAL PROPERTY MLE_PYTHON_SONAME)
+GET_PROPERTY(MLE_PYTHON_MAJOR_MINOR GLOBAL PROPERTY MLE_PYTHON_MAJOR_MINOR)
+IF(MLE_PYTHON_SONAME)
+  LIST(APPEND CPACK_COMPONENTS_ALL MleCPython)
 ENDIF()
 IF(MLE_SELINUX)
   LIST(APPEND CPACK_COMPONENTS_ALL MleSelinux)
@@ -113,9 +122,16 @@ SET(CPACK_DEBIAN_MLEPYTHONNATIVE_PACKAGE_DEPENDS
   "percona-mle-common (= ${mle_deb_ver}), percona-mle-python-runtime (= ${mle_deb_ver})")
 SET(CPACK_DEBIAN_MLEPYTHONNATIVE_DESCRIPTION
   "Percona MLE: the Python-only native build (highly optimised for Python-only use: less memory, fast worker start)")
+SET(CPACK_DEBIAN_MLECPYTHON_PACKAGE_NAME percona-mle-cpython)
+# The libpython the worker was built against (the package is per distribution anyway).
+SET(CPACK_DEBIAN_MLECPYTHON_PACKAGE_DEPENDS
+  "percona-mle-common (= ${mle_deb_ver}), libpython${MLE_PYTHON_MAJOR_MINOR}")
+SET(CPACK_DEBIAN_MLECPYTHON_DESCRIPTION
+  "Percona MLE: Python stored programs on CPython (mle.worker = CPYTHON): small workers, numpy, no JVM")
 SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_NAME percona-mle-tools)
-# mle_package is a Python 3 script; it runs npm, Maven and a GraalPy the DBA brings.
-SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_DEPENDS "percona-mle (= ${mle_deb_ver}), python3")
+# mle_package is a Python 3 script; it runs npm, Maven, a GraalPy the DBA brings, or the
+# CPython worker's Python (python3-venv): it needs neither build of the workers itself.
+SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_DEPENDS "percona-mle-common (= ${mle_deb_ver}), python3")
 SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_RECOMMENDS "nodejs, npm, maven")
 
 # RPM (checked on Oracle Linux 10)
@@ -163,10 +179,16 @@ SET(CPACK_RPM_MLEPYTHON_PACKAGE_REQUIRES
 SET(CPACK_RPM_MLEPYTHONNATIVE_PACKAGE_NAME percona-mle-python-native)
 SET(CPACK_RPM_MLEPYTHONNATIVE_PACKAGE_REQUIRES
   "percona-mle-common = ${mle_rpm_ver}, percona-mle-python-runtime = ${mle_rpm_ver}")
+SET(CPACK_RPM_MLECPYTHON_PACKAGE_NAME percona-mle-cpython)
+# No automatic dependencies (AUTOREQPROV OFF): libpython by its soname.
+SET(CPACK_RPM_MLECPYTHON_PACKAGE_REQUIRES
+  "percona-mle-common = ${mle_rpm_ver}, ${MLE_PYTHON_SONAME}()(64bit)")
+SET(CPACK_RPM_MLECPYTHON_PACKAGE_SUMMARY
+  "Percona MLE: Python stored programs on CPython (mle.worker = CPYTHON)")
 SET(CPACK_RPM_MLETOOLS_PACKAGE_NAME percona-mle-tools)
 # No automatic dependencies (AUTOREQPROV OFF): the interpreter by name. Weak dependencies as
 # in the Debian package (CPack versions that do not know RECOMMENDS leave it out).
-SET(CPACK_RPM_MLETOOLS_PACKAGE_REQUIRES "percona-mle = ${mle_rpm_ver}, python3")
+SET(CPACK_RPM_MLETOOLS_PACKAGE_REQUIRES "percona-mle-common = ${mle_rpm_ver}, python3")
 SET(CPACK_RPM_MLETOOLS_PACKAGE_RECOMMENDS "nodejs, npm, maven")
 SET(CPACK_RPM_MLESELINUX_PACKAGE_NAME percona-mle-selinux)
 SET(CPACK_RPM_MLESELINUX_PACKAGE_ARCHITECTURE noarch)

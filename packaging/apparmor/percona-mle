@@ -26,10 +26,15 @@ profile percona-mle flags=(complain) {
   # The launcher and the worker bootstrap.
   @{MLE_DIR}/mle_launcher mr,
   @{MLE_DIR}/mle_worker mrix,
+  @{MLE_DIR}/cpython/mle_cpython_worker mrix,
 
   # MLE's files: the JDK, the jars, the AOT cache, Python and numpy.
   @{MLE_DIR}/ r,
   @{MLE_DIR}/** mr,
+
+  # The CPython worker's standard library (the distribution's Python).
+  /usr/lib{,64}/python3*/ r,
+  /usr/lib{,64}/python3*/** mr,
 
   # Third-party packages the DBA installed with mle_package.
   @{MLE_PACKAGES}/ r,

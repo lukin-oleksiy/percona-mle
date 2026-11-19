@@ -4,6 +4,7 @@
 # a plain path (no regular expression) takes precedence over /usr/lib's lib_t.
 /usr/lib/mysql/plugin/mle/mle_launcher	--	gen_context(system_u:object_r:mle_launcher_exec_t,s0)
 /usr/lib/mysql/plugin/mle/mle_worker	--	gen_context(system_u:object_r:mle_worker_exec_t,s0)
+/usr/lib/mysql/plugin/mle/cpython/mle_cpython_worker	--	gen_context(system_u:object_r:mle_worker_exec_t,s0)
 
 # mle.package_dir as the packages and the Docker image suggest; the DBA's
 # mle_package writes it, mysqld and the workers read it.
@@ -12,3 +13,4 @@
 # The debug variants (mysqld-debug's plugin directory).
 /usr/lib/mysql/plugin/debug/mle/mle_launcher	--	gen_context(system_u:object_r:mle_launcher_exec_t,s0)
 /usr/lib/mysql/plugin/debug/mle/mle_worker	--	gen_context(system_u:object_r:mle_worker_exec_t,s0)
+/usr/lib/mysql/plugin/debug/mle/cpython/mle_cpython_worker	--	gen_context(system_u:object_r:mle_worker_exec_t,s0)

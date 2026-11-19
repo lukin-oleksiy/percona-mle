@@ -22,7 +22,8 @@ workers only read it; regular database users cannot add packages.
   mle_package [--dir DIR] install js     lodash@4.17.21 date-fns
   mle_package [--dir DIR] install python pandas networkx
   mle_package [--dir DIR] install java   org.apache.commons:commons-math3:3.6.1
-  mle_package [--dir DIR] remove  js|python|java NAME...
+  mle_package [--dir DIR] install cpython pandas         (the CPython worker)
+  mle_package [--dir DIR] remove  js|python|cpython|java NAME...
   mle_package [--dir DIR] list
 
 Then, in mysqld: SELECT mle_packages_refresh();  (new workers see the change)
@@ -30,10 +31,13 @@ Then, in mysqld: SELECT mle_packages_refresh();  (new workers see the change)
 Layout: js/ (npm --prefix: node_modules, package.json), python/site-packages
 (pip --target with GraalPy, using GraalPy's binary wheels where they exist),
 java/*.jar (Maven, with dependencies; java/mle_package.json keeps what was
-asked for). packages.json lists what is installed.
+asked for), cpython/site-packages (pip --target with the CPython the CPython
+worker embeds: mle.worker = CPYTHON). packages.json lists what is installed.
 
 Python packages need a GraalPy of the workers' version with pip (--graalpy):
-the packages do not bring one (README, "Install and packages").
+the packages do not bring one (README, "Install and packages"). Packages for
+the CPython worker need that Python with its venv module (python3-venv): its
+version is in <mle dir>/cpython/python-version (--cpython to give another).
 """
 
 import argparse
@@ -75,6 +79,27 @@ def graalpy(args):
     sys.exit("mle_package: no GraalPy found. Python packages must be installed with a "
              "GraalPy of the workers' version%s: give the graalpy of a venv made with "
              "one (graalpy -m venv DIR) as --graalpy DIR/bin/graalpy" % version)
+
+
+def cpython(args):
+    """The interpreter of the CPython worker's version (python3.X), for pip."""
+    if args.cpython:
+        return args.cpython
+    try:
+        with open(os.path.join(HERE, "cpython", "python-version")) as f:
+            version = f.read().strip()
+    except OSError:
+        sys.exit("mle_package: the CPython worker is not installed here (%s); give its Python "
+                 "as --cpython" % os.path.join(HERE, "cpython"))
+    found = shutil.which("python" + version)
+    if not found:
+        sys.exit("mle_package: python%s (the CPython worker's version) is not on PATH; give it "
+                 "as --cpython" % version)
+    return found
+
+
+def site_dir(d, language):
+    return os.path.join(d, "cpython" if language == "cpython" else "python", "site-packages")
 
 
 def inside(path, d):
@@ -149,9 +174,8 @@ def merge_tree(src, dst):
         os.replace(s, t)
 
 
-def install_python(d, specs, args):
-    python = graalpy(args)
-    site = os.path.join(d, "python", "site-packages")
+def install_python(d, specs, args, language="python"):
+    site = site_dir(d, language)
     os.makedirs(site, exist_ok=True)
     site = os.path.realpath(site)
     # Wheels only: building a source distribution runs its setup code as this
@@ -162,10 +186,19 @@ def install_python(d, specs, args):
     # installs into an empty directory beside it; then what it installed
     # replaces the versions site-packages has.
     with tempfile.TemporaryDirectory(prefix=".stage.", dir=os.path.dirname(site)) as stage:
-        run([python, "-m", "pip", "install", "--disable-pip-version-check",
-             *binary, "--target", stage,
-             "--extra-index-url", GRAALPY_WHEELS,
-             *specs])
+        if language == "python":
+            run([graalpy(args), "-m", "pip", "install", "--disable-pip-version-check",
+                 *binary, "--target", stage,
+                 "--extra-index-url", GRAALPY_WHEELS,
+                 *specs])
+        else:
+            # The distribution's pip refuses to install for its Python (PEP 668):
+            # a throw-away venv's pip, into the stage directory.
+            with tempfile.TemporaryDirectory(prefix="mle-pip.") as venv:
+                run([cpython(args), "-m", "venv", venv])
+                run([os.path.join(venv, "bin", "pip"), "install", "--disable-pip-version-check",
+                     *binary, "--target", stage, *specs])
+            shutil.rmtree(os.path.join(stage, "bin"), ignore_errors=True)  # scripts name the venv
         have = python_dists(site)
         for name in python_dists(stage):
             if name in have:
@@ -283,9 +316,9 @@ def python_dists(site):
     return out
 
 
-def python_packages(d):
-    dists = python_dists(os.path.join(d, "python", "site-packages"))
-    return [{"language": "python", "name": name, "version": version}
+def python_packages(d, language="python"):
+    dists = python_dists(site_dir(d, language))
+    return [{"language": language, "name": name, "version": version}
             for name in sorted(dists) for _, version in dists[name]]
 
 
@@ -314,7 +347,7 @@ def java_packages(d):
 
 
 def inventory(d):
-    return js_packages(d) + python_packages(d) + java_packages(d)
+    return js_packages(d) + python_packages(d) + python_packages(d, "cpython") + java_packages(d)
 
 
 def write_manifest(d):
@@ -377,7 +410,7 @@ def remove(d, language, names):
             record["resolved"] = [name for name in record["resolved"] if name not in gone]
             write_json(os.path.join(d, "java"), JAVA_RECORD, record)
         return
-    site = os.path.realpath(os.path.join(d, "python", "site-packages"))
+    site = os.path.realpath(site_dir(d, language))
     dists = python_dists(site)
     for n in names:
         if python_name(n) not in dists:
@@ -393,6 +426,9 @@ def main():
     p.add_argument("--graalpy",
                    help="GraalPy (with pip) for Python packages, of the workers' version; default: "
                         "a build tree's venv, else graalpy on PATH (the packages bring none)")
+    p.add_argument("--cpython",
+                   help="the Python (with venv) for the CPython worker's packages; default: "
+                        "python3.X of the worker's version on PATH")
     p.add_argument("--allow-scripts", action="store_true",
                    help="run npm packages' install scripts (they run as this OS user)")
     p.add_argument("--allow-source", action="store_true",
@@ -400,7 +436,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     for c in ("install", "remove"):
         s = sub.add_parser(c)
-        s.add_argument("language", choices=["js", "python", "java"])
+        s.add_argument("language", choices=["js", "python", "cpython", "java"])
         s.add_argument("names", nargs="+")
     sub.add_parser("list")
     args = p.parse_args()
@@ -420,6 +456,7 @@ def main():
         if args.cmd == "install":
             {"js": lambda: install_js(d, args.names, args),
              "python": lambda: install_python(d, args.names, args),
+             "cpython": lambda: install_python(d, args.names, args, "cpython"),
              "java": lambda: install_java(d, args.names)}[args.language]()
         else:
             remove(d, args.language, args.names)
