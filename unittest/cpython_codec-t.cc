@@ -67,7 +67,7 @@ class PythonEnvironment : public ::testing::Environment {
     ASSERT_TRUE(run(R"(
 import _mlewire, decimal, json, random, numpy as np, datetime as dt
 from mle_cpython import wire
-_mlewire.setup(decimal.Decimal, json.loads, wire.temporal, wire.new_vector, wire.demote)
+_mlewire.setup(decimal.Decimal, json.loads, wire.temporal, wire.new_vector, wire.demote, lambda *a: None, float)
 )"));
   }
 

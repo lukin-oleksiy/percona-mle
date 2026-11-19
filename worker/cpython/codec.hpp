@@ -164,13 +164,38 @@ class Writer {
 
 /** Python functions the codec calls for rare values (set by setup()). */
 struct Helpers {
-  Ref decimal;     // decimal.Decimal(str)
-  Ref json_loads;  // json.loads(str)
-  Ref temporal;    // temporal(tag, y, mo, d, h, mi, s, us, neg): errors (zero dates) as ConversionError
-  Ref new_vector;  // new_vector(body, pos, dims): a numpy array (copy)
-  Ref demote;      // demote(collector): a typed column collector becomes a list
+  Ref decimal;       // decimal.Decimal(str)
+  Ref json_loads;    // json.loads(str)
+  Ref temporal;      // temporal(tag, y, mo, d, h, mi, s, us, neg): errors (zero dates) as ConversionError
+  Ref new_vector;    // new_vector(body, pos, dims): a numpy array (copy)
+  Ref demote;        // demote(collector): a typed column collector becomes a list
+  Ref row_temporal;  // as temporal, for rows of SQL results: None for a zero date (PySql.temporal)
+  Ref number;        // DECIMAL of rows with the decimalType NUMBER: float(str)
 };
 Helpers &helpers();
+
+/** Which helpers values get: routine arguments (zero dates are errors), rows of SQL results
+    (zero dates are None), or rows with DECIMAL as a number. */
+enum class ValueRules : int { kArguments = 0, kRows = 1, kRowsNumber = 2 };
+
+/** The rules decode_value() applies; set for a decode call by UseRules. */
+ValueRules &value_rules();
+
+class UseRules {
+ public:
+  explicit UseRules(ValueRules r) : m_saved(value_rules()) { value_rules() = r; }
+  UseRules(const UseRules &) = delete;
+  UseRules &operator=(const UseRules &) = delete;
+  ~UseRules() { value_rules() = m_saved; }
+
+ private:
+  ValueRules m_saved;
+};
+
+/** Appends values (a sequence) to the SQL message in buffer (a bytearray) as statement parameters:
+    the common types here, the others through fallback(value, offset) (the Python encoder: the
+    bytes of one value at that offset of the message, VECTOR data 16-aligned). The count. */
+Py_ssize_t encode_values(PyObject *buffer, PyObject *values, PyObject *fallback);
 
 /** The next value of r as a Python object. vector(dims, pos) makes VECTORs if given. */
 Ref decode_value(Reader &r, PyObject *body, PyObject *vector);
@@ -197,6 +222,7 @@ Ref py_setup(PyObject *args);
 Ref py_decode(PyObject *args);
 Ref py_decode_rows(PyObject *args);
 Ref py_decode_columns(PyObject *args);
+Ref py_encode_values(PyObject *args);
 
 }  // namespace mle::cpython
 

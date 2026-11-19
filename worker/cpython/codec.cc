@@ -27,6 +27,7 @@
 #include <datetime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <vector>
 
@@ -37,6 +38,11 @@ using wire::Tag;
 Helpers &helpers() {
   static Helpers h;
   return h;
+}
+
+ValueRules &value_rules() {
+  static ValueRules r = ValueRules::kArguments;
+  return r;
 }
 
 namespace {
@@ -71,8 +77,9 @@ Ref temporal(Tag tag, Reader &r) {
   if (v != nullptr) return Ref::steal(v);
   // Out of Python's range (zero dates, a corrupt value): the Python helper raises the right error.
   PyErr_Clear();
-  return Ref::steal(PyObject_CallFunction(helpers().temporal.get(), "iIIIIIIIi", static_cast<int>(tag), year, month,
-                                          day, hour, minute, second, micro, neg ? 1 : 0));
+  PyObject *f = value_rules() == ValueRules::kArguments ? helpers().temporal.get() : helpers().row_temporal.get();
+  return Ref::steal(PyObject_CallFunction(f, "iIIIIIIIi", static_cast<int>(tag), year, month, day, hour, minute,
+                                          second, micro, neg ? 1 : 0));
 }
 
 Ref decode_tagged(Tag tag, Reader &r, PyObject *body, PyObject *vector) {
@@ -95,7 +102,8 @@ Ref decode_tagged(Tag tag, Reader &r, PyObject *body, PyObject *vector) {
       return Ref::steal(PyBytes_FromStringAndSize(reinterpret_cast<const char *>(s.data()), Py_ssize_t(s.size())));
     }
     case Tag::kDecimal:
-      return call(helpers().decimal.get(), unicode(r.str()).get());
+      return call(value_rules() == ValueRules::kRowsNumber ? helpers().number.get() : helpers().decimal.get(),
+                  unicode(r.str()).get());
     case Tag::kJson:
       return call(helpers().json_loads.get(), unicode(r.str()).get());
     case Tag::kDate:
@@ -159,13 +167,17 @@ void skip_value(Reader &r) {
 
 // ------------------------------------------------------------------------------ module functions
 
-/** setup(decimal, json_loads, temporal, new_vector, demote) */
+/** setup(decimal, json_loads, temporal, new_vector, demote, row_temporal, number) */
 Ref py_setup(PyObject *args) {
-  PyObject *d, *j, *t, *v, *m;
-  if (!PyArg_ParseTuple(args, "OOOOO", &d, &j, &t, &v, &m)) throw PyErrorSet{};
-  PyDateTime_IMPORT;
-  if (PyDateTimeAPI == nullptr) throw PyErrorSet{};
+  PyObject *d, *j, *t, *v, *m, *rt, *num;
+  if (!PyArg_ParseTuple(args, "OOOOOOO", &d, &j, &t, &v, &m, &rt, &num)) throw PyErrorSet{};
+  if (PyDateTimeAPI == nullptr) {
+    PyDateTime_IMPORT;
+    if (PyDateTimeAPI == nullptr) throw PyErrorSet{};
+  }
   Helpers &h = helpers();
+  h.row_temporal = Ref::borrow(rt);
+  h.number = Ref::borrow(num);
   h.decimal = Ref::borrow(d);
   h.json_loads = Ref::borrow(j);
   h.temporal = Ref::borrow(t);
@@ -193,7 +205,9 @@ Ref py_decode(PyObject *args) {
 Ref py_decode_rows(PyObject *args) {
   PyObject *body, *row_type;
   Py_ssize_t pos, nrows, ncols;
-  if (!PyArg_ParseTuple(args, "OnnnO", &body, &pos, &nrows, &ncols, &row_type)) throw PyErrorSet{};
+  int rules = 0;
+  if (!PyArg_ParseTuple(args, "OnnnO|i", &body, &pos, &nrows, &ncols, &row_type, &rules)) throw PyErrorSet{};
+  const UseRules use(static_cast<ValueRules>(rules));
   if (row_type != Py_None &&
       (!PyType_Check(row_type) || !PyType_IsSubtype(reinterpret_cast<PyTypeObject *>(row_type), &PyTuple_Type))) {
     PyErr_SetString(PyExc_TypeError, "row_type must be a tuple subclass");
@@ -314,7 +328,10 @@ bool add_typed(Column &c, Tag tag, Reader &r) {
 Ref py_decode_columns(PyObject *args) {
   PyObject *body, *collectors;
   Py_ssize_t pos, nrows;
-  if (!PyArg_ParseTuple(args, "OnnO!", &body, &pos, &nrows, &PyList_Type, &collectors)) throw PyErrorSet{};
+  int rules = 0;
+  if (!PyArg_ParseTuple(args, "OnnO!|i", &body, &pos, &nrows, &PyList_Type, &collectors, &rules))
+    throw PyErrorSet{};
+  const UseRules use(static_cast<ValueRules>(rules));
   if (nrows < 0) throw Malformed{"bad row count"};
   Buffer buf(body, PyBUF_SIMPLE);
   Reader r(buf.bytes(), size_t(pos));
@@ -342,6 +359,107 @@ Ref py_decode_columns(PyObject *args) {
   for (Column &c : cols)
     if (c.obj != Py_None && c.mode != Mode::kList && c.mode != Mode::kSkip) c.store();
   return Ref::steal(PyLong_FromSsize_t(Py_ssize_t(r.pos())));
+}
+
+// ------------------------------------------------------------------------------ parameters
+
+namespace {
+
+/** Appends n bytes to a bytearray; where they go. */
+std::byte *grow(PyObject *buffer, size_t n) {
+  const Py_ssize_t at = PyByteArray_GET_SIZE(buffer);
+  if (PyByteArray_Resize(buffer, at + Py_ssize_t(n)) != 0) throw PyErrorSet{};
+  return reinterpret_cast<std::byte *>(PyByteArray_AS_STRING(buffer)) + at;
+}
+
+template <class T>
+void append(PyObject *buffer, Tag tag, T v) {
+  std::byte *p = grow(buffer, 1 + sizeof(T));
+  p[0] = static_cast<std::byte>(tag);
+  std::memcpy(p + 1, &v, sizeof(T));
+}
+
+void append_text(PyObject *buffer, Tag tag, const char *s, size_t n) {
+  std::byte *p = grow(buffer, 5 + n);
+  p[0] = static_cast<std::byte>(tag);
+  const auto len = static_cast<uint32_t>(n);
+  std::memcpy(p + 1, &len, 4);
+  std::memcpy(p + 5, s, n);
+}
+
+/** One value of a common type (PySql.kind's rules); false: the Python encoder takes it. */
+bool encode_common(PyObject *buffer, PyObject *v) {
+  if (v == Py_None) {
+    *grow(buffer, 1) = static_cast<std::byte>(Tag::kNull);
+    return true;
+  }
+  if (v == Py_True || v == Py_False) {
+    append(buffer, Tag::kI64, int64_t{v == Py_True ? 1 : 0});
+    return true;
+  }
+  if (PyLong_CheckExact(v)) {
+    int overflow = 0;
+    const long long x = PyLong_AsLongLongAndOverflow(v, &overflow);
+    if (overflow == 0 && !(x == -1 && PyErr_Occurred())) {
+      append(buffer, Tag::kI64, int64_t{x});
+      return true;
+    }
+    PyErr_Clear();
+    if (overflow > 0) {
+      const unsigned long long u = PyLong_AsUnsignedLongLong(v);
+      if (!(u == static_cast<unsigned long long>(-1) && PyErr_Occurred())) {
+        append(buffer, Tag::kU64, uint64_t{u});
+        return true;
+      }
+      PyErr_Clear();
+    }
+    return false;  // beyond 64 bits: DECIMAL text, by the Python encoder's rules
+  }
+  if (PyFloat_CheckExact(v)) {
+    const double d = PyFloat_AS_DOUBLE(v);
+    if (!std::isfinite(d)) return false;  // the Python encoder's TypeError
+    append(buffer, Tag::kF64, d);
+    return true;
+  }
+  if (PyUnicode_CheckExact(v)) {
+    Py_ssize_t n;
+    const char *s = PyUnicode_AsUTF8AndSize(v, &n);
+    if (s == nullptr) {  // lone surrogates: the Python encoder replaces them
+      PyErr_Clear();
+      return false;
+    }
+    append_text(buffer, Tag::kString, s, size_t(n));
+    return true;
+  }
+  if (PyBytes_CheckExact(v)) {
+    append_text(buffer, Tag::kBytes, PyBytes_AS_STRING(v), size_t(PyBytes_GET_SIZE(v)));
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+Py_ssize_t encode_values(PyObject *buffer, PyObject *values, PyObject *fallback) {
+  Ref seq = Ref::steal(PySequence_Fast(values, "the parameters must be a sequence"));
+  const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq.get());
+  PyObject **items = PySequence_Fast_ITEMS(seq.get());
+  for (Py_ssize_t i = 0; i < n; i++) {
+    if (encode_common(buffer, items[i])) continue;
+    Ref bytes = Ref::steal(
+        PyObject_CallFunction(fallback, "On", items[i], PyByteArray_GET_SIZE(buffer)));
+    const Buffer b(bytes.get(), PyBUF_SIMPLE);
+    const auto src = b.bytes();
+    std::memcpy(grow(buffer, src.size()), src.data(), src.size());
+  }
+  return n;
+}
+
+/** encode_values(buffer, values, fallback) -> count */
+Ref py_encode_values(PyObject *args) {
+  PyObject *buffer, *values, *fallback;
+  if (!PyArg_ParseTuple(args, "O!OO", &PyByteArray_Type, &buffer, &values, &fallback)) throw PyErrorSet{};
+  return Ref::steal(PyLong_FromSsize_t(encode_values(buffer, values, fallback)));
 }
 
 }  // namespace mle::cpython

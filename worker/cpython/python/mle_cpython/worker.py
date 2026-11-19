@@ -586,17 +586,6 @@ class Dispatcher:
 
     # -- SQL round trip (called by sql.Api)
 
-    def sql_request(self, w):
-        self.sql.flush_raw()
-        _mlewire.send(wire.SQL, wire.OK, self.depth, self.seq, w.b)
-        while True:
-            op, status, depth, seq, body = _mlewire.receive()
-            if op == wire.SQL_RESULT and depth == self.depth:
-                return body
-            if op in (wire.CALL, wire.PREPARE, wire.DROP) and depth == self.depth + 1:
-                self.handle(op, depth, seq, body)
-                continue
-            raise RuntimeError('unexpected message %d at depth %d during SQL' % (op, depth))
 
 
 class MessageTooLarge(Exception):
@@ -619,7 +608,10 @@ def main():
     cls = os.environ.get('MLE_CLASS', 'cpython')
     import decimal
     import json
-    _mlewire.setup(decimal.Decimal, json.loads, wire.temporal, wire.new_vector, wire.demote)
+    from . import sql
+    # The values of routine arguments, and of rows (zero dates as None; DECIMAL as float with NUMBER).
+    _mlewire.setup(decimal.Decimal, json.loads, wire.temporal, wire.new_vector, wire.demote, sql._row_temporal,
+                   float)
     arena = _mlewire.open(int(os.environ.get("MLE_SPIN", "2000")))
     d = Dispatcher(arena, cls)
     sys.stdout = d.console.out

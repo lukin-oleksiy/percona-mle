@@ -407,7 +407,156 @@ Ref py_serve(PyObject *args) {
   }
 }
 
+// ------------------------------------------------------------------------------ SQL round trips
+//
+// The SQL API's mechanics in C++ (exp note 62 §9), as the JVM worker's Java core under its thin
+// language adapters: a statement message is finished and sent, the host's nested requests are
+// served while the worker waits, and the reply is parsed into a tuple. The API (sql.py) stays
+// Python.
+
+/** The str fields of a column, after its name and table: ParamType's name, original name,
+    schema, original table, charset, collation. */
+void skip_column_rest(Reader &r) {
+  r.take(14);  // ParamType: tag, unsigned, length, precision, scale
+  for (int i = 0; i < 6; i++) r.str();
+  r.get<uint32_t>();  // flags
+}
+
+Ref str_of(std::string_view s) {
+  return Ref::steal(PyUnicode_DecodeUTF8(s.data(), Py_ssize_t(s.size()), "replace"));
+}
+
+/** u32 n + n x (u32 level, u32 code, str message): None if none, else a list of tuples. */
+Ref warnings(Reader &r) {
+  const uint32_t n = r.get<uint32_t>();
+  if (n == 0) return Ref::borrow(Py_None);
+  Ref list = Ref::steal(PyList_New(n));
+  for (uint32_t i = 0; i < n; i++) {
+    const uint32_t level = r.get<uint32_t>(), code = r.get<uint32_t>();
+    Ref msg = str_of(r.str());
+    PyList_SET_ITEM(list.get(), i, Py_BuildValue("(IIN)", level, code, msg.release()));
+  }
+  return list;
+}
+
+/** A SQL_RESULT as a tuple:
+      (0, errno, sqlstate, message, failed row or None)
+      (1, affected, insert id, warnings, more results, parameter count, exec us)
+      (2, column block (bytes), labels, tags, total, body, rows position, rows, more, more results,
+       warnings, exec us)
+    The rows stay in body (decoded when needed); the column block is the columns' metadata as on the
+    wire, made into Column objects only when a routine asks for them. */
+Ref parse_sql_result(const Message &m, Ref &assembled) {
+  Reader r(m.body, 0);
+  switch (static_cast<w::SqlResultKind>(r.get<uint8_t>())) {
+    case w::SqlResultKind::kError: {
+      const uint32_t err = r.get<uint32_t>();
+      Ref state = str_of(r.str()), msg = str_of(r.str());
+      const uint32_t row = r.get<uint32_t>();
+      Ref failed = row == w::kNoRow ? Ref::borrow(Py_None) : Ref::steal(PyLong_FromUnsignedLong(row));
+      return Ref::steal(Py_BuildValue("(iINNN)", 0, err, state.release(), msg.release(), failed.release()));
+    }
+    case w::SqlResultKind::kOk: {
+      const uint64_t affected = r.get<uint64_t>(), insert_id = r.get<uint64_t>();
+      Ref warns = warnings(r);
+      const bool more_results = r.get<uint8_t>() != 0;
+      const uint32_t params = r.get<uint32_t>();
+      const uint64_t exec_us = r.get<uint64_t>();
+      return Ref::steal(Py_BuildValue("(iKKNOIK)", 1, static_cast<unsigned long long>(affected),
+                                      static_cast<unsigned long long>(insert_id), warns.release(),
+                                      more_results ? Py_True : Py_False, params,
+                                      static_cast<unsigned long long>(exec_us)));
+    }
+    case w::SqlResultKind::kRows: {
+      const uint32_t ncols = r.get<uint32_t>();
+      if (ncols > 4096) throw Malformed{"too many columns"};
+      const size_t block_at = r.pos();
+      Ref labels = Ref::steal(PyTuple_New(ncols));
+      Ref tags = Ref::steal(PyTuple_New(ncols));
+      for (uint32_t i = 0; i < ncols; i++) {
+        PyTuple_SET_ITEM(labels.get(), i, str_of(r.str()).release());
+        r.str();  // table
+        Reader peek = r;  // ParamType's tag
+        PyTuple_SET_ITEM(tags.get(), i, PyLong_FromLong(peek.get<uint8_t>()));
+        skip_column_rest(r);
+      }
+      const auto block = m.body.subspan(block_at, r.pos() - block_at);
+      Ref block_bytes = Ref::steal(
+          PyBytes_FromStringAndSize(reinterpret_cast<const char *>(block.data()), Py_ssize_t(block.size())));
+      const uint64_t total = r.get<uint64_t>();
+      const uint32_t nrows = r.get<uint32_t>();
+      const size_t rows_at = r.pos();
+      for (uint64_t i = 0; i < uint64_t{nrows} * ncols; i++) skip_value(r);
+      const bool more = r.get<uint8_t>() != 0, more_results = r.get<uint8_t>() != 0;
+      Ref warns = warnings(r);
+      const uint64_t exec_us = r.get<uint64_t>();
+      Ref body = nrows == 0 ? Ref::borrow(Py_None) : body_object(m, assembled);
+      return Ref::steal(Py_BuildValue("(iNNNKNnIOONK)", 2, block_bytes.release(), labels.release(), tags.release(),
+                                      static_cast<unsigned long long>(total), body.release(), Py_ssize_t(rows_at),
+                                      nrows, more ? Py_True : Py_False, more_results ? Py_True : Py_False,
+                                      warns.release(), static_cast<unsigned long long>(exec_us)));
+    }
+  }
+  throw Malformed{"bad SQL result kind"};
+}
+
+/** sql(message, action, statement id, count position, count, flags, row width, depth, call seq,
+    handle) -> the reply tuple, or None if the message is larger than the host accepts (nothing
+    sent). message: a bytearray of the SQL message without its trailer (u8 action and u64 statement
+    id at 0 and the u32 value count at count position are filled in here). handle(op, depth, seq,
+    body) serves the host's nested requests (CALL, PREPARE, DROP at depth + 1) while it waits. */
+Ref py_sql(PyObject *args) {
+  PyObject *message, *handle;
+  unsigned action, flags, width, depth;
+  unsigned long long sid, seq;
+  Py_ssize_t count_at;
+  unsigned count;
+  if (!PyArg_ParseTuple(args, "O!IKnIIIIKO", &PyByteArray_Type, &message, &action, &sid, &count_at, &count, &flags,
+                        &width, &depth, &seq, &handle))
+    throw PyErrorSet{};
+  const Buffer b(message, PyBUF_SIMPLE);
+  const auto in = b.bytes();
+  if (count_at < 9 || size_t(count_at) + 4 > in.size()) throw Malformed{"bad SQL message"};
+  if (in.size() + 9 > w::kMaxWorkerMessage) return Ref::borrow(Py_None);  // + flags, max rows, row width
+  std::vector<std::byte> msg(in.begin(), in.end());
+  const auto put = [&msg](size_t at, auto v) {
+    const auto bytes = std::bit_cast<std::array<std::byte, sizeof(v)>>(v);
+    std::copy(bytes.begin(), bytes.end(), msg.begin() + static_cast<std::ptrdiff_t>(at));
+  };
+  const auto add = [&msg](auto v) {
+    const auto bytes = std::bit_cast<std::array<std::byte, sizeof(v)>>(v);
+    msg.insert(msg.end(), bytes.begin(), bytes.end());
+  };
+  put(0, static_cast<uint8_t>(action));
+  put(1, static_cast<uint64_t>(sid));
+  put(size_t(count_at), static_cast<uint32_t>(count));
+  add(static_cast<uint8_t>(flags));
+  add(uint32_t{0});  // max rows per chunk: the host's default
+  add(static_cast<uint32_t>(width));
+  Mailbox::send(uint32_t(w::Op::kSql), uint32_t(w::Status::kOk), depth, seq, msg);
+  while (true) {
+    Ref assembled;
+    const Message m = Mailbox::receive([&assembled](size_t size) {
+      assembled = Ref::steal(PyBytes_FromStringAndSize(nullptr, Py_ssize_t(size)));
+      return reinterpret_cast<std::byte *>(PyBytes_AS_STRING(assembled.get()));
+    });
+    if (m.op == uint32_t(w::Op::kSqlResult) && m.depth == depth) return parse_sql_result(m, assembled);
+    const bool nested = m.op == uint32_t(w::Op::kCall) || m.op == uint32_t(w::Op::kPrepare) ||
+                        m.op == uint32_t(w::Op::kDrop);
+    if (nested && m.depth == depth + 1) {
+      const Ref body = body_object(m, assembled);
+      Ref r = Ref::steal(PyObject_CallFunction(handle, "IIKO", m.op, m.depth,
+                                               static_cast<unsigned long long>(m.call_seq), body.get()));
+      continue;
+    }
+    PyErr_Format(PyExc_RuntimeError, "unexpected message %u at depth %u during SQL", m.op, m.depth);
+    throw PyErrorSet{};
+  }
+}
+
 PyMethodDef kMethods[] = {
+    {"sql", boundary<py_sql>, METH_VARARGS, "sql(message, action, id, count_at, count, flags, width, depth, seq, handle)"},
+    {"encode_values", boundary<py_encode_values>, METH_VARARGS, "encode_values(buffer, values, fallback) -> count"},
     {"serve", boundary<py_serve>, METH_VARARGS, "serve(handle, finish, vector_arg, state, open): the request loop"},
     {"register", boundary<py_register>, METH_VARARGS, "register(id, fn, code, base, nparams, ret_tag, unsigned, vectors)"},
     {"unregister", boundary<py_unregister>, METH_VARARGS, "unregister([id]): drop fast routines"},

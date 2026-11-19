@@ -26,7 +26,6 @@ import math as _math
 import random as _random
 import re as _re
 import secrets as _secrets
-import struct as _struct
 import threading as _threading
 import time as _time
 import types as _types
@@ -38,8 +37,9 @@ from . import sql_batch, wire
 from .wire import Reader, Writer
 
 _decode_rows = _mlewire.decode_rows
+_encode_values = _mlewire.encode_values
+_sql = _mlewire.sql
 _decode_columns = _mlewire.decode_columns
-_setup = _mlewire.setup
 
 EXECUTE, PREPARE, EXECUTE_PREPARED, FETCH, NEXT_RESULT, CLOSE, EXECUTE_MANY = range(7)
 TO_CLIENT = 1
@@ -259,8 +259,6 @@ class Options:
 
 
 _NO_OPTIONS = Options()
-_HEAD = _struct.Struct('<BQ')
-_COUNT = _struct.Struct('<I')
 
 
 def _options(v):
@@ -289,31 +287,19 @@ def _row_temporal(tag, year, month, day, hour, minute, second, micro, neg):
     return None
 
 
-def _rows_codec(number):
-    """The codec's helpers for the values of rows (PySql.value): DECIMAL as Decimal (as float with
-    decimalType NUMBER), zero dates as None. Routine arguments keep the worker's (wire.temporal
-    raises for zero dates, as the JVM kind's arguments): _arguments_codec puts them back."""
-    _setup(float if number else _decimal.Decimal, _json.loads, _row_temporal, wire.new_vector, wire.demote)
-
-
-def _arguments_codec():
-    _setup(_decimal.Decimal, _json.loads, wire.temporal, wire.new_vector, wire.demote)
+# The codec's rules for values of rows (PySql.value): DECIMAL as Decimal (as float with the
+# decimalType NUMBER), zero dates as None (_row_temporal). Routine arguments keep the worker's
+# (wire.temporal raises for zero dates, as the JVM kind's arguments). The worker gives the codec
+# both sets of helpers once (worker.main); each decode call says which rules apply.
+_RULES_ROWS, _RULES_ROWS_NUMBER = 1, 2
 
 
 def _decode_rows_as(number, body, pos, nrows, ncols, row_type):
-    _rows_codec(number)
-    try:
-        return _decode_rows(body, pos, nrows, ncols, row_type)
-    finally:
-        _arguments_codec()
+    return _decode_rows(body, pos, nrows, ncols, row_type, _RULES_ROWS_NUMBER if number else _RULES_ROWS)
 
 
 def _decode_columns_as(number, body, pos, nrows, collectors):
-    _rows_codec(number)
-    try:
-        return _decode_columns(body, pos, nrows, collectors)
-    finally:
-        _arguments_codec()
+    return _decode_columns(body, pos, nrows, collectors, _RULES_ROWS_NUMBER if number else _RULES_ROWS)
 
 
 class Argument:
@@ -354,16 +340,14 @@ class _Msg:
         self.n = 0
 
     def add(self, values):
-        param = self.w.param
+        # The common types in C++ (_mlewire.encode_values), the others by Writer.param (_encode_one).
         try:
-            for v in values:
-                param(v)
+            self.n += _encode_values(self.w.b, values, _encode_one)
         except (TypeError, wire.ConversionError) as e:
             x = _param_error(values, e)
             if x is not None:
                 raise x from None
             raise
-        self.n += len(values)
         return self
 
     def size(self):
@@ -381,6 +365,16 @@ def _add_row(param, row):
         if x is not None:
             raise x from None
         raise
+
+
+def _encode_one(v, offset):
+    """One parameter by Writer.param, as the bytes it takes at offset of a message (VECTOR data is
+    16-aligned relative to the message start)."""
+    w = Writer()
+    pad = offset % 16
+    w.b += bytes(pad)
+    w.param(v)
+    return memoryview(w.b)[pad:]
 
 
 def _msg(text, params=None):
@@ -454,6 +448,34 @@ _NUMERIC = frozenset(('TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'BIGINT', 'YEAR
                       'DECIMAL'))
 _OWN_TYPES = frozenset(('TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'BIGINT', 'BIT', 'FLOAT', 'DOUBLE', 'DECIMAL',
                         'JSON', 'TIME', 'DATE', 'DATETIME', 'TIMESTAMP', 'SET', 'ENUM', 'GEOMETRY', 'VECTOR'))
+
+
+class _Columns:
+    """A result set's columns: the labels and type tags at once (from the C++ reply parser), Column
+    objects only when a routine asks for them (most statements never do)."""
+    __slots__ = ('labels', 'tags', '_block', '_list')
+
+    def __init__(self, block, labels, tags):
+        self.labels, self.tags, self._block, self._list = labels, tags, block, None
+
+    def _all(self):
+        cols = self._list
+        if cols is None:
+            r = Reader(self._block)
+            cols = self._list = [Column(r) for _ in self.labels]
+        return cols
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __iter__(self):
+        return iter(self._all())
+
+    def __getitem__(self, i):
+        return self._all()[i]
+
+
+_NO_COLUMNS = _Columns(b'', (), ())
 
 
 @_aliases
@@ -551,10 +573,32 @@ class Reply:
                  'param_count', 'exec_us')
 
 
-def _warnings(r):
+def _warning_list(ws):
     # mysqld's levels count from 0 (note, warning, error); Oracle's from 1.
-    n = r.u32()
-    return [Warning_(r.u32() + 1, r.u32(), r.str()) for _ in range(n)] if n else []
+    return [Warning_(level + 1, code, message) for level, code, message in ws] if ws else []
+
+
+def _reply(t):
+    """A reply tuple of _mlewire.sql (module.cc, parse_sql_result) as a Reply."""
+    kind = t[0]
+    rep = Reply()
+    if kind == 2:
+        _, block, labels, tags, rep.total, body, at, nrows, rep.more, rep.more_results, ws, rep.exec_us = t
+        rep.columns = _Columns(block, labels, tags)
+        rep.raw = (body, at, nrows) if nrows else None
+        rep.nrows = nrows
+        rep.warnings = _warning_list(ws)
+        rep.affected, rep.insert_id, rep.param_count = 0, 0, 0
+        return rep
+    if kind == 1:
+        _, rep.affected, rep.insert_id, ws, rep.more_results, rep.param_count, rep.exec_us = t
+        rep.warnings = _warning_list(ws)
+        rep.raw, rep.nrows, rep.columns, rep.total, rep.more = None, 0, None, 0, False
+        return rep
+    _, errno, state, message, row = t
+    raise _sql_error(errno, state, message, row)
+
+
 
 
 _COLUMN_MODE = {wire.T_VECTOR: wire.MODE_VECTOR, wire.T_I64: wire.MODE_INT64, wire.T_U64: wire.MODE_INT64,
@@ -591,7 +635,7 @@ class SqlResult:
         api = self._api
         api._drained(self)  # a former result set's rows are skipped
         self._has_data = reply.columns is not None
-        self._columns = reply.columns if self._has_data else []
+        self._columns = reply.columns if self._has_data else _NO_COLUMNS
         self._row_type = None
         self._rows = []
         self._at = 0
@@ -627,7 +671,7 @@ class SqlResult:
     def _type(self):
         t = self._row_type
         if t is None:
-            t = self._row_type = _row_class(tuple(c._name for c in self._columns))
+            t = self._row_type = _row_class(self._columns.labels)
         return t
 
     def _materialize(self):
@@ -759,7 +803,7 @@ class SqlResult:
         return list(self._columns)
 
     def get_column_names(self):
-        return [c._name for c in self._columns]
+        return list(self._columns.labels)
 
     def get_column_count(self):
         return len(self._columns)
@@ -820,7 +864,7 @@ class SqlResult:
         collectors = [None] * len(labels)
         for i in index.values():
             if collectors[i] is None:
-                collectors[i] = wire.Collector(_COLUMN_MODE.get(self._columns[i]._ptype.tag, wire.MODE_LIST),
+                collectors[i] = wire.Collector(_COLUMN_MODE.get(self._columns.tags[i], wire.MODE_LIST),
                                                self._total)
         for row in self._rows[self._at:]:  # rows decoded before (fetch_one ...)
             for i, c in enumerate(collectors):
@@ -1726,48 +1770,12 @@ class Api:
             raise _sql_error(1210, 'HY000', 'Incorrect arguments: %d values in one statement (at most %d)'
                              % (n, MAX_VALUES))
         self._drain_other(sid)
-        w = msg.w
-        _HEAD.pack_into(w.b, 0, action, sid)
-        _COUNT.pack_into(w.b, msg.at, n)
-        w.u8(flags)
-        w.u32(0)  # max rows per chunk: host default
-        w.u32(width)
-        if len(w.b) > wire.MAX_WORKER_MESSAGE:
+        self.flush_raw()  # rows still in the arena are read before it is written over
+        d = self.d
+        # Sent, nested requests served, the reply parsed: C++ (_mlewire.sql).
+        t = _sql(msg.w.b, action, sid, msg.at, n, flags, width, d.depth, d.seq, d.handle)
+        if t is None:
             # MySQL's error for a packet over max_allowed_packet, but not its SQLSTATE 08S01.
             raise _sql_error(1153, 'HY000', 'the SQL statement with its parameters is larger than MLE allows '
                              '(%d MiB)' % (wire.MAX_WORKER_MESSAGE >> 20))
-        return self._reply(self.d.sql_request(w))
-
-    @staticmethod
-    def _reply(body):
-        r = Reader(body)
-        kind = r.u8()
-        rep = Reply()
-        if kind == wire.SQL_ERROR:
-            errno, state, message, row = r.u32(), r.str(), r.str(), r.u32()
-            raise _sql_error(errno, state, message, None if row == wire.NO_ROW else row)
-        if kind == wire.SQL_OK:
-            rep.affected, rep.insert_id = r.u64(), r.u64()
-            rep.warnings = _warnings(r)
-            rep.more_results = r.u8() != 0
-            rep.param_count = r.u32()
-            rep.exec_us = r.u64()
-            rep.raw, rep.nrows, rep.columns, rep.total, rep.more = None, 0, None, 0, False
-            return rep
-        if kind != wire.SQL_ROWS:
-            raise RuntimeError('bad SQL result kind %d' % kind)
-        columns = [Column(r) for _ in range(r.u32())]
-        rep.columns = columns
-        rep.total = r.u64()
-        nrows = r.u32()
-        rows_at = r.p
-        # The rows are skipped now (the trailer follows them) and decoded when needed.
-        r.p = _decode_columns(body, rows_at, nrows, [None] * len(columns))
-        rep.raw = (body, rows_at, nrows) if nrows else None
-        rep.nrows = nrows
-        rep.more = r.u8() != 0
-        rep.more_results = r.u8() != 0
-        rep.warnings = _warnings(r)
-        rep.exec_us = r.u64()
-        rep.affected, rep.insert_id, rep.param_count = 0, 0, 0
-        return rep
+        return _reply(t)
