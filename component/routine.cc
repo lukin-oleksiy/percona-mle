@@ -128,6 +128,8 @@ bool valid_name(const std::string &name, unsigned language) {
   if (language == kJavaScript && name.size() > 2 && name[0] == '$' &&
       name[1] == 'a' && isdigit(static_cast<unsigned char>(name[2])))
     return false;  // $a0, $a1, ...: the wrapper's argument names
+  if (language == kJavaScript && (name == "$c" || name == "$G" || name == "$r"))
+    return false;  // the wrapper's own names
   const bool dollar = language != kPython;
   for (size_t i = 0; i < name.size(); i++) {
     const auto c = static_cast<unsigned char>(name[i]);
@@ -177,14 +179,20 @@ const char *sql_type_name(uint64_t t) {
       return "FLOAT";
     case MYSQL_SP_ARG_TYPE_DOUBLE:
       return "DOUBLE";
+    // Routine parameters have the NEW/2 codes, result columns the others.
+    case MYSQL_SP_ARG_TYPE_DECIMAL:
     case MYSQL_SP_ARG_TYPE_NEWDECIMAL:
       return "DECIMAL";
+    case MYSQL_SP_ARG_TYPE_DATE:
     case MYSQL_SP_ARG_TYPE_NEWDATE:
       return "DATE";
+    case MYSQL_SP_ARG_TYPE_TIME:
     case MYSQL_SP_ARG_TYPE_TIME2:
       return "TIME";
+    case MYSQL_SP_ARG_TYPE_DATETIME:
     case MYSQL_SP_ARG_TYPE_DATETIME2:
       return "DATETIME";
+    case MYSQL_SP_ARG_TYPE_TIMESTAMP:
     case MYSQL_SP_ARG_TYPE_TIMESTAMP2:
       return "TIMESTAMP";
     case MYSQL_SP_ARG_TYPE_JSON:
@@ -586,6 +594,19 @@ Routine *Routine::create(stored_program_handle sp) {
                       schema.str == nullptr ? r->schema.size() : schema.length);
     if (lib.str != nullptr) imp.name.assign(lib.str, lib.length);
     if (alias.str != nullptr) imp.alias.assign(alias.str, alias.length);
+    // The name the routine's code uses for the library is put into that
+    // code (JavaScript: the wrapper's text): an identifier like a
+    // parameter's, and not a parameter's or another library's.
+    const std::string &binding = imp.alias.empty() ? imp.name : imp.alias;
+    bool taken = false;
+    for (const ParamInfo &p : r->params) taken = taken || p.name == binding;
+    for (const mle::Import &other : m.imports)
+      taken = taken || (other.alias.empty() ? other.name : other.alias) == binding;
+    if (bit != kJava && (taken || !valid_name(binding, bit))) {
+      my_error(ER_LANGUAGE_COMPONENT_KEYWORD, MYF(0), r->display_language(),
+               binding.c_str());
+      return nullptr;
+    }
     m.imports.push_back(std::move(imp));
   }
   for (const ParamInfo &p : r->params) m.params.push_back({p.name, p.mode, p.type});

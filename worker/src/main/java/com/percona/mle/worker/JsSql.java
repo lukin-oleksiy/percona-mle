@@ -158,7 +158,9 @@ final class JsSql implements GuestSql.Lang {
             if (v instanceof ArrayBuffer) return [8, v];
             if (ArrayBuffer.isView(v)) return [8, v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)];
             if (v instanceof Set) return [2, [...v].map(String).join(',')];
-            return [9, JSON.stringify(v)];
+            const json = JSON.stringify(v);
+            if (json === undefined) throw new TypeError('cannot bind ' + Object.prototype.toString.call(v));
+            return [9, json];
           },
         };
       })
@@ -294,7 +296,7 @@ final class JsSql implements GuestSql.Lang {
       case 0 -> null;
       case 1 -> p.asBoolean() ? 1L : 0L;
       case 2 -> p.asString();
-      case 3 -> p.asLong();
+      case 3 -> p.fitsInLong() ? p.asLong() : (long) p.asDouble();  // -0 is a safe integer too
       case 4 -> p.asDouble();
       case 5 -> new BigInteger(p.asString());
       case 6 -> LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli((long) p.asDouble()), options.zone);

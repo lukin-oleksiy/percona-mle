@@ -145,9 +145,6 @@ class Filter {
     stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
     stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
   }
-  /** nr allowed only when its first argument is value (e.g. a socket
-      domain); otherwise EPERM. */
-  void only_arg0(long nr, uint32_t value) { only_self(nr, static_cast<pid_t>(value)); }
   /** clone: threads only (CLONE_THREAD), no new processes. */
   void threads_only(long nr) {
     stmt(BPF_LD | BPF_W | BPF_ABS, kNr);

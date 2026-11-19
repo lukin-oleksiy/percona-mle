@@ -120,6 +120,15 @@ struct SqlRunner::Statement {
   bool rows_open = false;
   /** The next result set is current but not reported yet. */
   bool next_pending = false;
+  /** Moving to the next result set failed: nextResult() reports the error. */
+  bool next_failed = false;
+  /** After a result set: makes the next one current, if there is one. A
+      failure counts as a next result, which nextResult() reports. */
+  void advance() {
+    bool more = false;
+    next_failed = mysql_service_mysql_stmt_result->next_result(h, &more);
+    if (next_failed || more) next_pending = true;
+  }
   std::vector<mle::Column> columns;
   std::vector<Reader> readers;
   /** One row read ahead (to know whether more rows follow). */
@@ -232,6 +241,7 @@ void SqlRunner::statement_error(Statement &s, SqlResultMsg *result) {
   m_pending = true;
   m_pending_errno = result->sql_errno;
   m_pending_sqlstate = result->sqlstate;
+  m_pending_message = result->message;
 }
 
 void SqlRunner::handle(const mle::SqlMsg &request, SqlResultMsg *result,
@@ -455,9 +465,19 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
   const uint64_t t0 = now_us();
   bool failed;
   if (with_params) {
-    failed = mysql_service_mysql_stmt_execute->prepare(text, s->h) ||
-             bind_values(s->h, request.params) ||
-             mysql_service_mysql_stmt_execute->execute(s->h);
+    failed = mysql_service_mysql_stmt_execute->prepare(text, s->h);
+    if (!failed) {
+      // As for a prepared statement: a value for each marker, no more.
+      uint32_t markers = 0;
+      (void)mysql_service_mysql_stmt_metadata->param_count(s->h, &markers);
+      if (request.params.size() != markers)
+        return sql_error(result, ER_WRONG_ARGUMENTS,
+                         request.params.size() > markers
+                             ? "more values than parameter markers"
+                             : "fewer values than parameter markers");
+      failed = bind_values(s->h, request.params) ||
+               mysql_service_mysql_stmt_execute->execute(s->h);
+    }
   } else {
     failed = mysql_service_mysql_stmt_execute_direct->execute(text, s->h);
   }
@@ -510,6 +530,7 @@ void SqlRunner::execute_prepared(const mle::SqlMsg &request,
   if (over_budget(&s, result)) return;  // its own results go when it runs
   s.rows_open = false;
   s.next_pending = false;
+  s.next_failed = false;
   s.lookahead.clear();
   s.pending = nullptr;
   s.all.clear();  // the handles of the last execution's rows
@@ -567,6 +588,7 @@ void SqlRunner::execute_many(const mle::SqlMsg &request,
                          std::to_string(s.param_count) + ")");
   s.rows_open = false;
   s.next_pending = false;
+  s.next_failed = false;
   s.lookahead.clear();
   s.pending = nullptr;
   s.all.clear();
@@ -633,7 +655,6 @@ void SqlRunner::next_result(const mle::SqlMsg &request, SqlResultMsg *result) {
   Statement &s = *it->second;
   if (!s.next_pending) {
     // Rows of the current set may be left: skip them.
-    bool more = false;
     if (s.rows_open) {
       my_h_row row = nullptr;
       while (!s.next_row(&row) && row != nullptr) {
@@ -642,7 +663,8 @@ void SqlRunner::next_result(const mle::SqlMsg &request, SqlResultMsg *result) {
       s.lookahead.clear();
       s.pending = nullptr;
     }
-    if (mysql_service_mysql_stmt_result->next_result(s.h, &more) || !more) {
+    s.advance();
+    if (!s.next_pending) {
       *result = SqlResultMsg();
       result->kind = SqlResultKind::kOk;
       if (!s.prepared) close(request.stmt_id);
@@ -650,6 +672,13 @@ void SqlRunner::next_result(const mle::SqlMsg &request, SqlResultMsg *result) {
     }
   }
   s.next_pending = false;
+  if (s.next_failed) {
+    // Not the end of the results: the statement's error (review C66).
+    s.next_failed = false;
+    statement_error(s, result);
+    if (!s.prepared) close(request.stmt_id);
+    return;
+  }
   reply(request.stmt_id, s,
         request.max_rows != 0 ? request.max_rows : sql_chunk_rows(), 0,
         result);
@@ -671,10 +700,7 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
     (void)mysql_service_mysql_stmt_diagnostics->insert_id(s.h,
                                                           &result->insert_id);
     read_warnings(s.h, result);
-    bool more = false;
-    if (!s.to_client &&
-        !mysql_service_mysql_stmt_result->next_result(s.h, &more) && more)
-      s.next_pending = true;
+    if (!s.to_client) s.advance();
     result->more_results = s.next_pending;
     if (!s.prepared && !s.next_pending) close(id);
     return;
@@ -703,6 +729,13 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
     c.type.length = static_cast<uint32_t>(number_info<unsigned long>(f, "length"));
     c.type.scale = number_info<uint>(f, "decimals");
     c.type.type_name = sql_type_name(type);
+    // As for a routine's parameters: text and bytes differ by the charset.
+    if (binary) {
+      if (c.type.type_name == "VARCHAR") c.type.type_name = "VARBINARY";
+      if (c.type.type_name == "CHAR") c.type.type_name = "BINARY";
+    } else if (c.type.type_name == "BLOB") {
+      c.type.type_name = "TEXT";
+    }
     Reader r;
     switch (type) {
       case MYSQL_SP_ARG_TYPE_TINY:
@@ -820,9 +853,7 @@ void SqlRunner::rows(uint64_t id, Statement &s, uint32_t max_rows, bool first,
 void SqlRunner::finish_result_set(uint64_t id, Statement &s,
                                   SqlResultMsg *result) {
   read_warnings(s.h, result);
-  bool more = false;
-  if (!mysql_service_mysql_stmt_result->next_result(s.h, &more) && more)
-    s.next_pending = true;
+  s.advance();
   result->more_results = s.next_pending;
   if (!s.prepared && !s.next_pending) close(id);
 }
@@ -1068,9 +1099,7 @@ SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s,
   w.patch_u32(count_at, rows);
   bool more_results = false;
   if (!s.rows_open) {
-    bool next = false;
-    if (!mysql_service_mysql_stmt_result->next_result(s.h, &next) && next)
-      s.next_pending = true;
+    s.advance();
     more_results = s.next_pending;
   }
   w.set_capacity(m_direct->capacity);  // the tail's room
@@ -1084,6 +1113,7 @@ SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s,
     return Direct::kWritten;
   }
   m_direct->length = w.position();
+  m_direct->rows = rows;
   if (!s.rows_open && !s.prepared && !s.next_pending) close(id);
   return Direct::kWritten;
 }
@@ -1134,8 +1164,10 @@ bool SqlRunner::read_rows(Statement &s, uint32_t max_rows,
 void SqlRunner::call_succeeded() { clear_pending_error(); }
 
 bool SqlRunner::propagates(const mle::Error &e) {
+  // The same error, text included: an error the routine made itself with
+  // the number of the one it caught is raised with its own text.
   if (m_pending && e.sql_errno == m_pending_errno &&
-      e.sqlstate == m_pending_sqlstate)
+      e.sqlstate == m_pending_sqlstate && e.message == m_pending_message)
     return true;
   clear_pending_error();
   return false;
@@ -1153,9 +1185,19 @@ bool SqlRunner::raise(const mle::Error &e) {
   if (!valid) return false;
   // The message as a hex literal: no quoting or escaping rules apply (also
   // under NO_BACKSLASH_ESCAPES), any bytes are safe in the statement text.
+  // MESSAGE_TEXT takes 128 characters: a longer text is cut (whole UTF-8
+  // characters) rather than losing the error's number to a failed SIGNAL.
+  size_t length = 0;
+  for (size_t chars = 0; length < e.message.size(); chars++) {
+    if (chars == 128) break;
+    length++;
+    while (length < e.message.size() &&
+           (static_cast<unsigned char>(e.message[length]) & 0xC0) == 0x80)
+      length++;
+  }
   static const char kHex[] = "0123456789ABCDEF";
   std::string message;
-  for (unsigned char c : e.message) {
+  for (unsigned char c : std::string_view(e.message).substr(0, length)) {
     message.push_back(kHex[c >> 4]);
     message.push_back(kHex[c & 15]);
   }

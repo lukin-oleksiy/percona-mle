@@ -97,6 +97,13 @@ public final class PreparedStatement {
    */
   public SqlResult executeMany(List<?> rows) {
     open();
+    // The same answer for every size of batch, before anything is written.
+    if (options.passResultToClient())
+      throw new MleSqlException(1210, "HY000", "Incorrect arguments to executeMany: it cannot send results to the "
+          + "client (passResultToClient)");
+    if (parameterCount == 0 && !rows.isEmpty())
+      throw new MleSqlException(1210, "HY000", "Incorrect arguments to executeMany: the statement has no "
+          + "parameter markers");
     if (rows.size() >= BATCH_MIN_ROWS && options.batchRewrite()) {
       BatchRewrite.Form f = form();
       if (f != null && session.innodb(f.schema(), f.table(), false)) return executeRewritten(rows, f);
@@ -105,8 +112,8 @@ public final class PreparedStatement {
   }
 
   /**
-   * Batches smaller than this run row by row: preparing the multi-row statement in every call (a
-   * top-level call closes its statements) costs ~0.2 ms per 1,000 markers, which fewer rows do not
+   * Batches smaller than this run row by row: preparing the multi-row statement in every call
+   * (every call closes its own statements) costs ~0.2 ms per 1,000 markers, which fewer rows do not
    * win back (exp note 52 §12-13).
    */
   static final int BATCH_MIN_ROWS = 256;
@@ -171,12 +178,15 @@ public final class PreparedStatement {
       int from = i, k = 0;
       long bytes = 0;
       List<Object> params = new ArrayList<>();
+      MleSqlException bad = null;  // a malformed row: thrown once the rows before it are written
       while (i < n && k < maxRows) {
         Object[] row = session.params(session.row(rows.get(i)));
         int w = row == null ? 0 : row.length;
-        if (w != parameterCount)
-          throw new MleSqlException(1210, "HY000", "Incorrect arguments to executeMany: row " + i + " has " + w
+        if (w != parameterCount) {
+          bad = new MleSqlException(1210, "HY000", "Incorrect arguments to executeMany: row " + i + " has " + w
               + " values for " + parameterCount + " parameter markers", i);
+          break;
+        }
         long size = 0;
         for (Object v : row) size += size(v);
         if (k > 0 && bytes + size > budget) break;
@@ -186,10 +196,13 @@ public final class PreparedStatement {
         i++;
       }
       if (k < REWRITE_MIN_ROWS) {  // a short last chunk: row by row
-        SqlResult r = executeRows(rows.subList(from, from + k), from);
-        affected += r.getAffectedItemsCount();
-        execUs += r.getExecutionMicros();
-        warnings = List.of();
+        if (k > 0) {
+          SqlResult r = executeRows(rows.subList(from, from + k), from);
+          affected += r.getAffectedItemsCount();
+          execUs += r.getExecutionMicros();
+          warnings = lastWarnings;
+        }
+        if (bad != null) throw bad;
         continue;
       }
       try {
@@ -209,7 +222,9 @@ public final class PreparedStatement {
         SqlResult r = executeRows(rows.subList(from, from + k), from);  // throws at the failing row
         affected += r.getAffectedItemsCount();
         execUs += r.getExecutionMicros();
+        warnings = lastWarnings;
       }
+      if (bad != null) throw bad;
     }
     return new SqlResult(session, id, false, options,
         new MleSql.Reply(id, false, List.of(), List.of(), false, false, affected, 0, warnings, 0, execUs, 0));
@@ -236,6 +251,9 @@ public final class PreparedStatement {
     return r;
   }
 
+  /** The warnings of executeRows' last message, as the reply had them (for executeRewritten). */
+  private List<MleSql.Warning> lastWarnings = List.of();
+
   /** executeMany row by row on mysqld's side (kExecuteMany); row indexes in errors count from offset. */
   private SqlResult executeRows(List<?> rows, long offset) {
     open();
@@ -248,16 +266,21 @@ public final class PreparedStatement {
     List<Object> batch = new ArrayList<>();
     long bytes = 0;
     int inBatch = 0;
-    for (int i = 0; i <= rows.size(); i++) {
+    MleSqlException bad = null;
+    for (int i = 0; i <= rows.size() && bad == null; i++) {
       Object[] row = null;
       long size = 0;
       if (i < rows.size()) {
         row = session.params(session.row(rows.get(i)));
         int n = row == null ? 0 : row.length;
-        if (n != parameterCount)
-          throw new MleSqlException(1210, "HY000", "Incorrect arguments to executeMany: row " + (offset + i)
+        if (n != parameterCount) {
+          // The rows before it stay written: those not sent yet go first.
+          bad = new MleSqlException(1210, "HY000", "Incorrect arguments to executeMany: row " + (offset + i)
               + " has " + n + " values for " + parameterCount + " parameter markers", offset + i);
-        for (Object v : row) size += size(v);
+          row = null;
+        } else {
+          for (Object v : row) size += size(v);
+        }
       }
       // A message carries at most MAX_VALUES values (the host's limit, independent review C10).
       if (inBatch > 0 && (row == null || bytes + size > budget || batch.size() + parameterCount > MAX_VALUES)) {
@@ -283,6 +306,8 @@ public final class PreparedStatement {
       }
     }
     executed = executed || done > offset;  // rows ran on this statement: its last row stays bound
+    if (bad != null) throw bad;
+    lastWarnings = warnings;
     return new SqlResult(session, id, false, options,
         new MleSql.Reply(id, false, List.of(), List.of(), false, false, affected, 0, warnings, 0, execUs, 0));
   }

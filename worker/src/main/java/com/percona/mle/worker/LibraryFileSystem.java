@@ -248,7 +248,18 @@ final class LibraryFileSystem implements FileSystem {
     }
   }
 
+  /**
+   * A JavaScript library is a module file "schema/name.mjs" (with its version's hash before the
+   * extension): a '.' or '/' in the names would read as another library's path.
+   */
+  static void checkJsName(String schema, String name) {
+    if (name.isEmpty() || name.indexOf('.') >= 0 || name.indexOf('/') >= 0 || schema.indexOf('/') >= 0)
+      throw new IllegalArgumentException("the JavaScript library " + schema + "." + name
+          + " cannot be imported: a library's name must not contain '.' or '/'");
+  }
+
   private static Path virtual(String schema, String name) {
+    checkJsName(schema, name);
     return Path.of(ROOT, schema, name + ".mjs");
   }
 

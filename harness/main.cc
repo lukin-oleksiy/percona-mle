@@ -65,6 +65,7 @@ struct Options {
 
 Options g_opt;
 std::string g_cgroup_base;
+pid_t g_launcher_pid = -1;  // the workers' cgroup leaves carry it
 
 double ms_since(Clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -104,6 +105,8 @@ std::unique_ptr<Launcher> start_launcher(std::vector<ClassConfig> classes) {
   LauncherConfig c;
   c.launcher_exe = layout().launcher_exe;
   c.cgroup_base = g_cgroup_base;
+  if (const char *d = getenv("MLE_DEBUG_WRITE_DIR"); d != nullptr && *d == '/')
+    c.debug_write_dir = d;
   c.classes = std::move(classes);
   c.timeout_ms = 60000;
   std::string err;
@@ -111,6 +114,7 @@ std::unique_ptr<Launcher> start_launcher(std::vector<ClassConfig> classes) {
   if (!l) die(err);
   for (size_t i = 0; i < l->info().class_errors.size(); i++)
     if (!l->info().class_errors[i].empty()) die(l->info().class_errors[i]);
+  g_launcher_pid = l->info().pid;
   return l;
 }
 
@@ -340,7 +344,8 @@ std::string status_field(pid_t pid, const char *name) {
 std::string cgroup_mb(uint64_t id, const char *file) {
   if (g_cgroup_base.empty()) return "-";
   const std::string v =
-      read_file(g_cgroup_base + "/mle-w" + std::to_string(id) + "/" + file);
+      read_file(g_cgroup_base + "/mle-" + std::to_string(g_launcher_pid) + "-w" +
+                std::to_string(id) + "/" + file);
   return v.empty() ? "?" : std::to_string(std::stoull(v) >> 20);
 }
 

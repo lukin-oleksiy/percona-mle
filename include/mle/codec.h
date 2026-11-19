@@ -129,9 +129,6 @@ class Reader {
   bool str(std::string *s) { return text(s, true); }
   /** Byte string (any bytes). */
   bool bytes(std::string *s) { return text(s, false); }
-  /** A u32 element count that can be satisfied by the remaining bytes when
-      each element takes at least min_size bytes. Protects against huge
-      allocations from a hostile count. */
   /** An element count: at most what the rest of the message can hold
       (min_size bytes each) and at most max (decoded elements can be much
       larger than their wire form). */

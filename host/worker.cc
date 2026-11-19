@@ -490,6 +490,7 @@ Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
         trace.exec += int64_t(r.exec_us) * 1000;
         trace.requests++;
         if (!r.columns.empty()) trace.rows += r.rows.size() / r.columns.size();
+        trace.rows += direct.rows;  // those written straight into the mailbox
         t = t2;
       }
       if (!m_usable) return died(error);

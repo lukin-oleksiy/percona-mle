@@ -297,7 +297,7 @@ enum class SqlResultKind : uint8_t { kError = 0, kOk = 1, kRows = 2 };
 enum class SqlAction : uint8_t {
   /** Run the text: without parameters directly (the whole result is
       buffered by the server), with parameters as a one-shot prepared
-      statement (a cursor). The reply carries the first rows. */
+      statement (buffered too: no cursor). The reply carries the first rows. */
   kExecute = 0,
   /** Prepare the text under the id; reply kOk with the parameter count. */
   kPrepare = 1,

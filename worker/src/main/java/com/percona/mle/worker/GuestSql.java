@@ -240,8 +240,9 @@ final class GuestSql {
           // runSql(query[, parameters], options)
           Value second = arg(a, 1);
           boolean params = second != null && second.hasArrayElements() && !second.isString();
+          // runSql(query, null, options): the options are the third argument then too.
           SqlResult r = s.runSql(str(a, 0), params ? elements(second) : null,
-              lang.options(params ? arg(a, 2) : second));
+              lang.options(params || (second == null && a.length > 2) ? arg(a, 2) : second));
           yield r == null ? null : new GResult(this, r);
         }
         case "prepare" -> new GPrepared(this, s.prepare(str(a, 0), lang.options(arg(a, 1))));

@@ -25,7 +25,7 @@ public interface RowSink {
   /**
    * One row's raw values (see ValueMapper#value); a VECTOR is a float[] or a read-only
    * java.lang.foreign.MemorySegment of little-endian floats, valid only during this call. The
-   * array is reused for the next row.
+   * array is reused for the next row. It must not run SQL: the result is still being read.
    */
   void row(Object[] values);
 }

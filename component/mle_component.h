@@ -117,7 +117,7 @@ bool principal_has_account(std::string_view principal,
                            std::string_view account);
 /** mysqld's plugin_dir and datadir: never readable by workers (keyring
     component configuration, data files). */
-std::vector<std::string> server_private_paths();
+bool server_private_paths(std::vector<std::string> *paths);
 /** mle.package_dir (or its default); safe without locks (READONLY). */
 std::string package_dir();
 /** Whether the session's account has a global (dynamic) privilege. */

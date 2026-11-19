@@ -144,6 +144,9 @@ final class Wire {
   static final int SQL_FETCH = 3;
   static final int SQL_NEXT_RESULT = 4;
   static final int SQL_CLOSE = 5;
+  static final int SQL_EXECUTE_MANY = 6;
+  /** An error's row when it is no row's (kNoRow). */
+  static final long NO_ROW = 0xFFFFFFFFL;
   static final int SQL_FLAG_TO_CLIENT = 1;
 
   // Control socket

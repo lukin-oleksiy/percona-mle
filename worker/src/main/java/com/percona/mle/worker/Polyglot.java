@@ -100,6 +100,9 @@ final class Polyglot {
       .denyAccess(Runtime.class)
       .denyAccess(System.class)
       .denyAccess(ProcessBuilder.class)
+      .denyAccess(ProcessHandle.class)
+      // Mle.context() is for Java routines; closing it from a script would end the worker's use.
+      .denyAccess(Context.class)
       .denyAccess(java.util.concurrent.Executors.class)
       .denyAccess(java.util.concurrent.ThreadPoolExecutor.class)
       .denyAccess(java.util.concurrent.ForkJoinPool.class)
@@ -401,9 +404,14 @@ final class Polyglot {
             except ImportError:
                 return None
             a = numpy.empty(shape, dtype=numpy.float32)
+            ptr = a.__array_interface__['data'][0]
             if readonly:
-                a.setflags(write=False)
-            return (a, a.__array_interface__['data'][0])
+                # The routine gets a view: the host writes the next call's vector to ptr, so the
+                # array that owns that memory must not be resized (a view cannot be).
+                v = a.view()
+                v.setflags(write=False)
+                return (v, ptr)
+            return (a, ptr)
 
         def _numpy_matrix(n, d):
             import numpy
@@ -895,6 +903,7 @@ final class Polyglot {
     if (hit != null && (long) hit[0] == hash) return (Value) hit[1];
     // The virtual path, not Oracle's "/schema/name": a host directory of that name does not hide
     // the library. The module map keeps one instance per version for every importer.
+    LibraryFileSystem.checkJsName(schema, name);
     LibraryFileSystem.evaluating(schema, name);
     Value ns = jsModule(LibraryFileSystem.ROOT + "/" + schema + "/" + name + ".mjs");
     jsLibraries.put(key, new Object[] {hash, ns});
@@ -973,9 +982,24 @@ final class Polyglot {
       throw e;
     }
     java.lang.foreign.MemorySegment data = (java.lang.foreign.MemorySegment) flat[1];
+    // The new array holds exactly what is copied into it; anything else (a typed array subclass
+    // whose length does not match its buffer) goes element by element.
+    long item = switch ((String) flat[0]) {
+      case "int8", "uint8" -> 1;
+      case "int16", "uint16" -> 2;
+      case "int32", "uint32", "float32" -> 4;
+      default -> 8;
+    };
+    if (rows < 0 || (long) rows * (cols < 0 ? 1 : cols) * item != data.byteSize()) return null;
     java.lang.foreign.MemorySegment.ofAddress(t.getArrayElement(1).asLong()).reinterpret(data.byteSize())
         .copyFrom(data);
     return t.getArrayElement(0);
+  }
+
+  private static int cells(int n, int d) {
+    long cells = (long) n * d;
+    if (cells > Integer.MAX_VALUE - 8) throw new Values.ConversionException("an array of " + n + " x " + d + " numbers is too large");
+    return (int) cells;
   }
 
   /** JavaScript's side of bulkArray: [dtype, ArrayBuffer, rows, columns] or null. */
@@ -1021,13 +1045,13 @@ final class Polyglot {
       case byte[] a -> new Object[] {"int8", java.lang.foreign.MemorySegment.ofArray(a), a.length, -1};
       case float[][] m when rectangular(m) -> {
         int n = m.length, d = m[0].length;
-        float[] out = new float[n * d];
+        float[] out = new float[cells(n, d)];
         for (int i = 0; i < n; i++) System.arraycopy(m[i], 0, out, i * d, d);
         yield new Object[] {"float32", java.lang.foreign.MemorySegment.ofArray(out), n, d};
       }
       case double[][] m when rectangular(m) -> {
         int n = m.length, d = m[0].length;
-        double[] out = new double[n * d];
+        double[] out = new double[cells(n, d)];
         for (int i = 0; i < n; i++) System.arraycopy(m[i], 0, out, i * d, d);
         yield new Object[] {"float64", java.lang.foreign.MemorySegment.ofArray(out), n, d};
       }
@@ -1069,7 +1093,17 @@ final class Polyglot {
    */
   Value importJs(String name) {
     Context c = context();
-    Value required = c.eval("js", "(n) => { try { return require(n) } catch (e) { return null } }").execute(name);
+    // An ES module (or no such CommonJS module) goes to import(); a CommonJS module's own failure
+    // while it loads is the routine's to see.
+    Value required = c.eval("js", """
+        (n) => {
+          try { return require(n) } catch (e) {
+            const text = String(e && e.message)
+            if (typeof require !== 'function' || e instanceof SyntaxError
+                || /Cannot (find|load)( CommonJS)? module|ERR_REQUIRE_ESM|ERR_MODULE_NOT_FOUND/.test(text)) return null
+            throw e
+          }
+        }""").execute(name);
     if (!required.isNull()) return required;
     return jsModule(name);
   }
@@ -1300,7 +1334,7 @@ final class Polyglot {
       case null -> null;
       // A JS number; beyond 2^53 a string (Oracle's UNSAFE_STRING default). Passed as a Long,
       // so that integers stay integers when a routine passes them back to SQL.
-      case Long l -> js && Math.abs(l) > (1L << 53) - 1 ? l.toString() : (Object) l;
+      case Long l -> js && (l > (1L << 53) - 1 || l < -((1L << 53) - 1)) ? l.toString() : (Object) l;
       case BigInteger b -> b.toString();
       case BigDecimal d -> d.toPlainString();
       case MleJson j -> j.text();
@@ -1370,6 +1404,7 @@ final class Polyglot {
       }
       case Wire.T_DECIMAL -> {
         if (v.fitsInLong()) return v.asLong();
+        if (v.fitsInBigInteger()) return v.asBigInteger();  // exact: not through a double
         if (v.fitsInDouble()) return v.asDouble();
         return parseDecimal(v.isString() ? v.asString() : h.str().execute(v).asString(), t);
       }
@@ -1415,6 +1450,9 @@ final class Polyglot {
   static Duration parseTime(String s, Values.ParamType t) {
     Matcher m = TIME.matcher(s.trim());
     if (!m.matches()) throw new Values.ConversionException("Cannot convert value '" + s + "' to TIME from MLE");
+    // Not normalised: 00:60:00 is not a TIME (and more than 838 hours is out of range anyway).
+    if (m.group(2).length() > 4 || Integer.parseInt(m.group(3)) > 59 || Integer.parseInt(m.group(4)) > 59)
+      throw new Values.ConversionException("Cannot convert value '" + s + "' to TIME from MLE");
     Duration d = Duration.ofHours(Long.parseLong(m.group(2))).plusMinutes(Long.parseLong(m.group(3)))
         .plusSeconds(Long.parseLong(m.group(4)));
     if (m.group(5) != null)
@@ -1544,6 +1582,9 @@ final class Polyglot {
       try {
         if (src.hasCharacters() && line >= 1 && line <= src.getLineCount())
           text = src.getCharacters(line).toString();
+        // The first line starts with MLE's wrapper: the routine's text comes after it.
+        Integer prefix = line == 1 && src.getURI() != null ? prefixes.get(src.getURI()) : null;
+        if (prefix != null && prefix <= text.length()) text = text.substring(prefix);
       } catch (RuntimeException ignored) {
         // no text: the location alone
       }

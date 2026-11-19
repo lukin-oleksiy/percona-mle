@@ -110,6 +110,8 @@ class Session {
   /** mle_set_session_state(): sent to the session's workers at once. */
   bool set_options(mle::wire::IntegerType integer_type,
                    mle::wire::DecimalType decimal_type);
+  /** The options in effect (mle_set_session_state() keeps those it is not given). */
+  const mle::OptionsMsg &options() const { return m_options; }
 
  private:
   struct Slot {

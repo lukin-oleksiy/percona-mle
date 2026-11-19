@@ -66,7 +66,6 @@ struct WorkerOptions {
   int control_timeout_ms = 10000;
 };
 
-/** Implemented by the caller (mysqld in the component, tests here). */
 /** The mailbox arena, for a reply written straight into it (exp note 44,
     step 2): the SQL_RESULT's bytes, without a SqlResultMsg, its Values or
     an encoding buffer. The writer sets posts_at_start to *posts when it
@@ -78,8 +77,11 @@ struct DirectReply {
   const uint64_t *posts = nullptr;
   uint64_t posts_at_start = 0;
   size_t length = 0;
+  /** The rows written (for the stage trace). */
+  uint32_t rows = 0;
 };
 
+/** Implemented by the caller (mysqld in the component, tests here). */
 class CallHooks {
  public:
   virtual ~CallHooks() = default;

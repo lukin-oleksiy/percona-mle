@@ -36,8 +36,8 @@ import org.graalvm.options.OptionStability;
 /**
  * Oracle MLE's recursion limit: a routine may have at most 1000 frames of its own code on the
  * stack ("Maximum frame limit of 1000 exceeded. Frames on stack: 1001."). GraalJS has no such
- * limit, so this instrument counts function entries in routine sources (URI scheme mle-routine,
- * Polyglot.ROUTINE_SCHEME); the worker's helpers do not count. Enabled with the option
+ * limit, so this instrument counts function entries in routine sources (Polyglot.isRoutineSource:
+ * the routines' files below Polyglot.ROUTINE_DIR); the worker's helpers do not count. Enabled with the option
  * mle-frame-limit=true. Python has its own recursion limit (1000 by default).
  *
  * <p>One counter for the worker: guest code runs on the worker's main thread only. Dispatcher

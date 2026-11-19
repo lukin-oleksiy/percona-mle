@@ -554,6 +554,8 @@ final class PySql implements GuestSql.Lang {
     } catch (Values.ConversionException e) {
       return null;  // a zero date
     }
+    // Python's dates start with year 1: None, as for a zero date.
+    if (t.year() < 1) return null;
     return j instanceof LocalDate d ? date.execute(d.toString()) : datetime.execute(j.toString());
   }
 

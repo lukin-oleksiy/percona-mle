@@ -41,6 +41,8 @@ final class Mailbox {
   private final int spin;
   private int seenW;
   private MemorySegment assembly = MemorySegment.NULL;
+  /** The last message was a large one: its buffer goes when the next message arrives. */
+  private boolean dropAssembly;
 
   /** A received message. body is valid until the worker posts its next message. */
   record Message(int op, int status, int depth, long callSeq, MemorySegment body) {}
@@ -61,7 +63,7 @@ final class Mailbox {
     long size = header.get(ValueLayout.JAVA_LONG, Wire.OFF_REGION_SIZE);
     Native.unmap(header);
     if (magic != Wire.MAGIC || version != Wire.VERSION)
-      throw new IllegalStateException("not an MLE v1 mailbox");
+      throw new IllegalStateException("not an MLE mailbox of protocol version " + Wire.VERSION);
     return new Mailbox(Native.mapShared(Wire.MAILBOX_FD, size), spin);
   }
 
@@ -140,21 +142,33 @@ final class Mailbox {
     long len = Integer.toUnsignedLong(msgInt(Wire.MSG_LEN));
     long total = msgLong(Wire.MSG_TOTAL_LEN);
     long seq = msgLong(Wire.MSG_CALL_SEQ);
-    if (len > arenaSize || len > total) throw new IllegalStateException("bad message header");
-    if ((flags & Wire.FLAG_MORE) == 0) return new Message(op, status, depth, seq, arena.asSlice(0, len));
+    if (dropAssembly) {  // a large message's buffer is not kept for the worker's life
+      assembly = MemorySegment.NULL;
+      dropAssembly = false;
+    }
+    // The checks of the host's own assembler (codec.cc): one chunk is the whole message, a chunk
+    // with more to follow leaves bytes to follow, and the chunks agree on depth and total.
+    boolean more = (flags & Wire.FLAG_MORE) != 0;
+    if (len > arenaSize || len > total || (more ? len == total : len != total))
+      throw new IllegalStateException("bad message header");
+    if (!more) return new Message(op, status, depth, seq, arena.asSlice(0, len));
 
     if (assembly.byteSize() < total) assembly = Arena.ofAuto().allocate(total, Wire.VECTOR_ALIGNMENT);
+    dropAssembly = assembly.byteSize() > 4L * arenaSize;
     long have = 0;
     while (true) {
       MemorySegment.copy(arena, 0, assembly, have, len);
       have += len;
-      if ((flags & Wire.FLAG_MORE) == 0) break;
+      if (!more) break;
       header(Wire.CONTINUE, Wire.OK, 0, depth, 0, 0, seq);
       post();
       waitHost();
       flags = msgInt(Wire.MSG_FLAGS);
+      more = (flags & Wire.FLAG_MORE) != 0;
       len = Integer.toUnsignedLong(msgInt(Wire.MSG_LEN));
-      if (msgInt(Wire.MSG_OP) != op || msgLong(Wire.MSG_CALL_SEQ) != seq || len > arenaSize || have + len > total)
+      if (msgInt(Wire.MSG_OP) != op || msgLong(Wire.MSG_CALL_SEQ) != seq || msgInt(Wire.MSG_DEPTH) != depth
+          || msgLong(Wire.MSG_TOTAL_LEN) != total || len > arenaSize || have + len > total
+          || (more && have + len == total))
         throw new IllegalStateException("bad message chunk");
     }
     if (have != total) throw new IllegalStateException("truncated message");

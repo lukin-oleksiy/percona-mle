@@ -56,7 +56,7 @@ public final class SqlBridge {
 
   /** EXECUTE_MANY of prepared statement id: params are rows of rowWidth values (exp note 51). */
   public static com.percona.mle.api.MleSql.Reply requestMany(long id, Object[] params, int rowWidth) {
-    return dispatcher().sqlRequest(6, id, null, params, 0, 0, Dispatcher.RAW, null, rowWidth);
+    return dispatcher().sqlRequest(Wire.SQL_EXECUTE_MANY, id, null, params, 0, 0, Dispatcher.RAW, null, rowWidth);
   }
 
   /** The values one SQL message may carry. */

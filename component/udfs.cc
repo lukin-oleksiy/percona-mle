@@ -78,6 +78,14 @@ void utf8_result(mysqlpp::udf_context &ctx) {
   charset_ext.set_return_value_collation(ctx, "utf8mb4_0900_ai_ci");
 }
 
+/** A text argument arrives as utf8mb4 whatever the connection's character
+    set (code and option names are sent to the workers as UTF-8). */
+void utf8_arg(mysqlpp::udf_context &ctx, std::size_t index) {
+  mysqlpp::udf_context_charset_extension charset_ext{
+      mysql_service_mysql_udf_metadata};
+  charset_ext.set_arg_value_charset(ctx, index, "utf8mb4");
+}
+
 std::string lower(std::string_view s) {
   std::string r(s);
   for (char &c : r) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
@@ -97,6 +105,7 @@ class mle_session_state_impl {
   }
   mysqlpp::udf_result_t<STRING_RESULT> calculate(
       const mysqlpp::udf_context &ctx) {
+    if (ctx.is_arg_null(0)) return {};  // NULL for NULL
     const auto key = ctx.get_arg<STRING_RESULT>(0);
     return Session::state(Session::current(false),
                           lower(key));
@@ -126,6 +135,8 @@ class mle_session_reset_impl {
             "mle_session_reset() cannot reset the session while one of its "
             "MLE routines runs");
     } else {
+      if (ctx.is_arg_null(0))
+        throw std::invalid_argument("the argument must be stdout, stderr or output");
       const std::string what = lower(ctx.get_arg<STRING_RESULT>(0));
       const bool out = what == "stdout" || what == "output";
       const bool err = what == "stderr" || what == "output";
@@ -137,38 +148,63 @@ class mle_session_reset_impl {
   }
 };
 
-/** The value of "key": "value" in a flat JSON object, or "" (absent). */
-/** The keys of a JSON object: strings followed by ':' (strings are skipped
-    whole, escapes included, so a ':' inside a value is not taken). */
-std::vector<std::string> json_keys(const std::string &json) {
-  std::vector<std::string> keys;
-  for (size_t i = 0; i < json.size(); i++) {
-    if (json[i] != '"') continue;
+/**
+  The options of mle_set_session_state(): a flat JSON object of strings,
+  {"key": "value", ...}, and nothing else (independent review C94: text that
+  is not such an object used to pass as "no options" and reset both).
+*/
+std::vector<std::pair<std::string, std::string>> json_options(
+    const std::string &json) {
+  std::vector<std::pair<std::string, std::string>> options;
+  size_t i = 0;
+  const auto fail = [] {
+    throw std::invalid_argument(
+        "the argument must be a JSON object of options, such as "
+        "{\"integer_type\": \"BIGINT\"}");
+  };
+  const auto space = [&] {
+    while (i < json.size() && isspace(static_cast<unsigned char>(json[i]))) i++;
+  };
+  const auto expect = [&](char c) {
+    space();
+    if (i >= json.size() || json[i] != c) fail();
+    i++;
+  };
+  const auto string = [&] {
+    expect('"');
     std::string text;
-    size_t j = i + 1;
-    for (; j < json.size() && json[j] != '"'; j++) {
-      if (json[j] == '\\' && j + 1 < json.size()) j++;
-      text.push_back(json[j]);
+    for (; i < json.size() && json[i] != '"'; i++) {
+      if (json[i] == '\\' && ++i >= json.size()) fail();
+      text.push_back(json[i]);
     }
-    size_t k = j + 1;
-    while (k < json.size() && isspace(static_cast<unsigned char>(json[k]))) k++;
-    if (k < json.size() && json[k] == ':') keys.push_back(text);
-    i = j;
+    if (i >= json.size()) fail();
+    i++;
+    return text;
+  };
+  expect('{');
+  space();
+  if (i < json.size() && json[i] == '}') {
+    i++;
+  } else {
+    while (true) {
+      std::string key = string();
+      expect(':');
+      space();
+      if (i >= json.size() || json[i] != '"')
+        throw std::invalid_argument("the value of " + key + " must be a string");
+      options.emplace_back(std::move(key), string());
+      space();
+      if (i < json.size() && json[i] == ',') {
+        i++;
+        continue;
+      }
+      expect('}');
+      break;
+    }
   }
-  return keys;
-}
-
-std::string json_string(const std::string &json, const std::string &key) {
-  const std::string quoted = "\"" + key + "\"";
-  size_t at = json.find(quoted);
-  if (at == std::string::npos) return "";
-  at = json.find(':', at + quoted.size());
-  if (at == std::string::npos) throw std::invalid_argument("invalid JSON");
-  const size_t open = json.find('"', at);
-  const size_t close = open == std::string::npos ? open : json.find('"', open + 1);
-  if (close == std::string::npos)
-    throw std::invalid_argument("the value of " + key + " must be a string");
-  return json.substr(open + 1, close - open - 1);
+  space();
+  if (i != json.size()) fail();
+  return options;
 }
 
 /** mle_packages(): the DBA's package manifest (14 §3) as JSON text. */
@@ -222,6 +258,7 @@ class mle_set_session_state_impl {
       throw std::invalid_argument("Wrong argument list: should be (json)");
     ctx.set_arg_type(0, STRING_RESULT);
     ctx.mark_arg_nullable(0, false);
+    utf8_arg(ctx, 0);
     ctx.mark_result_nullable(false);
     ctx.mark_result_const(false);
     // Oracle reports this when the function is set up (error 1123).
@@ -231,37 +268,44 @@ class mle_set_session_state_impl {
           "session first.");
   }
   mysqlpp::udf_result_t<INT_RESULT> calculate(const mysqlpp::udf_context &ctx) {
+    if (ctx.is_arg_null(0))
+      throw std::invalid_argument("the argument must not be NULL");
     const std::string json(ctx.get_arg<STRING_RESULT>(0));
-    // An unknown key (e.g. integerType, the SQL API's spelling) would
-    // otherwise be ignored without a word.
-    for (const std::string &key : json_keys(json))
-      if (key != "integer_type" && key != "decimal_type")
+    namespace w = mle::wire;
+    Session *s = Session::current(true);
+    if (s == nullptr) throw std::invalid_argument("no MLE session");
+    // An option that is not given keeps its value.
+    w::IntegerType integer_type = s->options().integer_type;
+    w::DecimalType decimal_type = s->options().decimal_type;
+    for (const auto &[key, value] : json_options(json)) {
+      const char *v = value.c_str();
+      if (key == "integer_type") {
+        if (strcasecmp(v, "UNSAFE_STRING") == 0)
+          integer_type = w::IntegerType::kUnsafeString;
+        else if (strcasecmp(v, "UNSAFE_BIGINT") == 0)
+          integer_type = w::IntegerType::kUnsafeBigint;
+        else if (strcasecmp(v, "STRING") == 0)
+          integer_type = w::IntegerType::kString;
+        else if (strcasecmp(v, "BIGINT") == 0)
+          integer_type = w::IntegerType::kBigint;
+        else
+          throw std::invalid_argument("invalid integer_type '" + value + "'");
+      } else if (key == "decimal_type") {
+        if (strcasecmp(v, "STRING") == 0)
+          decimal_type = w::DecimalType::kString;
+        else if (strcasecmp(v, "NUMBER") == 0)
+          decimal_type = w::DecimalType::kNumber;
+        else
+          throw std::invalid_argument("invalid decimal_type '" + value + "'");
+      } else {
+        // An unknown key (e.g. integerType, the SQL API's spelling) would
+        // otherwise be ignored without a word.
         throw std::invalid_argument("unknown option '" + key +
                                     "': the options are integer_type and "
                                     "decimal_type");
-    namespace w = mle::wire;
-    w::IntegerType integer_type = w::IntegerType::kUnsafeString;
-    w::DecimalType decimal_type = w::DecimalType::kString;
-    const std::string i = json_string(json, "integer_type");
-    const std::string d = json_string(json, "decimal_type");
-    if (i.empty() || strcasecmp(i.c_str(), "UNSAFE_STRING") == 0)
-      integer_type = w::IntegerType::kUnsafeString;
-    else if (strcasecmp(i.c_str(), "UNSAFE_BIGINT") == 0)
-      integer_type = w::IntegerType::kUnsafeBigint;
-    else if (strcasecmp(i.c_str(), "STRING") == 0)
-      integer_type = w::IntegerType::kString;
-    else if (strcasecmp(i.c_str(), "BIGINT") == 0)
-      integer_type = w::IntegerType::kBigint;
-    else
-      throw std::invalid_argument("invalid integer_type '" + i + "'");
-    if (d.empty() || strcasecmp(d.c_str(), "STRING") == 0)
-      decimal_type = w::DecimalType::kString;
-    else if (strcasecmp(d.c_str(), "NUMBER") == 0)
-      decimal_type = w::DecimalType::kNumber;
-    else
-      throw std::invalid_argument("invalid decimal_type '" + d + "'");
-    Session *s = Session::current(true);
-    if (s == nullptr || !s->set_options(integer_type, decimal_type))
+      }
+    }
+    if (!s->set_options(integer_type, decimal_type))
       throw std::invalid_argument(
           "Cannot set options of an active session. Please reset the "
           "session first.");
@@ -278,12 +322,15 @@ class mle_eval_impl {
     ctx.set_arg_type(1, STRING_RESULT);
     ctx.mark_arg_nullable(0, false);
     ctx.mark_arg_nullable(1, false);
+    utf8_arg(ctx, 0);
+    utf8_arg(ctx, 1);
     ctx.mark_result_nullable(true);
     ctx.mark_result_const(false);
     utf8_result(ctx);
   }
   mysqlpp::udf_result_t<STRING_RESULT> calculate(
       const mysqlpp::udf_context &ctx) {
+    if (ctx.is_arg_null(0) || ctx.is_arg_null(1)) return {};  // NULL for NULL
     const auto language = ctx.get_arg<STRING_RESULT>(0);
     const auto code = ctx.get_arg<STRING_RESULT>(1);
     const unsigned bit = mle_component::language_bit(std::string(language));

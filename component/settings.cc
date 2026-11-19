@@ -97,20 +97,23 @@ std::string g_default_dir;
 
 std::string text(const char *s) { return s == nullptr ? "" : s; }
 
-/** Engine restart after a setting changed; a failure leaves the engine
-    inactive (mle_status) and is reported as a warning and in the log. */
-void restart_engine(MYSQL_THD thd, const char *variable) {
+/** Engine restart after a setting changed; on a failure the running engine
+    and its settings stay, and the failure is reported as a warning and in
+    the log. */
+bool restart_engine(MYSQL_THD thd, const char *variable) {
   std::string error, info;
   if (engine_start(current_settings(), &error, &info)) {
     log_info(std::string("mle.") + variable + " changed. " + info);
-    return;
+    return true;
   }
   const std::string message = std::string("MLE: mle.") + variable +
-                              " changed, but the engine cannot start: " +
+                              " changed, but the engine cannot start with it"
+                              " (the previous settings stay in effect): " +
                               error;
   log_error(message);
   mysql_service_mysql_runtime_warning->emit(thd, ER_LANGUAGE_COMPONENT,
                                             message.c_str());
+  return false;
 }
 
 /** Whether a session holds a worker, after waiting up to a second for the
@@ -149,8 +152,23 @@ int check_shaping(MYSQL_THD thd, SYS_VAR *, void *save,
 template <typename T, const char *Name>
 void update_shaping(MYSQL_THD thd, SYS_VAR *, void *val_ptr,
                     const void *save) {
-  *static_cast<T *>(val_ptr) = *static_cast<const T *>(save);
-  restart_engine(thd, Name);
+  T &variable = *static_cast<T *>(val_ptr);
+  const T before = variable, value = *static_cast<const T *>(save);
+  if (value == before) return;  // nothing to restart for
+  // SET ... = DEFAULT comes here without the check above: an update cannot
+  // refuse, so the value stays and a warning says why.
+  if (workers_held(thd)) {
+    const std::string message =
+        std::string("MLE: mle.") + Name +
+        " is not changed: a session holds a worker";
+    mysql_service_mysql_runtime_warning->emit(thd, ER_LANGUAGE_COMPONENT,
+                                              message.c_str());
+    return;
+  }
+  variable = value;
+  // The engine keeps running with its settings when it cannot start with
+  // the new ones: the variable shows what is in effect.
+  if (!restart_engine(thd, Name)) variable = before;
 }
 
 constexpr const char kMemoryMax[] = "memory_max";
@@ -487,9 +505,11 @@ bool register_settings() {
   if (parse_languages(text(g_languages), &bits)) {
     g_language_bits = bits;
   } else {
-    log_warning("mle.languages '" + text(g_languages) +
-                "' is invalid; all languages are enabled.");
-    g_language_bits = kAllLanguages;
+    // Fails closed: a mistyped list must not enable what it meant to leave out.
+    log_error("mle.languages '" + text(g_languages) +
+              "' is invalid: no language is enabled until it is set to a "
+              "list of JAVASCRIPT, PYTHON, JAVA.");
+    g_language_bits = 0;
   }
 
   STR_CHECK_ARG(cgroup_base) cgroup_base;

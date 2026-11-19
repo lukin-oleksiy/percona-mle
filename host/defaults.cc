@@ -161,7 +161,8 @@ ClassConfig native_worker_class(const Layout &layout, const JvmClassOptions &o) 
             // (~30 ms) after every young one: 1M calls of a Python function took
             // 1.94 -> 2.17 s. Proportionate: no full GCs (flat ~1.97 s), idle pool
             // workers ~20 MB smaller, the same memory after numpy work.
-            "-XX:InitialCollectionPolicy=Proportionate"};
+            "-XX:InitialCollectionPolicy=Proportionate",
+            "-Dmle.vectorThreads=" + std::to_string(o.vector_threads)};
   if (!o.prewarm.empty()) c.args.push_back("-Dmle.prewarm=" + o.prewarm);
   if (!layout.python_venv.empty())
     c.args.push_back("-Dmle.python.venv=" + layout.python_venv);

@@ -17,6 +17,7 @@
 
 #include "mle/launcher.h"
 
+#include <algorithm>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -196,8 +197,8 @@ bool LauncherChannel::start(const LauncherConfig &config, std::string *error) {
   // Diagnostics: the only variable the launcher gets (its workers' sandbox
   // allows writes in that directory; README, launcher/child.cc).
   std::string debug_dir;
-  if (const char *d = getenv("MLE_DEBUG_WRITE_DIR"); d != nullptr && *d == '/')
-    debug_dir = std::string("MLE_DEBUG_WRITE_DIR=") + d;
+  if (!config.debug_write_dir.empty())
+    debug_dir = "MLE_DEBUG_WRITE_DIR=" + config.debug_write_dir;
   char *envp[] = {debug_dir.empty() ? nullptr : debug_dir.data(), nullptr};
   const int rc = posix_spawn(&m_pid, exe.c_str(), &fa, &attr, argv, envp);
   posix_spawn_file_actions_destroy(&fa);
@@ -239,13 +240,17 @@ bool LauncherChannel::start(const LauncherConfig &config, std::string *error) {
   uint32_t abi;
   if (!r.u8(&type) || !r.flag(&ok) || !r.str(&launcher_error) || !r.u32(&abi) ||
       !r.flag(&cgroup) || !r.str(&info.cgroup_info) ||
-      !launcher::get(r, &info.class_errors) || !r.finish() ||
-      info.class_errors.size() != config.classes.size()) {
+      !launcher::get(r, &info.class_errors) || !r.finish()) {
     *error = "bad configuration reply from the launcher: " + r.error();
     return false;
   }
-  if (!ok) {
+  if (!ok) {  // a refused configuration comes without its classes
     *error = "launcher: " + launcher_error;
+    return false;
+  }
+  if (info.class_errors.size() != config.classes.size()) {
+    *error = "bad configuration reply from the launcher: " +
+             std::to_string(info.class_errors.size()) + " classes";
     return false;
   }
   info.landlock_abi = static_cast<int>(abi);
@@ -279,9 +284,14 @@ LauncherChannel::Recv LauncherChannel::receive(int wait_ms, std::string *body,
     n = recvmsg(m_socket, &m, MSG_CMSG_CLOEXEC);
   } while (n < 0 && errno == EINTR);
   fds->clear();
+  if (n < 0) {  // no control data was written: nothing to walk
+    *error = errno_text("recvmsg launcher");
+    return Recv::kError;
+  }
   for (cmsghdr *c = CMSG_FIRSTHDR(&m); c != nullptr; c = CMSG_NXTHDR(&m, c)) {
     if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
-    const size_t count = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+    if (c->cmsg_len < CMSG_LEN(0)) break;
+    const size_t count = std::min<size_t>((c->cmsg_len - CMSG_LEN(0)) / sizeof(int), 4);
     for (size_t i = 0; i < count; i++) {
       int fd;
       memcpy(&fd, CMSG_DATA(c) + i * sizeof(int), sizeof fd);

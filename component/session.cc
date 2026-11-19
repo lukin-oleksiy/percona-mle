@@ -67,7 +67,6 @@ namespace {
 
 /** Read by every session thread, set at INSTALL and UNINSTALL. */
 std::atomic<mysql_thd_store_slot> g_slot{nullptr};
-std::atomic<long> g_sessions{0};
 
 constexpr size_t kConsoleKeep = 64 * 1024;
 
@@ -198,8 +197,14 @@ std::string log_safe(const std::string &text) {
 void append_capped(std::string *buffer, const std::string &more) {
   if (more.empty()) return;
   buffer->append(more);
-  if (buffer->size() > kConsoleKeep)
-    buffer->erase(0, buffer->size() - kConsoleKeep);
+  if (buffer->size() > kConsoleKeep) {
+    // The tail, from a whole UTF-8 character.
+    size_t from = buffer->size() - kConsoleKeep;
+    while (from < buffer->size() &&
+           (static_cast<unsigned char>((*buffer)[from]) & 0xC0) == 0x80)
+      from++;
+    buffer->erase(0, from);
+  }
 }
 
 
@@ -342,7 +347,7 @@ void Session::unregister_slot() {
   if (slot != nullptr) (void)mysql_service_mysql_thd_store->unregister_slot(slot);
 }
 
-long Session::count() { return g_sessions.load(); }
+long Session::count() { return g_counters.sessions.load(); }
 
 Session *Session::of(MYSQL_THD thd) {
   mysql_thd_store_slot slot = g_slot.load();
@@ -361,19 +366,21 @@ Session *Session::current(bool create) {
     delete s;
     return nullptr;
   }
-  raise_max(g_counters.sessions_max, ++g_sessions);
-  g_counters.sessions = g_sessions.load();
   return s;
 }
 
-Session::Session(MYSQL_THD thd) : m_thd(thd), m_mark(engine_session_begin()) {}
+// Counted where it is made and where it goes (one atomic counter, which the
+// status variable shows): a Session deleted before it was stored counts too.
+Session::Session(MYSQL_THD thd) : m_thd(thd), m_mark(engine_session_begin()) {
+  raise_max(g_counters.sessions_max, ++g_counters.sessions);
+}
 
 Session::~Session() {
   for (auto &[principal, slot] : m_workers)
     engine_release_worker(std::move(slot.worker), principal, m_mark);
   for (auto &w : m_retired) engine_release_worker(std::move(w));
   engine_session_end(m_mark);
-  g_counters.sessions = --g_sessions;
+  --g_counters.sessions;
 }
 
 std::string account_key(std::string_view user, std::string_view host) {
@@ -529,6 +536,7 @@ bool Session::prepare_in(const std::string &principal, Slot &slot,
   }
   keep_console(result);
   if (s != Status::kOk) {
+    m_console_now = console_warnings(m_thd);  // this failure's, not the last call's
     report(principal, s, result, error, routine, nullptr);
     return false;
   }
@@ -617,15 +625,18 @@ bool Session::execute(Routine &routine) {
   Hooks hooks(m_thd, &sql, &routine);
   ResultMsg result;
   std::string error;
-  raise_max(g_counters.threads_max, ++g_counters.threads);
   Status s;
   const uint64_t kills = m_kills.load();
   slot->worker->set_timing(spin_us(), interrupt_grace_ms());
   {
+    // mle_threads: counted while the call runs, released if it throws too.
+    struct Running {
+      Running() { raise_max(g_counters.threads_max, ++g_counters.threads); }
+      ~Running() { --g_counters.threads; }
+    } running;
     const KillGuard kill(this, slot->worker.get());
     s = slot->worker->call(routine.id, 0, args, hooks, &result, &error);
   }
-  --g_counters.threads;
   keep_console(result);
   // mle.console = WARNINGS: read only when there is something to show.
   m_console_now = (s != Status::kOk || !result.console_out.empty() ||
@@ -671,7 +682,12 @@ void Session::lines_to_warnings(const std::string &text, const std::string &pref
     if (end == std::string::npos) end = text.size();
     if (n < kMaxConsoleWarnings) {
       std::string line = prefix + ": " + text.substr(start, end - start);
-      if (line.size() > 500) line = line.substr(0, 497) + "...";
+      if (line.size() > 500) {
+        size_t cut = 497;  // at a whole UTF-8 character
+        while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0) == 0x80)
+          cut--;
+        line = line.substr(0, cut) + "...";
+      }
       mysql_service_mysql_runtime_warning->emit(m_thd, ER_LANGUAGE_COMPONENT, line.c_str());
     }
     ++n;
@@ -1005,6 +1021,13 @@ bool Session::parse_library(unsigned language, const std::string &name,
   routine.language = language;
   routine.name = name;
   routine.qualified_name = name;
+  // From a routine's SQL the worker is the one waiting for that statement:
+  // it takes calls there, not a library to check.
+  if (m_calls > 0) {
+    my_error(ER_LANGUAGE_COMPONENT, MYF(0),
+             "MLE> CREATE LIBRARY cannot run from the SQL of an MLE routine");
+    return false;
+  }
   // A library is code for the language's routines: the same privilege
   // (D-3) as CREATE FUNCTION / PROCEDURE in that language.
   if (!has_global_privilege(m_thd, privilege_of(routine))) {
@@ -1027,6 +1050,7 @@ bool Session::parse_library(unsigned language, const std::string &name,
     s = slot->worker->parse_library(m, hooks, &result, &error);
   }
   if (s == Status::kOk) return true;
+  m_console_now = console_warnings(m_thd);  // this failure's, not the last call's
   report(who, s, result, error, routine, nullptr);
   return false;
 }

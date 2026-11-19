@@ -45,7 +45,9 @@
 
   ClassConfig = str name, str executable, u32 n + n x str argument (argv[1..]),
     u32 n + n x str environment entry, u32 n + n x str read-only path,
-    u32 n + n x str read+execute path, u64 memory.max (0: no limit),
+    u32 n + n x str read+execute path, u32 n + n x str hidden path (what
+    workers must not read below the system directories), u64 memory.max
+    (0: no limit),
     u32 pids.max (0: no limit), u32 RLIMIT_NOFILE, u8 core dumps allowed,
     u32 pool size, u8 inherit stderr, u8 insecure without Landlock.
   ClassStats = u32 idle (in the pool), u64 spawned, u64 handed out,

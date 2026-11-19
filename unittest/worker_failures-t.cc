@@ -419,9 +419,9 @@ TEST_F(MleWorkerFailures, EscapesFromJsThroughJava) {
           "          'exec=' + t(() => new "
           "(Java.type('java.lang.ProcessBuilder'))"
           "('/bin/true').start()),\n"
-          "          'see_host=' + "
+          "          'see_host=' + t(() => "
           "Java.type('java.lang.ProcessHandle').of(host)"
-          ".isPresent()].join(' ');\n"
+          ".isPresent())].join(' ');\n"
           "}",
           {type_of(Tag::kI64)}, type_of(Tag::kString), &res),
       0u)
@@ -429,9 +429,10 @@ TEST_F(MleWorkerFailures, EscapesFromJsThroughJava) {
   ASSERT_EQ(s_host->call(210, {Value::i64(getpid())}, &res), 0u)
       << error_of(res);
   EXPECT_EQ(res.ret->as_text(),
-            // ProcessBuilder is not accessible to guests at all now.
+            // ProcessBuilder and ProcessHandle are not accessible to guests
+            // at all (the pid namespace would hide the host's processes).
             "read=AccessDeniedException write=AccessDeniedException "
-            "exec=TypeError see_host=false");
+            "exec=TypeError see_host=TypeError");
   EXPECT_EQ(access("/tmp/mle-js", F_OK), -1);
 }
 

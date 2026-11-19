@@ -304,6 +304,8 @@ public final class SqlResult implements Iterable<Row> {
     live();
     if (!moreResults && !moreRows) {
       hasData = false;
+      rows = List.of();  // the rows left are skipped here too
+      pos = 0;
       return false;
     }
     load(session.request(Session.NEXT_RESULT, id, null, null, 0, 0));

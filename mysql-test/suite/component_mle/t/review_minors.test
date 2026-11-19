@@ -1,0 +1,405 @@
+--echo #
+--echo # component_mle: regressions for the minor findings of the independent
+--echo # multi-model review (exp notes 60 and 61).
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(20));
+CREATE TABLE parent (id INT PRIMARY KEY);
+CREATE TABLE child (id INT PRIMARY KEY, a_rather_long_column_name_for_the_parent_reference INT,
+  CONSTRAINT a_foreign_key_constraint_with_quite_a_long_name_for_a_message
+  FOREIGN KEY (a_rather_long_column_name_for_the_parent_reference) REFERENCES parent (id));
+CREATE TABLE kinds (d DATE, tm TIME, dt DATETIME, ts TIMESTAMP NULL, de DECIMAL(10,2), tx TEXT, vb VARBINARY(10),
+  b BINARY(4), bl BLOB, c CHAR(3));
+
+--write_file $MYSQLTEST_VARDIR/tmp/review_minors.sql
+DELIMITER //
+-- C126: the VECTOR argument is a view of the array the host fills.
+CREATE FUNCTION py_resize(v VECTOR(4)) RETURNS TEXT LANGUAGE PYTHON AS $$
+    out = 'owns %s' % v.flags.owndata
+    try:
+        v.setflags(write=True)
+        v.resize((100000,), refcheck=False)
+        out += ' resized'
+    except Exception as e:
+        out += ' ' + type(e).__name__
+    return out + ' %d' % v.shape[0]
+$$//
+-- C129: a typed array whose length is not its buffer's.
+CREATE FUNCTION js_liar() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  class Liar extends Float32Array { get length() { return 1 } }
+  const np = importPython('numpy')
+  const a = np.array(new Liar(1000))
+  return String(a.size <= 1000)
+$$//
+-- C60, C162: the Context and ProcessHandle are not for scripts.
+CREATE FUNCTION js_context() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  try { Mle.context().close(true); out.push('closed') } catch (e) { out.push('context refused') }
+  try { Java.type('java.lang.ProcessHandle').current().pid(); out.push('pid') } catch (e) { out.push('ProcessHandle refused') }
+  return out.join(', ')
+$$//
+CREATE PROCEDURE java_close() LANGUAGE JAVA AS $$ Mle.context().close(true); $$//
+CREATE FUNCTION js_one() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$//
+-- C68: values and markers of runSql.
+CREATE PROCEDURE js_markers(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  for (const p of [[1], [1, 2, 3], [1, 2]]) {
+    try { out.push(session.runSql('SELECT ? + ? AS v', p).fetchOne().v) } catch (e) { out.push(e.code + ' ' + e.message) }
+  }
+  r = out.join(' | ')
+$$//
+CREATE PROCEDURE py_markers(OUT r TEXT) LANGUAGE PYTHON AS $$
+    out = []
+    for p in ([1], [1, 2, 3], [1, 2]):
+        try:
+            out.append(str(session.run_sql('SELECT ? + ? AS v', p).fetch_one().v))
+        except SqlError as e:
+            out.append('%d %s' % (e.code, e.message))
+    r = ' | '.join(out)
+$$//
+-- C67: an error with a long message rethrown after other SQL keeps its number.
+CREATE PROCEDURE js_rethrow_long() LANGUAGE JAVASCRIPT AS $$
+  session.startTransaction()
+  try { session.runSql('INSERT INTO child VALUES (1, 77)') }
+  catch (e) { session.rollback(); throw e }
+$$//
+-- C98: an error of the routine's own with the number of the one it caught.
+CREATE PROCEDURE js_own_text() LANGUAGE JAVASCRIPT AS $$
+  try { session.runSql('SELECT * FROM no_such_table') }
+  catch (e) { throw new SqlError(e.sqlState, 'my own text', e.code) }
+$$//
+CREATE PROCEDURE js_same_error() LANGUAGE JAVASCRIPT AS $$
+  try { session.runSql('SELECT * FROM no_such_table') } catch (e) { throw e }
+$$//
+-- C56: CREATE LIBRARY from a routine's SQL.
+CREATE PROCEDURE js_create_library(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  try { session.runSql("CREATE LIBRARY test.made_inside LANGUAGE JAVASCRIPT AS 'export const x = 1'"); r = 'created' }
+  catch (e) { r = e.message }
+$$//
+-- C146: the type names of result columns.
+CREATE PROCEDURE js_column_types(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  r = session.runSql('SELECT * FROM kinds').getColumns().map((c) => c.getColumnName() + ':' + c.getType()).join(' ')
+$$//
+-- C40, C41: nextResult() at the end, options after a null parameter list.
+CREATE PROCEDURE js_api(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  const res = session.runSql('SELECT id FROM t ORDER BY id')
+  res.fetchOne()
+  out.push('next ' + res.nextResult(), 'then ' + res.fetchOne())
+  out.push('to client ' + (session.runSql('SELECT 5 AS sent_to_the_client', null, {passResultToClient: true}) === null
+      || session.runSql('SELECT 1').fetchOne() !== undefined))
+  r = out.join(', ')
+$$//
+-- C42: a SqlError with a state that is not one.
+CREATE FUNCTION js_bad_state() RETURNS INT LANGUAGE JAVASCRIPT AS $$ throw new SqlError('oops', 'the text') $$//
+-- C161, C121, C105: values that cannot be bound, and -0, which can.
+CREATE PROCEDURE js_binds(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  try { session.runSql('SELECT ? AS v', [{toJSON() {}}]); out.push('bound') } catch (e) { out.push(e.name + ': ' + e.message) }
+  out.push('minus zero ' + session.runSql('SELECT ? + 1 AS v', [-0]).fetchOne().v)
+  r = out.join(', ')
+$$//
+CREATE PROCEDURE java_binds(OUT r TEXT) LANGUAGE JAVA AS $$
+  StringBuilder b = new StringBuilder();
+  for (Object v : new Object[] {Double.NaN, Double.POSITIVE_INFINITY, Float.NaN, 1.5}) {
+    try { b.append(Mle.session().runSql("SELECT ? AS v", v).fetchOne().get(0)).append(' '); }
+    catch (Exception e) { b.append(e.getClass().getSimpleName()).append(": ").append(e.getMessage()).append("; "); }
+  }
+  r[0] = b.toString();
+$$//
+-- C28, C92, C36, C93: executeMany.
+CREATE PROCEDURE js_batches(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  const count = () => session.runSql('SELECT COUNT(*) AS n FROM t').fetchOne().n
+  const rows = (n, from) => Array.from({length: n}, (_, i) => [from + i, 'r'])
+  // to the client: the same refusal for every size, nothing written
+  for (const n of [10, 300, 1005]) {
+    const p = session.prepare('INSERT INTO t VALUES (?, ?)', {passResultToClient: true})
+    try { p.executeMany(rows(n, 1)); out.push('ran') } catch (e) { out.push(e.code) }
+    p.deallocate()
+  }
+  out.push('rows ' + count())
+  // no markers
+  const q = session.prepare("INSERT INTO t VALUES (9999, 'x')")
+  try { q.executeMany([[], []]); out.push('ran') } catch (e) { out.push(e.code + ' ' + e.message) }
+  out.push('none ' + q.executeMany([]).getAffectedItemsCount())
+  // a malformed row: the rows before it stay written, with rewriting and without
+  for (const n of [3, 400]) {
+    session.runSql('TRUNCATE t')
+    const bad = rows(n, 1); bad.push([7777]); bad.push([8888, 'after'])
+    try { session.executeMany('INSERT INTO t VALUES (?, ?)', bad); out.push('ran') }
+    catch (e) { out.push(e.code + ' row ' + e.row + ' written ' + count()) }
+  }
+  // warnings of the last statement: a short tail's, and none after a clean one
+  session.runSql('TRUNCATE t')
+  session.runSql("INSERT INTO t VALUES (1005, 'there')")
+  out.push('warnings ' + session.executeMany('INSERT IGNORE INTO t VALUES (?, ?)', rows(1005, 1)).getWarningsCount())
+  session.runSql('TRUNCATE t')
+  out.push('warnings ' + session.executeMany('INSERT IGNORE INTO t VALUES (?, ?)', rows(1005, 1)).getWarningsCount())
+  r = out.join(', ')
+$$//
+-- C23: the helpers' own SELECT is not sent to the client.
+CREATE PROCEDURE java_load(OUT r TEXT) LANGUAGE JAVA AS $$
+  Mle.session().setOptions(new com.percona.mle.sql.SqlOptions().passResultToClient(true));
+  r[0] = "rows " + com.percona.mle.api.Stats.load("SELECT id FROM t WHERE id <= 3").size();
+$$//
+-- C22, C37, C45, C48, C122, C163: values at their edges.
+CREATE FUNCTION js_year(y INT) RETURNS DATETIME LANGUAGE JAVASCRIPT AS $$ return new Date(Date.UTC(y, 0, 2)) $$//
+CREATE FUNCTION js_time_text(s VARCHAR(40)) RETURNS TIME LANGUAGE JAVASCRIPT AS $$ return s $$//
+CREATE FUNCTION py_time_text(s VARCHAR(40)) RETURNS TIME LANGUAGE PYTHON AS $$ return s $$//
+CREATE FUNCTION java_long_time() RETURNS TIME LANGUAGE JAVA AS $$ return java.time.Duration.ofSeconds(Long.MIN_VALUE); $$//
+CREATE FUNCTION py_big(e INT) RETURNS DECIMAL(30,0) LANGUAGE PYTHON AS $$ return 2 ** e $$//
+CREATE PROCEDURE py_year_zero(OUT r TEXT) LANGUAGE PYTHON AS $$
+    row = session.run_sql("SELECT CAST('0000-01-01' AS DATE) AS d, CAST('0000-01-01 10:00:00' AS DATETIME) AS dt, DATE'0001-01-01' AS one").fetch_one()
+    r = '%s %s %s' % (row.d, row.dt, row.one)
+$$//
+-- C57: the kept output starts at a whole character.
+CREATE FUNCTION py_print_much() RETURNS INT LANGUAGE PYTHON AS $$
+    print('é' * 70001)
+    return 1
+$$//
+DELIMITER ;
+EOF
+--exec $MYSQL --default-character-set=utf8mb4 test < $MYSQLTEST_VARDIR/tmp/review_minors.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/review_minors.sql
+
+--echo # C126: twice with the same worker.
+SET @pid = mle_debug_worker_pid();
+SELECT py_resize(TO_VECTOR('[1,2,3,4]')) AS first;
+SELECT py_resize(TO_VECTOR('[5,6,7,8]')) AS second;
+--echo # C129
+SELECT js_liar();
+--echo # C60, C162
+SELECT js_context();
+CALL java_close();
+--echo # A Java routine may close it: the next script call finds it closed, and
+--echo # the worker is replaced (it used to stay, failing every call).
+--error ER_QUERY_INTERRUPTED
+SELECT js_one();
+SELECT js_one() AS works_after;
+SET @pid = mle_debug_worker_pid();
+--echo # C68
+CALL js_markers(@r);
+SELECT @r;
+CALL py_markers(@r);
+SELECT @r;
+--echo # C67
+--error ER_NO_REFERENCED_ROW_2
+CALL js_rethrow_long();
+--echo # C98
+--error ER_NO_SUCH_TABLE
+CALL js_own_text();
+--error ER_NO_SUCH_TABLE
+CALL js_same_error();
+--echo # C56
+CALL js_create_library(@r);
+SELECT @r;
+SELECT js_one() AS works_after;
+--echo # C146
+CALL js_column_types(@r);
+SELECT @r;
+--echo # C40, C41
+INSERT INTO t VALUES (1, 'a'), (2, 'b');
+CALL js_api(@r);
+SELECT @r;
+--echo # C42
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_bad_state();
+SELECT js_one() AS works_after;
+--echo # C161, C121, C105
+CALL js_binds(@r);
+SELECT @r;
+CALL java_binds(@r);
+SELECT @r;
+--echo # C28, C92, C36, C93
+TRUNCATE t;
+CALL js_batches(@r);
+SELECT @r;
+--echo # C23
+CALL java_load(@r);
+SELECT @r;
+--echo # C22: years MySQL does not have
+SELECT js_year(2026) AS y;
+--error ER_LANGUAGE_COMPONENT
+SELECT js_year(10000);
+--error ER_LANGUAGE_COMPONENT
+SELECT js_year(-5);
+--error ER_LANGUAGE_COMPONENT
+SELECT js_year(70000);
+--echo # C37: not normalised
+SELECT js_time_text('00:59:59') AS js, py_time_text('-01:02:03.5') AS py;
+--error ER_LANGUAGE_COMPONENT
+SELECT js_time_text('00:60:00');
+--error ER_LANGUAGE_COMPONENT
+SELECT py_time_text('00:00:60');
+--error ER_LANGUAGE_COMPONENT
+SELECT js_time_text('00:99:99');
+--error ER_LANGUAGE_COMPONENT
+SELECT py_time_text('12345678901234567890:00:00');
+--echo # C45
+--error ER_LANGUAGE_COMPONENT
+SELECT java_long_time();
+--echo # C48: exact
+SELECT py_big(64) AS p64, py_big(70) AS p70, py_big(3) AS p3;
+--echo # C122
+CALL py_year_zero(@r);
+SELECT @r;
+--echo # C57
+SELECT py_print_much();
+SELECT LENGTH(mle_session_state('stdout')) AS bytes, CHAR_LENGTH(mle_session_state('stdout')) AS chars,
+  LEFT(mle_session_state('stdout'), 2) AS start;
+--echo # The worker lived through all of it since the closed Context.
+SELECT mle_debug_worker_pid() = @pid AS same_worker;
+
+--echo # C94, C106, C107: mle_set_session_state() takes a JSON object of its options; NULL arguments.
+--disconnect con1
+--connect (con2, localhost, root,,test)
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('');
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('not json');
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('[]');
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('null');
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('{"integer_type": 1}');
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('{"integer_type": "BIGINT"} trailing');
+--error ER_UDF_ERROR
+SELECT mle_set_session_state(NULL);
+SELECT mle_set_session_state('{"integer_type": "BIGINT"}') AS first, mle_set_session_state('{"decimal_type": "NUMBER"}') AS second,
+  mle_set_session_state('{}') AS nothing;
+CREATE FUNCTION js_kinds(i BIGINT, d DECIMAL(10,2)) RETURNS TEXT LANGUAGE JAVASCRIPT AS $$ return typeof i + ' ' + typeof d $$;
+SELECT js_kinds(1, 1.5) AS both_kept;
+--echo # NULL is refused for every argument (by the UDF framework).
+--error ER_UDF_ERROR
+SELECT mle_eval('javascript', NULL);
+--error ER_UDF_ERROR
+SELECT mle_eval(NULL, '1');
+--error ER_UDF_ERROR
+SELECT mle_session_state(NULL);
+--error ER_UDF_ERROR
+SELECT mle_session_reset(NULL);
+SET NAMES latin1;
+SELECT mle_eval('javascript', CONCAT('"', _latin1 0xE9, '".charCodeAt(0)')) AS e_acute_is_233;
+SET NAMES utf8mb4;
+
+--echo # C39: the names libraries get in a routine are identifiers.
+CREATE LIBRARY lib1 LANGUAGE JAVASCRIPT AS $$ export function f() { return 1 } $$;
+--error ER_LANGUAGE_COMPONENT_KEYWORD
+CREATE FUNCTION bad1() RETURNS INT LANGUAGE JAVASCRIPT USING (lib1 AS `x=1;evil()`) AS $$ return 1 $$;
+--error ER_LANGUAGE_COMPONENT_KEYWORD
+CREATE FUNCTION bad2() RETURNS INT LANGUAGE JAVASCRIPT USING (lib1 AS `$c`) AS $$ return 1 $$;
+--error ER_LANGUAGE_COMPONENT_KEYWORD
+CREATE FUNCTION bad3(a INT) RETURNS INT LANGUAGE JAVASCRIPT USING (lib1 AS a) AS $$ return 1 $$;
+--error ER_LANGUAGE_COMPONENT_KEYWORD
+CREATE FUNCTION bad4() RETURNS INT LANGUAGE JAVASCRIPT USING (lib1 AS l, lib1 AS l) AS $$ return 1 $$;
+--error ER_LANGUAGE_COMPONENT_KEYWORD
+CREATE FUNCTION bad5() RETURNS INT LANGUAGE JAVASCRIPT USING (lib1 AS class) AS $$ return 1 $$;
+CREATE FUNCTION good() RETURNS INT LANGUAGE JAVASCRIPT USING (lib1 AS l) AS $$ return l.f() $$;
+SELECT good();
+
+--echo # C47: a JavaScript library with a '.' in its name is not taken for another one.
+CREATE LIBRARY `lib1.ab` LANGUAGE JAVASCRIPT AS $$ export function f() { return 2 } $$;
+CREATE FUNCTION dotted() RETURNS INT LANGUAGE JAVASCRIPT USING (`lib1.ab` AS l) AS $$ return l.f() $$;
+--error ER_LANGUAGE_COMPONENT_RUNTIME,ER_LANGUAGE_COMPONENT
+SELECT dotted();
+DROP FUNCTION dotted;
+DROP LIBRARY `lib1.ab`;
+--echo # C128: the text of a frame on a JavaScript body's first line is the body's.
+CREATE FUNCTION js_line1() RETURNS INT LANGUAGE JAVASCRIPT AS $$ const answer = 42; null.oops $$;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_line1();
+SELECT mle_session_state('traceback') AS traceback;
+DROP FUNCTION js_line1;
+
+--echo # C86: SET ... = DEFAULT of a setting that shapes workers, while a session holds one.
+--disconnect con2
+--connect (con4, localhost, root,,test)
+SET GLOBAL mle.heap_max = 268435456;
+--connect (con3, localhost, root,,test)
+SELECT js_one();
+--connection con4
+--echo # Not checked by the server before the update: refused there, with a warning.
+SET GLOBAL mle.heap_max = DEFAULT;
+--error ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
+SET GLOBAL mle.heap_max = 300000000;
+SELECT @@GLOBAL.mle.heap_max AS unchanged;
+--disconnect con3
+SET GLOBAL mle.heap_max = DEFAULT;
+SELECT @@GLOBAL.mle.heap_max = 536870912 AS the_default;
+--echo # C124: fetchColumns() with names, a NULL and a column that is not there.
+CREATE PROCEDURE js_columns(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const q = "SELECT 1 AS a, NULL AS b, 'x' AS c UNION ALL SELECT 2, 5, 'y'"
+  const out = []
+  const one = session.runSql(q).fetchColumns('c', 'a')
+  out.push(Object.keys(one).join('') + ' ' + one.c + ' ' + one.a)
+  out.push('b ' + session.runSql(q).fetchColumns(['b']).b)
+  try { session.runSql(q).fetchColumns('nope'); out.push('found') } catch (e) { out.push(e.message) }
+  r = out.join(', ')
+$$;
+CALL js_columns(@r);
+SELECT @r;
+DROP PROCEDURE js_columns;
+
+--echo # C134: mle.max_workers. This session holds a worker: another gets none, new or kept.
+SET GLOBAL mle.max_workers = 1;
+--connect (con5, localhost, root,,test)
+--error ER_LANGUAGE_COMPONENT_CONCURRENCY_LIMIT
+SELECT js_one();
+--connection con4
+SELECT js_one() AS the_holder_goes_on;
+SET GLOBAL mle.max_workers = DEFAULT;
+--connection con5
+SELECT js_one() AS room_again;
+
+--echo # C135: KILL of a connection inside a routine; an account renamed while a worker is kept for it.
+CREATE FUNCTION js_spin() RETURNS INT LANGUAGE JAVASCRIPT AS $$ while (true) {} $$;
+--let $id = `SELECT CONNECTION_ID()`
+--send SELECT js_spin()
+--connection con4
+let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE info = 'SELECT js_spin()';
+--source include/wait_condition.inc
+--disable_query_log
+eval KILL $id;
+--enable_query_log
+--connection con5
+--error 1317,2013
+--reap
+--disconnect con5
+--connection con4
+SELECT js_one() AS others_go_on;
+DROP FUNCTION js_spin;
+CREATE USER renamed1@localhost;
+GRANT EXECUTE ON test.* TO renamed1@localhost;
+--connect (con6, localhost, renamed1,,test)
+SELECT js_one();
+--disconnect con6
+--connection con4
+RENAME USER renamed1@localhost TO renamed2@localhost;
+--connect (con7, localhost, renamed2,,test)
+SELECT js_one() AS as_the_new_name, CURRENT_USER();
+--disconnect con7
+--connection con4
+DROP USER renamed2@localhost;
+
+--disconnect con4
+--connection default
+DROP TABLE child, parent, t, kinds;
+DROP FUNCTION py_resize; DROP FUNCTION js_liar; DROP FUNCTION js_context; DROP PROCEDURE java_close;
+DROP FUNCTION js_one; DROP PROCEDURE js_markers; DROP PROCEDURE py_markers; DROP PROCEDURE js_rethrow_long;
+DROP PROCEDURE js_own_text; DROP PROCEDURE js_same_error; DROP PROCEDURE js_create_library;
+DROP PROCEDURE js_column_types; DROP PROCEDURE js_api; DROP FUNCTION js_bad_state; DROP PROCEDURE js_binds;
+DROP PROCEDURE java_binds; DROP PROCEDURE js_batches; DROP PROCEDURE java_load; DROP FUNCTION js_year;
+DROP FUNCTION js_time_text; DROP FUNCTION py_time_text; DROP FUNCTION java_long_time; DROP FUNCTION py_big;
+DROP PROCEDURE py_year_zero; DROP FUNCTION py_print_much; DROP FUNCTION js_kinds; DROP FUNCTION good;
+DROP LIBRARY lib1;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
+--source include/wait_until_count_sessions.inc

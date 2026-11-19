@@ -376,8 +376,6 @@ final class Dispatcher {
     if (t instanceof OutOfMemoryError || t instanceof StackOverflowError) {
       tainted = true;  // the host retires this worker after the call
       result(Wire.EXHAUSTED, null, null, new ErrorInfo("java", t.toString(), userFrames(t), 0, ""));
-    } else if (interrupted) {
-      result(Wire.INTERRUPTED, null, null, guest("java", "interrupted"));
     } else if (t instanceof MleSqlException e) {
       result(Wire.GUEST_ERROR, null, null,
           new ErrorInfo("java", e.getMessage(), userFrames(t), e.getErrorCode(), e.getSqlState()));
@@ -388,18 +386,27 @@ final class Dispatcher {
     }
   }
 
+  /** Python's MemoryError itself, not a class of the routine named MemoryErrorSomething. */
+  private static boolean memoryError(String message) {
+    return message != null && message.startsWith("MemoryError")
+        && (message.length() == 11 || message.charAt(11) == ':');
+  }
+
   /** Errors from JS and Python (or from Java code they called). */
   private void failedGuest(PolyglotException e, boolean interrupted) {
     String language = Polyglot.languageOf(e);
     List<Frame> frames = Polyglot.frames(e);
     if (e.isInterrupted() || e.isCancelled()) {
+      // Cancelled: the Context was closed under the call (a routine can reach it: Mle.context()),
+      // and nothing runs in it again; the host retires this worker after the call.
+      if (e.isCancelled()) tainted = true;
       result(Wire.INTERRUPTED, null, null, new ErrorInfo(language, "interrupted", frames, 0, ""));
       return;
     }
     // GraalPy turns an exhausted Java heap into a Python MemoryError; treat it as exhaustion (the
     // worker is retired), also when numpy merely refused a too large array: better safe.
     if (e.isResourceExhausted() || (language.equals("python") && e.isGuestException()
-        && String.valueOf(e.getMessage()).startsWith("MemoryError"))) {
+        && memoryError(e.getMessage()))) {
       tainted = true;
       result(Wire.EXHAUSTED, null, null, new ErrorInfo(language, Polyglot.describe(e, false), frames, 0, ""));
       return;
@@ -458,9 +465,11 @@ final class Dispatcher {
       org.graalvm.polyglot.Value message = g.getMember("message");
       String text = message == null || message.isNull() ? "" : message.isString() ? message.asString()
           : message.toString();
-      return new ErrorInfo(language, text, frames,
-          code != null && code.fitsInInt() ? code.asInt() : 0,
-          state != null && state.isString() ? state.asString() : "");
+      String st = state != null && state.isString() ? state.asString() : "";
+      // A state the host would refuse (and end the worker for): an error of the routine then.
+      if (!st.isEmpty() && !st.matches("[0-9A-Z]{5}"))
+        return new ErrorInfo(language, text + " (SqlError with the invalid SQLSTATE '" + st + "')", frames, 0, "");
+      return new ErrorInfo(language, text, frames, code != null && code.fitsInInt() ? code.asInt() : 0, st);
     } catch (RuntimeException e) {
       return null;
     }
@@ -622,6 +631,8 @@ final class Dispatcher {
       int form, RowSink sink, int rowWidth) {
     if (Thread.currentThread() != thread)
       throw new IllegalStateException("SQL must be run on the routine's thread");
+    // The reply being read is in the mailbox, where this request would be written over it.
+    if (decodingRows) throw new IllegalStateException("a RowSink cannot run SQL: its result is still being read");
     // More values than the host accepts in one message would end the worker (independent review C10).
     if (params != null && params.length > Wire.MAX_VALUES)
       throw new MleSqlException(1210, "HY000", "Incorrect arguments: " + params.length
@@ -721,6 +732,9 @@ final class Dispatcher {
     return control.isInterrupted();
   }
 
+  /** A RowSink is being given the rows of a reply that is read in place. */
+  private static boolean decodingRows;
+
   private static MleSql.Reply sqlReply(long id, MessageReader r, int form, RowSink sink) {
     int kind = r.u8();
     switch (kind) {
@@ -729,7 +743,7 @@ final class Dispatcher {
         String sqlState = r.str();
         String message = r.str();
         long row = r.u32();
-        throw new MleSqlException(errno, sqlState, message, row == 0xFFFFFFFFL ? -1 : row);
+        throw new MleSqlException(errno, sqlState, message, row == Wire.NO_ROW ? -1 : row);
       }
       case Wire.SQL_OK -> {
         long affected = r.u64();
@@ -762,8 +776,16 @@ final class Dispatcher {
             Object v = Values.read(r);
             row[c] = v instanceof Values.VectorRef ref ? vector(ref, form, sink != null) : form == JAVA_VALUES ? Values.toJava(v) : v;
           }
-          if (sink != null) sink.row(row);
-          else rows.add(row);
+          if (sink != null) {
+            decodingRows = true;
+            try {
+              sink.row(row);
+            } finally {
+              decodingRows = false;
+            }
+          } else {
+            rows.add(row);
+          }
         }
         boolean more = r.flag();
         boolean moreResults = r.flag();

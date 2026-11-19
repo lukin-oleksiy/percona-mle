@@ -146,6 +146,8 @@ final class Values {
 
   private static void writeTemporal(
       MessageWriter w, int tag, int year, int month, int day, long hour, int minute, int second, int micro, boolean neg) {
+    // The wire's year is 16 bits and MySQL's range ends at 9999 (a JavaScript Date reaches 275760).
+    if (year < 0 || year > 9999) throw new ConversionException("the year " + year + " is out of range (0 to 9999)");
     w.u8(tag);
     w.u16(year);
     w.u8(month);
@@ -168,6 +170,8 @@ final class Values {
 
   private static void writeTime(MessageWriter w, Duration d) {
     boolean neg = d.isNegative();
+    // Before abs(), which overflows for the most negative Duration.
+    if (Math.abs(d.getSeconds() / 3600) > Wire.MAX_TIME_HOUR) throw new ConversionException("TIME value out of range: " + d);
     Duration a = d.abs();
     long hours = a.toHours();
     if (hours > Wire.MAX_TIME_HOUR || (hours == Wire.MAX_TIME_HOUR && a.toMinutesPart() == 59
@@ -217,10 +221,13 @@ final class Values {
         }
       }
       case Double d -> {
+        // Not SQL values, in any language (JavaScript and Python refuse them before this).
+        if (!Double.isFinite(d)) throw new IllegalArgumentException("cannot bind " + d);
         w.u8(Wire.T_F64);
         w.f64(d);
       }
       case Float f -> {
+        if (!Float.isFinite(f)) throw new IllegalArgumentException("cannot bind " + f);
         w.u8(Wire.T_F32);
         w.f32(f);
       }
@@ -527,8 +534,8 @@ final class Values {
         case Long l -> l;
         case BigInteger b -> b.longValueExact();
         case BigDecimal d -> d.longValueExact();
-        case Double d when d == Math.rint(d) && Math.abs(d) < 0x1p63 -> d.longValue();
-        case Float f when f == Math.rint(f) && Math.abs(f) < 0x1p63f -> f.longValue();
+        case Double d when d == Math.rint(d) && d >= -0x1p63 && d < 0x1p63 -> d.longValue();
+        case Float f when f == Math.rint(f) && f >= -0x1p63f && f < 0x1p63f -> f.longValue();
         default -> throw wrong(v, c);
       };
     } catch (ArithmeticException e) {

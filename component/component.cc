@@ -283,6 +283,7 @@ mysql_service_status_t deinit() {
      later): mle_set_session_state() creates sessions, so none can appear
      between the check below and the slot's unregistration. */
   if (unregister_udfs()) {
+    (void)register_udfs();  // those that did unregister: all stay or none
     my_error(ER_LANGUAGE_COMPONENT_CANNOT_UNINSTALL, MYF(0));
     return 1;
   }

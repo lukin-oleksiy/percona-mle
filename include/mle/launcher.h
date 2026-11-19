@@ -53,6 +53,9 @@ struct LauncherConfig {
   /** A cgroup v2 directory delegated to us (e.g. systemd Delegate=yes with
       DelegateSubgroup=), without processes of its own. Empty: no limits. */
   std::string cgroup_base;
+  /** Diagnostics: a directory workers may write in (MLE_DEBUG_WRITE_DIR,
+      once the caller has accepted it). Empty: none. */
+  std::string debug_write_dir;
   uint32_t arena_size = wire::kDefaultArenaSize;
   std::vector<ClassConfig> classes;
   /** How long start() and acquire() wait for the launcher. */
@@ -84,7 +87,8 @@ struct ExitInfo {
 class LauncherChannel;
 
 /** A worker process handed over by the launcher. Destroying it kills the
-    worker (workers hold no state worth saving and are never reused). */
+    worker (its owner decides before that whether to keep it for another
+    session of the account). */
 class WorkerProcess {
  public:
   ~WorkerProcess();

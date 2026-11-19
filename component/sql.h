@@ -164,6 +164,7 @@ class SqlRunner {
   bool m_pending = false;
   uint32_t m_pending_errno = 0;
   std::string m_pending_sqlstate;
+  std::string m_pending_message;
 };
 
 /** The error of a request the runner refuses (bad id, limits). */

@@ -30,7 +30,8 @@
     mle_memory_used          % of the summed worker memory limits in use
     mle_oom_errors           workers that ran out of memory
     mle_session_resets       mle_session_reset() calls
-    mle_sessions[_max]       sessions with a worker (now, most at a time)
+    mle_sessions[_max]       sessions that used MLE and are still connected
+                             (now, most at a time)
     mle_stored_functions, mle_stored_procedures, mle_stored_programs
                              MLE stored programs cached in sessions
     mle_stored_program_bytes_max  largest stored program body
@@ -94,7 +95,7 @@ int show_status(MYSQL_THD, SHOW_VAR *var, char *buff) {
 int show_heap_status(MYSQL_THD, SHOW_VAR *var, char *buff) {
   const EngineState st = engine_state(true);
   const bool allocated =
-      st.active && (st.pool_idle > 0 || engine_workers_in_use() > 0);
+      st.active && (st.pool_idle > 0 || st.cached > 0 || engine_workers_in_use() > 0);
   return show_text(var, buff, allocated ? "Allocated" : "Not Allocated");
 }
 

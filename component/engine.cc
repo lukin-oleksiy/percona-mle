@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <ctime>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -49,7 +50,6 @@ namespace mle_component {
 void log_info(const std::string &message);  // component.cc
 void log_warning(const std::string &message);  // component.cc
 /** mysqld's plugin_dir and datadir; false if they cannot be read. */
-bool server_private_paths(std::vector<std::string> *paths);  // session.cc
 size_t worker_cache_size();       // settings.cc
 uint32_t worker_cache_timeout();  // settings.cc
 
@@ -404,9 +404,11 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
     else if (access(d, W_OK) != 0)
       log_warning(std::string("MLE_DEBUG_WRITE_DIR=") + d +
                   " is ignored: not a directory mysqld can write (" + strerror(errno) + ")");
-    else
+    else {
+      config.debug_write_dir = d;
       log_warning(std::string("MLE_DEBUG_WRITE_DIR is set: MLE workers may write files in ") + d +
                   " (a diagnostic setting; unset it for production)");
+    }
   }
   config.classes = {native ? mle::native_worker_class(layout, options)
                            : mle::jvm_worker_class(layout, options)};
@@ -490,7 +492,9 @@ EngineState engine_state(bool with_stats) {
     st.error = g_error;
     if (!g_launcher) return st;
     launcher = g_launcher;
-    st.active = true;
+    // A launcher that died is restarted by the next call that needs a
+    // worker; until that works MLE is not active (g_error says why).
+    st.active = g_launcher->alive();
     st.launcher_pid = g_launcher->info().pid;
     st.cgroup = g_launcher->info().cgroup_enabled;
     st.cached = static_cast<uint32_t>(g_cache.size());
@@ -549,12 +553,18 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
     *why = AcquireError::kLimit;
     return nullptr;
   }
+  // Given back on every way out but the last, an exception (no memory) too.
+  struct InUse {
+    bool keep = false;
+    ~InUse() {
+      if (!keep) --g_workers_in_use;
+    }
+  } in_use;
   std::unique_ptr<mle::WorkerProcess> process;
   uint64_t generation = 0;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_launcher) {
-      --g_workers_in_use;
       *why = AcquireError::kInactive;
       *error = g_error.empty() ? "the MLE engine is stopped" : g_error;
       return nullptr;
@@ -579,7 +589,6 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
     generation = g_generation;
   }
   if (!process) {
-    --g_workers_in_use;
     *why = AcquireError::kFailed;
     return nullptr;
   }
@@ -591,7 +600,6 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
   if (worker->wait_ready(kReadyTimeoutMs, &ready, error, hooks) !=
       mle::Status::kOk) {
     worker.reset();
-    --g_workers_in_use;
     *why = AcquireError::kFailed;
     return nullptr;
   }
@@ -600,6 +608,7 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
     std::lock_guard<std::mutex> lock(g_mutex);
     g_live[worker.get()] = generation;
   }
+  in_use.keep = true;
   return worker;
 }
 
@@ -691,6 +700,9 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
         worker = std::move(it->worker);
         generation = it->generation;
         g_cache.erase(it);
+        // Held from here, under the mutex: a refresh or SET GLOBAL that
+        // checks for held workers sees it.
+        ++g_workers_in_use;
         break;
       }
       // None kept: wait while one of this principal is being reset.
@@ -702,8 +714,8 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
   if (!worker) return nullptr;
   // usable() is what the worker last did; alive() is the process now.
   const bool healthy = worker->usable() && worker->process().alive();
-  if (!healthy || ++g_workers_in_use > static_cast<long>(max_workers)) {
-    if (healthy) --g_workers_in_use;
+  if (!healthy || g_workers_in_use > static_cast<long>(max_workers)) {
+    --g_workers_in_use;
     return nullptr;  // destroyed: died while kept, or no room
   }
   {
@@ -736,7 +748,10 @@ long engine_memory_used_percent() {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_live.empty() || g_settings.heap_max == 0) return 0;
   uint64_t used = 0;
-  for (const auto &[w, generation] : g_live) used += w->stats().heap_used;
+  // The figures come from memory the workers write: none counts for more
+  // than its limit.
+  for (const auto &[w, generation] : g_live)
+    used += std::min<uint64_t>(w->stats().heap_used, g_settings.heap_max);
   return static_cast<long>(used * 100 / (g_settings.heap_max * g_live.size()));
 }
 

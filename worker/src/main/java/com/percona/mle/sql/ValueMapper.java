@@ -24,7 +24,8 @@ package com.percona.mle.sql;
  */
 public interface ValueMapper {
   /**
-   * A value as read from a result (Long, BigInteger, Double, Float, BigDecimal, String, byte[],
+   * A value as read from a result (Long, BigInteger, Double (also for FLOAT columns), BigDecimal,
+   * String, byte[],
    * com.percona.mle.api.MleJson, float[] for VECTOR, a worker temporal for DATE/TIME/DATETIME/
    * TIMESTAMP, or null) in this language, for column c under the statement's options.
    */
