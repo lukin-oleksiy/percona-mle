@@ -9,7 +9,7 @@ policy_module(percona_mle, 0.1.0)
 # mailbox memfd, a pidfd) and SIGKILL.
 #
 # mle_launcher_t: creates the workers' cgroups and mailboxes, no JIT.
-# mle_worker_t: runs routines (a JVM or a Native Image): needs execmem for
+# mle_worker_t: runs routines (a JVM, CPython or V8): needs execmem for
 # the JIT compilers; Landlock and seccomp confine it further.
 #
 

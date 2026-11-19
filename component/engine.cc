@@ -57,8 +57,6 @@ namespace {
 
 void log_restart(const std::string &message) { log_info(message); }
 
-/** The one worker class of Phase 4 (defaults.h). */
-constexpr char kWorkerClass[] = "jvm";
 
 std::mutex g_mutex;
 std::shared_ptr<mle::Launcher> g_launcher;  // guarded by g_mutex
@@ -91,6 +89,7 @@ std::atomic<long> g_workers_in_use{0};
 /** Reset workers kept for later sessions of the same principal (12 §17);
     newest at the back. */
 struct Cached {
+  WorkerKind kind;
   std::string principal;
   std::unique_ptr<mle::Worker> worker;
   std::chrono::steady_clock::time_point since;
@@ -187,57 +186,47 @@ std::string mib(uint64_t bytes) {
   return std::to_string(bytes >> 20) + " MiB";
 }
 
-/** The files the engine needs; "" if all are there, else what is missing.
-    mle_worker is only checked to exist: the launcher executes it (and reports
-    why it cannot), and under SELinux mysqld itself may not (it is
-    mle_worker_exec_t, for the workers' domain). */
-std::string check_layout(const mle::Layout &l, const Settings &s, bool native, bool cpython) {
+/** Whether a kind is installed (its worker is there). */
+bool installed(const mle::Layout &l, WorkerKind kind) {
+  switch (kind) {
+    case WorkerKind::kJvm:
+      return access(l.worker_jar.c_str(), R_OK) == 0;
+    case WorkerKind::kCPython:
+      return !l.cpython_exe.empty();
+    case WorkerKind::kV8:
+      return !l.v8_exe.empty();
+  }
+  return false;
+}
+
+/** What an installed kind lacks; "" if it can run. mle_worker is only checked
+    to exist: the launcher executes it (and reports why it cannot), and under
+    SELinux mysqld itself may not (it is mle_worker_exec_t, for the workers'
+    domain). */
+std::string kind_problem(const mle::Layout &l, const Settings &s, WorkerKind kind) {
   struct Need {
     const std::string &path;
     int mode;
     const char *what;
   };
-  if (cpython) {
-    // The CPython worker (exp design note 62): no jar, no JDK.
-    if (access(l.launcher_exe.c_str(), X_OK) != 0)
-      return "the MLE files are not installed in mle.dir '" + s.dir + "': mle_launcher (" + l.launcher_exe +
-             ") is missing or not accessible";
-    if (l.cpython_exe.empty())
-      return "mle.worker is CPYTHON but the CPython worker is not installed (" + s.dir +
-             "/cpython/mle_cpython_worker)";
+  if (kind == WorkerKind::kV8) return "";
+  if (kind == WorkerKind::kCPython) {
     if (access(l.cpython_code.c_str(), R_OK | X_OK) != 0)
       return "the CPython worker's Python code (" + l.cpython_code + ") is missing or not accessible";
     return "";
   }
-  if (native) {
-    // The Python-only native build (23): no jar, no JDK.
-    const Need needs[] = {{l.launcher_exe, X_OK, "mle_launcher"},
-                          {l.worker_exe, F_OK, "mle_worker"}};
-    for (const Need &n : needs)
-      if (access(n.path.c_str(), n.mode) != 0)
-        return std::string("the MLE files are not installed in mle.dir '") +
-               s.dir + "': " + n.what + " (" + n.path +
-               ") is missing or not accessible";
-    if (l.native_lib.empty())
-      return "mle.worker is NATIVE but the native build is not installed (" +
-             s.dir + "/native/libmleworker.so)";
-    return "";
-  }
   const std::string libjvm = l.java_home + "/lib/server/libjvm.so";
   const Need needs[] = {
-      {l.launcher_exe, X_OK, "mle_launcher"},
       {l.worker_exe, F_OK, "mle_worker"},
       {l.worker_jar, R_OK, "mle-worker.jar"},
       {l.resource_cache, R_OK | X_OK, "resources"},
   };
   for (const Need &n : needs)
     if (access(n.path.c_str(), n.mode) != 0)
-      return std::string("the MLE files are not installed in mle.dir '") +
-             s.dir + "': " + n.what + " (" + n.path +
-             ") is missing or not accessible";
+      return std::string("the JVM worker's files are not complete in mle.dir '") + s.dir + "': " + n.what +
+             " (" + n.path + ") is missing or not accessible";
   if (access(libjvm.c_str(), R_OK) != 0)
-    return "mle.java_home '" + s.java_home +
-           "' is not a GraalVM JDK 25: " + libjvm + " is missing";
+    return "mle.java_home '" + s.java_home + "' is not a GraalVM JDK 25: " + libjvm + " is missing";
   return "";
 }
 
@@ -322,38 +311,27 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   if (char real[PATH_MAX]; !s.package_dir.empty() &&
                            realpath(s.package_dir.c_str(), real) != nullptr)
     layout.package_dir = real;  // a missing directory: no packages
-  // mle.worker: the JVM build (Java, JavaScript, Python), the CPython worker
-  // (Python only, exp design note 62) or the Python-only native build (23).
-  // AUTO takes the JVM build when it is installed (its jar is there: a wrong
-  // mle.java_home is still an error, not a reason to run another kind), else
-  // the CPython worker, else the native build.
-  const bool jvm_installed = access(layout.worker_jar.c_str(), R_OK) == 0;
-  bool native = false;
-  bool cpython = false;
-  if (s.worker == "CPYTHON") {
-    cpython = true;
-  } else if (s.worker == "NATIVE") {
-    native = true;
-  } else if (s.worker == "AUTO") {
-    cpython = !jvm_installed && !layout.cpython_exe.empty();
-    native = !jvm_installed && !cpython && !layout.native_lib.empty();
-  } else if (s.worker != "JVM") {
-    *error = "mle.worker must be AUTO, JVM, NATIVE or CPYTHON, not '" + s.worker + "'";
+  const auto fail = [&](std::string why) {
+    *error = std::move(why);
     if (!g_launcher) g_error = *error;
     return false;
+  };
+  if (access(layout.launcher_exe.c_str(), X_OK) != 0)
+    return fail("the MLE files are not installed in mle.dir '" + s.dir + "': mle_launcher (" +
+                layout.launcher_exe + ") is missing or not accessible");
+  // Every installed worker kind runs its languages (exp design note 63): the
+  // JVM worker JAVASCRIPT, JAVA and (with GraalPy, an optional package)
+  // PYTHON; the CPython worker CPYTHON; the V8 worker JS. One that is
+  // installed but cannot run (a wrong mle.java_home) is an error, as before:
+  // the DBA sees it at INSTALL, not as a language gone missing.
+  std::vector<WorkerKind> kinds;
+  for (const WorkerKind kind : {WorkerKind::kJvm, WorkerKind::kCPython, WorkerKind::kV8}) {
+    if (!installed(layout, kind)) continue;
+    if (std::string why = kind_problem(layout, s, kind); !why.empty()) return fail(why);
+    kinds.push_back(kind);
   }
-  // Python is an optional package: without GraalPy, PYTHON routines are an
-  // unsupported language; the native build runs Python only.
-  // Applied only when the new launcher runs (a failed restart keeps the
-  // running engine as it is).
-  const unsigned languages = native || cpython ? kPython
-                             : layout.python   ? kAllLanguages
-                                               : kAllLanguages & ~kPython;
-  *error = check_layout(layout, s, native, cpython);
-  if (!error->empty()) {
-    if (!g_launcher) g_error = *error;
-    return false;
-  }
+  if (kinds.empty())
+    return fail("no MLE worker is installed in mle.dir '" + s.dir + "' (the JVM, CPython or V8 worker)");
 
   std::string cgroup_note;
   mle::LauncherConfig config;
@@ -367,7 +345,6 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   }
 
   mle::JvmClassOptions options;
-  options.name = kWorkerClass;
   options.memory_max = s.memory_max;
   options.heap = std::to_string(s.heap_max >> 20) + "m";
   options.malloc_mmap_threshold = s.malloc_mmap_threshold;
@@ -376,16 +353,12 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   // Pool workers start Java (javac) and JavaScript, which are cheap; GraalPy
   // (and numpy) only when mle.pool_prewarm asks (15 §1: Python starts lazily
   // by default, for memory); "vectors" warms the vector helper up after READY
-  // while the worker is idle (exp note 35). The native build skips what it
-  // does not have.
+  // while the worker is idle (exp note 35). The CPython worker reads "numpy".
   options.prewarm = s.pool_prewarm == "none" ? "java,js" : "java,js," + s.pool_prewarm;
-  if (!server_private_paths(&options.hidden_paths)) {
-    *error =
+  if (!server_private_paths(&options.hidden_paths))
+    return fail(
         "cannot read mysqld's plugin_dir and datadir (hidden from routines); "
-        "install component_mle with INSTALL COMPONENT";
-    if (!g_launcher) g_error = *error;
-    return false;
-  }
+        "install component_mle with INSTALL COMPONENT");
   // JavaScript's local time (Date.toString(), getHours()) follows mysqld's
   // system time zone; the worker cannot read the system's zone itself.
   const std::string zone = system_time_zone();
@@ -395,24 +368,20 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   // stderr (the error log) instead of nowhere.
   if (const char *e = getenv("MLE_WORKER_STDERR"); e != nullptr && *e == '1')
     options.inherit_stderr = true;
-  // Diagnostics (README): more options for the JVM workers and for the native
-  // image's runtime (GC logging and policy, for example).
-  const auto words = [](const char *text, std::vector<std::string> *out) {
+  // Diagnostics (README): more options for the JVM workers (GC logging and
+  // policy, for example).
+  if (const char *extra = getenv("MLE_JVM_OPTIONS"); extra != nullptr) {
     std::string word;
-    for (const char *c = text;; c++) {
+    for (const char *c = extra;; c++) {
       if (*c == ' ' || *c == '\0') {
-        if (!word.empty()) out->push_back(word);
+        if (!word.empty()) options.extra_jvm_options.push_back(word);
         word.clear();
         if (*c == '\0') break;
       } else {
         word += *c;
       }
     }
-  };
-  if (const char *extra = getenv("MLE_JVM_OPTIONS"); extra != nullptr)
-    words(extra, &options.extra_jvm_options);
-  if (const char *extra = getenv("MLE_NATIVE_OPTIONS"); extra != nullptr)
-    words(extra, &options.extra_native_options);
+  }
   // Diagnostics: a directory workers may write in (JFR recordings, Truffle
   // logs); the launcher passes it to the sandbox (launcher/child.cc).
   if (const char *d = getenv("MLE_DEBUG_WRITE_DIR"); d != nullptr && *d != '\0') {
@@ -427,9 +396,29 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
                   " (a diagnostic setting; unset it for production)");
     }
   }
-  config.classes = {cpython  ? mle::cpython_worker_class(layout, options)
-                    : native ? mle::native_worker_class(layout, options)
-                             : mle::jvm_worker_class(layout, options)};
+  for (const WorkerKind kind : kinds) {
+    mle::JvmClassOptions o = options;
+    o.name = kind_name(kind);
+    switch (kind) {
+      case WorkerKind::kJvm:
+        config.classes.push_back(mle::jvm_worker_class(layout, o));
+        break;
+      case WorkerKind::kCPython:
+        o.memory_max = s.cpython_memory_max;
+        o.pool_size = s.cpython_pool_size;
+        config.classes.push_back(mle::cpython_worker_class(layout, o));
+        break;
+      case WorkerKind::kV8: {
+        o.memory_max = s.v8_memory_max;
+        o.pool_size = s.v8_pool_size;
+        mle::ClassConfig c = mle::v8_worker_class(layout, o, s.v8_heap_max);
+        // Local time as mysqld's (V8 asks libc, which reads TZ).
+        c.env.push_back("TZ=" + (zone[0] == '+' || zone[0] == '-' ? std::string("UTC") : zone));
+        config.classes.push_back(std::move(c));
+        break;
+      }
+    }
+  }
 
   std::string launcher_error;
   std::unique_ptr<mle::Launcher> launcher =
@@ -440,39 +429,55 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
     return false;
   }
   const mle::LauncherInfo &li = launcher->info();
-  if (!li.class_errors.empty() && !li.class_errors[0].empty()) {
-    *error = "workers cannot run here: " + li.class_errors[0];
-    if (!g_launcher || !g_launcher->alive()) g_error = *error;
-    return false;  // destroying the launcher stops it
+  for (size_t i = 0; i < kinds.size() && i < li.class_errors.size(); i++)
+    if (!li.class_errors[i].empty()) {
+      *error = "workers cannot run here: " + li.class_errors[i];
+      if (!g_launcher || !g_launcher->alive()) g_error = *error;
+      return false;  // destroying the launcher stops it
+    }
+  unsigned languages = 0;
+  std::string running;
+  for (const WorkerKind kind : kinds) {
+    unsigned bits = kind_languages(kind);
+    if (kind == WorkerKind::kJvm && !layout.python) bits &= ~unsigned{kPython};
+    languages |= bits;
+    std::string what;
+    switch (kind) {
+      case WorkerKind::kJvm:
+        what = "JVM worker (JDK " + layout.java_home + (layout.aot_cache.empty() ? ", no AOT cache" : "") +
+               ", Java heap " + mib(s.heap_max) +
+               (!layout.python                ? ", no Python (package percona-mle-python)"
+                : layout.python_venv.empty() ? ", no Python venv (no numpy)"
+                                              : "") +
+               ")";
+        break;
+      case WorkerKind::kCPython:
+        what = "CPython worker (" + layout.cpython_exe +
+               (layout.cpython_site.empty() ? ", no site-packages: no numpy" : "") + ")";
+        break;
+      case WorkerKind::kV8:
+        what = "V8 worker (" + layout.v8_exe + ", V8 heap " + mib(s.v8_heap_max) + ")";
+        break;
+    }
+    running += (running.empty() ? "" : ", ") + what;
   }
 
   std::string cgroup;
   if (li.cgroup_enabled)
-    cgroup = "worker cgroups below " + li.cgroup_info + ", memory.max " +
-             mib(s.memory_max) + " each";
+    cgroup = "worker cgroups below " + li.cgroup_info + ", memory.max " + mib(s.memory_max) +
+             " (JVM), " + mib(s.cpython_memory_max) + " (CPython), " + mib(s.v8_memory_max) + " (V8)";
   else {
-    cgroup = "no worker cgroups, so mle.memory_max is not enforced (" +
+    cgroup = "no worker cgroups, so the mle.*memory_max limits are not enforced (" +
              (cgroup_note.empty() ? li.cgroup_info : cgroup_note) + ")";
-    // Workers then have no memory or thread limit of their own (only the
-    // Java heap; their OOM score makes the kernel pick them before mysqld).
+    // Workers then have no memory or thread limit of their own (only their
+    // heaps; their OOM score makes the kernel pick them before mysqld).
     log_warning("MLE workers run without cgroups: " + cgroup +
                 ". Delegate a cgroup to mysqld (systemd: Delegate=yes) or set "
                 "mle.cgroup_base.");
   }
-  *info = "Engine started: mle_launcher pid " + std::to_string(li.pid) +
-          ", Landlock ABI " + std::to_string(li.landlock_abi) + ", " + cgroup +
-          (cpython ? "" : ", Java heap " + mib(s.heap_max)) + ", pool " +
-          std::to_string(s.pool_size) + ", files in " + s.dir +
-          (cpython  ? ", CPython worker " + layout.cpython_exe +
-                         (layout.cpython_site.empty() ? " (no site-packages: no numpy)" : "")
-           : native ? ", Python-only native build " + layout.native_lib
-                    : ", JDK " + layout.java_home +
-                        (layout.aot_cache.empty() ? ", no AOT cache" : "")) +
-          (cpython                     ? ""
-           : !native && !layout.python ? ", no Python (package percona-mle-python)"
-           : layout.python_venv.empty() ? ", no Python venv (no numpy)" : "") +
-          (layout.package_dir.empty() ? "" : ", packages in " + layout.package_dir) +
-          ".";
+  *info = "Engine started: mle_launcher pid " + std::to_string(li.pid) + ", Landlock ABI " +
+          std::to_string(li.landlock_abi) + ", " + cgroup + ", files in " + s.dir + "; " + running +
+          (layout.package_dir.empty() ? "" : "; packages in " + layout.package_dir) + ".";
   // The new engine: kept workers have the old settings; running sessions'
   // workers keep the old launcher alive until they are released (and are
   // not kept then: an older generation).
@@ -526,10 +531,11 @@ EngineState engine_state(bool with_stats) {
   if (with_stats) {
     std::vector<mle::ClassStats> stats;
     std::string error;
-    if (launcher->stats(&stats, &error) && !stats.empty()) {
-      st.pool_idle = stats[0].idle;
-      st.spawned = stats[0].spawned;
-    }
+    if (launcher->stats(&stats, &error))
+      for (const mle::ClassStats &c : stats) {
+        st.pool_idle += c.idle;
+        st.spawned += c.spawned;
+      }
   }
   return st;
 }
@@ -564,7 +570,7 @@ namespace {
 constexpr int kReadyTimeoutMs = 120000;
 }  // namespace
 
-std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us,
+std::unique_ptr<mle::Worker> engine_new_worker(WorkerKind kind, uint32_t max_workers, int spin_us,
                                                int interrupt_grace_ms,
                                                mle::CallHooks *hooks,
                                                AcquireError *why,
@@ -590,7 +596,7 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
       *error = g_error.empty() ? "the MLE engine is stopped" : g_error;
       return nullptr;
     }
-    process = g_launcher->acquire(kWorkerClass, error);
+    process = g_launcher->acquire(kind_name(kind), error);
     const auto now = std::chrono::steady_clock::now();
     if (!process && !g_launcher->alive() &&
         now - g_last_failed_start >= std::chrono::seconds(1)) {
@@ -602,7 +608,7 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
       const Settings settings = g_settings;
       if (start_locked(settings, error, &info)) {
         log_restart(info);
-        process = g_launcher->acquire(kWorkerClass, error);
+        process = g_launcher->acquire(kind_name(kind), error);
       } else {
         g_last_failed_start = now;
       }
@@ -645,7 +651,7 @@ void engine_session_end(uint64_t mark) {
   prune_forgotten_locked();
 }
 
-void engine_release_worker(std::unique_ptr<mle::Worker> worker,
+void engine_release_worker(std::unique_ptr<mle::Worker> worker, WorkerKind kind,
                            const std::string &principal, uint64_t mark) {
   if (!worker) return;
   // The session's forced GCs, before RESET (which restarts the worker's count).
@@ -691,7 +697,7 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
           !worker->stats().tainted) {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_launcher && generation == g_generation && !forgotten()) {
-          g_cache.push_back({principal, std::move(worker),
+          g_cache.push_back({kind, principal, std::move(worker),
                              std::chrono::steady_clock::now(), generation});
           while (g_cache.size() > worker_cache_size()) {
             evicted.push_back(std::move(g_cache.front().worker));
@@ -707,7 +713,7 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker,
   worker.reset();
 }
 
-std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
+std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal, WorkerKind kind,
                                                  uint32_t max_workers) {
   std::unique_ptr<mle::Worker> worker;
   uint64_t generation = 0;
@@ -717,7 +723,7 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
     while (true) {
       for (auto it = g_cache.end(); it != g_cache.begin();) {
         --it;
-        if (it->principal != principal) continue;
+        if (it->principal != principal || it->kind != kind) continue;
         worker = std::move(it->worker);
         generation = it->generation;
         g_cache.erase(it);
@@ -767,13 +773,29 @@ void engine_forget_account(const std::string &principal) {
 
 long engine_memory_used_percent() {
   std::lock_guard<std::mutex> lock(g_mutex);
-  if (g_live.empty() || g_settings.heap_max == 0) return 0;
-  uint64_t used = 0;
+  uint64_t used = 0, limits = 0;
   // The figures come from memory the workers write: none counts for more
-  // than its limit.
-  for (const auto &[w, generation] : g_live)
-    used += std::min<uint64_t>(w->stats().heap_used, g_settings.heap_max);
-  return static_cast<long>(used * 100 / (g_settings.heap_max * g_live.size()));
+  // than its limit. Workers without a heap of their own (CPython) report none.
+  for (const auto &[w, generation] : g_live) {
+    const auto st = w->stats();
+    const uint64_t limit = st.heap_max != 0 ? st.heap_max : st.heap_used != 0 ? g_settings.heap_max : 0;
+    if (limit == 0) continue;
+    used += std::min<uint64_t>(st.heap_used, limit);
+    limits += limit;
+  }
+  return limits == 0 ? 0 : static_cast<long>(used * 100 / limits);
+}
+
+const char *kind_name(WorkerKind kind) {
+  switch (kind) {
+    case WorkerKind::kJvm:
+      return "jvm";
+    case WorkerKind::kCPython:
+      return "cpython";
+    case WorkerKind::kV8:
+      return "v8";
+  }
+  return "";
 }
 
 }  // namespace mle_component

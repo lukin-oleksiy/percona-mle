@@ -38,7 +38,7 @@ package com.percona.mle.api;
  * (numpy on float32 arrays has the same range): a vector whose squared length underflows float
  * (every component below about 1e-19) counts as a zero vector, and components or differences
  * above about 1.8e19 overflow to Infinity (cosine then NaN, normalize a zero vector; rows at
- * different such distances tie). The JVM build only: the Python-only native build cannot look up Java classes. One query and a batch of queries are computed differently and may order near-ties
+ * different such distances tie). The JVM worker only. One query and a batch of queries are computed differently and may order near-ties
  * (equal to ~1e-7) differently; the number of threads never changes a result. A killed
  * statement stops the work within milliseconds.
  */

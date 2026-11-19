@@ -17,24 +17,23 @@
 # install component. The paths follow the server build's install layout: build the server with
 # INSTALL_LAYOUT=DEB or RPM for packages (a standalone server build gives <prefix>/lib/plugin).
 #
-#   percona-mle-common         component_mle, mle_launcher, mle_worker            both builds
+#   percona-mle-common         component_mle, mle_launcher, mle_worker            every worker
 #   percona-mle-apparmor       the AppArmor profile (DEB only; -DMLE_APPARMOR=ON, the
 #                              default where /etc/apparmor.d exists)               <- common
 #   percona-mle                the JVM build: worker jar, runtime jars, AOT cache  -> common, jdk
 #   percona-mle-jdk            the trimmed GraalVM runtime (-DMLE_BUILD_JDK=ON; without it no
 #                              such package, and percona-mle does not ask for one)
-#   percona-mle-python-runtime Python's standard library and the numpy venv (both builds) -> common
+#   percona-mle-python-runtime GraalPy's standard library and the numpy venv     -> common
 #   percona-mle-python         GraalPy for the JVM build (jars)                      -> percona-mle, runtime
-#   percona-mle-python-native  the Python-only native build (-DMLE_PYTHON_NATIVE=ON) -> common, runtime
 #   percona-mle-cpython        the CPython worker (-DMLE_CPYTHON=ON, the default with Python 3.12+;
 #                              exp design note 62): Python only, on the distribution's
-#                              libpython, with numpy                                 -> common, libpython
+#                              libpython, with numpy (LANGUAGE CPYTHON)              -> common, libpython
 #   percona-mle-tools          mle_package (third-party packages; uses the JVM build)
 #   percona-mle-selinux        the SELinux policy module (RPM only; -DMLE_SELINUX=ON, the default
 #                              with selinux-policy-devel)                          <- common
 #
-# mle.worker = AUTO runs the JVM build when percona-mle is installed, else the CPython worker, else
-# the native one.
+# Every installed worker runs its languages (exp design note 63): the JVM worker JAVASCRIPT, JAVA
+# and PYTHON, the CPython worker CPYTHON.
 
 SET(MLE_VERSION "0.1.0" CACHE STRING "Version of the Percona MLE packages")
 SET(MLE_PACKAGE_RELEASE "1" CACHE STRING "Release of the Percona MLE packages")
@@ -64,9 +63,6 @@ ELSE()
   MESSAGE(STATUS "MLE packages: no percona-mle-jdk (-DMLE_BUILD_JDK=OFF); with such packages "
     "mle.java_home must name a GraalVM JDK 25 on the host they are installed on")
 ENDIF()
-IF(MLE_PYTHON_NATIVE)
-  LIST(APPEND CPACK_COMPONENTS_ALL MlePythonNative)
-ENDIF()
 GET_PROPERTY(MLE_PYTHON_SONAME GLOBAL PROPERTY MLE_PYTHON_SONAME)
 GET_PROPERTY(MLE_PYTHON_MAJOR_MINOR GLOBAL PROPERTY MLE_PYTHON_MAJOR_MINOR)
 IF(MLE_PYTHON_SONAME)
@@ -88,7 +84,7 @@ SET(CPACK_DEBIAN_PACKAGE_RELEASE ${MLE_PACKAGE_RELEASE})
 SET(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 SET(CPACK_DEBIAN_PACKAGE_ARCHITECTURE amd64)
 SET(CPACK_DEBIAN_PACKAGE_SECTION database)
-# The runtime is prebuilt (JDK, numpy venv, a Native Image): no shlibdeps over it (21 §5).
+# The runtime is prebuilt (JDK, numpy venv): no shlibdeps over it (21 §5).
 SET(CPACK_DEBIAN_PACKAGE_SHLIBDEPS OFF)
 SET(mle_deb_ver "${MLE_VERSION}-${MLE_PACKAGE_RELEASE}")
 SET(CPACK_DEBIAN_MLECOMMON_PACKAGE_NAME percona-mle-common)
@@ -117,11 +113,6 @@ SET(CPACK_DEBIAN_MLEPYTHONRUNTIME_PACKAGE_DEPENDS "percona-mle-common (= ${mle_d
 SET(CPACK_DEBIAN_MLEPYTHON_PACKAGE_NAME percona-mle-python)
 SET(CPACK_DEBIAN_MLEPYTHON_PACKAGE_DEPENDS
   "percona-mle (= ${mle_deb_ver}), percona-mle-python-runtime (= ${mle_deb_ver})")
-SET(CPACK_DEBIAN_MLEPYTHONNATIVE_PACKAGE_NAME percona-mle-python-native)
-SET(CPACK_DEBIAN_MLEPYTHONNATIVE_PACKAGE_DEPENDS
-  "percona-mle-common (= ${mle_deb_ver}), percona-mle-python-runtime (= ${mle_deb_ver})")
-SET(CPACK_DEBIAN_MLEPYTHONNATIVE_DESCRIPTION
-  "Percona MLE: the Python-only native build (highly optimised for Python-only use: less memory, fast worker start)")
 SET(CPACK_DEBIAN_MLECPYTHON_PACKAGE_NAME percona-mle-cpython)
 # The libpython the worker was built against (the package is per distribution anyway).
 SET(CPACK_DEBIAN_MLECPYTHON_PACKAGE_DEPENDS
@@ -176,9 +167,6 @@ SET(CPACK_RPM_MLEPYTHONRUNTIME_PACKAGE_REQUIRES "percona-mle-common = ${mle_rpm_
 SET(CPACK_RPM_MLEPYTHON_PACKAGE_NAME percona-mle-python)
 SET(CPACK_RPM_MLEPYTHON_PACKAGE_REQUIRES
   "percona-mle = ${mle_rpm_ver}, percona-mle-python-runtime = ${mle_rpm_ver}")
-SET(CPACK_RPM_MLEPYTHONNATIVE_PACKAGE_NAME percona-mle-python-native)
-SET(CPACK_RPM_MLEPYTHONNATIVE_PACKAGE_REQUIRES
-  "percona-mle-common = ${mle_rpm_ver}, percona-mle-python-runtime = ${mle_rpm_ver}")
 SET(CPACK_RPM_MLECPYTHON_PACKAGE_NAME percona-mle-cpython)
 # No automatic dependencies (AUTOREQPROV OFF): libpython by its soname.
 SET(CPACK_RPM_MLECPYTHON_PACKAGE_REQUIRES

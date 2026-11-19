@@ -26,6 +26,7 @@
 */
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -40,16 +41,42 @@ namespace mle_component {
 /** Name of the component: the prefix of its sysvars (mle.memory_max). */
 constexpr const char kName[] = "mle";
 
-/** Languages, as bits of mle.languages. */
+/** Languages, as bits of mle.languages: a LANGUAGE name each. The worker
+    kind runs it (exp design note 63): JAVASCRIPT, PYTHON and JAVA on the JVM
+    worker (GraalJS, GraalPy, Java), JS on the V8 worker, CPYTHON on the
+    CPython worker. */
 enum Language : unsigned {
   kJavaScript = 1,
   kPython = 2,
   kJava = 4,
-  kAllLanguages = 7
+  kJs = 8,
+  kCPython = 16,
+  kAllLanguages = 31
 };
+
+/** The kind that runs a language bit. */
+constexpr WorkerKind kind_of(unsigned bit) {
+  return bit == kJs ? WorkerKind::kV8 : bit == kCPython ? WorkerKind::kCPython : WorkerKind::kJvm;
+}
+
+/** The language a bit is written in, as the workers and the rules for names
+    and values see it: JS is JavaScript (Oracle's), CPYTHON is Python. */
+constexpr unsigned family(unsigned bit) {
+  return bit == kJs ? kJavaScript : bit == kCPython ? kPython : bit;
+}
+
+/** Language bits a kind runs. */
+constexpr unsigned kind_languages(WorkerKind kind) {
+  return kind == WorkerKind::kV8 ? unsigned{kJs}
+         : kind == WorkerKind::kCPython ? unsigned{kCPython}
+                                  : unsigned{kJavaScript | kPython | kJava};
+}
 
 /** Bit of a LANGUAGE name (case-insensitive), 0 if it is not ours. */
 unsigned language_bit(std::string_view name);
+
+/** The LANGUAGE name of a bit ("JAVASCRIPT", "JS", "CPYTHON", ...). */
+const char *language_sql_name(unsigned bit);
 
 /** "JAVASCRIPT, python" -> bits. False on an unknown name. */
 bool parse_languages(std::string_view text, unsigned *bits);
@@ -59,8 +86,8 @@ bool parse_languages(std::string_view text, unsigned *bits);
     "none" or the items lowercase, in that order, without repeats. */
 bool parse_prewarm(std::string_view text, std::string *normalized);
 
-/** Display names, e.g. "JavaScript,Python,Java" (Oracle's
-    mle_languages_supported spelling). */
+/** Display names, e.g. "JavaScript,Python,Java,JS,CPython" (Oracle's
+    mle_languages_supported spelling for its own). */
 std::string language_names(unsigned bits);
 
 /** Counters behind the status variables. */

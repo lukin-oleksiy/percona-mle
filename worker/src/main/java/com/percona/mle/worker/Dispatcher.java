@@ -109,11 +109,8 @@ final class Dispatcher {
     w.reset();
     w.u32(Wire.VERSION);
     w.str(System.getProperty("mle.class", "jvm"));
-    // Java only on the JVM (23): the Python-only native build reports "python" alone, and
-    // mysqld then refuses routines and libraries in the other languages.
-    boolean jvm = !Polyglot.nativeImage();
-    w.u32((jvm ? 1 : 0) + Polyglot.LANGUAGES.size());
-    if (jvm) w.str("java");
+    w.u32(1 + Polyglot.LANGUAGES.size());
+    w.str("java");
     for (String l : Polyglot.LANGUAGES) w.str(l);
     w.str("Java " + Runtime.version() + " (" + System.getProperty("java.vm.name") + ")");
     w.str(info);
@@ -215,7 +212,7 @@ final class Dispatcher {
     String error;
     try {
       error = !language.equals("java") ? polyglot.parseLibrary(language, name, body)
-          : Polyglot.nativeImage() ? "Java needs the JVM build of MLE" : java.checkLibrary(name, body);
+          : java.checkLibrary(name, body);
     } catch (Throwable t) {
       failed(t, false);
       return;
@@ -265,8 +262,7 @@ final class Dispatcher {
     r.finish();
     schemas.put(id, schema);
 
-    // Java routines need the JVM build (23); mysqld refuses them earlier (the worker's READY).
-    boolean javaRoutine = language.equals("java") && !Polyglot.nativeImage();
+    boolean javaRoutine = language.equals("java");
     if (!javaRoutine && !Polyglot.isGuest(language)) {
       result(Wire.GUEST_ERROR, null, null, guest(language, "the language " + language + " is not available in this worker"));
       return;

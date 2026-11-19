@@ -63,8 +63,6 @@ Layout Layout::installed(const std::string &dir, const std::string &java_home) {
     globfree(&g);
   }
   if (exists(dir + "/mle.aot")) l.aot_cache = resolve(dir + "/mle.aot");
-  if (exists(dir + "/native/libmleworker.so"))
-    l.native_lib = resolve(dir + "/native/libmleworker.so");
   if (exists(dir + "/cpython/mle_cpython_worker")) {
     l.cpython_exe = resolve(dir + "/cpython/mle_cpython_worker");
     l.cpython_code = resolve(dir + "/cpython/python");
@@ -73,6 +71,7 @@ Layout Layout::installed(const std::string &dir, const std::string &java_home) {
     if (exists(dir + "/cpython/pycache"))
       l.cpython_pycache = resolve(dir + "/cpython/pycache");
   }
+  if (exists(dir + "/v8/mle_v8_worker")) l.v8_exe = resolve(dir + "/v8/mle_v8_worker");
   if (glob_t g{}; glob((dir_of(l.worker_jar) + "/deps/python-language-*.jar").c_str(), 0,
                        nullptr, &g) == 0) {
     l.python = g.gl_pathc > 0;
@@ -160,48 +159,6 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
   return c;
 }
 
-ClassConfig native_worker_class(const Layout &layout, const JvmClassOptions &o) {
-  ClassConfig c = jvm_worker_class(layout, o);
-  // The same bootstrap and Main.run; the library is a Native Image with its
-  // own language resources beside it (no class path, no AOT cache, no JDK).
-  const std::string lib_dir = dir_of(layout.native_lib);
-  // Language resources (Python's standard library) as for the JVM class: extracted at build
-  // time, since workers cannot write a resource cache (same GraalVM release, same resources).
-  c.args = {"--jvm=" + layout.native_lib,
-            "-Dpolyglot.engine.userResourceCache=" + layout.resource_cache,
-            "-Xmx" + o.heap, "-Dmle.class=" + o.name,
-            "-Dmle.memoryMax=" + std::to_string(o.memory_max),
-            // The image's GC (exp note 37): the default (adaptive) policy shrinks the
-            // young generation under a stream of calls and then runs a full GC
-            // (~30 ms) after every young one: 1M calls of a Python function took
-            // 1.94 -> 2.17 s. Proportionate: no full GCs (flat ~1.97 s), idle pool
-            // workers ~20 MB smaller, the same memory after numpy work.
-            "-XX:InitialCollectionPolicy=Proportionate",
-            "-Dmle.vectorThreads=" + std::to_string(o.vector_threads)};
-  if (!o.prewarm.empty()) c.args.push_back("-Dmle.prewarm=" + o.prewarm);
-  if (!layout.python_venv.empty())
-    c.args.push_back("-Dmle.python.venv=" + layout.python_venv);
-  if (!layout.package_dir.empty())
-    c.args.push_back("-Dmle.packages=" + layout.package_dir);
-  // GraalPy's home (its standard library) in the extracted resources: the
-  // native image does not find it through the resource cache by itself.
-  if (glob_t g{}; glob((layout.resource_cache + "/python/python-home/*").c_str(),
-                       GLOB_ONLYDIR, nullptr, &g) == 0) {
-    if (g.gl_pathc > 0) c.args.push_back(std::string("-Dmle.python.home=") + g.gl_pathv[0]);
-    globfree(&g);
-  }
-  // System properties only (-D...): the -XX options of the JVM class do not
-  // apply to a Native Image.
-  for (const std::string &x : o.extra_jvm_options)
-    if (x.rfind("-D", 0) == 0) c.args.push_back(x);
-  c.args.insert(c.args.end(), o.extra_native_options.begin(), o.extra_native_options.end());
-  c.exec_paths = {dir_of(layout.worker_exe), lib_dir};
-  c.read_paths = {lib_dir, layout.resource_cache};
-  if (!layout.python_venv.empty()) c.read_paths.push_back(layout.python_venv);
-  if (!layout.package_dir.empty()) c.read_paths.push_back(layout.package_dir);
-  return c;
-}
-
 ClassConfig cpython_worker_class(const Layout &layout, const JvmClassOptions &o) {
   ClassConfig c = jvm_worker_class(layout, o);  // limits, environment, hidden paths
   c.executable = layout.cpython_exe;
@@ -222,6 +179,23 @@ ClassConfig cpython_worker_class(const Layout &layout, const JvmClassOptions &o)
   if (!layout.package_dir.empty() && exists(layout.package_dir + "/cpython/site-packages"))
     site(resolve(layout.package_dir + "/cpython/site-packages"));
   if (o.prewarm.find("numpy") != std::string::npos) c.env.push_back("MLE_PREWARM_NUMPY=1");
+  return c;
+}
+
+ClassConfig v8_worker_class(const Layout &layout, const JvmClassOptions &o, uint64_t heap_max) {
+  ClassConfig c = jvm_worker_class(layout, o);  // limits, environment, hidden paths
+  c.executable = layout.v8_exe;
+  c.args = {"--class=" + o.name, "--heap-mb=" + std::to_string(heap_max >> 20)};
+  // libnode and its libraries are the system's (the launcher's system paths).
+  c.exec_paths = {dir_of(layout.v8_exe)};
+  c.read_paths = {};
+  if (!layout.package_dir.empty() && exists(layout.package_dir + "/js")) {
+    const std::string js = resolve(layout.package_dir + "/js");
+    c.args.push_back("--packages=" + js);
+    c.read_paths.push_back(js);
+  }
+  // The JVM's environment (BLAS threads, malloc tunables) means nothing to V8.
+  c.env.clear();
   return c;
 }
 

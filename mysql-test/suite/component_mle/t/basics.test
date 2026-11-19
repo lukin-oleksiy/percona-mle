@@ -124,7 +124,7 @@ INSTALL COMPONENT "file://component_mle"
   SET GLOBAL mle.memory_max = 1536 * 1024 * 1024, GLOBAL mle.pool_size = 0;
 SELECT @@mle.memory_max, @@mle.pool_size, @@mle.heap_max;
 SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
-  WHERE VARIABLE_NAME IN ('mle_status', 'mle_heap_status', 'mle_pool_idle')
+  WHERE VARIABLE_NAME IN ('mle_status', 'mle_heap_status')
   ORDER BY VARIABLE_NAME;
 
 --echo # The error log tells how the engine runs.

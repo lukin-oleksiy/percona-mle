@@ -97,7 +97,7 @@ final class ThreadWatch {
 
   /** Live threads, virtual ones included when the thread containers can be read. */
   private static java.util.List<Thread> allThreads() {
-    if (CONTAINER_ROOT != null && !Polyglot.nativeImage()) {
+    if (CONTAINER_ROOT != null) {
       try {
         java.util.List<Thread> out = new java.util.ArrayList<>();
         collect(CONTAINER_ROOT.invoke(null), out, 0);
@@ -127,7 +127,7 @@ final class ThreadWatch {
    * Dispatcher, have no Java frames at all.)
    */
   private boolean runsGuestCode(Thread t) {
-    if (Polyglot.nativeImage() || t == Thread.currentThread()) return false;  // no Java code there
+    if (t == Thread.currentThread()) return false;
     StackTraceElement[] stack = t.getStackTrace();
     if (stack.length == 0) return t.isAlive() && !startup.contains(t.threadId());
     for (StackTraceElement e : stack) {
@@ -155,10 +155,7 @@ final class ThreadWatch {
   private static boolean system(String name) {
     for (String s : SYSTEM)
       if (name.startsWith(s)) return true;
-    // The Python-only native build (23) runs executor threads of its own ("pool-N-thread-M")
-    // and GraalPy's native-memory "Python GC". No routine can start a thread there (Python's
-    // thread API is refused; no Java routines, no JavaScript), so they are the runtime's.
-    // On the JVM a "pool-" thread may come from a Java routine: still a stranger there.
-    return Polyglot.nativeImage() && (name.startsWith("pool-") || name.startsWith("Python GC"));
+    // A "pool-" thread may come from a Java routine: a stranger.
+    return false;
   }
 }

@@ -29,7 +29,7 @@ MYSQL_ADD_COMPONENT(mle
   SKIP_INSTALL
   )
 # In the package percona-mle-common (install component MleCommon), not in
-# the server's: both builds (JVM and Python-only native) use it.
+# the server's: every worker kind uses it.
 MYSQL_INSTALL_TARGET(component_mle DESTINATION ${INSTALL_PLUGINDIR}
   COMPONENT MleCommon)
 # Default of mle.java_home: the GraalVM JDK the worker was built with.

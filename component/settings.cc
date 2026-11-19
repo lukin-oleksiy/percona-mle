@@ -62,13 +62,18 @@ namespace mle_component {
 
 namespace {
 
-constexpr const char kAllLanguageNames[] = "JAVASCRIPT,PYTHON,JAVA";
+constexpr const char kAllLanguageNames[] = "JAVASCRIPT,PYTHON,JAVA,JS,CPYTHON";
 
 /* Variable values (written by the server). */
 ulonglong g_memory_max = 0;
 ulonglong g_heap_max = 0;
 ulonglong g_malloc_mmap_threshold = 0;
 uint g_pool_size = 0;
+ulonglong g_cpython_memory_max = 0;
+uint g_cpython_pool_size = 0;
+ulonglong g_v8_memory_max = 0;
+ulonglong g_v8_heap_max = 0;
+uint g_v8_pool_size = 0;
 uint g_vector_threads = 4;
 uint g_max_workers = 0;
 uint g_worker_cache_size = 0;
@@ -86,7 +91,6 @@ char *g_dir = nullptr;
 char *g_java_home = nullptr;
 char *g_package_dir = nullptr;
 char *g_pool_prewarm = nullptr;
-char *g_worker = nullptr;
 
 std::atomic<unsigned> g_language_bits{kAllLanguages};
 /** What is installed (Python is an optional package): set at engine start. */
@@ -175,6 +179,11 @@ constexpr const char kMemoryMax[] = "memory_max";
 constexpr const char kHeapMax[] = "heap_max";
 constexpr const char kMallocMmapThreshold[] = "malloc_mmap_threshold";
 constexpr const char kPoolSize[] = "pool_size";
+constexpr const char kCPythonMemoryMax[] = "cpython_memory_max";
+constexpr const char kCPythonPoolSize[] = "cpython_pool_size";
+constexpr const char kV8MemoryMax[] = "v8_memory_max";
+constexpr const char kV8HeapMax[] = "v8_heap_max";
+constexpr const char kV8PoolSize[] = "v8_pool_size";
 /** mle.pool_prewarm's default (exp note 35): the vector helper warmed up. */
 constexpr const char kPoolPrewarm[] = "vectors";
 constexpr const char kVectorThreads[] = "vector_threads";
@@ -238,13 +247,15 @@ struct Registered {
 };
 Registered g_registered[] = {
     {"memory_max", false}, {"heap_max", false},    {"pool_size", false},
+    {"cpython_memory_max", false}, {"cpython_pool_size", false},
+    {"v8_memory_max", false}, {"v8_heap_max", false}, {"v8_pool_size", false},
     {"max_workers", false}, {"spin_us", false},    {"interrupt_grace_ms", false},
     {"languages", false},  {"cgroup_base", false}, {"dir", false},
     {"java_home", false},  {"sql_result_max", false}, {"sql_row_max", false},
     {"sql_statements_max", false}, {"sql_chunk_rows", false},
     {"sql_call_results_max", false},
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
-    {"package_dir", false}, {"pool_prewarm", false}, {"worker", false},
+    {"package_dir", false}, {"pool_prewarm", false},
     {"vector_threads", false}, {"console", false},
     {"malloc_mmap_threshold", false}};
 
@@ -304,7 +315,7 @@ bool register_settings() {
   memory_max.max_val = kMemoryMaxMax;
   memory_max.blk_sz = kMiB;
   if (reg("memory_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
-          "Memory limit of each MLE worker process in bytes (cgroup "
+          "Memory limit of each JVM worker process in bytes (cgroup "
           "memory.max: JVM, GraalJS, GraalPy, numpy). Can be changed while no "
           "session holds a worker; restarts the engine.",
           check_shaping<ulonglong, kMemoryMax, kMemoryMaxMin, kMemoryMaxMax>,
@@ -351,11 +362,73 @@ bool register_settings() {
   pool_size.max_val = kPoolSizeMax;
   pool_size.blk_sz = 0;
   if (reg("pool_size", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
-          "Started MLE workers kept ready for sessions (JVM with Java, "
-          "JavaScript and Python loaded). Can be changed while no session "
-          "holds a worker; restarts the engine.",
+          "Started JVM workers kept ready for sessions (Java, JavaScript and "
+          "Python loaded). Can be changed while no session holds a worker; "
+          "restarts the engine.",
           check_shaping<uint, kPoolSize, 0, kPoolSizeMax>,
           update_shaping<uint, kPoolSize>, &pool_size, &g_pool_size))
+    return true;
+
+  // The CPython and V8 workers' own (exp design note 63): tens of MB a worker,
+  // not the JVM's gigabytes.
+  ulonglong_check_arg_s cpython_memory_max;
+  cpython_memory_max.def_val = 1ULL << 30;
+  cpython_memory_max.min_val = kMemoryMaxMin;
+  cpython_memory_max.max_val = kMemoryMaxMax;
+  cpython_memory_max.blk_sz = kMiB;
+  if (reg("cpython_memory_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
+          "Memory limit of each CPython worker process (LANGUAGE CPYTHON) in "
+          "bytes (cgroup memory.max). Can be changed while no session holds a "
+          "worker; restarts the engine.",
+          check_shaping<ulonglong, kCPythonMemoryMax, kMemoryMaxMin, kMemoryMaxMax>,
+          update_shaping<ulonglong, kCPythonMemoryMax>, &cpython_memory_max,
+          &g_cpython_memory_max))
+    return true;
+  uint_check_arg_s cpython_pool_size;
+  cpython_pool_size.def_val = 2;
+  cpython_pool_size.min_val = 0;
+  cpython_pool_size.max_val = kPoolSizeMax;
+  cpython_pool_size.blk_sz = 0;
+  if (reg("cpython_pool_size", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Started CPython workers kept ready for sessions. Can be changed "
+          "while no session holds a worker; restarts the engine.",
+          check_shaping<uint, kCPythonPoolSize, 0, kPoolSizeMax>,
+          update_shaping<uint, kCPythonPoolSize>, &cpython_pool_size, &g_cpython_pool_size))
+    return true;
+  ulonglong_check_arg_s v8_memory_max;
+  v8_memory_max.def_val = 1ULL << 30;
+  v8_memory_max.min_val = kMemoryMaxMin;
+  v8_memory_max.max_val = kMemoryMaxMax;
+  v8_memory_max.blk_sz = kMiB;
+  if (reg("v8_memory_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
+          "Memory limit of each V8 worker process (LANGUAGE JS) in bytes "
+          "(cgroup memory.max). Can be changed while no session holds a "
+          "worker; restarts the engine.",
+          check_shaping<ulonglong, kV8MemoryMax, kMemoryMaxMin, kMemoryMaxMax>,
+          update_shaping<ulonglong, kV8MemoryMax>, &v8_memory_max, &g_v8_memory_max))
+    return true;
+  ulonglong_check_arg_s v8_heap_max;
+  v8_heap_max.def_val = 512 * kMiB;
+  v8_heap_max.min_val = kHeapMaxMin;
+  v8_heap_max.max_val = kHeapMaxMax;
+  v8_heap_max.blk_sz = kMiB;
+  if (reg("v8_heap_max", PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED,
+          "JavaScript heap of each V8 worker in bytes (V8's old space and "
+          "young generation). Can be changed while no session holds a worker; "
+          "restarts the engine.",
+          check_shaping<ulonglong, kV8HeapMax, kHeapMaxMin, kHeapMaxMax>,
+          update_shaping<ulonglong, kV8HeapMax>, &v8_heap_max, &g_v8_heap_max))
+    return true;
+  uint_check_arg_s v8_pool_size;
+  v8_pool_size.def_val = 2;
+  v8_pool_size.min_val = 0;
+  v8_pool_size.max_val = kPoolSizeMax;
+  v8_pool_size.blk_sz = 0;
+  if (reg("v8_pool_size", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Started V8 workers kept ready for sessions. Can be changed while no "
+          "session holds a worker; restarts the engine.",
+          check_shaping<uint, kV8PoolSize, 0, kPoolSizeMax>,
+          update_shaping<uint, kV8PoolSize>, &v8_pool_size, &g_v8_pool_size))
     return true;
 
   uint_check_arg_s vector_threads;
@@ -497,7 +570,8 @@ bool register_settings() {
   STR_CHECK_ARG(languages) languages;
   languages.def_val = const_cast<char *>(kAllLanguageNames);
   if (reg("languages", PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC,
-          "Languages MLE runs: a list of JAVASCRIPT, PYTHON, JAVA.",
+          "Languages MLE runs: a list of JAVASCRIPT, PYTHON, JAVA (the JVM "
+          "worker), JS (the V8 worker), CPYTHON (the CPython worker).",
           check_languages, update_languages, &languages, &g_languages))
     return true;
   /* A value from the command line or my.cnf is not checked by the server. */
@@ -508,7 +582,7 @@ bool register_settings() {
     // Fails closed: a mistyped list must not enable what it meant to leave out.
     log_error("mle.languages '" + text(g_languages) +
               "' is invalid: no language is enabled until it is set to a "
-              "list of JAVASCRIPT, PYTHON, JAVA.");
+              "list of JAVASCRIPT, PYTHON, JAVA, JS, CPYTHON.");
     g_language_bits = 0;
   }
 
@@ -560,18 +634,6 @@ bool register_settings() {
           nullptr, nullptr, &package_dir, &g_package_dir))
     return true;
 
-  // The worker build (23): READONLY and not persistable, like the paths.
-  STR_CHECK_ARG(worker) worker;
-  worker.def_val = const_cast<char *>("AUTO");
-  if (reg("worker",
-          PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY |
-              PLUGIN_VAR_NOPERSIST,
-          "Which worker build runs routines: JVM (Java, JavaScript and "
-          "Python), CPYTHON (Python only, on CPython: <mle.dir>/cpython), "
-          "NATIVE (the Python-only native build in <mle.dir>/native) or AUTO "
-          "(the JVM build when it is installed, else CPYTHON, else NATIVE).",
-          nullptr, nullptr, &worker, &g_worker))
-    return true;
   return false;
 }
 
@@ -582,7 +644,7 @@ void unregister_settings() {
             kName, r.name))
       r.done = false;
   }
-  g_languages = g_cgroup_base = g_dir = g_java_home = g_package_dir = g_pool_prewarm = g_worker = nullptr;
+  g_languages = g_cgroup_base = g_dir = g_java_home = g_package_dir = g_pool_prewarm = nullptr;
 }
 
 std::string package_dir() {
@@ -596,6 +658,11 @@ Settings current_settings() {
   s.heap_max = g_heap_max;
   s.malloc_mmap_threshold = g_malloc_mmap_threshold;
   s.pool_size = g_pool_size;
+  s.cpython_memory_max = g_cpython_memory_max;
+  s.cpython_pool_size = g_cpython_pool_size;
+  s.v8_memory_max = g_v8_memory_max;
+  s.v8_heap_max = g_v8_heap_max;
+  s.v8_pool_size = g_v8_pool_size;
   s.vector_threads = g_vector_threads;
   s.cgroup_base = text(g_cgroup_base);
   s.dir = text(g_dir);
@@ -610,9 +677,6 @@ Settings current_settings() {
   s.package_dir = text(g_package_dir);
   // A value set at startup was not checked: an invalid one means the default.
   if (!parse_prewarm(text(g_pool_prewarm), &s.pool_prewarm)) s.pool_prewarm = kPoolPrewarm;
-  s.worker = text(g_worker);
-  for (char &c : s.worker) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
-  if (s.worker.empty()) s.worker = "AUTO";
   if (s.package_dir.empty()) s.package_dir = s.dir + "/packages";
   return s;
 }
@@ -646,7 +710,26 @@ unsigned language_bit(std::string_view name) {
   if (is("JAVASCRIPT")) return kJavaScript;
   if (is("PYTHON")) return kPython;
   if (is("JAVA")) return kJava;
+  if (is("JS")) return kJs;
+  if (is("CPYTHON")) return kCPython;
   return 0;
+}
+
+const char *language_sql_name(unsigned bit) {
+  switch (bit) {
+    case kJavaScript:
+      return "JAVASCRIPT";
+    case kPython:
+      return "PYTHON";
+    case kJava:
+      return "JAVA";
+    case kJs:
+      return "JS";
+    case kCPython:
+      return "CPYTHON";
+    default:
+      return "";
+  }
 }
 
 bool parse_languages(std::string_view text, unsigned *bits) {
@@ -711,6 +794,8 @@ std::string language_names(unsigned bits) {
   add(kJavaScript, "JavaScript");
   add(kPython, "Python");
   add(kJava, "Java");
+  add(kJs, "JS");
+  add(kCPython, "CPython");
   return names;
 }
 

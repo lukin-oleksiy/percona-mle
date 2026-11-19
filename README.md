@@ -24,7 +24,7 @@ comments cite the project's design notes by name (e.g. `14-phase6-libraries.md`)
 | `component/` | `component_mle`: the server side (language service, sessions, SQL for routines, UDFs, variables) |
 | `host/`, `include/mle/` | the host library: wire protocol and codec, launcher and worker clients, the installed layout |
 | `launcher/` | `mle_launcher`: starts and sandboxes workers (clone, Landlock, seccomp, cgroups) |
-| `worker/` | `mle_worker` (a JNI launcher of the JVM) and `mle-worker.jar` (GraalJS, GraalPy, Java routines, the SQL API); Maven; the numpy venv; the AOT cache; `native/`: the Python-only native build; `cpython/`: the CPython worker |
+| `worker/` | `mle_worker` (a JNI launcher of the JVM) and `mle-worker.jar` (GraalJS, GraalPy, Java routines, the SQL API); Maven; the numpy venv; the AOT cache; `cpython/`: the CPython worker; `v8/`: the V8 worker; `common/`: their shared C++ |
 | `tools/` | `mle_package` (the DBA's npm/PyPI/Maven tool), `mle_aot_cache` (makes the AOT cache at install) |
 | `harness/` | a command-line driver for workers (development) |
 | `unittest/` | GoogleTest unit tests (9 binaries) |
@@ -43,15 +43,15 @@ JDK 25 (`MLE_JAVA_HOME`, default `$JAVA_HOME`), Maven, network access to Maven C
           -DMYSQL_SOURCE_DIR=<server source> -DMYSQL_BUILD_DIR=<server build> [-DMLE_BUILD_JDK=ON]
     ninja -C BUILD-mle
 
-**The Python-only native build** (`-DMLE_PYTHON_NATIVE=ON`, optional): the worker as a GraalVM Native Image
-library that `mle_worker` loads instead of the JVM — highly optimised for Python-only use: about half the memory
-per worker, a worker starts in about 0.2 s instead of about 2.5 s, no JDK. It runs Python routines only (no Java,
-no JavaScript). Building it takes a few minutes and about 12 GB of RAM. `mle.worker` (read-only) selects the build:
-`AUTO` (the JVM build when it is installed, else the CPython worker, else the native one), `JVM`, `CPYTHON` or
-`NATIVE`.
+**Workers by language name** (exp design note 63): every installed worker runs its languages at once. The JVM
+worker runs `LANGUAGE JAVASCRIPT` (GraalJS), `PYTHON` (GraalPy) and `JAVA`; the CPython worker `LANGUAGE CPYTHON`;
+the V8 worker `LANGUAGE JS` (the name js_lang uses: `lang_router.language_map` picks which component runs it). A
+session that uses two kinds holds two workers. Each kind has its own pool and limits (`mle.pool_size`,
+`mle.memory_max`, `mle.heap_max` for the JVM worker; `mle.cpython_*`, `mle.v8_*`) and its own privilege
+(`CREATE_CPYTHON_ROUTINE`; `CREATE_JS_ROUTINE`, shared with js_lang).
 
 **The CPython worker** (`-DMLE_CPYTHON=ON`, the default when Python 3.12 or later with its headers is found,
-e.g. `python3-dev`): `mle_cpython_worker` embeds the distribution's CPython and runs Python routines only, with
+e.g. `python3-dev`): `mle_cpython_worker` embeds the distribution's CPython and runs `LANGUAGE CPYTHON`, with
 the same launcher, sandbox, protocol and SQL API (exp design note 62). A worker takes about 15 MB (PSS; 25 MB
 with numpy) instead of hundreds, starts in about 60 ms, and frees numpy memory at once. The build installs numpy
 (`MLE_CPYTHON_NUMPY`, default `numpy==2.4.4`) from PyPI into `cpython/site-packages`. In a build tree the
@@ -88,8 +88,7 @@ Environment variables of mysqld, for diagnosing and profiling workers; not for p
 | Variable | Effect |
 |---|---|
 | `MLE_WORKER_STDERR=1` | workers write to mysqld's stderr (the error log) |
-| `MLE_JVM_OPTIONS="..."` | more JVM options for JVM workers (`-D` options also reach native workers) |
-| `MLE_NATIVE_OPTIONS="..."` | more runtime options for native workers, e.g. `-XX:+PrintGC` |
+| `MLE_JVM_OPTIONS="..."` | more JVM options for JVM workers |
 | `MLE_DEBUG_WRITE_DIR=/dir` | workers may write files in `/dir` (the sandbox allows it; a warning in the error log) |
 
 A JDK Flight Recorder recording of a JVM worker:
@@ -100,8 +99,7 @@ A JDK Flight Recorder recording of a JVM worker:
     jfr view hot-methods /tmp/mle-jfr/w.jfr
 
 The same directory takes Truffle's compilation log: `-Dpolyglot.log.file=/dir/truffle.log
--Dpolyglot.engine.TraceCompilation=true`. For native workers, `perf` needs an image built with
-`MLE_NATIVE_IMAGE_OPTIONS=-g` (worker/native/build-native.sh), its `.debug` file beside the library.
+-Dpolyglot.engine.TraceCompilation=true`.
 
 ## Install and packages
 
@@ -114,9 +112,8 @@ Packages (`cpack -G DEB` or `cpack -G RPM` in the build directory; the server mu
 | `percona-mle-apparmor` | `MleApparmor` | the AppArmor profile (DEB only; `-DMLE_APPARMOR=ON`, the default where `/etc/apparmor.d` exists) | common; recommended by it |
 | `percona-mle` | `MleCore` | the JVM build: worker jar, runtime jars, JavaScript and Java | common, jdk |
 | `percona-mle-jdk` | `MleJdk` | a trimmed GraalVM runtime (`-DMLE_BUILD_JDK=ON`) | |
-| `percona-mle-python-runtime` | `MlePythonRuntime` | Python's standard library and the numpy venv (both builds) | common |
+| `percona-mle-python-runtime` | `MlePythonRuntime` | GraalPy's standard library and the numpy venv | common |
 | `percona-mle-python` | `MlePython` | GraalPy for the JVM build | percona-mle, python-runtime |
-| `percona-mle-python-native` | `MlePythonNative` | the Python-only native build (`-DMLE_PYTHON_NATIVE=ON`) | common, python-runtime |
 | `percona-mle-cpython` | `MleCPython` | the CPython worker, its Python code and numpy (`-DMLE_CPYTHON=ON`) | common, the distribution's libpython3.x |
 | `percona-mle-tools` | `MleTools` | `mle_package` (third-party npm, PyPI, Maven packages; `install cpython ...` for the CPython worker) | common |
 | `percona-mle-selinux` | `MleSelinux` | the SELinux policy module (RPM only; `-DMLE_SELINUX=ON`, the default with selinux-policy-devel) | pulled by common where SELinux policy is installed |
@@ -140,7 +137,7 @@ AppArmor (`packaging/apparmor`, Debian and Ubuntu): `percona-mle` is the profile
 (they start with `no_new_privs`, so they keep the launcher's profile); `abstractions/percona-mle-mysqld` holds the
 rules mysqld's profile needs, and the package's `postinst` includes it from `local/usr.sbin.mysqld`. Both follow the
 mode of the server's packaged profile (complain). Checked enforcing in an Ubuntu 26.04 VM with a server installed in
-the package layout: JVM and native workers, cgroups, packages, `KILL`, a dying worker, no denials.
+the package layout: JVM workers, cgroups, packages, `KILL`, a dying worker, no denials.
 
 In the server:
 

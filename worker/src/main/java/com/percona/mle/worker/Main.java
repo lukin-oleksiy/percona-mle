@@ -47,8 +47,7 @@ public final class Main {
       String info;
       try {
         String prewarm = System.getProperty("mle.prewarm", "");
-        // Only what this build has (23): no Java routines or GraalJS in the native build.
-        if (prewarm.contains("java") && !Polyglot.nativeImage()) java.prewarm();
+        if (prewarm.contains("java")) java.prewarm();
         if (prewarm.contains("js") && Polyglot.JS) polyglot.context().eval("js", "1");
         // mle.pool_prewarm (15 §2): python, or numpy (Python and numpy).
         if (prewarm.contains("python") || prewarm.contains("numpy")) polyglot.prewarmPython(prewarm.contains("numpy"));
@@ -72,7 +71,7 @@ public final class Main {
       // A worker started for a waiting session gets its first request at once (the grace
       // below) and skips it; a pool worker warms up while it waits in the pool.
       if (status == Wire.OK && System.getProperty("mle.prewarm", "").contains("vectors")
-          && !Polyglot.nativeImage() && !mb.awaitPending(50_000_000L) && VectorWarmup.run(mb::pending))
+          && !mb.awaitPending(50_000_000L) && VectorWarmup.run(mb::pending))
         System.gc();  // as after starting: the warm-up's garbage, before waiting in the pool
       d.loop();
     } catch (Throwable t) {

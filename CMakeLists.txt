@@ -74,17 +74,6 @@ IF(MLE_CPYTHON_DIR)
     VERBATIM)
   ADD_DEPENDENCIES(mle_build_layout mle_cpython_layout)
 ENDIF()
-# The Python-only native build (-DMLE_PYTHON_NATIVE=ON; exp design note 23).
-GET_PROPERTY(MLE_NATIVE_DIR GLOBAL PROPERTY MLE_NATIVE_DIR)
-IF(MLE_NATIVE_DIR)
-  ADD_CUSTOM_COMMAND(TARGET mle_build_layout POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E create_symlink ${MLE_NATIVE_DIR} ${MLE_BUILD_LAYOUT}/native
-    VERBATIM)
-  ADD_DEPENDENCIES(mle_build_layout mle_native_worker)
-  INSTALL(FILES ${MLE_NATIVE_DIR}/libmleworker.so
-    DESTINATION ${INSTALL_PLUGINDIR}/mle/native COMPONENT MlePythonNative
-    PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
-ENDIF()
 
 # The DBA's tool for third-party packages (14-phase6-libraries.md §3), and
 # the AOT cache maker the packages' install scripts run (21-packaging.md §3).
@@ -166,15 +155,11 @@ IF(MLE_DEBUG_BUILD)
     COMPONENT MleCommon)
   INSTALL_DEBUG_TARGET(mle_worker DESTINATION ${MLE_DEBUG_DIR}
     COMPONENT MleCommon)
-  # resources: both builds read it (engine/ from the JVM build, python/ from
-  # Python); native: the Python-only native build; packages: the default
+  # resources: the JVM worker reads it (engine/, python/); packages: the default
   # mle.package_dir, which the DBA makes (mle_package): a link to nothing
   # until then, which the component takes as no packages.
   SET(MLE_DEBUG_LINKS mle-worker.jar:MleCore deps:MleCore resources:MleCommon
     mle.aot:MleCore python-venv:MlePythonRuntime packages:MleCommon)
-  IF(MLE_NATIVE_DIR)
-    LIST(APPEND MLE_DEBUG_LINKS native:MlePythonNative)
-  ENDIF()
   IF(MLE_BUILD_JDK)
     LIST(APPEND MLE_DEBUG_LINKS jdk:MleJdk)
   ENDIF()

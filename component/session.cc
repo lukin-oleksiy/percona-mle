@@ -376,8 +376,8 @@ Session::Session(MYSQL_THD thd) : m_thd(thd), m_mark(engine_session_begin()) {
 }
 
 Session::~Session() {
-  for (auto &[principal, slot] : m_workers)
-    engine_release_worker(std::move(slot.worker), principal, m_mark);
+  for (auto &[key, slot] : m_workers)
+    engine_release_worker(std::move(slot.worker), slot.kind, slot.principal, m_mark);
   for (auto &w : m_retired) engine_release_worker(std::move(w));
   engine_session_end(m_mark);
   --g_counters.sessions;
@@ -440,24 +440,39 @@ std::string Session::principal(const Routine *routine) const {
 
 // ------------------------------------------------------------- workers
 
-void Session::drop_worker(const std::string &principal) {
-  auto it = m_workers.find(principal);
+std::string Session::slot_key(const std::string &principal, unsigned language) {
+  std::string key = principal;
+  key += '\0';
+  key += kind_name(kind_of(language));
+  return key;
+}
+
+std::string Session::display_key(const std::string &key) {
+  const size_t nul = key.find('\0');
+  if (nul == std::string::npos) return key;
+  return key.substr(0, nul) + " (" + key.substr(nul + 1) + ")";
+}
+
+void Session::drop_worker(const std::string &key) {
+  auto it = m_workers.find(key);
   if (it == m_workers.end()) return;
   // Outer requests of this session may still run in it (nested calls).
   if (m_calls > 0)
     m_retired.push_back(std::move(it->second.worker));
   else
-    engine_release_worker(std::move(it->second.worker));
+    engine_release_worker(std::move(it->second.worker), it->second.kind);
   m_workers.erase(it);
 }
 
-Session::Slot *Session::worker_for(const std::string &principal,
+Session::Slot *Session::worker_for(const std::string &key,
                                    const Routine &routine) {
-  auto it = m_workers.find(principal);
+  auto it = m_workers.find(key);
   if (it != m_workers.end()) {
     if (it->second.worker && it->second.worker->usable()) return &it->second;
-    drop_worker(principal);  // died or retired: a fresh one below
+    drop_worker(key);  // died or retired: a fresh one below
   }
+  const std::string principal = key.substr(0, key.find('\0'));
+  const WorkerKind kind = kind_of(routine.language);
 
   if (!m_options_bound) {
     // Oracle: the session's time zone is bound at its first use (until
@@ -478,15 +493,15 @@ Session::Slot *Session::worker_for(const std::string &principal,
   // new one from the pool. A kept worker that died meanwhile fails its
   // OPTIONS: then a new one.
   std::unique_ptr<mle::Worker> worker =
-      engine_reuse_worker(principal, max_workers());
+      engine_reuse_worker(principal, kind, max_workers());
   if (worker && worker->options(m_options, &error) != Status::kOk) {
-    engine_release_worker(std::move(worker));
+    engine_release_worker(std::move(worker), kind);
     error.clear();
   }
   const bool reused = worker != nullptr;
   Hooks hooks(m_thd);
   if (!worker)
-    worker = engine_new_worker(max_workers(), spin_us(), interrupt_grace_ms(),
+    worker = engine_new_worker(kind, max_workers(), spin_us(), interrupt_grace_ms(),
                                &hooks, &why, &error);
   if (why == AcquireError::kFailed && hooks.killed())
     return nullptr;  // KILL while waiting for the worker: the server reports it
@@ -501,24 +516,26 @@ Session::Slot *Session::worker_for(const std::string &principal,
       engine_error("The MLE engine is not running: " + error);
       return nullptr;
     case AcquireError::kFailed:
-      log_error("No worker for " + principal + ": " + log_safe(error));
+      log_error("No worker for " + display_key(key) + ": " + log_safe(error));
       my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
       return nullptr;
   }
 
   if (!reused && worker->options(m_options, &error) != Status::kOk) {
-    engine_release_worker(std::move(worker));
+    engine_release_worker(std::move(worker), kind);
     if (error.find("unknown time zone") != std::string::npos) {
       my_error(ER_LANGUAGE_COMPONENT_TIMEZONE, MYF(0),
                routine.display_language(), zone.c_str());
     } else {
-      log_error("A new worker for " + principal + " failed: " + log_safe(error));
+      log_error("A new worker for " + display_key(key) + " failed: " + log_safe(error));
       my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
     }
     return nullptr;
   }
-  Slot &slot = m_workers[principal];
+  Slot &slot = m_workers[key];
   slot.worker = std::move(worker);
+  slot.principal = principal;
+  slot.kind = kind;
   return &slot;
 }
 
@@ -556,7 +573,7 @@ bool Session::prepare_in(const std::string &principal, Slot &slot,
 
 bool Session::parse(Routine &routine) {
   if (!check_create_privilege(m_thd, routine)) return false;
-  const std::string who = principal(&routine);
+  const std::string who = slot_key(principal(&routine), routine.language);
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr) return false;
   // CREATE: the worker also checks the code (exp note 39); its findings
@@ -607,7 +624,7 @@ bool Session::execute(Routine &routine) {
   m_trace.reset();
   std::vector<Value> args = std::move(m_args);  // reused; a nested call allocates
   if (!routine.read_args(&args)) return false;
-  const std::string who = principal(&routine);  // a copy: nested calls change it
+  const std::string who = slot_key(principal(&routine), routine.language);  // a copy: nested calls change it
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr || !prepare_in(who, *slot, routine)) return false;
 
@@ -768,7 +785,7 @@ void Session::report(const std::string &principal, Status status,
       if (it != m_workers.end() &&
           (!it->second.worker || !it->second.worker->usable())) {
         // Retired after running out of heap or stack.
-        log_warning("The worker of " + principal +
+        log_warning("The worker of " + display_key(principal) +
                     " was retired: " + log_safe(e->message));
         drop_worker(principal);
       }
@@ -789,7 +806,7 @@ void Session::report(const std::string &principal, Status status,
     // Lost, but the reason is a host-side diagnostic: the log has it, the
     // caller gets an internal error.
     ++g_counters.worker_failures;
-    log_error("The worker of " + principal + " broke the protocol during " +
+    log_error("The worker of " + display_key(principal) + " broke the protocol during " +
               log_safe(routine.qualified_name) + " and was killed: " +
               log_safe(why));
     drop_worker(principal);
@@ -799,7 +816,7 @@ void Session::report(const std::string &principal, Status status,
   if (status != Status::kInternal) {
     ++g_counters.worker_failures;
     if (why.find("out-of-memory") != std::string::npos) ++g_counters.oom_errors;
-    log_warning("The worker of " + principal + " was lost during " +
+    log_warning("The worker of " + display_key(principal) + " was lost during " +
                 log_safe(routine.qualified_name) + ": " + log_safe(why));
     drop_worker(principal);
     if (status == Status::kKilled && Hooks(m_thd).killed()) return;
@@ -892,9 +909,13 @@ std::optional<std::string> Session::state(const Session *s,
 }
 
 long Session::worker_pid() {
-  const auto it = m_workers.find(principal());
-  if (it == m_workers.end() || !it->second.worker) return -1;
-  return it->second.worker->process().pid();
+  // The current principal's worker (the JVM worker's first, if it has several).
+  const std::string who = principal();
+  long pid = -1;
+  for (const auto &[key, slot] : m_workers)
+    if (slot.principal == who && slot.worker && (pid == -1 || slot.kind == WorkerKind::kJvm))
+      pid = slot.worker->process().pid();
+  return pid;
 }
 
 void Session::reset_output(bool out, bool err) {
@@ -903,8 +924,8 @@ void Session::reset_output(bool out, bool err) {
 }
 
 void Session::clear_state(bool reuse) {
-  for (auto &[principal, slot] : m_workers)
-    engine_release_worker(std::move(slot.worker), reuse ? principal : "",
+  for (auto &[key, slot] : m_workers)
+    engine_release_worker(std::move(slot.worker), slot.kind, reuse ? slot.principal : "",
                           m_mark);
   m_workers.clear();
   m_programs.clear();
@@ -946,7 +967,7 @@ bool Session::set_options(mle::wire::IntegerType integer_type,
     std::string error;
     if (slot.worker && slot.worker->usable() &&
         slot.worker->options(m_options, &error) != Status::kOk)
-      log_warning("Options for the worker of " + principal + ": " + error);
+      log_warning("Options for the worker of " + display_key(principal) + ": " + error);
   }
   return true;
 }
@@ -990,18 +1011,34 @@ bool server_private_paths(std::vector<std::string> *paths) {
 // ------------------------------------------------------------- privileges
 
 namespace {
-constexpr const char *kPrivileges[] = {"CREATE_JAVASCRIPT_ROUTINE",
-                                       "CREATE_PYTHON_ROUTINE",
-                                       "CREATE_JAVA_ROUTINE"};
+/** CREATE_<LANGUAGE>_ROUTINE for each language name (D-3; exp design note
+    63). CREATE_JS_ROUTINE is js_lang's too: LANGUAGE JS needs the same grant
+    whichever component runs it. */
+constexpr const char *kPrivileges[] = {"CREATE_JAVASCRIPT_ROUTINE", "CREATE_PYTHON_ROUTINE",
+                                       "CREATE_JAVA_ROUTINE", "CREATE_JS_ROUTINE",
+                                       "CREATE_CPYTHON_ROUTINE"};
+/** js_lang's privilege: never unregistered by MLE (the server removes a
+    dynamic privilege for every component that uses it). */
+constexpr const char *kSharedPrivilege = "CREATE_JS_ROUTINE";
 
 const char *privilege_of(const Routine &r) {
-  return r.language == kJavaScript ? kPrivileges[0]
-         : r.language == kPython   ? kPrivileges[1]
-                                   : kPrivileges[2];
+  switch (r.language) {
+    case kJavaScript:
+      return kPrivileges[0];
+    case kPython:
+      return kPrivileges[1];
+    case kJs:
+      return kPrivileges[3];
+    case kCPython:
+      return kPrivileges[4];
+    default:
+      return kPrivileges[2];
+  }
 }
 }  // namespace
 
 bool register_privileges() {
+  // An already registered privilege (js_lang's) registers as success.
   for (const char *p : kPrivileges)
     if (mysql_service_dynamic_privilege_register->register_privilege(
             p, strlen(p)))
@@ -1011,7 +1048,8 @@ bool register_privileges() {
 
 void unregister_privileges() {
   for (const char *p : kPrivileges)
-    (void)mysql_service_dynamic_privilege_register->unregister_privilege(
+    if (strcmp(p, kSharedPrivilege) != 0)
+      (void)mysql_service_dynamic_privilege_register->unregister_privilege(
         p, strlen(p));
 }
 
@@ -1034,7 +1072,7 @@ bool Session::parse_library(unsigned language, const std::string &name,
     my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), privilege_of(routine));
     return false;
   }
-  const std::string who = principal();
+  const std::string who = slot_key(principal(), routine.language);
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr) return false;
   mle::ParseLibraryMsg m;
@@ -1084,7 +1122,7 @@ std::optional<std::string> Session::eval(unsigned language,
   // Called by a routine's SQL: the code is that routine's author's, and runs
   // where that author's code runs (not in the worker of the account's own
   // code, when the author is another account).
-  const std::string who = principal(m_running_routine);
+  const std::string who = slot_key(principal(m_running_routine), routine.language);
   Slot *slot = worker_for(who, routine);
   if (slot == nullptr || !prepare_in(who, *slot, routine)) {
     forget(routine);

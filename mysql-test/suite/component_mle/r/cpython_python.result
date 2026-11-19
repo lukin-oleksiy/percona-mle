@@ -1,29 +1,48 @@
 #
-# component_mle: the CPython worker (exp design note 62; mle.worker =
+# component_mle: the CPython worker (exp design notes 62, 63; LANGUAGE
 # CPYTHON, the distribution's CPython embedded in mle_cpython_worker).
 # Python routines, numpy, the SQL API, VECTOR values, Python libraries,
-# mle_eval and the CREATE check; JavaScript and Java refused; the sandbox,
-# KILL, a native crash and the cgroup memory limit as with the JVM build.
+# mle_eval and the CREATE check; beside LANGUAGE PYTHON (GraalPy on the JVM
+# worker); the sandbox, KILL, a native crash and the cgroup memory limit as
+# with the JVM worker.
 #
 call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
 INSTALL COMPONENT "file://component_mle";
-GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+GRANT CREATE_CPYTHON_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
 #
-# 1. The CPython worker runs Python only.
+# 1. LANGUAGE CPYTHON runs on the CPython worker, LANGUAGE PYTHON on the JVM
+#    worker (GraalPy): both at once, in different processes of the session.
 #
-SELECT @@mle.worker;
-@@mle.worker
-CPYTHON
-SELECT VARIABLE_VALUE AS languages FROM performance_schema.global_status
-WHERE VARIABLE_NAME = 'mle_languages_supported';
-languages
-Python
-CREATE FUNCTION js_f() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
-ERROR HY000: Language component: Unsupported language 'JAVASCRIPT'
-CREATE FUNCTION java_f() RETURNS INT LANGUAGE JAVA AS $$ return 1; $$;
-ERROR HY000: Language component: Unsupported language 'JAVA'
-CREATE LIBRARY jslib LANGUAGE JAVASCRIPT AS $$ export function f() { return 1 } $$;
-ERROR HY000: Libraries are not supported for JAVASCRIPT.
+SELECT FIND_IN_SET('CPython', VARIABLE_VALUE) > 0 AS cpython_supported
+FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_languages_supported';
+cpython_supported
+1
+CREATE FUNCTION cpy_impl() RETURNS TEXT LANGUAGE CPYTHON AS $$
+import os, sys
+return f"{sys.implementation.name} {os.getpid()}"
+$$;
+CREATE FUNCTION graal_impl() RETURNS TEXT LANGUAGE PYTHON AS $$
+import os, sys
+return f"{sys.implementation.name} {os.getpid()}"
+$$;
+SELECT SUBSTRING_INDEX(cpy_impl(), ' ', 1) AS cpython, SUBSTRING_INDEX(graal_impl(), ' ', 1) AS python,
+SUBSTRING_INDEX(cpy_impl(), ' ', -1) <> SUBSTRING_INDEX(graal_impl(), ' ', -1) AS two_workers;
+cpython	python	two_workers
+cpython	graalpy	1
+SHOW CREATE FUNCTION cpy_impl;
+Function	sql_mode	Create Function	character_set_client	collation_connection	Database Collation
+cpy_impl	ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION	CREATE DEFINER=`root`@`localhost` FUNCTION `cpy_impl`() RETURNS text CHARSET utf8mb4
+    LANGUAGE CPYTHON
+AS $$
+import os, sys
+return f"{sys.implementation.name} {os.getpid()}"
+$$	utf8mb4	utf8mb4_0900_ai_ci	utf8mb4_0900_ai_ci
+DROP FUNCTION cpy_impl;
+DROP FUNCTION graal_impl;
+REVOKE CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+# LANGUAGE CPYTHON needs CREATE_CPYTHON_ROUTINE, not CREATE_PYTHON_ROUTINE.
+CREATE FUNCTION py_denied() RETURNS INT LANGUAGE PYTHON AS $$ return 1 $$;
+ERROR 42000: Access denied; you need (at least one of) the CREATE_PYTHON_ROUTINE privilege(s) for this operation
 #
 # 2. Python routines, numpy, the SQL API, VECTOR values, libraries.
 #
@@ -80,7 +99,7 @@ py_state()
 routine global 1, library state 2
 # A library changed by DDL is used in its new version.
 DROP LIBRARY pycounter;
-CREATE LIBRARY pycounter LANGUAGE PYTHON AS $$bump = lambda: 100$$;
+CREATE LIBRARY pycounter LANGUAGE CPYTHON AS $$bump = lambda: 100$$;
 SELECT py_state();
 py_state()
 routine global 1, library state 100
@@ -135,16 +154,16 @@ read /etc/passwd: refused, write /tmp: refused, socket: refused, fork: refused, 
 SELECT py_spawn();
 ERROR HY000: Python> (process creation refused)
 # mle_eval and the CREATE check.
-SELECT mle_eval('python', 'import numpy as np\nnp.arange(5) * 2') AS python;
+SELECT mle_eval('cpython', 'import numpy as np\nnp.arange(5) * 2') AS python;
 python
 array([0, 2, 4, 6, 8])
-SELECT mle_eval('python', 'print("hello")\n6 * 7') AS printed_and_value;
+SELECT mle_eval('cpython', 'print("hello")\n6 * 7') AS printed_and_value;
 printed_and_value
 hello
 42
-SELECT mle_eval('python', 'a = 1\nb = 0\na / b');
+SELECT mle_eval('cpython', 'a = 1\nb = 0\na / b');
 ERROR HY000: Python> ZeroDivisionError: division by zero (mle_eval, line 3)
-CREATE FUNCTION py_typo(word VARCHAR(20)) RETURNS INT LANGUAGE PYTHON AS $$
+CREATE FUNCTION py_typo(word VARCHAR(20)) RETURNS INT LANGUAGE CPYTHON AS $$
 n = 0
 return lenght(word) + n
 $$;
@@ -219,5 +238,5 @@ DROP FUNCTION py_package;
 DROP FUNCTION py_crash;
 DROP FUNCTION py_hog;
 DROP TABLE items;
-REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+REVOKE CREATE_CPYTHON_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_mle";

@@ -21,16 +21,18 @@
 /**
   @file component/engine.h
 
-  The MLE engine of the server: one mle_launcher process with the worker
-  class of the current settings and its warm pool (11-phase4-component.md
-  §3). Started at INSTALL; restarted when a setting that shapes workers
-  changes while no session holds a worker; stopped at UNINSTALL.
+  The MLE engine of the server: one mle_launcher process with a worker class
+  per installed kind (the JVM, CPython and V8 workers: exp design note 63)
+  and their warm pools (11-phase4-component.md §3). Started at INSTALL;
+  restarted when a setting that shapes workers changes while no session
+  holds a worker; stopped at UNINSTALL.
 
   No MySQL dependencies (libmle_host only). Thread-safe.
 */
 
 #include <sys/types.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -42,10 +44,25 @@ class CallHooks;
 
 namespace mle_component {
 
+/** The worker kinds: a launcher class each (defaults.h; exp design note 63). */
+enum class WorkerKind : unsigned { kJvm = 0, kCPython = 1, kV8 = 2 };
+constexpr size_t kKinds = 3;
+
+/** The launcher class name of a kind ("jvm", "cpython", "v8"). */
+const char *kind_name(WorkerKind kind);
+
 /** What the engine is started with (from the mle.* sysvars). */
 struct Settings {
+  /** The JVM worker's (mle.memory_max, mle.heap_max, mle.pool_size). */
   uint64_t memory_max = 2ULL << 30;
   uint64_t heap_max = 512ULL << 20;
+  /** The CPython worker's (mle.cpython_memory_max, mle.cpython_pool_size). */
+  uint64_t cpython_memory_max = 1ULL << 30;
+  uint32_t cpython_pool_size = 2;
+  /** The V8 worker's (mle.v8_memory_max, mle.v8_heap_max, mle.v8_pool_size). */
+  uint64_t v8_memory_max = 1ULL << 30;
+  uint64_t v8_heap_max = 512ULL << 20;
+  uint32_t v8_pool_size = 2;
   /** glibc's mmap threshold in workers; 0: glibc's adaptive default. */
   uint64_t malloc_mmap_threshold = 4ULL << 20;
   uint32_t pool_size = 2;
@@ -60,9 +77,6 @@ struct Settings {
   std::string pool_prewarm = "vectors";
   /** Third-party packages installed by the DBA (14 §3); "": <dir>/packages. */
   std::string package_dir;
-  /** Which worker build runs routines (23): AUTO, JVM or NATIVE (the
-      Python-only native build); upper case. */
-  std::string worker = "AUTO";
 };
 
 struct EngineState {
@@ -111,7 +125,7 @@ enum class AcquireError { kNone, kInactive, kLimit, kFailed };
   A started worker (READY) for a session, counted in engine_workers_in_use()
   until engine_release_worker(). At most max_workers at a time.
 */
-std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us,
+std::unique_ptr<mle::Worker> engine_new_worker(WorkerKind kind, uint32_t max_workers, int spin_us,
                                                int interrupt_grace_ms,
                                                mle::CallHooks *hooks,
                                                AcquireError *why,
@@ -120,10 +134,10 @@ std::unique_ptr<mle::Worker> engine_new_worker(uint32_t max_workers, int spin_us
 /**
   A session gives a worker back. With the principal it ran for, a healthy
   idle worker is reset (RESET: no routines, memory trimmed) and kept for a
-  later session of the same principal (mle.worker_cache_size,
+  later session of the same principal and kind (mle.worker_cache_size,
   mle.worker_cache_timeout; 12 §17); otherwise it is destroyed (killed).
 */
-void engine_release_worker(std::unique_ptr<mle::Worker> worker,
+void engine_release_worker(std::unique_ptr<mle::Worker> worker, WorkerKind kind = WorkerKind::kJvm,
                            const std::string &principal = "",
                            uint64_t mark = 0);
 
@@ -133,18 +147,18 @@ uint64_t engine_session_begin();
 void engine_session_end(uint64_t mark);
 
 /**
-  A kept worker of this principal (READY, reset), counted like
+  A kept worker of this principal and kind (READY, reset), counted like
   engine_new_worker()'s; nullptr if none (or at max_workers).
 */
-std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal,
+std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal, WorkerKind kind,
                                                  uint32_t max_workers);
 
 /** DROP USER / RENAME USER: kept workers of that account are destroyed (a
     new account of the same name must not get them). */
 void engine_forget_account(const std::string &principal);
 
-/** Java heap in use over all session workers, % of their summed limits
-    (mle_memory_used). */
+/** Heap in use over all session workers that report one (JVM: the Java
+    heap, V8: its heap), % of their summed limits (mle_memory_used). */
 long engine_memory_used_percent();
 
 /**

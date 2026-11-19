@@ -62,7 +62,9 @@ using mle::Value;
 using mle::wire::ParamMode;
 
 const char *worker_language(unsigned bit) {
-  switch (bit) {
+  // The language the worker runs: JS (the V8 worker) is JavaScript, CPYTHON
+  // (the CPython worker) is Python (exp design note 63).
+  switch (family(bit)) {
     case kJavaScript:
       return "js";
     case kPython:
@@ -119,11 +121,13 @@ const std::set<std::string> &reserved(unsigned language) {
       "transient", "try",       "void",      "volatile",   "while",
       "true",     "false",      "null",      "var",        "yield",
       "record",   "_"};
-  return language == kJavaScript ? js : language == kPython ? python : java;
+  const unsigned f = family(language);
+  return f == kJavaScript ? js : f == kPython ? python : java;
 }
 
 /** A parameter name the language accepts as a variable. */
-bool valid_name(const std::string &name, unsigned language) {
+bool valid_name(const std::string &name, unsigned bit) {
+  const unsigned language = family(bit);
   if (name.empty() || reserved(language).count(name) != 0) return false;
   if (language == kJavaScript && name.size() > 2 && name[0] == '$' &&
       name[1] == 'a' && isdigit(static_cast<unsigned char>(name[2])))
@@ -503,9 +507,8 @@ const char *display_language(const std::string &l) {
 }
 
 const char *Routine::display_language() const {
-  return language == kJavaScript ? "JavaScript"
-         : language == kPython   ? "Python"
-                                 : "Java";
+  const unsigned f = family(language);
+  return f == kJavaScript ? "JavaScript" : f == kPython ? "Python" : "Java";
 }
 
 uint64_t next_routine_id() { return ++g_next_id; }
@@ -602,7 +605,7 @@ Routine *Routine::create(stored_program_handle sp) {
     for (const ParamInfo &p : r->params) taken = taken || p.name == binding;
     for (const mle::Import &other : m.imports)
       taken = taken || (other.alias.empty() ? other.name : other.alias) == binding;
-    if (bit != kJava && (taken || !valid_name(binding, bit))) {
+    if (family(bit) != kJava && (taken || !valid_name(binding, bit))) {
       my_error(ER_LANGUAGE_COMPONENT_KEYWORD, MYF(0), r->display_language(),
                binding.c_str());
       return nullptr;

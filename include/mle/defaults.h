@@ -33,6 +33,8 @@
     mle.aot                    JDK AOT cache (optional)
     cpython/                   the CPython worker (optional): mle_cpython_worker,
                                python/ (its code), site-packages/ (numpy)
+    v8/                        the V8 worker (optional): mle_v8_worker (the
+                               distribution's V8 from libnode; exp note 63)
 */
 
 #include <cstdint>
@@ -58,10 +60,6 @@ struct Layout {
   std::string package_dir;
   /** GraalPy is installed (deps/python-language-*.jar; an optional package). */
   bool python = false;
-  /** The Python-only native build of the worker (exp design note 23):
-      <dir>/native/libmleworker.so, with its language resources beside it;
-      empty: not installed. */
-  std::string native_lib;
   /** The CPython worker (exp design note 62): <dir>/cpython/mle_cpython_worker;
       empty: not installed. */
   std::string cpython_exe;
@@ -71,6 +69,8 @@ struct Layout {
   std::string cpython_site;
   /** Bytecode of its code kept apart (a build tree): <dir>/cpython/pycache; empty: none. */
   std::string cpython_pycache;
+  /** The V8 worker (exp design note 63): <dir>/v8/mle_v8_worker; empty: not installed. */
+  std::string v8_exe;
 
   /** The installed layout below dir; optional parts that do not exist are
       left empty. Symlinks are resolved (the build tree has a layout of
@@ -105,9 +105,6 @@ struct JvmClassOptions {
   int compiler_threads = 2;
   bool inherit_stderr = false;
   std::vector<std::string> extra_jvm_options;
-  /** More runtime options of the native image (-XX:..., -D...; diagnostics:
-      MLE_NATIVE_OPTIONS). The JVM class's -XX options do not apply to it. */
-  std::vector<std::string> extra_native_options;
   /** Paths workers must never read (ClassConfig::hidden_paths). */
   std::vector<std::string> hidden_paths;
 };
@@ -117,17 +114,17 @@ struct JvmClassOptions {
 ClassConfig jvm_worker_class(const Layout &layout,
                              const JvmClassOptions &options = {});
 
-/** The Python-only native worker class (exp design note 23): the same
-    bootstrap loads layout.native_lib instead of libjvm.so; system properties
-    and the heap size as for the JVM class, no JVM-only options; no JDK in
-    the Landlock paths. */
-ClassConfig native_worker_class(const Layout &layout,
-                                const JvmClassOptions &options = {});
-
 /** The CPython worker class (exp design note 62; Python only):
     mle_cpython_worker with its code, its site-packages and the DBA's CPython
     packages (<package_dir>/cpython/site-packages) on sys.path; limits,
     environment and hidden paths as for the JVM class. */
+/** The V8 worker class (exp design note 63; LANGUAGE JS): mle_v8_worker with
+    the V8 heap limit (--heap-mb) and the DBA's npm packages
+    (<package_dir>/js); limits, environment and hidden paths as for the JVM
+    class. */
+ClassConfig v8_worker_class(const Layout &layout, const JvmClassOptions &options,
+                            uint64_t heap_max);
+
 ClassConfig cpython_worker_class(const Layout &layout,
                                  const JvmClassOptions &options = {});
 

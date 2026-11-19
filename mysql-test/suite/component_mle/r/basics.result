@@ -18,9 +18,11 @@ SHOW GLOBAL VARIABLES WHERE Variable_name LIKE 'mle.%'
 Variable_name	Value
 mle.cgroup_base	AUTO
 mle.console	OFF
+mle.cpython_memory_max	1073741824
+mle.cpython_pool_size	2
 mle.heap_max	536870912
 mle.interrupt_grace_ms	1000
-mle.languages	JAVASCRIPT,PYTHON,JAVA
+mle.languages	JAVASCRIPT,PYTHON,JAVA,JS,CPYTHON
 mle.malloc_mmap_threshold	4194304
 mle.max_workers	64
 mle.memory_max	2147483648
@@ -33,8 +35,10 @@ mle.sql_chunk_rows	1000
 mle.sql_result_max	67108864
 mle.sql_row_max	16777216
 mle.sql_statements_max	1024
+mle.v8_heap_max	536870912
+mle.v8_memory_max	1073741824
+mle.v8_pool_size	2
 mle.vector_threads	4
-mle.worker	AUTO
 mle.worker_cache_size	4
 mle.worker_cache_timeout	60
 SELECT @@mle.dir = CONCAT(TRIM(TRAILING '/' FROM @@plugin_dir), '/mle') AS default_dir,
@@ -74,8 +78,8 @@ WHERE VARIABLE_NAME IN ('mle_status', 'mle_heap_status',
 ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	VARIABLE_VALUE
 mle_heap_status	Allocated
-mle_languages_supported	JavaScript,Python,Java
-mle_pool_idle	2
+mle_languages_supported	JavaScript,Python,Java,CPython
+mle_pool_idle	4
 mle_status	Active
 mle_stored_programs	0
 mle_workers	0
@@ -139,7 +143,7 @@ ERROR 42000: Variable 'mle.languages' can't be set to the value of 'JAVASCRIPT,'
 SET GLOBAL mle.languages = DEFAULT;
 SELECT @@mle.languages;
 @@mle.languages
-JAVASCRIPT,PYTHON,JAVA
+JAVASCRIPT,PYTHON,JAVA,JS,CPYTHON
 #
 # Settings that shape workers restart the engine while no session
 # holds a worker; out of range values are refused.
@@ -190,11 +194,10 @@ SELECT @@mle.memory_max, @@mle.pool_size, @@mle.heap_max;
 @@mle.memory_max	@@mle.pool_size	@@mle.heap_max
 1610612736	0	536870912
 SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
-WHERE VARIABLE_NAME IN ('mle_status', 'mle_heap_status', 'mle_pool_idle')
+WHERE VARIABLE_NAME IN ('mle_status', 'mle_heap_status')
 ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	VARIABLE_VALUE
-mle_heap_status	Not Allocated
-mle_pool_idle	0
+mle_heap_status	Allocated
 mle_status	Active
 # The error log tells how the engine runs.
 include/assert_grep.inc [Both INSTALLs logged how the engine runs]

@@ -16,7 +16,7 @@
 """Performance regression test of Percona MLE: two builds, side by side.
 
     perf/regression.py --server <server build> --base <MLE build> --new <MLE build>
-                       [--rounds 5] [--worker JVM|NATIVE] [--only REGEX] [--threshold 5]
+                       [--rounds 5] [--only REGEX] [--threshold 5]
                        [--work DIR] [--port 13997] [--wait-quiet] [--json FILE]
 
 Runs the cases of perf/setup.sql (the call path, values of every kind, SQL
@@ -99,7 +99,7 @@ class Server:
                         '--innodb-buffer-pool-size=2G', '--innodb-flush-log-at-trx-commit=2',
                         '--log-error=' + os.path.join(self.a.work, 'error.log'),
                         '--pid-file=' + os.path.join(self.a.work, 'mysqld.pid'),
-                        '--loose-mle.worker=' + self.a.worker, '--loose-mle.pool_prewarm=python',
+                        '--loose-mle.pool_prewarm=python',
                         '--loose-mle.sql_result_max=1073741824'),
             stdout=log, stderr=log)
         for _ in range(120):
@@ -131,11 +131,11 @@ class Server:
         """The data directory, made once (with the build given) and reused."""
         setup = open(os.path.join(HERE, 'setup.sql')).read()
         stamp = os.path.join(self.a.work, 'setup.sha1')
-        digest = hashlib.sha1((setup + self.a.worker).encode()).hexdigest()
+        digest = hashlib.sha1(setup.encode()).hexdigest()
         if os.path.isdir(self.data) and os.path.exists(stamp):
             if open(stamp).read().strip() == digest:
                 return
-            sys.exit('perf/setup.sql (or --worker) changed since %s was made: delete it and run again' % self.data)
+            sys.exit('perf/setup.sql changed since %s was made: delete it and run again' % self.data)
         print('# preparing the data in %s (once; a few minutes)' % self.data, flush=True)
         shutil.rmtree(self.data, ignore_errors=True)
         r = subprocess.run(self.mysqld('--initialize-insecure'), capture_output=True, text=True)
@@ -241,7 +241,6 @@ def main():
     ap.add_argument('--base', required=True, help='the MLE build to compare with')
     ap.add_argument('--new', required=True, help='the MLE build under test')
     ap.add_argument('--rounds', type=int, default=5)
-    ap.add_argument('--worker', default='JVM', choices=['JVM', 'NATIVE'])
     ap.add_argument('--only', default='', help='cases whose name matches this regular expression')
     ap.add_argument('--threshold', type=float, default=5, help='percent (default 5)')
     ap.add_argument('--work', default=None)
@@ -258,8 +257,8 @@ def main():
     server = Server(args)
     server.prepare_data(args.new)
     load, governor = quiet(args)
-    print('# base %s\n# new  %s\n# worker %s, %d rounds, threshold %g %%, load %.2f, governor %s' %
-          (args.base, args.new, args.worker, args.rounds, args.threshold, load, governor), flush=True)
+    print('# base %s\n# new  %s\n# %d rounds, threshold %g %%, load %.2f, governor %s' %
+          (args.base, args.new, args.rounds, args.threshold, load, governor), flush=True)
     if governor not in ('performance', 'unknown'):
         print('# WARNING: the CPU governor is "%s": times vary more; use "performance"' % governor)
 

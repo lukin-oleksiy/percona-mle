@@ -45,6 +45,7 @@
 #include <mysql/components/services/mysql_current_thread_reader.h>
 
 #include "mle/codec.h"
+#include "engine.h"
 #include "mle/worker.h"
 #include "routine.h"
 #include "sql.h"
@@ -114,10 +115,19 @@ class Session {
   const mle::OptionsMsg &options() const { return m_options; }
 
  private:
+  /** A worker of the session: one per principal and worker kind (exp design
+      note 63: a session that uses JS and CPYTHON holds two). */
   struct Slot {
     std::unique_ptr<mle::Worker> worker;
     std::unordered_set<uint64_t> prepared;
+    std::string principal;
+    WorkerKind kind = WorkerKind::kJvm;
   };
+  /** The key of a slot in m_workers: the principal and the kind of the
+      language's worker ('\0' between: not in account names). */
+  static std::string slot_key(const std::string &principal, unsigned language);
+  /** The key as the error log shows it: "'u'@'h' (v8)". */
+  static std::string display_key(const std::string &key);
 
   explicit Session(MYSQL_THD thd);
 
@@ -214,7 +224,8 @@ class Session {
     false after reporting the missing privilege. Other statements pass. */
 bool check_create_privilege(MYSQL_THD thd, const Routine &routine);
 
-/** CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE. */
+/** CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE,
+    CREATE_JS_ROUTINE (shared with js_lang), CREATE_CPYTHON_ROUTINE. */
 bool register_privileges();
 void unregister_privileges();
 
