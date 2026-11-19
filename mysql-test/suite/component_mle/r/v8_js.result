@@ -1,0 +1,129 @@
+#
+# component_mle: the V8 worker's own (exp design note 63): LANGUAGE JS on the
+# distribution's V8 in its own worker beside the JVM and CPython workers;
+# nested calls across workers; the sandbox; KILL and the statement time
+# limit; the V8 heap limit (mle.v8_heap_max) and the cgroup limit
+# (mle.v8_memory_max) for memory outside the heap; the stack limit. The
+# JavaScript API itself is tested by the v8_*.test variants of the
+# JavaScript tests.
+#
+call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+#
+# 1. LANGUAGE JS runs on V8, LANGUAGE JAVASCRIPT on GraalJS: two workers.
+#
+CREATE FUNCTION js_engine() RETURNS TEXT LANGUAGE JS AS $$
+return typeof Java === 'undefined' && typeof Graal === 'undefined' ? 'V8' : 'GraalJS'
+$$;
+CREATE FUNCTION graal_engine() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+return typeof Graal === 'object' ? 'GraalJS' : 'V8'
+$$;
+SELECT js_engine() AS js, graal_engine() AS javascript;
+js	javascript
+V8	GraalJS
+SELECT FIND_IN_SET('JS', VARIABLE_VALUE) > 0 AS js_supported
+FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_languages_supported';
+js_supported
+1
+# Nested calls across the workers: JS -> SQL -> JAVASCRIPT -> SQL -> JS.
+CREATE FUNCTION js_double(x INT) RETURNS INT LANGUAGE JS AS $$ return 2 * x $$;
+CREATE PROCEDURE graal_calls(IN x INT, OUT r INT) LANGUAGE JAVASCRIPT AS $$
+r = session.runSql('SELECT js_double(?) AS d', [x]).fetchOne().d + 1
+$$;
+CREATE PROCEDURE js_calls(OUT r INT) LANGUAGE JS AS $$
+session.runSql('CALL graal_calls(20, @inner)')
+r = session.runSql('SELECT @inner AS i').fetchOne().i
+$$;
+CALL js_calls(@r);
+SELECT @r;
+@r
+41
+#
+# 2. The sandbox: a bare isolate (no Node.js), no files, network or processes.
+#
+CREATE FUNCTION js_probe() RETURNS TEXT LANGUAGE JS AS $$
+const out = []
+out.push('process: ' + typeof process, 'Buffer: ' + typeof Buffer, 'fetch: ' + typeof fetch)
+for (const m of ['fs', 'child_process', 'net'])
+try { require(m); out.push(m + ': loaded') } catch (e) { out.push(m + ': ' + e.name) }
+return out.join(', ')
+$$;
+SELECT js_probe();
+js_probe()
+process: undefined, Buffer: undefined, fetch: undefined, fs: ReferenceError, child_process: ReferenceError, net: ReferenceError
+#
+# 3. KILL and the statement time limit stop a loop and a sleep.
+#
+CREATE FUNCTION js_spin() RETURNS INT LANGUAGE JS AS $$ for (;;) {} $$;
+CREATE PROCEDURE js_sleep() LANGUAGE JS AS $$ mysql.sleep(60) $$;
+SELECT /*+ MAX_EXECUTION_TIME(500) */ js_spin();
+ERROR HY000: Query execution was interrupted, maximum statement execution time exceeded
+CALL js_sleep();
+KILL QUERY ID;
+ERROR 70100: Query execution was interrupted
+SELECT js_double(21) AS after_kill;
+after_kill
+42
+#
+# 4. Recursion: V8's stack limit is an error, the worker goes on.
+#
+CREATE FUNCTION js_deep(n INT) RETURNS INT LANGUAGE JS AS $$
+function f(k) { return k === 0 ? 0 : 1 + f(k - 1) }
+return f(n)
+$$;
+SELECT js_deep(1000) AS deep;
+deep
+1000
+SELECT js_deep(10000000);
+ERROR HY000: JavaScript> RangeError: Maximum call stack size exceeded (js_deep, ...)
+SELECT js_deep(10) AS after_overflow;
+after_overflow
+10
+#
+# 5. The V8 heap limit: an error that retires the worker; the next call gets
+#    a new one.
+#
+CREATE FUNCTION js_pid() RETURNS INT LANGUAGE JS AS $$ return 0 $$;
+CREATE FUNCTION js_hog() RETURNS INT LANGUAGE JS AS $$
+const a = []
+for (;;) a.push(new Array(100000).fill(1))
+$$;
+SELECT js_hog();
+ERROR HY000: JavaScript> RangeError: out of memory (the V8 heap limit, mle.v8_heap_max)
+SELECT js_double(4) AS after_heap;
+after_heap
+8
+#
+# 6. Memory outside the heap (ArrayBuffers) is the cgroup's (mle.v8_memory_max):
+#    the kernel ends the worker, mysqld goes on.
+#
+SET GLOBAL mle.v8_memory_max = 256 * 1024 * 1024;
+CREATE FUNCTION js_buffers(mib INT) RETURNS INT LANGUAGE JS AS $$
+const keep = []
+for (let i = 0; i < mib; i++) { const b = new Uint8Array(1 << 20); b.fill(1); keep.push(b) }
+return keep.length
+$$;
+SELECT js_buffers(64) AS mib;
+mib
+64
+SELECT js_buffers(1024);
+ERROR HY000: MLE> the worker died: <reason>
+SELECT js_double(5) AS after_oom;
+after_oom
+10
+SET GLOBAL mle.v8_memory_max = DEFAULT;
+DROP FUNCTION js_engine;
+DROP FUNCTION graal_engine;
+DROP FUNCTION js_double;
+DROP PROCEDURE graal_calls;
+DROP PROCEDURE js_calls;
+DROP FUNCTION js_probe;
+DROP FUNCTION js_spin;
+DROP PROCEDURE js_sleep;
+DROP FUNCTION js_deep;
+DROP FUNCTION js_pid;
+DROP FUNCTION js_hog;
+DROP FUNCTION js_buffers;
+REVOKE CREATE_JS_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
