@@ -45,15 +45,9 @@ MAX_TIME_HOUR = 838
 LANGUAGE_TYPE = 'MLE-Type'
 LANGUAGE_TIME_ZONE = 'MLE-TimeZone'
 
-_U8 = _struct.Struct('<B').unpack_from
-_U16 = _struct.Struct('<H').unpack_from
 _U32 = _struct.Struct('<I').unpack_from
 _U64 = _struct.Struct('<Q').unpack_from
-_I64 = _struct.Struct('<q').unpack_from
-_F64 = _struct.Struct('<d').unpack_from
-_F32 = _struct.Struct('<f').unpack_from
 _TEMPORAL = _struct.Struct('<HBBIBBIB')
-_TEMPORAL_UNPACK = _TEMPORAL.unpack_from
 
 P_U8 = _struct.Struct('<B').pack
 P_U32 = _struct.Struct('<I').pack
@@ -153,63 +147,6 @@ class Reader:
             raise RuntimeError('trailing bytes in a message')
 
     # values -----------------------------------------------------------------------------------
-
-    def value(self, vector=None):
-        """The next value. vector(dims, offset) makes VECTORs (default: a new numpy array)."""
-        b = self.b
-        p = self.p
-        tag = b[p]
-        p += 1
-        if tag == T_I64:
-            self.p = p + 8
-            return _I64(b, p)[0]
-        if tag == T_STRING:
-            n, = _U32(b, p)
-            self.p = p + 4 + n
-            return str(b[p + 4:p + 4 + n], 'utf-8')
-        if tag == T_NULL:
-            self.p = p
-            return None
-        if tag == T_F64:
-            self.p = p + 8
-            return _F64(b, p)[0]
-        if tag == T_U64:
-            self.p = p + 8
-            return _U64(b, p)[0]
-        if tag == T_F32:
-            self.p = p + 4
-            return _F32(b, p)[0]
-        if tag == T_VECTOR:
-            dims, = _U32(b, p)
-            p += 4
-            p += (-p) % 16  # VECTOR data is 16-aligned relative to the message start
-            self.p = p + dims * 4
-            if vector is not None:
-                return vector(dims, p)
-            return new_vector(b, p, dims)
-        if tag == T_DECIMAL:
-            self.p = p
-            return _decimal.Decimal(self.str())
-        if tag == T_BYTES:
-            self.p = p
-            return self.raw()
-        if tag == T_JSON:
-            self.p = p
-            return _json.loads(self.str())
-        if T_DATE <= tag <= T_TIMESTAMP:
-            year, month, day, hour, minute, second, micro, neg = _TEMPORAL_UNPACK(b, p)
-            self.p = p + _TEMPORAL.size
-            if tag == T_TIME:
-                d = _dt.timedelta(hours=hour, minutes=minute, seconds=second, microseconds=micro)
-                return -d if neg else d
-            try:
-                if tag == T_DATE:
-                    return _dt.date(year, month, day)
-                return _dt.datetime(year, month, day, hour, minute, second, micro)
-            except ValueError:
-                raise ConversionError('the %s value %04d-%02d-%02d has no Python equivalent (zero date?)'
-                                      % (TAG_NAMES[tag], year, month, day)) from None
-        raise RuntimeError('unknown value tag %d' % tag)
 
 
 def new_vector(b, p, dims):
@@ -452,7 +389,11 @@ def param_decimal_text(d, target='SQL'):
 
 
 def _cannot(v, t):
-    return ConversionError('cannot convert %s to %s' % (type(v).__name__, t.sql_name()))
+    # The value, as the JVM worker shows it (shortened); its type for what has no short form.
+    shown = repr(v) if isinstance(v, (str, int, float, bytes)) else type(v).__name__
+    if len(shown) > 60:
+        shown = shown[:57] + '...'
+    return ConversionError('cannot convert %s to %s' % (shown, t.sql_name()))
 
 
 def _range(v, t):
@@ -488,6 +429,8 @@ def _number(v, t):
 
 
 def _decimal_text(v, t):
+    if type(v).__module__ == 'numpy' and getattr(v, 'ndim', 1) == 0:
+        v = v.item()  # a numpy number: as the Python number (Values.toBigDecimal takes any Number)
     if isinstance(v, _decimal.Decimal):
         d = v
     elif isinstance(v, (int, str)) and not isinstance(v, bool):

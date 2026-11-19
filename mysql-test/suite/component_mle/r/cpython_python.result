@@ -106,6 +106,24 @@ SELECT py_add(1, 2);
 py_add(1, 2)
 3
 DROP TABLE zero_dates;
+# Errors as the JVM worker reports them: a class defined in the routine by
+# its name, IndentationError by its own, conversion errors naming the value,
+# what json cannot convert as the Python error it is (with its traceback).
+SELECT py_custom();
+ERROR HY000: Python> MyError: custom (py_custom, line 4)
+SELECT py_conv();
+ERROR HY000: MLE-Type> cannot convert 'abc' to INT in 'py_conv()'
+SELECT py_json();
+ERROR HY000: Python> TypeError: Object of type set is not JSON serializable
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+Traceback (most recent call last):
+TypeError: Object of type set is not JSON serializable
+
+ERROR 6113 (HY000) at line 1: Python> IndentationError: unexpected indent (py_indent, line 3)
+DROP FUNCTION py_custom;
+DROP FUNCTION py_conv;
+DROP FUNCTION py_json;
 # A third-party package installed by the DBA (mle.package_dir).
 SELECT py_package(1, 2, 6);
 py_package(1, 2, 6)

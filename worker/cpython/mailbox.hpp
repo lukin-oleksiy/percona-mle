@@ -74,7 +74,8 @@ class Interrupts {
  public:
   /** A top-level request starts; an INTERRUPT that came first applies now. */
   static void begin(uint64_t seq);
-  /** The request ended; whether it was interrupted. */
+  /** The request ended; whether it was interrupted (a KILL still pending in the interpreter is
+      taken: it raises in nothing that follows). Needs the GIL. */
   static bool end();
 };
 

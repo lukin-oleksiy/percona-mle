@@ -335,11 +335,17 @@ bool fast_call(Loop &l, const Message &m, Ref &assembled) {
   Interrupts::begin(m.call_seq);
   Mailbox::stats(uint32_t(w::WorkerState::kRunning), g_tainted);
   g_marked = false;
-  Ref fn = f.fn ? Ref::borrow(f.fn.get())
-                : Ref::steal(PyFunction_New(f.code.get(), Ref::steal(PyDict_Copy(f.base.get())).get()));
-  std::array<PyObject *, 64> raw;
-  for (uint32_t i = 0; i < n; i++) raw[i] = argv[i].get();
-  PyObject *ret = PyObject_Vectorcall(fn.get(), raw.data(), n, nullptr);
+  // The function with fresh globals (its errors, MemoryError, are the call's, as Python's own).
+  PyObject *ret = nullptr;
+  PyObject *globals = f.fn ? nullptr : PyDict_Copy(f.base.get());
+  PyObject *made = f.fn || globals == nullptr ? nullptr : PyFunction_New(f.code.get(), globals);
+  Py_XDECREF(globals);
+  if (f.fn || made != nullptr) {
+    std::array<PyObject *, 64> raw;
+    for (uint32_t i = 0; i < n; i++) raw[i] = argv[i].get();
+    ret = PyObject_Vectorcall(f.fn ? f.fn.get() : made, raw.data(), n, nullptr);
+  }
+  Py_XDECREF(made);
   Ref result = ret == nullptr ? Ref() : Ref::steal(ret);
   Ref failure = ret == nullptr ? Ref::steal(PyErr_GetRaisedException()) : Ref();
   set(l.state, l.k_routine.get(), Ref::steal(PyLong_FromLong(0)));

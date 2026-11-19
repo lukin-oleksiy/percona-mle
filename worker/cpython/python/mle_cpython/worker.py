@@ -242,11 +242,6 @@ class Dispatcher:
 
     # -- messages
 
-    def send(self, op, status, w):
-        if len(w.b) > wire.MAX_WORKER_MESSAGE:
-            raise MessageTooLarge()
-        _mlewire.send(op, status, self.depth, self.seq, w.b)
-
     def ready(self, status, info):
         w = Writer()
         w.u32(wire.VERSION)
@@ -472,12 +467,18 @@ class Dispatcher:
             w = self.write_result(ret, routine, error, console)
             if len(w.b) > wire.MAX_WORKER_MESSAGE:
                 raise MessageTooLarge()
-        except (ConversionError, MessageTooLarge) as e:
+        except MessageTooLarge:
             status = wire.GUEST_ERROR
-            message = str(e) if isinstance(e, ConversionError) else \
-                "the routine's result with its output is larger than MLE allows (64 MiB)"
-            w = self.write_result(None, None, (wire.LANGUAGE_TYPE, message, [], 0, ''),
-                                  console if isinstance(e, ConversionError) else (b'', b''))
+            w = self.write_result(None, None, (wire.LANGUAGE_TYPE, "the routine's result with its output is "
+                                               "larger than MLE allows (64 MiB)", [], 0, ''), (b'', b''))
+        except Exception as e:
+            # A value that cannot be the declared type: the call's error, never the worker's end.
+            # ConversionError is MLE's (MLE-Type); what json or numpy raise converting it (a set as
+            # JSON, strings as a VECTOR) is Python's, as on the JVM worker (its helpers run them).
+            status = wire.GUEST_ERROR
+            error = (wire.LANGUAGE_TYPE, str(e), [], 0, '') if isinstance(e, ConversionError) else \
+                ('python', _describe(e), [], 0, '')
+            w = self.write_result(None, None, error, console)
         _mlewire.stats(wire.STATE_IDLE if self.depth == 0 else wire.STATE_RUNNING, int(self.tainted))
         _mlewire.send(wire.RESULT, status, self.depth, self.seq, w.b)
 
@@ -561,11 +562,10 @@ class Dispatcher:
             else:
                 self.result(wire.GUEST_ERROR, error=('python', e.message, frames, int(e.code), state))
         elif isinstance(e, SyntaxError) and e.filename == name:
-            self.result(wire.GUEST_ERROR, error=('python', 'SyntaxError: %s' % e.msg,
+            self.result(wire.GUEST_ERROR, error=('python', '%s: %s' % (type(e).__name__, e.msg),
                                                  [('', name, e.lineno or 0, (e.text or '').strip()[:200])], 0, ''))
         else:
-            msg = ''.join(traceback.format_exception_only(type(e), e)).strip()
-            self.result(wire.GUEST_ERROR, error=('python', msg, frames, 0, ''))
+            self.result(wire.GUEST_ERROR, error=('python', _describe(e), frames, 0, ''))
 
     # -- requests to the host while a routine runs
 
@@ -584,12 +584,21 @@ class Dispatcher:
         from .libraries import read_reply
         return read_reply(body)
 
-    # -- SQL round trip (called by sql.Api)
-
-
 
 class MessageTooLarge(Exception):
     pass
+
+
+def _describe(e):
+    """An exception as Python's last traceback line, named by its class's own name (as GraalPy names
+    it): a class defined in a routine is MyError, not r.__mle_routine.<locals>.MyError (that
+    wrapper is ours); module prefixes go the same way."""
+    text = ''.join(traceback.format_exception_only(type(e), e)).strip()
+    prefix = text.split(':', 1)[0]
+    name = type(e).__name__
+    if prefix != name and prefix.endswith('.' + name):
+        text = name + text[len(prefix):]
+    return text
 
 
 def _no_js(name):

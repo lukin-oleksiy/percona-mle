@@ -210,6 +210,39 @@ SELECT py_types(1, 1, 'a', d, '00:00:00', 'null', '', 0) FROM zero_dates;
 SET sql_mode = @old_mode;
 SELECT py_add(1, 2);
 DROP TABLE zero_dates;
+--echo # Errors as the JVM worker reports them: a class defined in the routine by
+--echo # its name, IndentationError by its own, conversion errors naming the value,
+--echo # what json cannot convert as the Python error it is (with its traceback).
+--write_file $MYSQLTEST_VARDIR/tmp/cpython_errors.sql
+CREATE FUNCTION py_custom() RETURNS INT LANGUAGE PYTHON AS $$
+    class MyError(Exception):
+        pass
+    raise MyError('custom')
+$$;
+CREATE FUNCTION py_conv() RETURNS INT LANGUAGE PYTHON AS $$ return 'abc' $$;
+CREATE FUNCTION py_json() RETURNS JSON LANGUAGE PYTHON AS $$ return {1, 2} $$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/cpython_errors.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/cpython_errors.sql
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_custom();
+--error ER_LANGUAGE_COMPONENT
+SELECT py_conv();
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_json();
+SELECT mle_session_state('traceback') AS traceback;
+--write_file $MYSQLTEST_VARDIR/tmp/cpython_indent.sql
+CREATE FUNCTION py_indent() RETURNS INT LANGUAGE PYTHON AS $$
+    x = 1
+      return x
+$$;
+EOF
+--error 1
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/cpython_indent.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/cpython_indent.sql
+DROP FUNCTION py_custom;
+DROP FUNCTION py_conv;
+DROP FUNCTION py_json;
 --echo # A third-party package installed by the DBA (mle.package_dir).
 SELECT py_package(1, 2, 6);
 SELECT py_probe();

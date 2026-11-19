@@ -36,7 +36,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <mutex>
 #include <system_error>
+#include <utility>
 
 namespace mle::cpython {
 
@@ -51,11 +53,15 @@ uint32_t g_seen_w = 0;
 int g_spin = 2000;
 
 // Interrupts: the running top-level request's call_seq (0: none), the last one begun, an INTERRUPT
-// that came before its request began, and whether the running one was interrupted.
-std::atomic<uint64_t> g_running{0};
-std::atomic<uint64_t> g_last{0};
-std::atomic<uint64_t> g_pending{0};
-std::atomic<bool> g_interrupted{false};
+// that came before its request began, and whether the running one was interrupted. One lock for the
+// control thread's decision and begin()/end(): an INTERRUPT is then either for the running request
+// (and end() reports it) or pending for a later one, never lost between two stores and never
+// tripped after its request ended.
+std::mutex g_interrupt_lock;
+uint64_t g_running = 0;
+uint64_t g_last = 0;
+uint64_t g_pending = 0;
+bool g_interrupted = false;
 
 [[noreturn]] void fatal(const char *why) {
   fprintf(stderr, "mle_cpython_worker: fatal: %s\n", why);
@@ -117,8 +123,11 @@ void header(uint32_t op, uint32_t status, uint32_t flags, uint32_t depth, uint32
   m.call_seq = seq;
 }
 
+/** With g_interrupt_lock held. */
 void interrupt_main() {
-  if (!g_interrupted.exchange(true)) PyErr_SetInterruptEx(SIGINT);
+  if (g_interrupted) return;
+  g_interrupted = true;
+  PyErr_SetInterruptEx(SIGINT);  // async-signal-safe; no thread state needed
 }
 
 void *control_thread(void *) {
@@ -130,10 +139,11 @@ void *control_thread(void *) {
     if (buf[0] != uint8_t(w::Control::kInterrupt) || n < 9) continue;
     uint64_t seq;
     std::memcpy(&seq, buf.data() + 1, sizeof seq);
-    if (seq == g_running.load())
+    const std::lock_guard lock(g_interrupt_lock);
+    if (seq == g_running)
       interrupt_main();
-    else if (seq > g_last.load())
-      g_pending.store(seq);
+    else if (seq > g_last)
+      g_pending = seq;
   }
 }
 
@@ -237,18 +247,27 @@ void Mailbox::stats(uint32_t state, bool tainted, uint64_t heap_used) {
 }
 
 void Interrupts::begin(uint64_t seq) {
-  g_interrupted.store(false);
-  g_last.store(seq);
-  g_running.store(seq);
-  if (g_pending.load() == seq) {
-    g_pending.store(0);
+  const std::lock_guard lock(g_interrupt_lock);
+  g_interrupted = false;
+  g_last = seq;
+  g_running = seq;
+  if (g_pending == seq) {
+    g_pending = 0;
     interrupt_main();
   }
 }
 
 bool Interrupts::end() {
-  g_running.store(0);
-  return g_interrupted.exchange(false);
+  bool interrupted;
+  {
+    const std::lock_guard lock(g_interrupt_lock);
+    g_running = 0;
+    interrupted = std::exchange(g_interrupted, false);
+  }
+  // A KILL tripped in the request's last moments is still pending in the interpreter: taken now,
+  // so that it does not raise in the code that sends the RESULT (or in the next request).
+  if (interrupted && PyErr_CheckSignals() != 0) PyErr_Clear();
+  return interrupted;
 }
 
 }  // namespace mle::cpython

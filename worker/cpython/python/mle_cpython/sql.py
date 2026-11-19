@@ -842,7 +842,7 @@ class SqlResult:
         int64 / float64 arrays, others (or columns with NULLs) as lists. The rows not read yet go
         straight from the messages into the arrays."""
         if not names or (len(names) == 1 and names[0] is None):
-            want = [c._name for c in self._columns]
+            want = list(self._columns.labels)
         else:
             want = []
             for v in names:
@@ -852,7 +852,7 @@ class SqlResult:
                     want.append(v)
                 else:
                     raise TypeError('a column name must be a string, not %s' % type(v).__name__)
-        labels = [c._name for c in self._columns]
+        labels = list(self._columns.labels)
         index = {}
         for label in want:
             if label not in index:
