@@ -50,6 +50,8 @@ struct Config {
   uint64_t heap_max = 512ULL << 20;
   /** The DBA's npm packages (<package_dir>/js); empty: none. */
   std::string packages;
+  /** Directories of ICU data files of the distribution's Node (/usr/share/node-22/icudata). */
+  std::vector<std::string> icu_data;
 };
 
 /** A guest error for the RESULT (protocol.h: Error). */

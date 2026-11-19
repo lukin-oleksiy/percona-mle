@@ -21,7 +21,8 @@
   mle_v8_worker: the MLE worker for LANGUAGE JS on V8 (exp design note 63), the distribution's V8
   from libnode, as a bare isolate (no Node.js environment).
 
-    mle_v8_worker [--class=<name>] [--heap-mb=<n>] [--packages=<dir>] [--spin=<n>] [--dumpable]
+    mle_v8_worker [--class=<name>] [--heap-mb=<n>] [--packages=<dir>] [--icu-data=<dir>]... [--spin=<n>]
+                  [--dumpable]
 
   Started by mle_launcher like the other workers: Landlock, the cgroup and the descriptors (3 =
   mailbox, 4 = control socket) are in place. Here: PR_SET_DUMPABLE 0 unless --dumpable; the seccomp
@@ -60,13 +61,15 @@ int main(int argc, char **argv) {
       config.heap_max = std::strtoull(std::string(v).c_str(), nullptr, 10) << 20;
     } else if (value("--packages=", &v)) {
       config.packages = v;
+    } else if (value("--icu-data=", &v)) {
+      config.icu_data.emplace_back(v);
     } else if (value("--spin=", &v)) {
       config.spin = std::atoi(std::string(v).c_str());
     } else {
       std::fprintf(stderr, "mle_v8_worker: unknown argument %s\n", argv[i]);
       std::fprintf(stderr,
-                   "usage: mle_v8_worker [--class=<name>] [--heap-mb=<n>] [--packages=<dir>] [--spin=<n>] "
-                   "[--dumpable]\n");
+                   "usage: mle_v8_worker [--class=<name>] [--heap-mb=<n>] [--packages=<dir>] [--icu-data=<dir>]... "
+                   "[--spin=<n>] [--dumpable]\n");
       return 20;
     }
   }
