@@ -35,11 +35,10 @@
      mle_cpython.worker.main().
 
   Exit codes: 0 normal (the host closed the control socket); 1 fatal protocol error; 20 bad
-  arguments; 21 dumpable; 22 seccomp; 23 environment or signals; 24 Python start; 25 the worker's
+  arguments; 21 dumpable; 22 seccomp; 23 environment; 24 Python start; 25 the worker's
   Python code failed.
 */
 
-#include <signal.h>
 #include <sys/prctl.h>
 
 #include <cstdio>
@@ -99,7 +98,7 @@ bool start_python(const Args &a) {
   if (PyImport_AppendInittab("_mlewire", mle::cpython::init_mlewire) != 0) return false;
   PyConfig config;
   PyConfig_InitIsolatedConfig(&config);
-  config.install_signal_handlers = 1;  // KILL: SIGINT's handler raises KeyboardInterrupt
+  config.install_signal_handlers = 1;  // Python's own (SIGPIPE ignored); KILL needs none (mailbox.cc)
   config.write_bytecode = 0;           // workers cannot write
   config.site_import = 0;
   config.module_search_paths_set = 1;
@@ -145,17 +144,6 @@ int main(int argc, char **argv) {
   if (setenv("MLE_CLASS", args.cls.c_str(), 1) != 0 ||
       setenv("MLE_SPIN", std::to_string(args.spin).c_str(), 1) != 0)
     return 23;
-  // KILL raises KeyboardInterrupt through SIGINT's Python handler (PyErr_SetInterruptEx), and
-  // CPython installs that handler only where SIGINT has its default action: under systemd mysqld's
-  // workers inherit SIGINT ignored (KILL then did nothing until the host's SIGKILL). The worker
-  // takes no real SIGINT from anyone (seccomp: no signals across processes but its own).
-  struct sigaction dfl {};
-  dfl.sa_handler = SIG_DFL;
-  sigemptyset(&dfl.sa_mask);
-  sigset_t intr;
-  sigemptyset(&intr);
-  sigaddset(&intr, SIGINT);
-  if (sigaction(SIGINT, &dfl, nullptr) != 0 || pthread_sigmask(SIG_UNBLOCK, &intr, nullptr) != 0) return 23;
   if (!start_python(args)) return 24;
   PyObject *mod = PyImport_ImportModule("mle_cpython.worker");
   PyObject *r = mod != nullptr ? PyObject_CallMethod(mod, "main", nullptr) : nullptr;

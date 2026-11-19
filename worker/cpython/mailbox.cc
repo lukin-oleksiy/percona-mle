@@ -123,11 +123,26 @@ void header(uint32_t op, uint32_t status, uint32_t flags, uint32_t depth, uint32
   m.call_seq = seq;
 }
 
-/** With g_interrupt_lock held. */
+/** Runs in the main thread (a pending call, between two bytecodes): KeyboardInterrupt in the request
+    the INTERRUPT was for, nothing if it has ended meanwhile (a late one never stops the next). */
+int raise_interrupt(void *arg) {
+  const auto seq = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(arg));
+  {
+    const std::lock_guard lock(g_interrupt_lock);
+    if (g_running != seq) return 0;
+  }
+  PyErr_SetNone(PyExc_KeyboardInterrupt);
+  return -1;
+}
+
+/** With g_interrupt_lock held. A pending call, not PyErr_SetInterruptEx: from another thread,
+    CPython 3.12 only marks the signal and wakes nothing (the main thread alone flags its own
+    signals), so a Python loop ran on until the host's SIGKILL; a pending call wakes the main
+    thread's eval loop in every version, and needs neither the GIL nor a SIGINT handler. */
 void interrupt_main() {
   if (g_interrupted) return;
   g_interrupted = true;
-  PyErr_SetInterruptEx(SIGINT);  // async-signal-safe; no thread state needed
+  Py_AddPendingCall(raise_interrupt, reinterpret_cast<void *>(static_cast<uintptr_t>(g_running)));
 }
 
 void *control_thread(void *) {
@@ -258,16 +273,9 @@ void Interrupts::begin(uint64_t seq) {
 }
 
 bool Interrupts::end() {
-  bool interrupted;
-  {
-    const std::lock_guard lock(g_interrupt_lock);
-    g_running = 0;
-    interrupted = std::exchange(g_interrupted, false);
-  }
-  // A KILL tripped in the request's last moments is still pending in the interpreter: taken now,
-  // so that it does not raise in the code that sends the RESULT (or in the next request).
-  if (interrupted && PyErr_CheckSignals() != 0) PyErr_Clear();
-  return interrupted;
+  const std::lock_guard lock(g_interrupt_lock);
+  g_running = 0;  // a pending call that has not run yet does nothing now (raise_interrupt)
+  return std::exchange(g_interrupted, false);
 }
 
 }  // namespace mle::cpython
