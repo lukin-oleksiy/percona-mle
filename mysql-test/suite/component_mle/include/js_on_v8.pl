@@ -25,6 +25,13 @@ our @KNOWN = (
   ['oracle_examples', qr/<date> GMT\+0300 \(GMT\+3\)/, '<date> GMT+0300 (GMT+03:00)'],
   ['oracle_examples', qr/TypeError: \(intermediate value\)\.lob is not a function/, 'TypeError: console.lob is not a function'],
   ['oracle_examples', qr/<js> pc2:3:1-47/, '<js> pc2:3:9'],
+  # Libraries created with LANGUAGE JS show it in information_schema.LIBRARIES.
+  ['libraries', qr/(?<=jslib\tlib\d\t)JAVASCRIPT$/m, 'JS'],
+  ['libraries', qr/SyntaxError: lib3:3:10 Expected an operand but found \*/, "SyntaxError: lib3:3:11 Unexpected token '*'"],
+  # GraalJS prefixes a failed import: "Error reading module '/other/secret' imported from peek: ".
+  ['libraries', qr/Error: Error reading module '\/other\/secret' imported from peek: library/, 'Error: library'],
+  # The session holds a V8 worker (JavaScript) and a JVM worker (its Python).
+  ['packages', qr/cannot refresh: 1 session workers are in use/, 'cannot refresh: 2 session workers are in use'],
 );
 
 sub js_on_v8 {

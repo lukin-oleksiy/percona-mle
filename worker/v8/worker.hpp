@@ -31,7 +31,10 @@
 #include <v8.h>
 
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -86,8 +89,14 @@ class Worker {
       array (see worker.cc). Throws (a V8 exception, returns empty) on a value that cannot be bound
       or a message larger than the host takes. */
   v8::MaybeLocal<v8::Value> sql(const v8::FunctionCallbackInfo<v8::Value> &info);
-  /** N.state(): [depth, scope, routine schema, integer type, decimal type, arena size]. */
+  /** N.state(): [depth, scope, routine schema, integer type, decimal type, arena size, call seq]. */
   v8::Local<v8::Value> state();
+  /** $c.lib(schema, name), N.library: a database library's module namespace (USING). */
+  v8::MaybeLocal<v8::Value> library_namespace(const std::string &schema, const std::string &name);
+  /** N.readFile / N.isDir for api.js's require(): only below the DBA's package directory. */
+  std::optional<std::string> package_file(const std::string &path);
+  bool package_dir_exists(const std::string &path);
+  const std::string &packages() const { return m_config.packages; }
 
   static Worker *current() { return s_current; }
 
@@ -119,7 +128,7 @@ class Worker {
   /** Compiles a routine; on a compile error *error says it (and the function is empty). */
   void compile(uint64_t id, const std::string &name, const std::string &entry, const std::string &source,
                Routine &r, const std::vector<std::string> &param_names, const std::vector<uint8_t> &modes,
-               std::string *error);
+               const std::vector<std::string> &usings, std::string *error);
   /** A script of ours (routine, eval) compiled and run; registers it for frames. */
   v8::MaybeLocal<v8::Value> run_script(const std::string &text, const std::string &name, int prefix,
                                        int *script_id);
@@ -135,6 +144,43 @@ class Worker {
   void write_result(Writer &w, const ErrorInfo *error, const Routine *r, v8::Local<v8::Value> ret,
                     v8::Local<v8::Array> outs);
   void stats(uint32_t state);
+
+  // Database libraries (modules.cc; LibraryFileSystem.java's rules).
+  struct Library {
+    std::string language, body;
+    uint64_t hash = 0;
+    uint64_t checked = 0, generation = 0;
+    std::shared_ptr<std::map<std::string, uint64_t>> loadset;
+    uint64_t stamp() const;
+  };
+  struct ModuleEntry {
+    uint64_t stamp;
+    v8::Global<v8::Module> module;
+  };
+  void libraries_revalidate();
+  void lib_touch(const std::string &key, const Library &lib);
+  Library &lib_renewed(const std::string &key, const Library &lib);
+  void lib_new_generation();
+  void lib_confirm_loadset(const Library &lib);
+  /** The library's current body (LIBRARY request when not confirmed); nullptr and *why if refused. */
+  const Library *lib_fetch(const std::string &schema, const std::string &name, std::string *why);
+  v8::MaybeLocal<v8::Module> compile_module(const std::string &text, const std::string &name, const std::string &path);
+  v8::MaybeLocal<v8::Module> library_module(const std::string &schema, const std::string &name);
+  v8::MaybeLocal<v8::Module> package_module(v8::Local<v8::Context> ctx, const std::string &spec, const std::string &from);
+  v8::MaybeLocal<v8::Value> module_namespace(v8::Local<v8::Context> ctx, v8::Local<v8::Module> m);
+  static v8::MaybeLocal<v8::Module> resolve(v8::Local<v8::Context> ctx, v8::Local<v8::String> specifier,
+                                            v8::Local<v8::FixedArray> assertions, v8::Local<v8::Module> referrer);
+  static v8::MaybeLocal<v8::Promise> dynamic_import(v8::Local<v8::Context> ctx, v8::Local<v8::Data> options,
+                                                    v8::Local<v8::Value> resource, v8::Local<v8::String> specifier,
+                                                    v8::Local<v8::FixedArray> assertions);
+
+  std::map<std::string, Library> m_libraries;
+  uint64_t m_lib_epoch = 1, m_lib_generation = 0;
+  std::vector<std::shared_ptr<std::map<std::string, uint64_t>>> m_lib_open;
+  std::set<std::string> m_lib_confirmed;
+  std::map<std::string, ModuleEntry> m_modules;
+  std::map<std::string, v8::Global<v8::Module>> m_package_modules;
+  std::unordered_map<int, std::string> m_module_paths;
 
   static inline Worker *s_current = nullptr;
   static size_t near_heap_limit(void *data, size_t current, size_t initial);

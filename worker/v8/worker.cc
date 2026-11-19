@@ -115,8 +115,36 @@ void native_nap(const v8::FunctionCallbackInfo<Value> &info) {
 
 void native_library(const v8::FunctionCallbackInfo<Value> &info) {
   v8::Isolate *iso = info.GetIsolate();
-  iso->ThrowException(v8::Exception::Error(
-      v8_string(iso, "database libraries are not available in the V8 worker yet")));
+  Local<Value> ns;
+  if (Worker::current()->library_namespace(utf8(iso, info[0]), utf8(iso, info[1])).ToLocal(&ns))
+    info.GetReturnValue().Set(ns);
+}
+
+void native_read_file(const v8::FunctionCallbackInfo<Value> &info) {
+  v8::Isolate *iso = info.GetIsolate();
+  const std::optional<std::string> text = Worker::current()->package_file(utf8(iso, info[0]));
+  if (text) info.GetReturnValue().Set(v8_string(iso, *text));
+  else info.GetReturnValue().SetNull();
+}
+
+void native_is_dir(const v8::FunctionCallbackInfo<Value> &info) {
+  info.GetReturnValue().Set(Worker::current()->package_dir_exists(utf8(info.GetIsolate(), info[0])));
+}
+
+/** N.compileFunction(text, filename, params): a CommonJS module's function (line numbers as in the file). */
+void native_compile_function(const v8::FunctionCallbackInfo<Value> &info) {
+  v8::Isolate *iso = info.GetIsolate();
+  const Local<v8::Context> ctx = iso->GetCurrentContext();
+  v8::ScriptOrigin origin(info[1]);
+  v8::ScriptCompiler::Source src(info[0]->ToString(ctx).ToLocalChecked(), origin);
+  std::vector<Local<v8::String>> params;
+  if (info[2]->IsArray()) {
+    const Local<v8::Array> a = info[2].As<v8::Array>();
+    for (uint32_t i = 0; i < a->Length(); i++) params.push_back(a->Get(ctx, i).ToLocalChecked().As<v8::String>());
+  }
+  Local<v8::Function> f;
+  if (v8::ScriptCompiler::CompileFunction(ctx, &src, params.size(), params.data(), 0, nullptr).ToLocal(&f))
+    info.GetReturnValue().Set(f);
 }
 
 }  // namespace
@@ -139,6 +167,7 @@ Worker::Worker(const Config &config) : m_config(config) {
   m_isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
   m_isolate->SetCaptureStackTraceForUncaughtExceptions(true, w::kMaxStackFrames, v8::StackTrace::kDetailed);
   m_isolate->AddNearHeapLimitCallback(near_heap_limit, this);
+  m_isolate->SetHostImportModuleDynamicallyCallback(dynamic_import);
 
   v8::HandleScope scope(m_isolate);
   const Local<v8::Context> ctx = v8::Context::New(m_isolate);
@@ -156,6 +185,10 @@ Worker::Worker(const Config &config) : m_config(config) {
   fn("sql", native_sql);
   fn("state", native_state);
   fn("nap", native_nap);
+  fn("readFile", native_read_file);
+  fn("isDir", native_is_dir);
+  fn("compileFunction", native_compile_function);
+  (void)natives->Set(ctx, v8_string(m_isolate, "packages"), v8_string(m_isolate, m_config.packages));
   v8::TryCatch tc(m_isolate);
   const Local<v8::Script> api =
       v8::Script::Compile(ctx, v8_string(m_isolate, kApiJs)).ToLocalChecked();
@@ -237,7 +270,10 @@ void Worker::handle(const Message &m) {
   const uint64_t saved_scope = m_scope;
   m_scope = ++m_scopes;
   m_depth = m.depth;
-  if (m.depth == 0) m_seq = m.call_seq;
+  if (m.depth == 0) {
+    m_seq = m.call_seq;
+    m_lib_open.clear();  // a top-level request starts (LibraryFileSystem.requestStart)
+  }
   try {
     switch (static_cast<w::Op>(m.op)) {
       case w::Op::kPrepare:
@@ -340,8 +376,19 @@ void Worker::prepare(const Message &m) {
   }
   routine.has_return = r.get<uint8_t>() != 0;
   if (routine.has_return) routine.ret = ParamType::read(r);
-  const auto imports = r.get<uint32_t>();
-  for (uint32_t i = 0; i < imports; i++) (void)r.str(), (void)r.str(), (void)r.str();
+  const auto nimports = r.get<uint32_t>();
+  if (nimports > w::kMaxValues) throw Malformed{"too many imports"};
+  struct Import {
+    std::string schema, name, alias;
+  };
+  std::vector<Import> imports;
+  for (uint32_t i = 0; i < nimports; i++) {
+    Import imp;
+    imp.schema = r.str();
+    imp.name = r.str();
+    imp.alias = r.str();
+    imports.push_back(std::move(imp));
+  }
   m_schemas[id] = std::string(r.str());
   (void)r.get<uint8_t>();  // check (names never defined: Python's)
   if (language != "js") {
@@ -349,11 +396,12 @@ void Worker::prepare(const Message &m) {
     result(uint32_t(w::Status::kGuestError), &e);
     return;
   }
-  if (imports > 0) {
-    ErrorInfo e{"js", "USING (database libraries) is not available in the V8 worker yet", {}, 0, ""};
-    result(uint32_t(w::Status::kGuestError), &e);
-    return;
-  }
+  // A routine is (re)loaded: library DDL may have happened (LibraryFileSystem.revalidate).
+  libraries_revalidate();
+  std::vector<std::string> usings;
+  for (const Import &imp : imports)
+    usings.push_back("const " + (imp.alias.empty() ? imp.name : imp.alias) + "=$c.lib(" + js_string(imp.schema) + "," +
+                     js_string(imp.name) + ");");
   stats(uint32_t(w::WorkerState::kCompiling));
   const bool top = m_depth == 0;
   if (top) Interrupts::begin(m_seq);
@@ -361,7 +409,7 @@ void Worker::prepare(const Message &m) {
   std::string compile_err;
   v8::TryCatch tc(m_isolate);
   const uint64_t outer = std::exchange(m_routine, id);
-  compile(id, name.empty() ? "routine_" + std::to_string(id) : name, entry, source, routine, names, modes,
+  compile(id, name.empty() ? "routine_" + std::to_string(id) : name, entry, source, routine, names, modes, usings,
           &compile_err);
   m_routine = outer;
   const bool interrupted = top && Interrupts::end();
@@ -396,7 +444,7 @@ v8::MaybeLocal<Value> Worker::run_script(const std::string &text, const std::str
 
 void Worker::compile(uint64_t, const std::string &name, const std::string &entry, const std::string &source,
                      Routine &r, const std::vector<std::string> &names, const std::vector<uint8_t> &modes,
-                     std::string *error) {
+                     const std::vector<std::string> &usings, std::string *error) {
   const Local<v8::Context> ctx = m_context.Get(m_isolate);
   v8::TryCatch tc(m_isolate);
   tc.SetVerbose(false);
@@ -464,6 +512,8 @@ void Worker::compile(uint64_t, const std::string &name, const std::string &entry
              (modes[i] == uint8_t(w::ParamMode::kOut) ? std::string("null") : "$a" + std::to_string(i));
     }
     if (!names.empty()) pre += ";";
+    // USING (Phase 6): each library bound to its name or alias, loaded synchronously.
+    for (const std::string &u : usings) pre += u;
     pre += std::string("const $r=") + (r.async ? "await(async($c,$G)=>{" : "(($c,$G)=>{");
     std::string post = "\n";
     if (r.outs.empty()) {
