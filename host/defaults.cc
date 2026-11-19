@@ -18,7 +18,7 @@
 #include "mle/defaults.h"
 
 #include <glob.h>
-#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <climits>
@@ -28,10 +28,10 @@ namespace mle {
 
 namespace {
 
-bool exists(const std::string &path) {
-  struct stat st;
-  return stat(path.c_str(), &st) == 0;
-}
+/** access(F_OK), not stat(): under SELinux mysqld_t may not getattr the workers' executables
+    (mle_worker_exec_t; denied without an audit record), and F_OK needs only the path's search
+    permissions (exp note 25: the same rule for mle_worker). */
+bool exists(const std::string &path) { return access(path.c_str(), F_OK) == 0; }
 
 /** The path with symlinks resolved, or the path itself if it does not exist.
     Landlock rules apply to the files symlinks point to, and the AOT cache
