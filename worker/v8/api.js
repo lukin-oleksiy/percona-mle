@@ -7,24 +7,12 @@
 
   // ---------------------------------------------------------------- console
   // Oracle: console output goes to the session (stdout, stderr); console.clear() clears it.
+  // As GraalJS's console: each argument as String(v) (arrays "1,2", errors by their toString()).
   const show = (v) => {
-    switch (typeof v) {
-      case 'string': return v;
-      case 'undefined': return 'undefined';
-      case 'bigint': return v.toString() + 'n';
-      case 'symbol': return v.toString();
-      case 'function': return '[Function ' + (v.name || '(anonymous)') + ']';
-      case 'object':
-        if (v === null) return 'null';
-        if (v instanceof Error) return v.stack || String(v);
-        if (v instanceof Date) return isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString();
-        try {
-          const s = JSON.stringify(v, (k, x) => typeof x === 'bigint' ? x.toString() : x);
-          return s === undefined ? String(v) : s;
-        } catch (e) {
-          return String(v);
-        }
-      default: return String(v);
+    try {
+      return typeof v === 'symbol' ? v.toString() : String(v);
+    } catch (e) {
+      return Object.prototype.toString.call(v);
     }
   };
   const line = (args) => args.map(show).join(' ') + '\n';

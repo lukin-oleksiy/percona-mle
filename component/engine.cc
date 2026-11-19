@@ -412,8 +412,15 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
         o.memory_max = s.v8_memory_max;
         o.pool_size = s.v8_pool_size;
         mle::ClassConfig c = mle::v8_worker_class(layout, o, s.v8_heap_max);
-        // Local time as mysqld's (V8 asks libc, which reads TZ).
-        c.env.push_back("TZ=" + (zone[0] == '+' || zone[0] == '-' ? std::string("UTC") : zone));
+        // Local time as mysqld's (V8 asks ICU, which reads TZ): an IANA name; an offset of whole
+        // hours as Etc/GMT-3 (IANA counts west: the sign is the other way). ICU takes no other
+        // offsets (+05:30): those keep the host's zone.
+        std::string tz = zone;
+        if ((zone[0] == '+' || zone[0] == '-') && zone.size() >= 6 && zone.substr(3) == ":00") {
+          const int hours = std::stoi(zone.substr(1, 2));
+          tz = hours == 0 ? "UTC" : std::string("Etc/GMT") + (zone[0] == '+' ? "-" : "+") + std::to_string(hours);
+        }
+        if (tz[0] != '+' && tz[0] != '-') c.env.push_back("TZ=" + tz);
         config.classes.push_back(std::move(c));
         break;
       }

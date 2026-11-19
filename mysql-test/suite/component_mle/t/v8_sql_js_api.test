@@ -1,0 +1,2 @@
+--let $v8_test = sql_js_api
+--source ../include/js_on_v8.inc

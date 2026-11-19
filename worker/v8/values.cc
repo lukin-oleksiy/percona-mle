@@ -356,7 +356,7 @@ Local<Value> Values::integer(int64_t v, bool is_unsigned, const ParamType *t) {
   if (t != nullptr && t->is("BIT"))
     return is_safe && v >= 0 ? Local<Value>(v8::Number::New(m_iso, static_cast<double>(v)))
                              : Local<Value>(v8::BigInt::NewFromUnsigned(m_iso, static_cast<uint64_t>(v)));
-  switch (m_opt->integer_type) {
+  switch (rules()->integer_type) {
     case w::IntegerType::kString:
       return as_string();
     case w::IntegerType::kBigint:
@@ -423,7 +423,7 @@ Local<Value> Values::argument(Reader &r, const ParamType &t) {
       return v8::Number::New(m_iso, r.get<float>());
     case w::Tag::kDecimal: {
       const std::string_view s = r.str();
-      if (m_opt->decimal_type == w::DecimalType::kNumber)
+      if (rules()->decimal_type == w::DecimalType::kNumber)
         return v8::Number::New(m_iso, std::strtod(std::string(s).c_str(), nullptr));
       return v8_string(m_iso, s);
     }
@@ -467,7 +467,12 @@ Local<Value> Values::argument(Reader &r, const ParamType &t) {
   throw Malformed{"bad value tag"};
 }
 
-Local<Value> Values::column(Reader &r, std::string_view type_name) {
+Local<Value> Values::column(Reader &r, std::string_view type_name, const Options *rules) {
+  struct Use {
+    const Options *&slot, *saved;
+    ~Use() { slot = saved; }
+  } use{m_rules, m_rules};
+  if (rules != nullptr) m_rules = rules;
   ParamType t;
   t.type_name = std::string(type_name);
   const auto tag = static_cast<w::Tag>(r.get<uint8_t>());

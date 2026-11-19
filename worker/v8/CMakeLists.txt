@@ -40,13 +40,20 @@ GET_FILENAME_COMPONENT(mle_libnode_real ${MLE_LIBNODE} REALPATH)
 GET_FILENAME_COMPONENT(MLE_LIBNODE_SONAME ${mle_libnode_real} NAME)
 MESSAGE(STATUS "MLE V8 worker: V8 ${mle_v8_major}.${mle_v8_minor} from ${mle_libnode_real}")
 
-# api.js, compiled into the worker as a string.
-SET(MLE_V8_API_H ${CMAKE_CURRENT_BINARY_DIR}/api_js.h)
-ADD_CUSTOM_COMMAND(OUTPUT ${MLE_V8_API_H}
-  COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_CURRENT_SOURCE_DIR}/api.js -DOUT=${MLE_V8_API_H}
-    -DNAME=kApiJs -P ${CMAKE_CURRENT_SOURCE_DIR}/embed.cmake
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/api.js ${CMAKE_CURRENT_SOURCE_DIR}/embed.cmake
-  VERBATIM)
+# api.js and sql.js, compiled into the worker as strings.
+SET(MLE_V8_JS_H)
+FOREACH(js api sql)
+  SET(h ${CMAKE_CURRENT_BINARY_DIR}/${js}_js.h)
+  STRING(SUBSTRING ${js} 0 1 first)
+  STRING(TOUPPER ${first} first)
+  STRING(SUBSTRING ${js} 1 -1 rest)
+  ADD_CUSTOM_COMMAND(OUTPUT ${h}
+    COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_CURRENT_SOURCE_DIR}/${js}.js -DOUT=${h}
+      -DNAME=k${first}${rest}Js -P ${CMAKE_CURRENT_SOURCE_DIR}/embed.cmake
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${js}.js ${CMAKE_CURRENT_SOURCE_DIR}/embed.cmake
+    VERBATIM)
+  LIST(APPEND MLE_V8_JS_H ${h})
+ENDFOREACH()
 
 MYSQL_ADD_EXECUTABLE(mle_v8_worker
   main.cc
@@ -54,7 +61,7 @@ MYSQL_ADD_EXECUTABLE(mle_v8_worker
   values.cc
   ../common/mailbox.cc
   ../bootstrap/seccomp.cc
-  ${MLE_V8_API_H}
+  ${MLE_V8_JS_H}
   LINK_LIBRARIES ${MLE_LIBNODE}
   DESTINATION ${INSTALL_PLUGINDIR}/mle/v8
   COMPONENT MleV8

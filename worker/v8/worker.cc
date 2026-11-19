@@ -26,6 +26,7 @@
 #include <regex>
 
 #include "api_js.h"
+#include "sql_js.h"
 
 namespace mle::v8w {
 
@@ -98,6 +99,20 @@ void native_write(const v8::FunctionCallbackInfo<Value> &info) {
 
 void native_clear(const v8::FunctionCallbackInfo<Value> &) { Worker::current()->clear_console(); }
 
+void native_sql(const v8::FunctionCallbackInfo<Value> &info) {
+  Local<Value> v;
+  if (Worker::current()->sql(info).ToLocal(&v)) info.GetReturnValue().Set(v);
+}
+
+void native_state(const v8::FunctionCallbackInfo<Value> &info) {
+  info.GetReturnValue().Set(Worker::current()->state());
+}
+
+void native_nap(const v8::FunctionCallbackInfo<Value> &info) {
+  const double ms = info[0]->NumberValue(info.GetIsolate()->GetCurrentContext()).FromMaybe(0);
+  if (ms > 0) usleep(static_cast<useconds_t>(std::min(ms, 10.0) * 1000));
+}
+
 void native_library(const v8::FunctionCallbackInfo<Value> &info) {
   v8::Isolate *iso = info.GetIsolate();
   iso->ThrowException(v8::Exception::Error(
@@ -138,6 +153,9 @@ Worker::Worker(const Config &config) : m_config(config) {
   fn("write", native_write);
   fn("clear", native_clear);
   fn("library", native_library);
+  fn("sql", native_sql);
+  fn("state", native_state);
+  fn("nap", native_nap);
   v8::TryCatch tc(m_isolate);
   const Local<v8::Script> api =
       v8::Script::Compile(ctx, v8_string(m_isolate, kApiJs)).ToLocalChecked();
@@ -149,6 +167,12 @@ Worker::Worker(const Config &config) : m_config(config) {
   m_show.Reset(m_isolate,
                helpers->Get(ctx, v8_string(m_isolate, "show")).ToLocalChecked().As<v8::Function>());
   m_values = std::make_unique<Values>(m_isolate, ctx, &m_options);
+  // The SQL API (sql.js): the globals session, mysql, SqlError; its end-of-call hook.
+  const Local<v8::Function> sql_install =
+      v8::Script::Compile(ctx, v8_string(m_isolate, kSqlJs)).ToLocalChecked()->Run(ctx).ToLocalChecked().As<v8::Function>();
+  const Local<v8::Object> sql_hooks =
+      sql_install->Call(ctx, v8::Undefined(m_isolate), 1, &arg).ToLocalChecked().As<v8::Object>();
+  m_call_ended.Reset(m_isolate, sql_hooks->Get(ctx, v8_string(m_isolate, "callEnded")).ToLocalChecked().As<v8::Function>());
 }
 
 Worker::~Worker() = default;
@@ -210,6 +234,8 @@ void Worker::handle(const Message &m) {
   v8::HandleScope scope(m_isolate);
   const uint32_t saved_depth = m_depth;
   const uint64_t saved_seq = m_seq;
+  const uint64_t saved_scope = m_scope;
+  m_scope = ++m_scopes;
   m_depth = m.depth;
   if (m.depth == 0) m_seq = m.call_seq;
   try {
@@ -222,13 +248,16 @@ void Worker::handle(const Message &m) {
         break;
       case w::Op::kDrop: {
         Reader r(m.body, 0);
-        m_routines.erase(r.get<uint64_t>());
+        const auto id = r.get<uint64_t>();
+        m_routines.erase(id);
+        m_schemas.erase(id);
         result(uint32_t(w::Status::kOk), nullptr);
         break;
       }
       case w::Op::kReset:
         m_routines.erase(m_routines.begin(), m_routines.end());
         m_scripts.clear();
+        m_schemas.clear();
         m_isolate->LowMemoryNotification();  // a reset worker waits for reuse: give memory back
         result(uint32_t(w::Status::kOk), nullptr);
         break;
@@ -249,6 +278,7 @@ void Worker::handle(const Message &m) {
   }
   m_depth = saved_depth;
   m_seq = saved_seq;
+  m_scope = saved_scope;
 }
 
 void Worker::options(const Message &m) {
@@ -312,8 +342,8 @@ void Worker::prepare(const Message &m) {
   if (routine.has_return) routine.ret = ParamType::read(r);
   const auto imports = r.get<uint32_t>();
   for (uint32_t i = 0; i < imports; i++) (void)r.str(), (void)r.str(), (void)r.str();
-  (void)r.str();                // schema
-  (void)r.get<uint8_t>();       // check (names never defined: Python's)
+  m_schemas[id] = std::string(r.str());
+  (void)r.get<uint8_t>();  // check (names never defined: Python's)
   if (language != "js") {
     ErrorInfo e{language, "the language " + language + " is not available in this worker", {}, 0, ""};
     result(uint32_t(w::Status::kGuestError), &e);
@@ -330,8 +360,10 @@ void Worker::prepare(const Message &m) {
   m_routines.erase(id);  // prepared again after ALTER
   std::string compile_err;
   v8::TryCatch tc(m_isolate);
+  const uint64_t outer = std::exchange(m_routine, id);
   compile(id, name.empty() ? "routine_" + std::to_string(id) : name, entry, source, routine, names, modes,
           &compile_err);
+  m_routine = outer;
   const bool interrupted = top && Interrupts::end();
   if (!compile_err.empty()) {
     ErrorInfo e{"js", compile_err, {}, 0, ""};
@@ -514,8 +546,16 @@ void Worker::call(const Message &m) {
   if (top) Interrupts::begin(m_seq);
   stats(uint32_t(w::WorkerState::kRunning));
   Local<Value> ret;
+  const uint64_t outer = std::exchange(m_routine, id);
   const bool ok = routine.fn.Get(m_isolate)->Call(ctx, v8::Undefined(m_isolate), static_cast<int>(n), argv)
                       .ToLocal(&ret);
+  m_routine = outer;
+  // The SQL API's end of a call (sql.js: a nested call's unread result closed).
+  if (!m_call_ended.IsEmpty()) {
+    v8::TryCatch inner(m_isolate);
+    Local<Value> arg = v8::Boolean::New(m_isolate, top);
+    (void)m_call_ended.Get(m_isolate)->Call(ctx, v8::Undefined(m_isolate), 1, &arg);
+  }
   bool settled = true;
   if (ok) {
     m_isolate->PerformMicrotaskCheckpoint();
@@ -785,6 +825,222 @@ void Worker::result(uint32_t status, const ErrorInfo *error, const Routine *r, L
     (void)post(&instead, nullptr);
   }
   m_out.clear(), m_err.clear(), m_cleared = false;
+}
+
+// ------------------------------------------------------------ SQL
+
+Local<Value> Worker::state() {
+  const Local<v8::Context> ctx = m_context.Get(m_isolate);
+  const auto schema = m_schemas.find(m_routine);
+  Local<Value> items[] = {
+      v8::Number::New(m_isolate, m_depth),
+      v8::Number::New(m_isolate, static_cast<double>(m_scope)),
+      schema == m_schemas.end() ? Local<Value>(v8::Null(m_isolate)) : Local<Value>(v8_string(m_isolate, schema->second)),
+      v8::Number::New(m_isolate, static_cast<double>(m_options.integer_type)),
+      v8::Number::New(m_isolate, static_cast<double>(m_options.decimal_type)),
+      v8::Number::New(m_isolate, static_cast<double>(Mailbox::arena().size())),
+      v8::Number::New(m_isolate, static_cast<double>(m_seq)),
+  };
+  (void)ctx;
+  return v8::Array::New(m_isolate, items, std::size(items));
+}
+
+namespace {
+
+/** u32 n + n x (u32 level, u32 code, str message) as [[level, code, message], ...]. */
+Local<Value> warnings_of(v8::Isolate *iso, Reader &r) {
+  const auto n = r.get<uint32_t>();
+  if (n > 65535) throw Malformed{"too many warnings"};
+  const Local<v8::Array> a = v8::Array::New(iso, static_cast<int>(n));
+  const Local<v8::Context> ctx = iso->GetCurrentContext();
+  for (uint32_t i = 0; i < n; i++) {
+    const auto level = r.get<uint32_t>(), code = r.get<uint32_t>();
+    Local<Value> w[] = {v8::Number::New(iso, level), v8::Number::New(iso, code), v8_string(iso, r.str())};
+    (void)a->Set(ctx, i, v8::Array::New(iso, w, 3));
+  }
+  return a;
+}
+
+Local<Value> number(v8::Isolate *iso, uint64_t v) {
+  return v <= (uint64_t{1} << 53) ? Local<Value>(v8::Number::New(iso, static_cast<double>(v)))
+                                   : Local<Value>(v8::BigInt::NewFromUnsigned(iso, v));
+}
+
+}  // namespace
+
+v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
+  v8::Isolate *iso = m_isolate;
+  const Local<v8::Context> ctx = m_context.Get(iso);
+  const auto u32 = [&](int i) { return info[i]->Uint32Value(ctx).FromMaybe(0); };
+  const auto f64 = [&](int i) { return info[i]->NumberValue(ctx).FromMaybe(0); };
+  const auto throw_type = [&](const std::string &m) {
+    iso->ThrowException(v8::Exception::TypeError(v8_string(iso, m)));
+    return v8::MaybeLocal<Value>();
+  };
+  if (info.Length() < 9) return throw_type("sql: 9 arguments");
+  const auto action = static_cast<uint8_t>(u32(0));
+  const auto sid = static_cast<uint64_t>(f64(1));
+  const std::string text = info[2]->IsString() ? utf8(iso, info[2]) : std::string();
+  const auto flags = static_cast<uint8_t>(u32(4));
+  const auto width = u32(5);
+  // The statement's integerType and decimalType; -1: the session's.
+  Options rules = m_options;
+  const auto i32 = [&](int i) { return info[i]->Int32Value(ctx).FromMaybe(-1); };
+  if (const int it = i32(6); it >= 0 && it <= w::kMaxIntegerType) rules.integer_type = static_cast<w::IntegerType>(it);
+  if (const int dt = i32(7); dt >= 0 && dt <= w::kMaxDecimalType) rules.decimal_type = static_cast<w::DecimalType>(dt);
+  const Local<Value> proto_for = info[8];
+
+  // The message: in a buffer the size of the arena, larger when it does not fit (up to the host's limit).
+  Local<v8::Array> params;
+  uint32_t nparams = 0;
+  if (info[3]->IsArray()) {
+    params = info[3].As<v8::Array>();
+    nparams = params->Length();
+  }
+  if (nparams > w::kMaxValues)
+    return throw_type("Incorrect arguments: " + std::to_string(nparams) + " values in one statement (at most " +
+                      std::to_string(w::kMaxValues) + ")");
+  size_t size = Mailbox::arena().size();
+  size_t len = 0;
+  while (true) {
+    m_sql_buf.resize(size);
+    Writer wr(m_sql_buf);
+    try {
+      bool ok = wr.put(action) && wr.put(sid) && wr.str(text) && wr.put(nparams);
+      for (uint32_t i = 0; ok && i < nparams; i++) {
+        Local<Value> p;
+        if (!params->Get(ctx, i).ToLocal(&p)) return {};
+        m_values->write_param(wr, p);
+      }
+      ok = ok && wr.put(flags) && wr.put(uint32_t{0}) && wr.put(width);
+      if (!ok) throw ArenaFull{};
+      len = wr.size();
+      break;
+    } catch (const ArenaFull &) {
+      if (size >= w::kMaxWorkerMessage) {
+        // MySQL's error for a packet over max_allowed_packet (not its SQLSTATE 08S01): sql.js makes it a SqlError.
+        Local<Value> e[] = {v8::Number::New(iso, 0), v8::Number::New(iso, 1153), v8_string(iso, "HY000"),
+                            v8_string(iso, "the SQL statement with its parameters is larger than MLE allows (" +
+                                               std::to_string(w::kMaxWorkerMessage >> 20) + " MiB)"),
+                            v8::Number::New(iso, -1)};
+        m_sql_buf.clear();
+        m_sql_buf.shrink_to_fit();
+        return v8::Array::New(iso, e, 5);
+      }
+      size = std::min<size_t>(size * 4, w::kMaxWorkerMessage);
+    } catch (const ConversionError &c) {
+      return throw_type(c.message);
+    }
+  }
+  Mailbox::send(uint32_t(w::Op::kSql), uint32_t(w::Status::kOk), m_depth, m_seq, std::span(m_sql_buf).first(len));
+  if (m_sql_buf.size() > (4U << 20)) {
+    m_sql_buf.clear();
+    m_sql_buf.shrink_to_fit();
+  }
+  std::vector<std::byte> assembled;
+  while (true) {
+    const Message m = Mailbox::receive([&assembled](size_t total) {
+      assembled.resize(total);
+      return assembled.data();
+    });
+    if (m.op == uint32_t(w::Op::kSqlResult) && m.depth == m_depth) {
+      Reader r(m.body, 0);
+      switch (static_cast<w::SqlResultKind>(r.get<uint8_t>())) {
+        case w::SqlResultKind::kError: {
+          const auto code = r.get<uint32_t>();
+          const std::string state(r.str()), message(r.str());
+          const auto row = r.get<uint32_t>();
+          Local<Value> e[] = {v8::Number::New(iso, 0), v8::Number::New(iso, code), v8_string(iso, state),
+                              v8_string(iso, message),
+                              v8::Number::New(iso, row == w::kNoRow ? -1.0 : static_cast<double>(row))};
+          return v8::Array::New(iso, e, 5);
+        }
+        case w::SqlResultKind::kOk: {
+          const auto affected = r.get<uint64_t>(), insert_id = r.get<uint64_t>();
+          const Local<Value> warns = warnings_of(iso, r);
+          const bool more_results = r.get<uint8_t>() != 0;
+          const auto pcount = r.get<uint32_t>();
+          const auto exec_us = r.get<uint64_t>();
+          Local<Value> o[] = {v8::Number::New(iso, 1),       number(iso, affected),
+                              number(iso, insert_id),        warns,
+                              v8::Boolean::New(iso, more_results), v8::Number::New(iso, pcount),
+                              v8::Number::New(iso, static_cast<double>(exec_us))};
+          return v8::Array::New(iso, o, 7);
+        }
+        case w::SqlResultKind::kRows: {
+          const auto ncols = r.get<uint32_t>();
+          if (ncols > 4096) throw Malformed{"too many columns"};
+          std::vector<Local<v8::Name>> names;
+          std::vector<std::string> types;
+          std::vector<bool> keep;  // a label's first column (labels repeat: SELECT 1 a, 2 a)
+          const Local<v8::Array> labels = v8::Array::New(iso, static_cast<int>(ncols));
+          const Local<v8::Array> columns = v8::Array::New(iso, static_cast<int>(ncols));
+          std::vector<std::string> seen;
+          for (uint32_t i = 0; i < ncols; i++) {
+            const std::string name(r.str()), table(r.str());
+            const ParamType t = ParamType::read(r);
+            const std::string org_name(r.str()), schema(r.str()), org_table(r.str()), charset(r.str()),
+                collation(r.str());
+            const auto flags_ = r.get<uint32_t>();
+            const bool first = std::find(seen.begin(), seen.end(), name) == seen.end();
+            seen.push_back(name);
+            keep.push_back(first);
+            if (first) names.push_back(v8_string(iso, name));
+            types.push_back(t.type_name);
+            (void)labels->Set(ctx, i, v8_string(iso, name));
+            Local<Value> c[] = {v8_string(iso, name),          v8_string(iso, table),
+                                v8::Number::New(iso, static_cast<double>(t.tag)), v8::Boolean::New(iso, t.is_unsigned),
+                                v8::Number::New(iso, t.length), v8::Number::New(iso, t.precision),
+                                v8::Number::New(iso, t.scale),  v8_string(iso, t.type_name),
+                                v8_string(iso, org_name),       v8_string(iso, schema),
+                                v8_string(iso, org_table),      v8_string(iso, charset),
+                                v8_string(iso, collation),      v8::Number::New(iso, flags_)};
+            (void)columns->Set(ctx, i, v8::Array::New(iso, c, std::size(c)));
+          }
+          const auto total = r.get<uint64_t>();
+          const auto nrows = r.get<uint32_t>();
+          // The rows' prototype (getField, indexes, ...) from sql.js, once per reply.
+          Local<Value> proto = v8::Null(iso);
+          if (nrows > 0 && proto_for->IsFunction()) {
+            Local<Value> a = labels;
+            if (!proto_for.As<v8::Function>()->Call(ctx, v8::Undefined(iso), 1, &a).ToLocal(&proto)) return {};
+          }
+          const Local<v8::Array> rows = v8::Array::New(iso, static_cast<int>(nrows));
+          std::vector<Local<Value>> values(ncols);
+          try {
+            // A row is an array of its values with the labels as properties (GuestSql.GRow: array
+            // elements and members), its prototype sql.js's (getField ...).
+            for (uint32_t k = 0; k < nrows; k++) {
+              for (uint32_t i = 0; i < ncols; i++) values[i] = m_values->column(r, types[i], &rules);
+              const Local<v8::Array> row = v8::Array::New(iso, values.data(), ncols);
+              if (proto->IsObject()) (void)row->SetPrototype(ctx, proto);
+              for (uint32_t i = 0, j = 0; i < ncols; i++)
+                if (keep[i]) (void)row->CreateDataProperty(ctx, names[j++], values[i]);
+              (void)rows->Set(ctx, k, row);
+            }
+          } catch (const ConversionError &c) {
+            return throw_type(c.message);
+          }
+          const bool more = r.get<uint8_t>() != 0, more_results = r.get<uint8_t>() != 0;
+          const Local<Value> warns = warnings_of(iso, r);
+          const auto exec_us = r.get<uint64_t>();
+          Local<Value> o[] = {v8::Number::New(iso, 2),     labels, columns, number(iso, total), rows,
+                              v8::Boolean::New(iso, more), v8::Boolean::New(iso, more_results), warns,
+                              v8::Number::New(iso, static_cast<double>(exec_us))};
+          return v8::Array::New(iso, o, std::size(o));
+        }
+      }
+      throw Malformed{"bad SQL result kind"};
+    }
+    const bool nested = m.op == uint32_t(w::Op::kCall) || m.op == uint32_t(w::Op::kPrepare) ||
+                        m.op == uint32_t(w::Op::kDrop);
+    if (nested && m.depth == m_depth + 1) {
+      handle(m);
+      continue;
+    }
+    std::fprintf(stderr, "mle_v8_worker: fatal: unexpected message %u at depth %u during SQL\n", m.op, m.depth);
+    _exit(1);
+  }
 }
 
 }  // namespace mle::v8w

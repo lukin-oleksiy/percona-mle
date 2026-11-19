@@ -107,8 +107,9 @@ class Values {
 
   /** A SQL value (a row's column, an OUT value) without a declared parameter type: the value's
       own tag decides (Oracle's SQL API rules). type_name: the column's SQL type ("SET", "BIT",
-      "YEAR"; empty if unknown). */
-  v8::Local<v8::Value> column(Reader &r, std::string_view type_name);
+      "YEAR"; empty if unknown). rules: the statement's integerType and decimalType (nullptr: the
+      session's). */
+  v8::Local<v8::Value> column(Reader &r, std::string_view type_name, const Options *rules = nullptr);
 
   /** Skips one value. */
   static void skip(Reader &r);
@@ -131,9 +132,12 @@ class Values {
   v8::Local<v8::Value> temporal(const Temporal &t, bool as_date);
   [[noreturn]] void cannot(v8::Local<v8::Value> v, const ParamType &t);
 
+  const Options *rules() const { return m_rules != nullptr ? m_rules : m_opt; }
+
   v8::Isolate *m_iso;
   v8::Global<v8::Context> m_ctx;
   const Options *m_opt;
+  const Options *m_rules = nullptr;  // a statement's, while its rows are decoded
 };
 
 /** A UTF-8 std::string of a V8 string (or of String(v)). */

@@ -81,6 +81,13 @@ class Worker {
   // Natives (api.js's N).
   void write(int stream, std::string_view text);
   void clear_console();
+  /** N.sql(action, id, text, params, flags, width, integerType, decimalType, protoFor): one SQL
+      request (protocol.h kSql); serves the host's nested requests while it waits; the reply as an
+      array (see worker.cc). Throws (a V8 exception, returns empty) on a value that cannot be bound
+      or a message larger than the host takes. */
+  v8::MaybeLocal<v8::Value> sql(const v8::FunctionCallbackInfo<v8::Value> &info);
+  /** N.state(): [depth, scope, routine schema, integer type, decimal type, arena size]. */
+  v8::Local<v8::Value> state();
 
   static Worker *current() { return s_current; }
 
@@ -139,6 +146,7 @@ class Worker {
   v8::Global<v8::Context> m_context;
   v8::Global<v8::Object> m_api;      // api.js's helpers
   v8::Global<v8::Function> m_show;   // mle_eval's text of a value
+  v8::Global<v8::Function> m_call_ended;  // sql.js: the end of a routine call
   Options m_options;
   std::unique_ptr<Values> m_values;
   std::unordered_map<uint64_t, Routine> m_routines;
@@ -149,6 +157,12 @@ class Worker {
   bool m_exhausted = false;
   uint32_t m_depth = 0;
   uint64_t m_seq = 0;
+  /** Each request handled gets a scope (options set in a call apply to it only, C15). */
+  uint64_t m_scope = 0, m_scopes = 0;
+  /** The routine running (or loading) and each routine's schema (PREPARE). */
+  uint64_t m_routine = 0;
+  std::unordered_map<uint64_t, std::string> m_schemas;
+  std::vector<std::byte> m_sql_buf;
   uint32_t m_calls = 0;
   std::vector<std::byte> m_big;  // a RESULT larger than the arena
 };
