@@ -188,7 +188,9 @@ SET(CPACK_RPM_MLECPYTHON_PACKAGE_SUMMARY
   "Percona MLE: Python stored programs on CPython (mle.worker = CPYTHON)")
 SET(CPACK_RPM_MLEV8_PACKAGE_NAME percona-mle-v8)
 # No automatic dependencies (AUTOREQPROV OFF): libnode by its soname (nodejs-libs).
-SET(CPACK_RPM_MLEV8_PACKAGE_REQUIRES "percona-mle-common = ${mle_rpm_ver}, ${MLE_LIBNODE_SONAME}()(64bit)")
+# nodejs-full-i18n: ICU's data for nodejs-libs' own ICU (Intl; the worker points ICU at it).
+SET(CPACK_RPM_MLEV8_PACKAGE_REQUIRES
+  "percona-mle-common = ${mle_rpm_ver}, ${MLE_LIBNODE_SONAME}()(64bit), nodejs-full-i18n")
 SET(CPACK_RPM_MLEV8_PACKAGE_SUMMARY "Percona MLE: JavaScript stored programs on V8 (LANGUAGE JS)")
 SET(CPACK_RPM_MLETOOLS_PACKAGE_NAME percona-mle-tools)
 # No automatic dependencies (AUTOREQPROV OFF): the interpreter by name. Weak dependencies as

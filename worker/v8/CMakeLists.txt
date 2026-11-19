@@ -73,6 +73,8 @@ TARGET_INCLUDE_DIRECTORIES(mle_v8_worker PRIVATE
 TARGET_INCLUDE_DIRECTORIES(mle_v8_worker SYSTEM PRIVATE ${MLE_V8_INCLUDE_DIR})
 # V8's headers: the build's flags as libnode's (no pointer compression, no sandbox: config.gypi).
 TARGET_COMPILE_OPTIONS(mle_v8_worker PRIVATE -Wno-unused-parameter)
+TARGET_COMPILE_DEFINITIONS(mle_v8_worker PRIVATE MLE_LIBNODE_SONAME="${MLE_LIBNODE_SONAME}")
+TARGET_LINK_LIBRARIES(mle_v8_worker ${CMAKE_DL_LIBS})
 
 # The build tree's <plugin dir>/mle/v8 (CMakeLists.txt at the top links it).
 SET(MLE_V8_DIR ${CMAKE_CURRENT_BINARY_DIR}/layout)

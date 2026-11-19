@@ -17,6 +17,9 @@
 
 #include "worker.hpp"
 
+#include <dlfcn.h>
+#include <glob.h>
+#include <link.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -151,8 +154,45 @@ void native_compile_function(const v8::FunctionCallbackInfo<Value> &info) {
 
 // ------------------------------------------------------------ start
 
+namespace {
+
+/** ICU's data for a libnode with ICU of its own (the RHEL family's nodejs-libs: small data built
+    in, the full data in /usr/share/node-<major>/icudata, package nodejs-full-i18n). Node points ICU
+    there when it starts; an embedder must too, or Intl (and V8's date formatting) stops the
+    process with a fatal error. A libnode that uses the system's ICU (Debian, Ubuntu) needs none. */
+void setup_icu() {
+#ifdef MLE_LIBNODE_SONAME
+  void *lib = dlopen(MLE_LIBNODE_SONAME, RTLD_NOW | RTLD_NOLOAD);
+  if (lib == nullptr) return;
+  for (int v = 99; v >= 60; v--) {
+    void *set_dir = dlsym(lib, ("u_setDataDirectory_" + std::to_string(v)).c_str());
+    if (set_dir == nullptr) continue;
+    // Only ICU in libnode itself (dladdr names the object that defines the symbol).
+    Dl_info where{};
+    if (dladdr(set_dir, &where) == 0 || where.dli_fname == nullptr ||
+        std::string_view(where.dli_fname).find("libnode") == std::string_view::npos)
+      return;
+    glob_t g{};
+    const std::string pattern = "/usr/share/node*/icudata/icudt" + std::to_string(v) + "l.dat";
+    if (glob(pattern.c_str(), 0, nullptr, &g) == 0 && g.gl_pathc > 0) {
+      std::string dir(g.gl_pathv[0]);
+      dir.erase(dir.rfind('/'));
+      reinterpret_cast<void (*)(const char *)>(set_dir)(dir.c_str());
+    } else {
+      std::fprintf(stderr, "mle_v8_worker: no ICU %d data (%s; the package nodejs-full-i18n): Intl will fail\n", v,
+                   pattern.c_str());
+    }
+    globfree(&g);
+    return;
+  }
+#endif
+}
+
+}  // namespace
+
 Worker::Worker(const Config &config) : m_config(config) {
   s_current = this;
+  setup_icu();
   // Few background threads: a worker serves one session (compilation and GC helpers).
   m_platform = v8::platform::NewDefaultPlatform(2);
   v8::V8::InitializeICU();

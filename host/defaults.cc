@@ -194,6 +194,11 @@ ClassConfig v8_worker_class(const Layout &layout, const JvmClassOptions &o, uint
     c.args.push_back("--packages=" + js);
     c.read_paths.push_back(js);
   }
+  // ICU's data of a libnode with ICU of its own (the RHEL family: /usr/share/node-22/icudata).
+  if (glob_t g{}; glob("/usr/share/node*/icudata", GLOB_ONLYDIR, nullptr, &g) == 0) {
+    for (size_t i = 0; i < g.gl_pathc; i++) c.read_paths.push_back(g.gl_pathv[i]);
+    globfree(&g);
+  }
   // The JVM's environment (BLAS threads, malloc tunables) means nothing to V8.
   c.env.clear();
   return c;
