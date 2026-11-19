@@ -45,12 +45,25 @@ class Routine:
         self.base = base        # the globals each call starts from (USING binds into them)
 
 
+class _Output(io.StringIO):
+    """sys.stdout/stderr of routines: a write marks the call, so that the C++ call loop leaves its
+    RESULT (with the output) to Python."""
+
+    def write(self, s):
+        _mlewire.mark()
+        return io.StringIO.write(self, s)
+
+    def writelines(self, lines):
+        _mlewire.mark()
+        return io.StringIO.writelines(self, lines)
+
+
 class Console:
     """print() output of a call, returned in its RESULT."""
 
     def __init__(self):
-        self.out = io.StringIO()
-        self.err = io.StringIO()
+        self.out = _Output()
+        self.err = _Output()
 
     @staticmethod
     def take(s):
@@ -121,6 +134,7 @@ def load_body(src, name, params, has_outs, globals_):
 
     def fresh(*args):
         return make(code, base.copy())(*args)
+    fresh.__mle_code__ = code  # the C++ call loop makes the function itself
     return fresh, base
 
 
@@ -214,7 +228,7 @@ class Dispatcher:
         self.scope = 0
         self.scopes = 0
         self.schemas = {}  # each prepared routine's schema (execute_many's engine lookups)
-        self.tainted = False
+        self._tainted = False
         self.console = Console()
         self.vector_buffers = {}
         self.routine = 0  # the routine whose PREPARE or call runs now (libraries are per routine)
@@ -244,15 +258,31 @@ class Dispatcher:
         _mlewire.stats(wire.STATE_IDLE, 0)
         _mlewire.send(wire.READY, status, 0, 0, w.b)
 
+    @property
+    def tainted(self):
+        return self._tainted
+
+    @tainted.setter
+    def tainted(self, value):
+        self._tainted = bool(value)
+        _mlewire.taint(self._tainted)
+
     def loop(self):
-        while True:
-            try:
-                op, status, depth, seq, body = _mlewire.receive()
-                if depth != 0:
-                    raise RuntimeError('top-level message at depth %d' % depth)
-                self.handle(op, depth, seq, body)
-            except KeyboardInterrupt:
-                pass  # a KILL that came after its call had ended
+        """The request loop is C++ (_mlewire.serve): top-level calls of simple routines run there,
+        every other request comes to handle(), and the end of a fast call that needs Python (output,
+        SQL, an error, other result types) to fast_finish()."""
+        _mlewire.serve(self.handle, self.fast_finish, self.vector_arg, self.__dict__, self.libraries.open)
+
+    def fast_finish(self, rid, ret, failure, interrupted):
+        """The tail of call() for a call the C++ loop ran (its state is set: depth 0, seq, scope)."""
+        routine = self.routines[rid]
+        self.sql.call_ended(True)
+        if failure is None and interrupted:
+            self.result(wire.INTERRUPTED, error=self.guest('python', 'interrupted'))
+        elif failure is None:
+            self.result(wire.OK, ret, routine)
+        else:
+            self.failed(failure, interrupted, routine.name, routine.lines)
 
     def handle(self, op, depth, seq, body):
         saved = (self.depth, self.seq, self.scope)
@@ -272,10 +302,12 @@ class Dispatcher:
                 rid = r.u64()
                 self.routines.pop(rid, None)
                 self.schemas.pop(rid, None)
+                _mlewire.unregister(rid)
                 self.result(wire.OK)
             elif op == wire.RESET:
                 self.routines.clear()
                 self.schemas.clear()
+                _mlewire.unregister()
                 self.vector_buffers.clear()
                 gc.collect()
                 self.result(wire.OK)
@@ -324,6 +356,7 @@ class Dispatcher:
         if top:
             _mlewire.begin(self.seq)
         self.routines.pop(rid, None)
+        _mlewire.unregister(rid)
         outer, self.routine = self.routine, rid
         failure = None
         lines = source.split('\n')
@@ -341,8 +374,15 @@ class Dispatcher:
                 known = [alias or lib for _, lib, alias in imports]
                 for finding in check_names(source, names if entry == '' else [], known, self.globals):
                     self.console.err.write('\x1fmle-check:' + finding + '\n')
-            self.routines[rid] = Routine(fn, params, ret, outs, name, lines,
-                                         [(schema, lib, alias or lib) for schema, lib, alias in imports], base)
+            routine = Routine(fn, params, ret, outs, name, lines,
+                              [(schema, lib, alias or lib) for schema, lib, alias in imports], base)
+            self.routines[rid] = routine
+            if not routine.outs and not routine.imports and len(params) <= 64:
+                # The C++ call loop runs its top-level calls (exp note 62 §8).
+                code = getattr(fn, '__mle_code__', None)
+                _mlewire.register(rid, fn, code, base if code is not None else None, len(params),
+                                  -1 if ret is None else ret.tag, False if ret is None else ret.unsigned,
+                                  routine.vector_params)
         except BaseException as e:
             failure = e
         finally:
@@ -376,17 +416,21 @@ class Dispatcher:
         if routine is None or routine.nparams != n:
             self.result(wire.INTERNAL, error=('', 'routine %d is not prepared with %d parameters' % (rid, n), [], 0, ''))
             return
-        if routine.vector_params:
-            # VECTOR arguments into reused read-only numpy arrays, by parameter position.
-            at = [0]
+        try:
+            if routine.vector_params:
+                # VECTOR arguments into reused read-only numpy arrays, by parameter position.
+                at = [0]
 
-            def vector(dims, p, b=body):
-                i = at[0]
-                at[0] += 1
-                return self.vector_arg(i, dims, b, p)
-            args, _ = _decode(body, 16, n, vector)
-        else:
-            args, _ = _decode(body, 16, n)
+                def vector(dims, p, b=body):
+                    i = at[0]
+                    at[0] += 1
+                    return self.vector_arg(i, dims, b, p)
+                args, _ = _decode(body, 16, n, vector)
+            else:
+                args, _ = _decode(body, 16, n)
+        except ConversionError as e:
+            self.result(wire.GUEST_ERROR, error=(wire.LANGUAGE_TYPE, str(e), [], 0, ''))
+            return
         top = self.depth == 0
         if top:
             _begin(self.seq)
@@ -505,7 +549,7 @@ class Dispatcher:
         if isinstance(e, KeyboardInterrupt) or (interrupted and not isinstance(e, MemoryError)):
             self.result(wire.INTERRUPTED, error=('python', 'interrupted', frames, 0, ''))
         elif isinstance(e, (MemoryError, RecursionError)):
-            self.tainted = isinstance(e, MemoryError)
+            self.tainted = isinstance(e, MemoryError) or self.tainted
             self.result(wire.EXHAUSTED, error=('python', '%s: %s' % (type(e).__name__, e), frames, 0, ''))
         elif isinstance(e, ConversionError):
             self.result(wire.GUEST_ERROR, error=(wire.LANGUAGE_TYPE, str(e), frames, 0, ''))
@@ -527,6 +571,7 @@ class Dispatcher:
 
     def library_request(self, schema, name, known_hash):
         """A database library's body (Phase 6): LIBRARY, answered by LIBRARY_RESULT."""
+        _mlewire.mark()
         self.sql.flush_raw()
         w = Writer()
         w.str(schema)

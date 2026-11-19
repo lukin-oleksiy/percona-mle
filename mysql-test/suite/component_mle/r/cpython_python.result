@@ -94,6 +94,18 @@ SELECT py_err(1);
 ERROR HY000: Python> ZeroDivisionError: division by zero (py_err, line 3, in helper)
 SELECT py_range(-1);
 ERROR HY000: MLE-Type> value -1 is out of range for BIGINT in 'py_range(-1)'
+# A value Python cannot hold (a zero date) is the call's conversion error.
+SET @old_mode = @@sql_mode;
+SET sql_mode = '';
+CREATE TABLE zero_dates (d DATETIME);
+INSERT INTO zero_dates VALUES ('0000-00-00 00:00:00');
+SELECT py_types(1, 1, 'a', d, '00:00:00', 'null', '', 0) FROM zero_dates;
+ERROR HY000: MLE-Type> the DATETIME value 0000-00-00 0:00:00.000000 has no Python equivalent (zero date?) in 'py_types(1, 1.000, 'a', '0000-00-00 00:00:00.000000', '0:00:00.000000', 'null', ..., 0)'
+SET sql_mode = @old_mode;
+SELECT py_add(1, 2);
+py_add(1, 2)
+3
+DROP TABLE zero_dates;
 # A third-party package installed by the DBA (mle.package_dir).
 SELECT py_package(1, 2, 6);
 py_package(1, 2, 6)

@@ -200,6 +200,16 @@ SELECT py_print();
 SELECT py_err(1);
 --error ER_LANGUAGE_COMPONENT
 SELECT py_range(-1);
+--echo # A value Python cannot hold (a zero date) is the call's conversion error.
+SET @old_mode = @@sql_mode;
+SET sql_mode = '';
+CREATE TABLE zero_dates (d DATETIME);
+INSERT INTO zero_dates VALUES ('0000-00-00 00:00:00');
+--error ER_LANGUAGE_COMPONENT
+SELECT py_types(1, 1, 'a', d, '00:00:00', 'null', '', 0) FROM zero_dates;
+SET sql_mode = @old_mode;
+SELECT py_add(1, 2);
+DROP TABLE zero_dates;
 --echo # A third-party package installed by the DBA (mle.package_dir).
 SELECT py_package(1, 2, 6);
 SELECT py_probe();

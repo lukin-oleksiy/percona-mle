@@ -1719,6 +1719,7 @@ class Api:
 
     def _send(self, action, sid, msg, flags=0, width=0):
         """One SQL request (protocol.h kSql, Dispatcher.sqlRequest) of the message msg."""
+        _mlewire.mark()  # the C++ call loop leaves the end of this call to Python
         n = msg.n
         # More values than the host accepts in one message would end the worker (independent review C10).
         if n > MAX_VALUES:
