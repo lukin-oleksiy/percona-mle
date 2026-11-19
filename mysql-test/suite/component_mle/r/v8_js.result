@@ -140,6 +140,58 @@ CALL js_tampered(@r);
 SELECT @r;
 @r
 1:2:2 2:4:4 
+#
+# 8. Values MLE converts: a toJSON or toString that runs SQL while MLE
+#    writes the value is an error (the message being written is not
+#    overwritten); numbers too large for any column; lone surrogates; a
+#    SqlError's code out of range.
+#
+CREATE PROCEDURE js_reenter_param(OUT r TEXT) LANGUAGE JS AS $$
+const v = { toJSON() { session.runSql('SELECT 1'); return 1 } }
+try { session.runSql('SELECT ? AS x', [v]); r = 'ran' } catch (e) { r = e.name + ': ' + e.message }
+$$;
+CREATE PROCEDURE js_reenter_out(OUT r TEXT) LANGUAGE JS AS $$
+r = { toString() { session.runSql('SELECT 1'); return 'x' } }
+$$;
+CALL js_reenter_param(@r);
+SELECT @r;
+@r
+TypeError: cannot bind [object Object]
+# (a toString that throws gives '?', as before)
+CALL js_reenter_out(@r);
+SELECT @r;
+@r
+?
+SELECT js_double(6) AS after_reenter;
+after_reenter
+12
+CREATE FUNCTION js_huge_int() RETURNS BIGINT LANGUAGE JS AS $$ return '1e999999999' $$;
+CREATE FUNCTION js_huge_dec() RETURNS DECIMAL(10, 2) LANGUAGE JS AS $$ return '1e999999999' $$;
+SELECT js_huge_int();
+ERROR HY000: MLE-Type> Cannot convert value '1e999999999' to BIGINT from MLE in 'js_huge_int()'
+SELECT js_huge_dec();
+ERROR HY000: MLE-Type> value of 1000000000 digits is out of range for DECIMAL in 'js_huge_dec()'
+CREATE FUNCTION js_surrogate() RETURNS TEXT LANGUAGE JS AS $$ return 'a\uD800b' $$;
+SELECT HEX(js_surrogate()) AS replaced;
+replaced
+61EFBFBD62
+CREATE PROCEDURE js_bad_code() LANGUAGE JS AS $$ throw new SqlError('45000', 'bad code', 'x') $$;
+CALL js_bad_code();
+ERROR 45000: bad code
+#
+# 9. KILL while a nested routine runs stops the outer one too, although it
+#    catches the nested call's error.
+#
+CREATE FUNCTION js_nap() RETURNS INT LANGUAGE JS AS $$ mysql.sleep(60); return 1 $$;
+CREATE PROCEDURE js_catches() LANGUAGE JS AS $$
+for (;;) { try { session.runSql('SELECT js_nap()') } catch (e) { } }
+$$;
+CALL js_catches();
+KILL QUERY ID;
+ERROR 70100: Query execution was interrupted
+SELECT js_double(7) AS after_nested_kill;
+after_nested_kill
+14
 SET GLOBAL mle.v8_memory_max = DEFAULT;
 DROP FUNCTION js_engine;
 DROP FUNCTION graal_engine;
@@ -155,5 +207,13 @@ DROP FUNCTION js_hog;
 DROP FUNCTION js_buffers;
 DROP PROCEDURE js_rows;
 DROP PROCEDURE js_tampered;
+DROP PROCEDURE js_reenter_param;
+DROP PROCEDURE js_reenter_out;
+DROP FUNCTION js_huge_int;
+DROP FUNCTION js_huge_dec;
+DROP FUNCTION js_surrogate;
+DROP PROCEDURE js_bad_code;
+DROP FUNCTION js_nap;
+DROP PROCEDURE js_catches;
 REVOKE CREATE_JS_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_mle";

@@ -151,6 +151,57 @@ CALL js_rows(@r);
 SELECT @r;
 CALL js_tampered(@r);
 SELECT @r;
+
+--echo #
+--echo # 8. Values MLE converts: a toJSON or toString that runs SQL while MLE
+--echo #    writes the value is an error (the message being written is not
+--echo #    overwritten); numbers too large for any column; lone surrogates; a
+--echo #    SqlError's code out of range.
+--echo #
+CREATE PROCEDURE js_reenter_param(OUT r TEXT) LANGUAGE JS AS $$
+  const v = { toJSON() { session.runSql('SELECT 1'); return 1 } }
+  try { session.runSql('SELECT ? AS x', [v]); r = 'ran' } catch (e) { r = e.name + ': ' + e.message }
+$$;
+CREATE PROCEDURE js_reenter_out(OUT r TEXT) LANGUAGE JS AS $$
+  r = { toString() { session.runSql('SELECT 1'); return 'x' } }
+$$;
+CALL js_reenter_param(@r);
+SELECT @r;
+--echo # (a toString that throws gives '?', as before)
+CALL js_reenter_out(@r);
+SELECT @r;
+SELECT js_double(6) AS after_reenter;
+CREATE FUNCTION js_huge_int() RETURNS BIGINT LANGUAGE JS AS $$ return '1e999999999' $$;
+CREATE FUNCTION js_huge_dec() RETURNS DECIMAL(10, 2) LANGUAGE JS AS $$ return '1e999999999' $$;
+--error ER_LANGUAGE_COMPONENT
+SELECT js_huge_int();
+--error ER_LANGUAGE_COMPONENT
+SELECT js_huge_dec();
+CREATE FUNCTION js_surrogate() RETURNS TEXT LANGUAGE JS AS $$ return 'a\uD800b' $$;
+SELECT HEX(js_surrogate()) AS replaced;
+CREATE PROCEDURE js_bad_code() LANGUAGE JS AS $$ throw new SqlError('45000', 'bad code', 'x') $$;
+--error 1644
+CALL js_bad_code();
+
+--echo #
+--echo # 9. KILL while a nested routine runs stops the outer one too, although it
+--echo #    catches the nested call's error.
+--echo #
+CREATE FUNCTION js_nap() RETURNS INT LANGUAGE JS AS $$ mysql.sleep(60); return 1 $$;
+CREATE PROCEDURE js_catches() LANGUAGE JS AS $$
+  for (;;) { try { session.runSql('SELECT js_nap()') } catch (e) { } }
+$$;
+let $id = `SELECT CONNECTION_ID()`;
+--send CALL js_catches()
+--connection default
+let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.PROCESSLIST WHERE INFO = 'SELECT js_nap()';
+--source include/wait_condition.inc
+--replace_result $id ID
+eval KILL QUERY $id;
+--connection con2
+--error ER_QUERY_INTERRUPTED
+--reap
+SELECT js_double(7) AS after_nested_kill;
 --disconnect con2
 --connection default
 --source include/wait_until_count_sessions.inc
@@ -169,5 +220,13 @@ DROP FUNCTION js_hog;
 DROP FUNCTION js_buffers;
 DROP PROCEDURE js_rows;
 DROP PROCEDURE js_tampered;
+DROP PROCEDURE js_reenter_param;
+DROP PROCEDURE js_reenter_out;
+DROP FUNCTION js_huge_int;
+DROP FUNCTION js_huge_dec;
+DROP FUNCTION js_surrogate;
+DROP PROCEDURE js_bad_code;
+DROP FUNCTION js_nap;
+DROP PROCEDURE js_catches;
 REVOKE CREATE_JS_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_mle";

@@ -546,7 +546,15 @@ Ref py_sql(PyObject *args) {
       assembled = Ref::steal(PyBytes_FromStringAndSize(nullptr, Py_ssize_t(size)));
       return reinterpret_cast<std::byte *>(PyBytes_AS_STRING(assembled.get()));
     });
-    if (m.op == uint32_t(w::Op::kSqlResult) && m.depth == depth) return parse_sql_result(m, assembled);
+    if (m.op == uint32_t(w::Op::kSqlResult) && m.depth == depth) {
+      // A KILL that stopped a nested routine (its KeyboardInterrupt ended there) stops this one
+      // too: its SqlError could be caught (except Exception) and the routine run on.
+      if (Interrupts::interrupted()) {
+        PyErr_SetNone(PyExc_KeyboardInterrupt);
+        throw PyErrorSet{};
+      }
+      return parse_sql_result(m, assembled);
+    }
     const bool nested = m.op == uint32_t(w::Op::kCall) || m.op == uint32_t(w::Op::kPrepare) ||
                         m.op == uint32_t(w::Op::kDrop);
     if (nested && m.depth == depth + 1) {

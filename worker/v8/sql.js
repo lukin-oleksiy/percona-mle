@@ -177,7 +177,7 @@
   let makers = objectCreate(null), makerCount = 0;
   const makerFor = (labels) => {
     const n = labels.length;
-    let key = '';
+    let key = n + ':';  // the count too: a label may hold the separator
     for (let j = 0; j < n; j++) key += (j === 0 ? '' : '\u0000') + labels[j];
     let m = makers[key];
     if (m !== undefined) return m;
@@ -298,9 +298,15 @@
 
   // ---------------------------------------------------------------- results
   const REPLACED = 'the result was replaced by a new execution of its prepared statement';
-  // A batch of rows onto the rows read so far, in place (concat would copy them all per batch).
+  // A batch of rows onto the rows read so far, in place (concat would copy them all per batch); the
+  // rows from at. Index stores, not push or slice, which routine code may have replaced.
   const appendRows = (rows, batch) => {
-    for (let i = 0; i < batch.length; i++) rows.push(batch[i]);
+    for (let i = 0; i < batch.length; i++) rows[rows.length] = batch[i];
+  };
+  const rowsFrom = (rows, at) => {
+    const out = [];
+    for (let i = at; i < rows.length; i++) out[out.length] = rows[i];
+    return out;
   };
 
   // A result's own state: one slot under a symbol (not in its keys or JSON; a plain store, where
@@ -346,7 +352,7 @@
     $drain() {
       const s = this.$s;
       if (!s.more || s.replaced) return;
-      const rows = s.rows.slice(s.at);
+      const rows = rowsFrom(s.rows, s.at);
       while (s.more) appendRows(rows, this.$fetch());
       s.rows = rows; s.at = 0;
     }
@@ -372,7 +378,7 @@
     fetchAll() {
       this.$live();
       const s = this.$s;
-      const rows = s.at === 0 ? s.rows : s.rows.slice(s.at);
+      const rows = s.at === 0 ? s.rows : rowsFrom(s.rows, s.at);
       s.rows = []; s.at = 0;
       while (s.more) appendRows(rows, this.$fetch());
       return rows;

@@ -271,6 +271,11 @@ bool Interrupts::end() {
   return interrupted;
 }
 
+bool Interrupts::interrupted() {
+  const std::lock_guard lock(g_interrupt_lock);
+  return g_interrupted && g_running != 0;
+}
+
 bool Interrupts::running(uint64_t seq) {
   const std::lock_guard lock(g_interrupt_lock);
   return g_running == seq;

@@ -111,9 +111,6 @@ class Values {
       session's). */
   v8::Local<v8::Value> column(Reader &r, std::string_view type_name, const Options *rules = nullptr);
 
-  /** Skips one value. */
-  static void skip(Reader &r);
-
   /** Writes result v as type t (JsOracle.toJava, then Values.writeAs); ConversionError if it
       cannot be one, ArenaFull if it does not fit. */
   void write_as(Writer &w, v8::Local<v8::Value> v, const ParamType &t);

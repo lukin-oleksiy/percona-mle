@@ -184,6 +184,17 @@ CREATE FUNCTION py_hog(mib INT) RETURNS INT LANGUAGE CPYTHON AS $$
     a = np.ones(mib * 1024 * 1024 // 8)
     return int(a.sum())
 $$;
+CREATE FUNCTION py_nap() RETURNS INT LANGUAGE CPYTHON AS $$
+    mysql.sleep(60)
+    return 1
+$$;
+CREATE PROCEDURE py_catches() LANGUAGE CPYTHON AS $$
+    while True:
+        try:
+            session.run_sql('SELECT py_nap()')
+        except Exception:
+            pass
+$$;
 EOF
 --exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/cpython_python.sql 2>&1
 --remove_file $MYSQLTEST_VARDIR/tmp/cpython_python.sql
@@ -298,6 +309,18 @@ SELECT py_add(1, 1);
 --let $assert_text = The same worker after the timeout and KILL QUERY
 --let $assert_cond = $pid1 = $pid0
 --source include/assert.inc
+--echo # KILL while a nested routine runs stops the outer one too, although it
+--echo # catches the nested call's error (except Exception).
+--send CALL py_catches()
+--connection default
+--let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE info = 'SELECT py_nap()'
+--source include/wait_condition.inc
+--replace_result $con1_id CON1
+--eval KILL QUERY $con1_id
+--connection con1
+--error ER_QUERY_INTERRUPTED
+--reap
+SELECT py_add(2, 2) AS after_nested_kill;
 
 --echo #
 --echo # 4. A native crash ends the worker, not mysqld; the next call gets a new one.
@@ -349,6 +372,8 @@ DROP FUNCTION py_print;
 DROP FUNCTION py_err;
 DROP FUNCTION py_range;
 DROP FUNCTION py_loop;
+DROP FUNCTION py_nap;
+DROP PROCEDURE py_catches;
 DROP FUNCTION py_probe;
 DROP FUNCTION py_spawn;
 DROP FUNCTION py_package;

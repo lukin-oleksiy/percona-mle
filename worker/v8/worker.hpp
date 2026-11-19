@@ -44,6 +44,11 @@
 
 namespace mle::v8w {
 
+/** The error of N.sql or a library import from a toString / toJSON that MLE runs while it writes
+    a parameter, result or OUT value. */
+inline constexpr const char *kNoHostWhileConverting =
+    "SQL and library imports are not available in toString or toJSON while MLE converts a value";
+
 struct Config {
   std::string cls = "v8";
   int spin = 2000;
@@ -112,6 +117,8 @@ class Worker {
     bool async = false;
     bool eval = false;  // mle_eval: the value as text
     int script_id = 0;
+    /** mle_eval's script, which fn runs (V8 has no handle that keeps a Script but a Global). */
+    std::unique_ptr<v8::Global<v8::Script>> eval_script;
   };
   /** A routine's script: its name and source lines (line 1 without the wrapper), for frames. */
   struct Script {
@@ -123,6 +130,7 @@ class Worker {
   void ready(uint32_t status, const std::string &info);
   void handle(const common::Message &m);
   void prepare(const common::Message &m);
+  void drop_routine(uint64_t id);
   void call(const common::Message &m);
   void options(const common::Message &m);
   void parse_library(const common::Message &m);
@@ -213,6 +221,17 @@ class Worker {
   std::vector<std::byte> m_sql_buf;
   uint32_t m_calls = 0;
   std::vector<std::byte> m_big;  // a RESULT larger than the arena
+  /** C++ is writing values into a message (the SQL buffer, the arena): a value's toString or toJSON
+      runs routine code, which then may not send to the host (N.sql, a library), whose reply would
+      overwrite or move the message being written. */
+  int m_converting = 0;
+  struct Converting {
+    explicit Converting(int &n) : n_(n) { ++n_; }
+    ~Converting() { --n_; }
+    Converting(const Converting &) = delete;
+    Converting &operator=(const Converting &) = delete;
+    int &n_;
+  };
 };
 
 }  // namespace mle::v8w

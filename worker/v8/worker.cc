@@ -312,6 +312,13 @@ void Worker::stats(uint32_t state) {
 
 // ------------------------------------------------------------ requests
 
+void Worker::drop_routine(uint64_t id) {
+  const auto it = m_routines.find(id);
+  if (it == m_routines.end()) return;
+  m_scripts.erase(it->second.script_id);  // its frames' source lines
+  m_routines.erase(it);
+}
+
 void Worker::handle(const Message &m) {
   v8::HandleScope scope(m_isolate);
   const uint32_t saved_depth = m_depth;
@@ -334,7 +341,7 @@ void Worker::handle(const Message &m) {
       case w::Op::kDrop: {
         Reader r(m.body, 0);
         const auto id = r.get<uint64_t>();
-        m_routines.erase(id);
+        drop_routine(id);
         m_schemas.erase(id);
         result(uint32_t(w::Status::kOk), nullptr);
         break;
@@ -454,7 +461,7 @@ void Worker::prepare(const Message &m) {
   stats(uint32_t(w::WorkerState::kCompiling));
   const bool top = m_depth == 0;
   if (top) Interrupts::begin(m_seq);
-  m_routines.erase(id);  // prepared again after ALTER
+  drop_routine(id);  // prepared again after ALTER
   std::string compile_err;
   v8::TryCatch tc(m_isolate);
   const uint64_t outer = std::exchange(m_routine, id);
@@ -526,7 +533,8 @@ void Worker::compile(uint64_t, const std::string &name, const std::string &entry
     m_scripts[r.script_id] = std::move(s);
     // A function that runs the bound script: V8 has no handle to keep a Script, so the routine is
     // a native function holding it.
-    const Local<v8::External> data = v8::External::New(m_isolate, new v8::Global<v8::Script>(m_isolate, script));
+    r.eval_script = std::make_unique<v8::Global<v8::Script>>(m_isolate, script);
+    const Local<v8::External> data = v8::External::New(m_isolate, r.eval_script.get());
     r.fn.Reset(m_isolate, v8::Function::New(ctx,
                                             [](const v8::FunctionCallbackInfo<Value> &info) {
                                               auto *s = static_cast<v8::Global<v8::Script> *>(
@@ -671,6 +679,15 @@ void Worker::call(const Message &m) {
     }
   }
   const bool interrupted = top && Interrupts::end();
+  if (m_exhausted) {
+    // The heap limit hit after the routine returned (callEnded, the microtasks, whose TryCatch may
+    // have taken the termination): the same error as during the call.
+    m_exhausted = false;
+    m_isolate->CancelTerminateExecution();
+    ErrorInfo e{"js", "RangeError: out of memory (the V8 heap limit, mle.v8_heap_max)", {}, 0, ""};
+    result(uint32_t(w::Status::kExhausted), &e);
+    return;
+  }
   if (ok && settled && !tc.HasCaught() && !tc.HasTerminated()) {
     if (interrupted) {
       ErrorInfo e{"", "interrupted", {}, 0, ""};
@@ -754,8 +771,11 @@ ErrorInfo Worker::error_of(Local<Value> exception, Local<v8::Message> message) {
     if (o->Get(ctx, v8_string(m_isolate, "$mle$sql")).ToLocal(&mark) && mark->IsTrue()) {
       Local<Value> code, state, text;
       if (o->Get(ctx, v8_string(m_isolate, "message")).ToLocal(&text)) e.message = m_values->str(text);
-      if (o->Get(ctx, v8_string(m_isolate, "code")).ToLocal(&code) && code->IsNumber())
-        e.sql_errno = static_cast<uint32_t>(code.As<v8::Number>()->Value());
+      if (o->Get(ctx, v8_string(m_isolate, "code")).ToLocal(&code) && code->IsNumber()) {
+        // SIGNAL's MYSQL_ERRNO range; anything else (NaN from new SqlError(s, m, 'x')): 1644, SIGNAL's own.
+        const double c = code.As<v8::Number>()->Value();
+        e.sql_errno = c >= 1 && c <= 65535 && c == std::floor(c) ? static_cast<uint32_t>(c) : 1644;
+      }
       if (o->Get(ctx, v8_string(m_isolate, "sqlState")).ToLocal(&state) && state->IsString()) {
         e.sql_state = utf8(m_isolate, state);
         const bool valid = e.sql_state.size() == 5 &&
@@ -878,6 +898,7 @@ void Worker::result(uint32_t status, const ErrorInfo *error, const Routine *r, L
                     Local<v8::Array> outs) {
   ErrorInfo instead;
   const auto attempt = [&](Writer &wr, const ErrorInfo *e, const Routine *rr) {
+    const Converting converting(m_converting);
     write_result(wr, e, rr, ret, outs);
     return wr.size();
   };
@@ -977,6 +998,15 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
     return v8::MaybeLocal<Value>();
   };
   if (info.Length() < 8) return throw_type("sql: 8 arguments");
+  if (m_converting > 0) return throw_type(kNoHostWhileConverting);
+  // A KILL that stopped a nested routine (its failure cancels the termination) stops this one too,
+  // once back in JavaScript: it could catch the SqlError and run on.
+  struct Rearm {
+    v8::Isolate *iso;
+    ~Rearm() {
+      if (Interrupts::interrupted()) iso->TerminateExecution();
+    }
+  } rearm{iso};
   const auto action = static_cast<uint8_t>(u32(0));
   const auto sid = static_cast<uint64_t>(f64(1));
   const std::string text = info[2]->IsString() ? utf8(iso, info[2]) : std::string();
@@ -1003,6 +1033,7 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
   while (true) {
     m_sql_buf.resize(size);
     Writer wr(m_sql_buf);
+    const Converting converting(m_converting);
     try {
       bool ok = wr.put(action) && wr.put(sid) && wr.str(text) && wr.put(nparams);
       for (uint32_t i = 0; ok && i < nparams; i++) {

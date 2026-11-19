@@ -182,6 +182,14 @@ SELECT py_add(1, 1);
 py_add(1, 1)
 2
 include/assert.inc [The same worker after the timeout and KILL QUERY]
+# KILL while a nested routine runs stops the outer one too, although it
+# catches the nested call's error (except Exception).
+CALL py_catches();
+KILL QUERY CON1;
+ERROR 70100: Query execution was interrupted
+SELECT py_add(2, 2) AS after_nested_kill;
+after_nested_kill
+4
 #
 # 4. A native crash ends the worker, not mysqld; the next call gets a new one.
 #
@@ -232,6 +240,8 @@ DROP FUNCTION py_print;
 DROP FUNCTION py_err;
 DROP FUNCTION py_range;
 DROP FUNCTION py_loop;
+DROP FUNCTION py_nap;
+DROP PROCEDURE py_catches;
 DROP FUNCTION py_probe;
 DROP FUNCTION py_spawn;
 DROP FUNCTION py_package;

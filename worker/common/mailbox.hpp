@@ -94,6 +94,9 @@ class Interrupts {
   static bool end();
   /** Whether seq is the running request (for an engine's interrupt helper thread). */
   static bool running(uint64_t seq);
+  /** The top-level request was interrupted (an INTERRUPT delivered, end() not called yet): a nested
+      request that the interrupt stopped may not leave the outer code running. */
+  static bool interrupted();
 };
 
 }  // namespace mle::common

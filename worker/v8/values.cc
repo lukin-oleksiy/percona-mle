@@ -153,7 +153,7 @@ std::string utf8(v8::Isolate *iso, Local<Value> v) {
   if (v->IsString()) {
     const Local<v8::String> s = v.As<v8::String>();
     std::string out(s->Utf8Length(iso), '\0');
-    s->WriteUtf8(iso, out.data(), static_cast<int>(out.size()), nullptr, v8::String::NO_NULL_TERMINATION);
+    s->WriteUtf8(iso, out.data(), static_cast<int>(out.size()), nullptr, v8::String::NO_NULL_TERMINATION | v8::String::REPLACE_INVALID_UTF8);  // a lone surrogate: U+FFFD (3 bytes too)
     return out;
   }
   const v8::String::Utf8Value u(iso, v);
@@ -321,7 +321,7 @@ std::optional<std::string> decimal_text(std::string_view s, std::string_view tar
     if (d->zero() || integer_digits < -static_cast<int64_t>(kDecimalMaxScale)) return std::string("0");
     const std::string what = target == "SQL" ? "a DECIMAL parameter" : std::string(target);
     if (integer_digits > static_cast<int64_t>(kDecimalMaxDigits))
-      throw ConversionError{"value " + (d->precision() <= 40 ? d->plain()
+      throw ConversionError{"value " + (integer_digits <= 80 ? d->plain()  // not 1e999999999's zeros
                                                              : "of " + std::to_string(integer_digits) + " digits") +
                             " is out of range for " + what};
     d->round_to(kDecimalMaxScale);
@@ -499,41 +499,6 @@ Local<Value> Values::column(Reader &r, std::string_view type_name, const Options
   }
 }
 
-void Values::skip(Reader &r) {
-  const auto tag = static_cast<w::Tag>(r.get<uint8_t>());
-  switch (tag) {
-    case w::Tag::kNull:
-      return;
-    case w::Tag::kI64:
-    case w::Tag::kU64:
-    case w::Tag::kF64:
-      r.take(8);
-      return;
-    case w::Tag::kF32:
-      r.take(4);
-      return;
-    case w::Tag::kDecimal:
-    case w::Tag::kString:
-    case w::Tag::kJson:
-    case w::Tag::kBytes:
-      (void)r.str();
-      return;
-    case w::Tag::kDate:
-    case w::Tag::kTime:
-    case w::Tag::kDatetime:
-    case w::Tag::kTimestamp:
-      r.take(16);
-      return;
-    case w::Tag::kVector: {
-      const auto dims = r.get<uint32_t>();
-      r.align();
-      r.take(size_t{dims} * 4);
-      return;
-    }
-  }
-  throw Malformed{"bad value tag"};
-}
-
 // ------------------------------------------------------------ from JavaScript
 
 void Values::cannot(Local<Value> v, const ParamType &t) {
@@ -626,7 +591,8 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
         if (!d) cannot(v, t);
         Decimal rounded = *d;
         rounded.round_to(0);
-        if (!parse_int128(rounded.plain(), &b)) cannot(v, t);
+        // At most 40 digits before the text ("1e999999999" would be a billion zeros).
+        if (rounded.precision() - rounded.scale > 40 || !parse_int128(rounded.plain(), &b)) cannot(v, t);
       } else {
         cannot(v, t);
       }
@@ -717,6 +683,7 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
       std::vector<float> f;
       if (v->IsFloat32Array()) {
         const Local<v8::Float32Array> a = v.As<v8::Float32Array>();
+        if (a->Length() > w::kMaxVectorDimensions) throw ConversionError{"VECTOR too large: " + std::to_string(a->Length())};
         f.resize(a->Length());
         a->CopyContents(f.data(), f.size() * 4);
       } else if (v->IsArray() || v->IsArrayBufferView()) {
@@ -725,6 +692,7 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
         Local<Value> len;
         if (!o->Get(ctx, v8_string(m_iso, "length")).ToLocal(&len) || !len->IsNumber()) cannot(v, t);
         const double n = len.As<v8::Number>()->Value();
+        if (!(n >= 0 && n == std::floor(n))) cannot(v, t);
         if (n > w::kMaxVectorDimensions) throw ConversionError{"VECTOR too large: " + std::to_string(int64_t(n))};
         f.resize(static_cast<size_t>(n));
         for (uint32_t i = 0; i < f.size(); i++) {

@@ -119,6 +119,10 @@ const Worker::Library *Worker::lib_fetch(const std::string &schema, const std::s
     if (!m_lib_open.empty()) lib_touch(key, *known);
     return known;
   }
+  if (m_converting > 0) {
+    if (why != nullptr) *why = kNoHostWhileConverting;
+    return nullptr;
+  }
   // LIBRARY: the body from mysqld (protocol.h kLibrary), unless the worker has the current one.
   std::vector<std::byte> msg(16 + schema.size() + name.size() + 8);
   Writer wr(msg);
@@ -299,7 +303,7 @@ v8::MaybeLocal<Value> Worker::library_namespace(const std::string &schema, const
   return module_namespace(ctx, m);
 }
 
-v8::MaybeLocal<v8::Promise> Worker::dynamic_import(Local<v8::Context> ctx, Local<v8::Data>, Local<Value>,
+v8::MaybeLocal<v8::Promise> Worker::dynamic_import(Local<v8::Context> ctx, Local<v8::Data>, Local<Value> resource,
                                                    Local<v8::String> specifier, Local<v8::FixedArray>) {
   Worker *self = current();
   v8::Isolate *iso = self->m_isolate;
@@ -308,7 +312,14 @@ v8::MaybeLocal<v8::Promise> Worker::dynamic_import(Local<v8::Context> ctx, Local
   v8::TryCatch tc(iso);
   Local<v8::Module> m;
   Local<Value> ns;
-  const bool ok = resolve(ctx, specifier, Local<v8::FixedArray>(), Local<v8::Module>()).ToLocal(&m) &&
+  // The importer: its resource name, a package module's path (relative names and node_modules
+  // resolve from it, as for a static import; package_module ignores any other name).
+  const std::string spec = utf8(iso, specifier);
+  std::string schema, name;
+  const bool ok = (spec.starts_with("/") && library_path(spec, &schema, &name)
+                       ? self->library_module(schema, name)
+                       : self->package_module(ctx, spec, resource->IsString() ? utf8(iso, resource) : std::string()))
+                      .ToLocal(&m) &&
                   self->module_namespace(ctx, m).ToLocal(&ns);
   if (tc.HasTerminated()) {
     tc.ReThrow();
