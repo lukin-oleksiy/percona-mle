@@ -1,10 +1,12 @@
 #!/bin/sh
 set -e
 
-# The AOT cache is not a file of the package: remove it with the package (an
-# upgrade makes a new one).
+# The AOT cache is not a file of the package: remove it with the package. An
+# upgrade keeps it (as the RPM does) until the new postinst has made the new
+# one, which replaces it by a rename: workers that start in between get the
+# old cache, and the JVM does not use a cache that does not match its files.
 case "$1" in
-	remove|upgrade|deconfigure)
+	remove|deconfigure)
 		rm -f /usr/lib/mysql/plugin/mle/mle.aot /usr/lib/mysql/plugin/mle/mle.aot.new
 		;;
 esac

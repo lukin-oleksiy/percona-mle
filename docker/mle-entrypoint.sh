@@ -10,11 +10,41 @@
 # Environment: MYSQL_ROOT_PASSWORD (or MYSQL_ALLOW_EMPTY_PASSWORD=yes),
 # MLE_APP_USER / MLE_APP_PASSWORD (optional: an account with the MLE
 # privileges on its own database MLE_APP_DATABASE, default the user name).
+# Arguments: mysqld's options (with or without "mysqld" before them), or
+# another command to run instead.
 set -eu
 
+# Only options: they are mysqld's.
+case "${1:-}" in -*) set -- mysqld "$@" ;; esac
 if [ "${1:-mysqld}" != "mysqld" ]; then exec "$@"; fi
-shift || true
+[ $# -eq 0 ] || shift  # (dash ends the script on a shift of nothing)
 DATADIR=/var/lib/mysql
+# There while the first start does its setup, gone when all of it is done:
+# the data directory alone does not tell (mysqld --initialize makes it before
+# the accounts exist). In /var/lib/mysql's parent would not survive with the
+# volume, so it is a file of the data directory.
+MARKER="$DATADIR/.mle-first-start"
+
+# The values below come from the environment: any character may be in them.
+# They are written with printf (dash's echo takes backslash sequences), never
+# through a command substitution (it drops trailing newlines).
+# sql_string VALUE: the inside of a '...' string literal, for a session
+# without NO_BACKSLASH_ESCAPES (first_start sets its sql_mode): \ becomes
+# \\ and ' becomes ''. Nothing else is special there, to the server or to
+# the mysql client.
+sql_string() {
+  printf '%s' "$1" | LC_ALL=C sed -e 's/\\/\\\\/g' -e "s/'/''/g"
+}
+# sql_name VALUE: the inside of a `...` identifier: ` becomes ``.
+sql_name() {
+  printf '%s' "$1" | LC_ALL=C sed -e 's/`/``/g'
+}
+# sql_name_pattern VALUE: the same for a database name in GRANT ... ON
+# `name`.*, which is a LIKE pattern: \, _ and % stand for themselves with a
+# \ before them.
+sql_name_pattern() {
+  printf '%s' "$1" | LC_ALL=C sed -e 's/[\\_%]/\\&/g' -e 's/`/``/g'
+}
 
 delegate_cgroup() {
   cg=/sys/fs/cgroup
@@ -38,34 +68,74 @@ delegate_cgroup() {
 first_start() {
   echo "mle-entrypoint: initializing $DATADIR"
   mysqld --initialize-insecure --user=mysql --datadir="$DATADIR"
+  touch "$MARKER"  # (after: mysqld wants an empty directory to initialize)
   mysqld --user=mysql --skip-networking --socket=/var/run/mysqld/init.sock &
   pid=$!
+  up=no
   for i in $(seq 120); do
-    mysqladmin --socket=/var/run/mysqld/init.sock -uroot ping >/dev/null 2>&1 && break
+    if mysqladmin --socket=/var/run/mysqld/init.sock -uroot ping >/dev/null 2>&1; then
+      up=yes
+      break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
     sleep 1
   done
+  if [ "$up" != yes ]; then
+    echo "mle-entrypoint: the server did not start for the setup" >&2
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" || true
+    exit 1
+  fi
+  mle_privileges="CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE"
+  # --binary-mode: the client passes the bytes on as they are (no \r\n to
+  # \n). The first SQL error ends the batch and, with set -e, this script.
   {
-    echo "INSTALL COMPONENT 'file://component_mle';"
-    echo "INSTALL COMPONENT 'file://component_lang_router';"
+    printf '%s\n' "SET @@SESSION.sql_mode = '';"
+    printf '%s\n' "INSTALL COMPONENT 'file://component_mle';"
+    printf '%s\n' "INSTALL COMPONENT 'file://component_lang_router';"
     if [ -n "${MYSQL_ROOT_PASSWORD:-}" ]; then
-      echo "ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';"
-      echo "CREATE USER 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';"
-      echo "GRANT ALL ON *.* TO 'root'@'%' WITH GRANT OPTION;"
+      printf '%s' "ALTER USER 'root'@'localhost' IDENTIFIED BY '"
+      sql_string "$MYSQL_ROOT_PASSWORD"
+      printf '%s\n' "';"
+      printf '%s' "CREATE USER 'root'@'%' IDENTIFIED BY '"
+      sql_string "$MYSQL_ROOT_PASSWORD"
+      printf '%s\n' "';"
+      printf '%s\n' "GRANT ALL ON *.* TO 'root'@'%' WITH GRANT OPTION;"
     fi
-    echo "GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO 'root'@'localhost';"
+    printf '%s\n' "GRANT $mle_privileges ON *.* TO 'root'@'localhost';"
     if [ -n "${MLE_APP_USER:-}" ]; then
       db=${MLE_APP_DATABASE:-$MLE_APP_USER}
-      echo "CREATE DATABASE IF NOT EXISTS \`$db\`;"
-      echo "CREATE USER '${MLE_APP_USER}'@'%' IDENTIFIED BY '${MLE_APP_PASSWORD:-}';"
-      echo "GRANT ALL ON \`$db\`.* TO '${MLE_APP_USER}'@'%';"
-      echo "GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO '${MLE_APP_USER}'@'%';"
+      printf '%s' 'CREATE DATABASE IF NOT EXISTS `'
+      sql_name "$db"
+      printf '%s\n' '`;'
+      printf '%s' "CREATE USER '"
+      sql_string "$MLE_APP_USER"
+      printf '%s' "'@'%' IDENTIFIED BY '"
+      sql_string "${MLE_APP_PASSWORD:-}"
+      printf '%s\n' "';"
+      printf '%s' 'GRANT ALL ON `'
+      sql_name_pattern "$db"
+      printf '%s' "\`.* TO '"
+      sql_string "$MLE_APP_USER"
+      printf '%s\n' "'@'%';"
+      printf '%s' "GRANT $mle_privileges ON *.* TO '"
+      sql_string "$MLE_APP_USER"
+      printf '%s\n' "'@'%';"
     fi
     # In this session: root may have a password from here on.
-    echo "SHUTDOWN;"
-  } | mysql --socket=/var/run/mysqld/init.sock -uroot
-  wait "$pid" || true
+    printf '%s\n' "SHUTDOWN;"
+  } | mysql --binary-mode --socket=/var/run/mysqld/init.sock -uroot
+  wait "$pid"
+  rm -f "$MARKER"
 }
 
+if [ -e "$MARKER" ]; then
+  # Starting this server would run it without the component, the accounts
+  # and the root password.
+  echo "mle-entrypoint: $MARKER is there: the first start of this container" \
+    "did not finish its setup (see its log). Start again with an empty volume." >&2
+  exit 1
+fi
 if [ ! -d "$DATADIR/mysql" ]; then
   if [ -z "${MYSQL_ROOT_PASSWORD:-}" ] && [ "${MYSQL_ALLOW_EMPTY_PASSWORD:-}" != "yes" ]; then
     echo "mle-entrypoint: set MYSQL_ROOT_PASSWORD (or MYSQL_ALLOW_EMPTY_PASSWORD=yes)" >&2

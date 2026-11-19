@@ -210,6 +210,9 @@ IF(MLE_BUILD_JDK)
     COMMAND ${CMAKE_COMMAND} -E rm -rf ${MLE_JDK_DIR}
     COMMAND ${MLE_JAVA_HOME}/bin/jlink --add-modules ${MLE_JDK_MODULES}
       --strip-debug --no-man-pages --no-header-files --output ${MLE_JDK_DIR}
+    # jlink writes with the builder's umask, and the install keeps the modes
+    # (programs stay programs): readable by all, writable by the owner only.
+    COMMAND chmod -R u+rwX,go+rX,go-w ${MLE_JDK_DIR}
     COMMENT "Linking a trimmed GraalVM runtime for MLE"
     VERBATIM
     )

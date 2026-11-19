@@ -113,6 +113,12 @@ With the JVM build, `<plugin dir>/mle/mle_aot_cache` makes the JDK AOT cache tha
 `percona-mle` package runs it: Debian triggers, RPM file triggers, once per transaction that changes the JDK,
 jars or Python).
 
+`mle_package install python` needs a GraalPy with pip, of the workers' GraalVM version (the version in the name of
+`<plugin dir>/mle/deps/python-language-<version>.jar`), and the packages do not bring one: the venv they install is
+for the workers only, without its `bin/`. Get a GraalPy of that version, make a venv with it
+(`graalpy -m venv DIR`) and give `mle_package --graalpy DIR/bin/graalpy`; `docker/Dockerfile.tools` does this with
+GraalPy's jars from Maven on MLE's own runtime. In a build tree the tool finds the build's venv itself.
+
 SELinux (`packaging/selinux/percona_mle.te`): mysqld (`mysqld_t`) starts `mle_launcher` in `mle_launcher_t`
 (cgroups, mailboxes; no JIT), which starts workers in `mle_worker_t` (`execmem` for the JIT compilers); mysqld
 gains only the workers' descriptors and signals. On RHEL-like kernels Landlock must be enabled on the kernel

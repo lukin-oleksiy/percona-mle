@@ -40,7 +40,7 @@ if [ ! -x "$JAVA_HOME/bin/java" ]; then
   exit 0
 fi
 
-set -- -XX:+UseSerialGC --enable-native-access=ALL-UNNAMED \
+set -- -XX:+UseSerialGC -XX:-UseJVMCICompiler --enable-native-access=ALL-UNNAMED \
   --add-modules=jdk.incubator.vector \
   --add-exports=java.base/jdk.internal.vm=ALL-UNNAMED \
   -Dpolyglot.engine.userResourceCache="$DIR/resources" \

@@ -19,7 +19,8 @@ BUILD=$(realpath "${2:?$USAGE}")
 TAG=${3:-percona-mle:dev}
 HERE=$(dirname "$(realpath "$0")")
 CTX=$(mktemp -d "${TMPDIR:-/tmp}/percona-mle.XXXXXX")
-trap 'rm -rf "$CTX"' EXIT
+TOOLS_CTX=
+trap 'rm -rf "$CTX" ${TOOLS_CTX:+"$TOOLS_CTX"}' EXIT
 
 grep -q '^CMAKE_PROJECT_NAME:STATIC=percona-mle$' "$BUILD/CMakeCache.txt" ||
   { echo "build-image.sh: $BUILD is not a build of percona-mle" >&2; exit 1; }
@@ -53,10 +54,14 @@ docker build -t "$TAG" "$CTX"
 
 if [ "$TOOLS" = yes ]; then
   VERSION=$(sed -n 's:.*<graalvm.version>\(.*\)</graalvm.version>.*:\1:p' "$HERE/../worker/pom.xml")
-  TOOLS_TAG="${TAG%%:*}-tools:${TAG#*:}"
+  # <name>-tools:<tag>. The tag follows the last colon of the last path
+  # component (a colon before that is a registry's port); none: latest.
+  case "${TAG##*/}" in
+    *:*) TOOLS_TAG="${TAG%:*}-tools:${TAG##*:}" ;;
+    *) TOOLS_TAG="$TAG-tools:latest" ;;
+  esac
   TOOLS_CTX=$(mktemp -d "${TMPDIR:-/tmp}/percona-mle-tools.XXXXXX")
   cp "$HERE/Dockerfile.tools" "$HERE/graalpy" "$TOOLS_CTX/"
   docker build -t "$TOOLS_TAG" -f "$TOOLS_CTX/Dockerfile.tools" \
     --build-arg BASE="$TAG" --build-arg GRAALVM_VERSION="$VERSION" "$TOOLS_CTX"
-  rm -rf "$TOOLS_CTX"
 fi

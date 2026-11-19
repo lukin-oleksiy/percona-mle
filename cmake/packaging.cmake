@@ -21,7 +21,8 @@
 #                              (and the AppArmor profile, -DMLE_APPARMOR=ON: the
 #                              default where /etc/apparmor.d exists)
 #   percona-mle                the JVM build: worker jar, runtime jars, AOT cache  -> common, jdk
-#   percona-mle-jdk            the trimmed GraalVM runtime (-DMLE_BUILD_JDK=ON)
+#   percona-mle-jdk            the trimmed GraalVM runtime (-DMLE_BUILD_JDK=ON; without it no
+#                              such package, and percona-mle does not ask for one)
 #   percona-mle-python-runtime Python's standard library and the numpy venv (both builds) -> common
 #   percona-mle-python         GraalPy for the JVM build (jars)                      -> percona-mle, runtime
 #   percona-mle-python-native  the Python-only native build (-DMLE_PYTHON_NATIVE=ON) -> common, runtime
@@ -47,7 +48,21 @@ SET(CPACK_PACKAGE_VERSION ${MLE_VERSION})
 SET(CPACK_PACKAGE_DESCRIPTION_SUMMARY
   "Percona MLE: Python, Java and JavaScript stored programs for Percona Server")
 SET(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
-SET(CPACK_COMPONENTS_ALL MleCommon MleCore MleJdk MlePythonRuntime MlePython MlePythonNative MleTools)
+SET(CPACK_COMPONENTS_ALL MleCommon MleCore MlePythonRuntime MlePython MleTools)
+# Only the components the build has install rules for (both options are OFF by default).
+IF(MLE_BUILD_JDK)
+  LIST(APPEND CPACK_COMPONENTS_ALL MleJdk)
+  SET(mle_deb_jdk ", percona-mle-jdk (= ${MLE_VERSION}-${MLE_PACKAGE_RELEASE})")
+  SET(mle_rpm_jdk ", percona-mle-jdk = ${MLE_VERSION}-${MLE_PACKAGE_RELEASE}")
+ELSE()
+  SET(mle_deb_jdk "")
+  SET(mle_rpm_jdk "")
+  MESSAGE(STATUS "MLE packages: no percona-mle-jdk (-DMLE_BUILD_JDK=OFF); with such packages "
+    "mle.java_home must name a GraalVM JDK 25 on the host they are installed on")
+ENDIF()
+IF(MLE_PYTHON_NATIVE)
+  LIST(APPEND CPACK_COMPONENTS_ALL MlePythonNative)
+ENDIF()
 IF(MLE_SELINUX)
   LIST(APPEND CPACK_COMPONENTS_ALL MleSelinux)
 ENDIF()
@@ -74,7 +89,7 @@ IF(MLE_APPARMOR)
 ENDIF()
 SET(CPACK_DEBIAN_MLECORE_PACKAGE_NAME percona-mle)
 SET(CPACK_DEBIAN_MLECORE_PACKAGE_DEPENDS
-  "percona-mle-common (= ${mle_deb_ver}), percona-mle-jdk (= ${mle_deb_ver}), zlib1g")
+  "percona-mle-common (= ${mle_deb_ver})${mle_deb_jdk}, zlib1g")
 SET(CPACK_DEBIAN_MLECORE_PACKAGE_CONTROL_EXTRA
   "${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle/postinst;${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle/prerm;${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle/triggers")
 SET(CPACK_DEBIAN_MLEJDK_PACKAGE_NAME percona-mle-jdk)
@@ -89,7 +104,8 @@ SET(CPACK_DEBIAN_MLEPYTHONNATIVE_PACKAGE_DEPENDS
 SET(CPACK_DEBIAN_MLEPYTHONNATIVE_DESCRIPTION
   "Percona MLE: the Python-only native build (highly optimised for Python-only use: less memory, fast worker start)")
 SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_NAME percona-mle-tools)
-SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_DEPENDS "percona-mle (= ${mle_deb_ver})")
+# mle_package is a Python 3 script; it runs npm, Maven and a GraalPy the DBA brings.
+SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_DEPENDS "percona-mle (= ${mle_deb_ver}), python3")
 SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_RECOMMENDS "nodejs, npm, maven")
 
 # RPM (checked on Oracle Linux 10)
@@ -98,9 +114,12 @@ SET(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 SET(CPACK_RPM_PACKAGE_LICENSE "GPLv2")
 SET(CPACK_RPM_PACKAGE_ARCHITECTURE x86_64)
 SET(CPACK_RPM_PACKAGE_AUTOREQPROV OFF)
-# The server's directories belong to the server's package, not to ours.
+# The server's directories belong to the server's packages (plugin/debug: its debug package),
+# SELinux's to selinux-policy: not to ours.
 SET(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
-  /usr/lib64/mysql /usr/lib64/mysql/plugin /usr/lib/mysql /usr/lib/mysql/plugin)
+  /usr/lib64/mysql /usr/lib64/mysql/plugin /usr/lib64/mysql/plugin/debug
+  /usr/lib/mysql /usr/lib/mysql/plugin /usr/lib/mysql/plugin/debug
+  /usr/share/selinux /usr/share/selinux/packages /usr/share/selinux/packages/targeted)
 # Prebuilt runtime: no stripping, debuginfo or Python byte-compiling of the venv by rpmbuild.
 SET(CPACK_RPM_SPEC_MORE_DEFINE "%define __strip /bin/true
 %define __os_install_post %{nil}
@@ -117,7 +136,7 @@ IF(MLE_SELINUX)
 ENDIF()
 SET(CPACK_RPM_MLECORE_PACKAGE_NAME percona-mle)
 SET(CPACK_RPM_MLECORE_PACKAGE_REQUIRES
-  "percona-mle-common = ${mle_rpm_ver}, percona-mle-jdk = ${mle_rpm_ver}")
+  "percona-mle-common = ${mle_rpm_ver}${mle_rpm_jdk}")
 # The AOT cache: made by file triggers (packaging/rpm/percona-mle.triggers), once per transaction
 # that changes the JDK, jars or Python. CPack has no trigger sections: they follow the erase
 # scriptlet, the last section before the file list.
@@ -135,7 +154,10 @@ SET(CPACK_RPM_MLEPYTHONNATIVE_PACKAGE_NAME percona-mle-python-native)
 SET(CPACK_RPM_MLEPYTHONNATIVE_PACKAGE_REQUIRES
   "percona-mle-common = ${mle_rpm_ver}, percona-mle-python-runtime = ${mle_rpm_ver}")
 SET(CPACK_RPM_MLETOOLS_PACKAGE_NAME percona-mle-tools)
-SET(CPACK_RPM_MLETOOLS_PACKAGE_REQUIRES "percona-mle = ${mle_rpm_ver}")
+# No automatic dependencies (AUTOREQPROV OFF): the interpreter by name. Weak dependencies as
+# in the Debian package (CPack versions that do not know RECOMMENDS leave it out).
+SET(CPACK_RPM_MLETOOLS_PACKAGE_REQUIRES "percona-mle = ${mle_rpm_ver}, python3")
+SET(CPACK_RPM_MLETOOLS_PACKAGE_RECOMMENDS "nodejs, npm, maven")
 SET(CPACK_RPM_MLESELINUX_PACKAGE_NAME percona-mle-selinux)
 SET(CPACK_RPM_MLESELINUX_PACKAGE_ARCHITECTURE noarch)
 SET(CPACK_RPM_MLESELINUX_PACKAGE_REQUIRES "selinux-policy-targeted")

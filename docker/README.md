@@ -12,8 +12,8 @@ and a release build of percona-mle against it (best with `-DMLE_BUILD_JDK=ON`), 
 The image (Ubuntu 26.04) holds the server and component_mle with its runtime in `<plugin_dir>/mle`, as the packages
 install them (`21-packaging.md`): JavaScript, Java, Python + numpy, and the GraalVM runtime in `<plugin_dir>/mle/jdk`
 (the trimmed runtime of `-DMLE_BUILD_JDK=ON`, else a copy of the JDK the build used). The JDK AOT cache for worker
-start is made in the image (`mle_aot_cache`). `--tools` also builds `percona-mle-tools:dev` (mle_package with npm,
-Maven and a GraalPy of the workers' version).
+start is made in the image (`mle_aot_cache`). `--tools` also builds the tools image, `<name>-tools:<tag>` of the
+image's `<name>:<tag>` (`percona-mle-tools:dev`): mle_package with npm, Maven and a GraalPy of the workers' version.
 
 ## Run
 
@@ -21,7 +21,12 @@ Maven and a GraalPy of the workers' version).
       -v mle-data:/var/lib/mysql percona-mle:dev
 
 First start: initializes the datadir, installs component_mle and component_lang_router, grants the MLE privileges
-to root (and to `MLE_APP_USER`, optional, on its database).
+to root (and to `MLE_APP_USER`, optional, on its database). Passwords and names may hold any character. While
+that runs, `/var/lib/mysql/.mle-first-start` exists; a data directory that still has the file is one whose first
+start failed half way, and the container refuses to start on it: start again with an empty volume.
+
+Arguments after the image name are mysqld's options (`docker run ... percona-mle:dev --mle.pool-size=4`); another
+command runs instead of the server.
 
 - **Default (unprivileged):** the MLE sandbox (Landlock, seccomp) works; workers have no cgroups of their own (the
   error log says so): the Java heap per worker and the container's memory limit apply, and on memory pressure the

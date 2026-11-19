@@ -157,9 +157,11 @@ IF(MLE_DEBUG_BUILD)
   INSTALL_DEBUG_TARGET(mle_worker DESTINATION ${MLE_DEBUG_DIR}
     COMPONENT MleCommon)
   # resources: both builds read it (engine/ from the JVM build, python/ from
-  # Python); native: the Python-only native build.
+  # Python); native: the Python-only native build; packages: the default
+  # mle.package_dir, which the DBA makes (mle_package): a link to nothing
+  # until then, which the component takes as no packages.
   SET(MLE_DEBUG_LINKS mle-worker.jar:MleCore deps:MleCore resources:MleCommon
-    mle.aot:MleCore python-venv:MlePythonRuntime)
+    mle.aot:MleCore python-venv:MlePythonRuntime packages:MleCommon)
   IF(MLE_NATIVE_DIR)
     LIST(APPEND MLE_DEBUG_LINKS native:MlePythonNative)
   ENDIF()
