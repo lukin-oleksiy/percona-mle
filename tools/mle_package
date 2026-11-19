@@ -192,13 +192,23 @@ def install_python(d, specs, args, language="python"):
                  "--extra-index-url", GRAALPY_WHEELS,
                  *specs])
         else:
+            # The worker's own site-packages (numpy) comes first on its path:
+            # pip must resolve against those versions, and need not install
+            # them again (pip --target does not see them by itself).
+            bundled = python_dists(os.path.join(HERE, "cpython", "site-packages"))
             # The distribution's pip refuses to install for its Python (PEP 668):
             # a throw-away venv's pip, into the stage directory.
             with tempfile.TemporaryDirectory(prefix="mle-pip.") as venv:
+                constraints = os.path.join(venv, "bundled.txt")
+                with open(constraints, "w") as f:
+                    f.writelines("%s==%s\n" % (name, dists[0][1]) for name, dists in bundled.items())
                 run([cpython(args), "-m", "venv", venv])
                 run([os.path.join(venv, "bin", "pip"), "install", "--disable-pip-version-check",
-                     *binary, "--target", stage, *specs])
+                     *binary, "--target", stage, "--constraint", constraints, *specs])
             shutil.rmtree(os.path.join(stage, "bin"), ignore_errors=True)  # scripts name the venv
+            for name, dists in python_dists(stage).items():
+                if name in bundled:
+                    remove_python(stage, name, [info for info, _ in dists])
         have = python_dists(site)
         for name in python_dists(stage):
             if name in have:

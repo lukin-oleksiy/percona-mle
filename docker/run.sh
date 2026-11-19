@@ -37,6 +37,8 @@
 #   MLE_MEMORY     the container's memory limit [8g]
 #   MLE_PRIVILEGED yes: a privileged container, in which each MLE worker gets
 #                  its own memory and process limits (mle.memory_max) [no]
+#   MLE_WORKER     the worker build (mle.worker): JVM (Python, JavaScript and
+#                  Java) or CPYTHON (Python only, on CPython) [AUTO: JVM]
 #   MYSQL_ROOT_PASSWORD, MLE_APP_USER [app], MLE_APP_PASSWORD
 #                  for the first start; passwords not given are generated and
 #                  kept in the container's labels (run.sh status shows them)
@@ -98,11 +100,13 @@ start)
     app_pw=${MLE_APP_PASSWORD:-$(password)}
     privileged=
     [ "${MLE_PRIVILEGED:-no}" = yes ] && privileged=--privileged
+    worker=
+    [ -n "${MLE_WORKER:-}" ] && worker=--loose-mle.worker=$MLE_WORKER
     docker run -d --name "$NAME" $privileged -m "$MEMORY" -p "$BIND:$PORT:3306" \
       -v "$NAME-data:/var/lib/mysql" \
       -e MYSQL_ROOT_PASSWORD="$root_pw" -e MLE_APP_USER="$APP_USER" -e MLE_APP_PASSWORD="$app_pw" \
       --label "mle.root-password=$root_pw" --label "mle.app-user=$APP_USER" --label "mle.app-password=$app_pw" \
-      "$IMAGE" >/dev/null
+      "$IMAGE" $worker >/dev/null
   fi
   wait_ready
   "$0" status
