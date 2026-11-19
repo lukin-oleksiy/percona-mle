@@ -115,6 +115,7 @@ Packages (`cpack -G DEB` or `cpack -G RPM` in the build directory; the server mu
 | `percona-mle-python-runtime` | `MlePythonRuntime` | GraalPy's standard library and the numpy venv | common |
 | `percona-mle-python` | `MlePython` | GraalPy for the JVM build | percona-mle, python-runtime |
 | `percona-mle-cpython` | `MleCPython` | the CPython worker, its Python code and numpy (`-DMLE_CPYTHON=ON`) | common, the distribution's libpython3.x |
+| `percona-mle-v8` | `MleV8` | the V8 worker (`-DMLE_V8=ON`): `LANGUAGE JS` on the distribution's libnode | common, libnode (`libnode127`, `nodejs-libs`) |
 | `percona-mle-tools` | `MleTools` | `mle_package` (third-party npm, PyPI, Maven packages; `install cpython ...` for the CPython worker) | common |
 | `percona-mle-selinux` | `MleSelinux` | the SELinux policy module (RPM only; `-DMLE_SELINUX=ON`, the default with selinux-policy-devel) | pulled by common where SELinux policy is installed |
 

@@ -7,13 +7,14 @@ FROM ubuntu:26.04
 
 # The libraries mysqld, its plugins and the MLE binaries need (from ldd of the
 # installed tree on Ubuntu 26.04); libpython for the CPython worker
-# (mle.worker = CPYTHON), python3.14-venv for mle_package install cpython.
+# (LANGUAGE CPYTHON), python3.14-venv for mle_package install cpython; libnode
+# for the V8 worker (LANGUAGE JS).
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       libaio1t64 libatomic1 libcurl4t64 libfido2-1 libgssapi-krb5-2 libkrb5-3 \
       libldap2 libnuma1 libsasl2-2 libssl3t64 libtinfo6 libtirpc3t64 libzstd1 \
       zlib1g tini ca-certificates \
-      libpython3.14 python3.14-venv \
+      libpython3.14 python3.14-venv libnode127 \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # mysqld runs as mysql; MLE workers run as mysqld's user (19 §2).

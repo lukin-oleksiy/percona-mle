@@ -27,6 +27,7 @@ profile percona-mle flags=(complain) {
   @{MLE_DIR}/mle_launcher mr,
   @{MLE_DIR}/mle_worker mrix,
   @{MLE_DIR}/cpython/mle_cpython_worker mrix,
+  @{MLE_DIR}/v8/mle_v8_worker mrix,
 
   # MLE's files: the JDK, the jars, the AOT cache, Python and numpy.
   @{MLE_DIR}/ r,

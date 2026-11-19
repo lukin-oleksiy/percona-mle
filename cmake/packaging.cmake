@@ -28,6 +28,9 @@
 #   percona-mle-cpython        the CPython worker (-DMLE_CPYTHON=ON, the default with Python 3.12+;
 #                              exp design note 62): Python only, on the distribution's
 #                              libpython, with numpy (LANGUAGE CPYTHON)              -> common, libpython
+#   percona-mle-v8             the V8 worker (-DMLE_V8=ON, the default with libnode's V8 headers;
+#                              exp design note 63): LANGUAGE JS on the distribution's
+#                              libnode (its V8)                                      -> common, libnode
 #   percona-mle-tools          mle_package (third-party packages; uses the JVM build)
 #   percona-mle-selinux        the SELinux policy module (RPM only; -DMLE_SELINUX=ON, the default
 #                              with selinux-policy-devel)                          <- common
@@ -67,6 +70,12 @@ GET_PROPERTY(MLE_PYTHON_SONAME GLOBAL PROPERTY MLE_PYTHON_SONAME)
 GET_PROPERTY(MLE_PYTHON_MAJOR_MINOR GLOBAL PROPERTY MLE_PYTHON_MAJOR_MINOR)
 IF(MLE_PYTHON_SONAME)
   LIST(APPEND CPACK_COMPONENTS_ALL MleCPython)
+ENDIF()
+GET_PROPERTY(MLE_LIBNODE_SONAME GLOBAL PROPERTY MLE_LIBNODE_SONAME)
+IF(MLE_LIBNODE_SONAME)
+  LIST(APPEND CPACK_COMPONENTS_ALL MleV8)
+  # libnode.so.127 -> Debian's package libnode127, the RPM capability libnode.so.127()(64bit)
+  STRING(REGEX REPLACE "^lib(node)\\.so\\.([0-9]+)$" "lib\\1\\2" mle_libnode_deb "${MLE_LIBNODE_SONAME}")
 ENDIF()
 IF(MLE_SELINUX)
   LIST(APPEND CPACK_COMPONENTS_ALL MleSelinux)
@@ -119,6 +128,10 @@ SET(CPACK_DEBIAN_MLECPYTHON_PACKAGE_DEPENDS
   "percona-mle-common (= ${mle_deb_ver}), libpython${MLE_PYTHON_MAJOR_MINOR}")
 SET(CPACK_DEBIAN_MLECPYTHON_DESCRIPTION
   "Percona MLE: Python stored programs on CPython (mle.worker = CPYTHON): small workers, numpy, no JVM")
+SET(CPACK_DEBIAN_MLEV8_PACKAGE_NAME percona-mle-v8)
+SET(CPACK_DEBIAN_MLEV8_PACKAGE_DEPENDS "percona-mle-common (= ${mle_deb_ver}), ${mle_libnode_deb}")
+SET(CPACK_DEBIAN_MLEV8_DESCRIPTION
+  "Percona MLE: JavaScript stored programs on V8 (LANGUAGE JS): small workers, the distribution's libnode")
 SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_NAME percona-mle-tools)
 # mle_package is a Python 3 script; it runs npm, Maven, a GraalPy the DBA brings, or the
 # CPython worker's Python (python3-venv): it needs neither build of the workers itself.
@@ -173,6 +186,10 @@ SET(CPACK_RPM_MLECPYTHON_PACKAGE_REQUIRES
   "percona-mle-common = ${mle_rpm_ver}, ${MLE_PYTHON_SONAME}()(64bit)")
 SET(CPACK_RPM_MLECPYTHON_PACKAGE_SUMMARY
   "Percona MLE: Python stored programs on CPython (mle.worker = CPYTHON)")
+SET(CPACK_RPM_MLEV8_PACKAGE_NAME percona-mle-v8)
+# No automatic dependencies (AUTOREQPROV OFF): libnode by its soname (nodejs-libs).
+SET(CPACK_RPM_MLEV8_PACKAGE_REQUIRES "percona-mle-common = ${mle_rpm_ver}, ${MLE_LIBNODE_SONAME}()(64bit)")
+SET(CPACK_RPM_MLEV8_PACKAGE_SUMMARY "Percona MLE: JavaScript stored programs on V8 (LANGUAGE JS)")
 SET(CPACK_RPM_MLETOOLS_PACKAGE_NAME percona-mle-tools)
 # No automatic dependencies (AUTOREQPROV OFF): the interpreter by name. Weak dependencies as
 # in the Debian package (CPack versions that do not know RECOMMENDS leave it out).

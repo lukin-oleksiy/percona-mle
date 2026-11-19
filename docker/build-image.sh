@@ -36,9 +36,13 @@ done
 for c in MleCommon MleCore MlePythonRuntime MlePython MleTools; do
   cmake --install "$BUILD" --prefix "$CTX/stage" --component "$c" >> "$CTX/install.log"
 done
-# The CPython worker (mle.worker = CPYTHON), when the build has it (exp design note 62).
+# The CPython worker (LANGUAGE CPYTHON), when the build has it (exp design note 62).
 if grep -q '^MLE_CPYTHON:BOOL=ON' "$BUILD/CMakeCache.txt"; then
   cmake --install "$BUILD" --prefix "$CTX/stage" --component MleCPython >> "$CTX/install.log"
+fi
+# The V8 worker (LANGUAGE JS), when the build has it (exp design note 63).
+if grep -q '^MLE_V8:BOOL=ON' "$BUILD/CMakeCache.txt"; then
+  cmake --install "$BUILD" --prefix "$CTX/stage" --component MleV8 >> "$CTX/install.log"
 fi
 if grep -q '^MLE_BUILD_JDK:BOOL=ON' "$BUILD/CMakeCache.txt"; then
   cmake --install "$BUILD" --prefix "$CTX/stage" --component MleJdk >> "$CTX/install.log"
