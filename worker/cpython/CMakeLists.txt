@@ -58,13 +58,14 @@ MYSQL_ADD_EXECUTABLE(mle_cpython_worker
   mailbox.cc
   module.cc
   codec.cc
+  ../common/mailbox.cc
   ../bootstrap/seccomp.cc
   LINK_LIBRARIES Python3::Python
   DESTINATION ${INSTALL_PLUGINDIR}/mle/cpython
   COMPONENT MleCPython
   )
 TARGET_INCLUDE_DIRECTORIES(mle_cpython_worker PRIVATE
-  ${PROJECT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/../bootstrap)
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/worker ${CMAKE_CURRENT_SOURCE_DIR}/../bootstrap)
 TARGET_INCLUDE_DIRECTORIES(mle_cpython_worker SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
 TARGET_COMPILE_DEFINITIONS(mle_cpython_worker PRIVATE
   MLE_PYTHON_STDLIB="${MLE_PYTHON_STDLIB}"

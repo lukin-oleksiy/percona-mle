@@ -36,7 +36,7 @@ Ref py_open(PyObject *args) {
   int spin = 2000;
   if (!PyArg_ParseTuple(args, "|i", &spin)) throw PyErrorSet{};
   try {
-    return Ref::steal(PyLong_FromUnsignedLong(Mailbox::open(spin)));
+    return Ref::steal(PyLong_FromUnsignedLong(open_mailbox(spin)));
   } catch (const std::exception &e) {
     PyErr_SetString(PyExc_OSError, e.what());
     throw PyErrorSet{};

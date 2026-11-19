@@ -41,19 +41,17 @@
 #include <string_view>
 #include <utility>
 
+#include "common/wire.hpp"
 #include "mle/protocol.h"
 
 namespace mle::cpython {
 
-static_assert(std::endian::native == std::endian::little, "the wire is little-endian");
-
 /** A Python exception is set; return nullptr to Python. */
 struct PyErrorSet {};
 
-/** A message that does not follow the protocol. */
-struct Malformed {
-  const char *what;
-};
+using common::Malformed;
+using common::Reader;
+using common::Writer;
 
 /** An owned PyObject reference (nullptr allowed). */
 class Ref {
@@ -104,62 +102,6 @@ class Buffer {
 
  private:
   Py_buffer m_view{};
-};
-
-class Reader {
- public:
-  Reader(std::span<const std::byte> b, size_t pos) : m_b(b), m_p(pos) {
-    if (pos > b.size()) throw Malformed{"position beyond the message"};
-  }
-  template <class T>
-  T get() {
-    std::array<std::byte, sizeof(T)> a;
-    std::memcpy(a.data(), take(sizeof(T)).data(), sizeof(T));
-    return std::bit_cast<T>(a);
-  }
-  std::span<const std::byte> take(size_t n) {
-    if (n > m_b.size() - m_p) throw Malformed{"message too short"};
-    auto s = m_b.subspan(m_p, n);
-    m_p += n;
-    return s;
-  }
-  std::string_view str() {
-    const auto n = get<uint32_t>();
-    auto s = take(n);
-    return {reinterpret_cast<const char *>(s.data()), s.size()};
-  }
-  /** VECTOR data starts at kVectorAlignment relative to the message start. */
-  void align() { take((wire::kVectorAlignment - m_p % wire::kVectorAlignment) % wire::kVectorAlignment); }
-  size_t pos() const { return m_p; }
-
- private:
-  std::span<const std::byte> m_b;
-  size_t m_p;
-};
-
-/** Writes into a fixed span (the arena); false from fits() when it is full. */
-class Writer {
- public:
-  explicit Writer(std::span<std::byte> b) : m_b(b) {}
-  template <class T>
-  bool put(T v) {
-    const auto a = std::bit_cast<std::array<std::byte, sizeof(T)>>(v);
-    return bytes(a);
-  }
-  bool bytes(std::span<const std::byte> s) {
-    if (s.size() > m_b.size() - m_p) return false;
-    std::memcpy(m_b.data() + m_p, s.data(), s.size());
-    m_p += s.size();
-    return true;
-  }
-  bool str(std::string_view s) {
-    return put(static_cast<uint32_t>(s.size())) && bytes(std::as_bytes(std::span(s.data(), s.size())));
-  }
-  size_t size() const { return m_p; }
-
- private:
-  std::span<std::byte> m_b;
-  size_t m_p = 0;
 };
 
 /** Python functions the codec calls for rare values (set by setup()). */

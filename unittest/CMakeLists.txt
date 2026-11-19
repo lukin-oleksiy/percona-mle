@@ -92,11 +92,11 @@ IF(TARGET mle_cpython_worker)
   GET_PROPERTY(MLE_PYTHON_DYNLOAD GLOBAL PROPERTY MLE_PYTHON_DYNLOAD)
   SET(cpy ${PROJECT_SOURCE_DIR}/worker/cpython)
   MYSQL_ADD_EXECUTABLE(mle_cpython_codec-t cpython_codec-t.cc
-    ${cpy}/codec.cc ${cpy}/module.cc ${cpy}/mailbox.cc
+    ${cpy}/codec.cc ${cpy}/module.cc ${cpy}/mailbox.cc ${PROJECT_SOURCE_DIR}/worker/common/mailbox.cc
     ADD_TEST mle_cpython_codec
     LINK_LIBRARIES mle_host Python3::Python ${MLE_GMOCK_LIB} ${MLE_GTEST_LIB} Threads::Threads
     )
-  TARGET_INCLUDE_DIRECTORIES(mle_cpython_codec-t PRIVATE ${cpy})
+  TARGET_INCLUDE_DIRECTORIES(mle_cpython_codec-t PRIVATE ${cpy} ${PROJECT_SOURCE_DIR}/worker)
   TARGET_INCLUDE_DIRECTORIES(mle_cpython_codec-t SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
   TARGET_COMPILE_DEFINITIONS(mle_cpython_codec-t PRIVATE
     MLE_PYTHON_STDLIB="${MLE_PYTHON_STDLIB}"
