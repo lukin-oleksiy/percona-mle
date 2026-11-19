@@ -1,0 +1,22 @@
+# Percona MLE: what mysqld's profile (usr.sbin.mysqld) needs to run routines.
+# mysqld starts mle_launcher, which gets a profile of its own (percona-mle),
+# and talks to the launcher and the workers over inherited descriptors.
+#
+# The percona-mle-common package includes this file from
+# /etc/apparmor.d/local/usr.sbin.mysqld. A profile of mysqld that does not
+# include that file needs the line itself:
+#   include <abstractions/percona-mle-mysqld>
+
+  /usr/lib/mysql/plugin/{,debug/}mle/mle_launcher Px -> percona-mle,
+  /usr/lib/mysql/plugin/{,debug/}mle/ r,
+  /usr/lib/mysql/plugin/{,debug/}mle/** r,
+  /usr/lib/mysql/plugin/debug/component_mle.so mr,
+  /var/lib/mysql-mle-packages/ r,
+  /var/lib/mysql-mle-packages/** r,
+
+  signal (send) peer=percona-mle,
+  unix (send, receive) type=seqpacket peer=(label=percona-mle),
+
+  # The cgroup mysqld runs in: the workers' cgroups go below it.
+  @{PROC}/@{pid}/cgroup r,
+  @{sys}/fs/cgroup/** r,

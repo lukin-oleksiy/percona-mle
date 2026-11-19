@@ -115,6 +115,22 @@ IF(MLE_SELINUX)
     DESTINATION share/selinux/packages/targeted COMPONENT MleSelinux)
 ENDIF()
 
+# The AppArmor profile (packaging/apparmor; in percona-mle-common, Debian and
+# Ubuntu): the launcher and the workers in a profile of their own, and the
+# rules mysqld's profile needs to start them.
+IF(EXISTS /etc/apparmor.d)
+  SET(MLE_APPARMOR_DEFAULT ON)
+ELSE()
+  SET(MLE_APPARMOR_DEFAULT OFF)
+ENDIF()
+OPTION(MLE_APPARMOR "Install the AppArmor profile (/etc/apparmor.d)" ${MLE_APPARMOR_DEFAULT})
+IF(MLE_APPARMOR)
+  INSTALL(FILES packaging/apparmor/percona-mle
+    DESTINATION /etc/apparmor.d COMPONENT MleCommon)
+  INSTALL(FILES packaging/apparmor/percona-mle-mysqld
+    DESTINATION /etc/apparmor.d/abstractions COMPONENT MleCommon)
+ENDIF()
+
 ADD_SUBDIRECTORY(component)
 
 # The debug server (mysqld-debug, plugin_dir <plugin>/debug) gets MLE too: a

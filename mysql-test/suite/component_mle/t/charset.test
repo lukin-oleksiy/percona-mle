@@ -1,0 +1,131 @@
+--echo #
+--echo # component_mle: text in utf8mb4, the one character set of this
+--echo # proof of concept. Routines are created and called by utf8mb4 clients;
+--echo # other client character sets are not supported (the independent
+--echo # review's C8: a routine created by a latin1 client stores the
+--echo # non-ASCII text of its SQL wrongly).
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+SET NAMES utf8mb4;
+SELECT @@character_set_client, @@character_set_connection, @@character_set_results;
+
+# Two, three and four byte characters.
+SET @s = 'héllo Київ 日本 😀';
+SELECT HEX(@s) AS expected;
+CREATE TABLE cs (id INT PRIMARY KEY, who VARCHAR(10), v VARCHAR(40)) CHARACTER SET utf8mb4;
+CREATE TABLE l1 (v VARCHAR(40)) CHARACTER SET latin1;
+INSERT INTO l1 VALUES ('héllo');
+
+--echo # Arguments and return values.
+CREATE FUNCTION js_echo(s VARCHAR(40)) RETURNS VARCHAR(40) LANGUAGE JAVASCRIPT AS $$ return s $$;
+CREATE FUNCTION py_echo(s VARCHAR(40)) RETURNS VARCHAR(40) LANGUAGE PYTHON AS $$ return s $$;
+CREATE FUNCTION java_echo(s VARCHAR(40)) RETURNS VARCHAR(40) LANGUAGE JAVA AS $$ return s; $$;
+SELECT js_echo(@s) = @s AS js, py_echo(@s) = @s AS py, java_echo(@s) = @s AS java,
+  HEX(js_echo(@s)) = HEX(@s) AS js_bytes, HEX(py_echo(@s)) = HEX(@s) AS py_bytes,
+  HEX(java_echo(@s)) = HEX(@s) AS java_bytes;
+
+--echo # A literal of the routine's own text; characters are counted as
+--echo # characters (Python), not bytes.
+CREATE FUNCTION js_lit() RETURNS VARCHAR(40) LANGUAGE JAVASCRIPT AS $$ return 'héllo Київ 日本 😀' $$;
+CREATE FUNCTION py_lit() RETURNS VARCHAR(40) LANGUAGE PYTHON AS $$ return 'héllo Київ 日本 😀' $$;
+CREATE FUNCTION java_lit() RETURNS VARCHAR(40) LANGUAGE JAVA AS $$ return "héllo Київ 日本 😀"; $$;
+CREATE FUNCTION py_len(s VARCHAR(40)) RETURNS INT LANGUAGE PYTHON AS $$ return len(s) $$;
+SELECT js_lit() = @s AS js, py_lit() = @s AS py, java_lit() = @s AS java,
+  py_len(@s) AS py_len, CHAR_LENGTH(@s) AS sql_len;
+--echo # The same from plain SQL, to compare (the warning is the server's).
+CREATE FUNCTION sql_lit() RETURNS VARCHAR(40) RETURN 'héllo Київ 日本 😀';
+SELECT sql_lit() = @s AS sqlf;
+SELECT ROUTINE_NAME, ROUTINE_DEFINITION FROM information_schema.ROUTINES
+  WHERE ROUTINE_SCHEMA = 'test' AND ROUTINE_NAME IN ('js_lit', 'sql_lit') ORDER BY 1;
+SHOW CREATE FUNCTION js_lit;
+DROP FUNCTION sql_lit;
+
+--echo # An argument from a latin1 column arrives converted (C3A9 for é).
+SELECT HEX(js_echo(v)) AS js, HEX(py_echo(v)) AS py, HEX(java_echo(v)) AS java FROM l1;
+
+--echo # SQL from the routine: a literal in the statement, a parameter, the
+--echo # value read back, and a write to a latin1 column.
+--write_file $MYSQLTEST_VARDIR/tmp/charset_1.sql
+CREATE PROCEDURE js_sql(IN s VARCHAR(40), OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  session.runSql("INSERT INTO cs VALUES (1, 'js', 'héllo Київ 日本 😀')")
+  session.runSql("INSERT INTO cs VALUES (2, 'js', ?)", [s])
+  session.runSql("INSERT INTO cs VALUES (3, 'js', ?)", ['héllo Київ 日本 😀'])
+  session.runSql("INSERT INTO l1 VALUES (?)", ['café'])
+  const rows = session.runSql("SELECT v, HEX(v) AS h, v = ? AS same FROM cs WHERE who = 'js' ORDER BY id", [s]).fetchAll()
+  r = rows.map(x => (x.v === s) + '/' + x.same).join(' ') + ' ' +
+      session.runSql("SELECT HEX('é') AS h, HEX(?) AS p, CHAR_LENGTH(?) AS n", ['é', s]).fetchOne().join(' ')
+$$;
+CREATE PROCEDURE py_sql(IN s VARCHAR(40), OUT r TEXT) LANGUAGE PYTHON AS $$
+    session.run_sql("INSERT INTO cs VALUES (11, 'py', 'héllo Київ 日本 😀')")
+    session.run_sql("INSERT INTO cs VALUES (12, 'py', ?)", [s])
+    session.run_sql("INSERT INTO cs VALUES (13, 'py', ?)", ['héllo Київ 日本 😀'])
+    session.run_sql("INSERT INTO l1 VALUES (?)", ['café'])
+    rows = session.run_sql("SELECT v, HEX(v) AS h, v = ? AS same FROM cs WHERE who = 'py' ORDER BY id", [s]).fetch_all()
+    row = session.run_sql("SELECT HEX('é') AS h, HEX(?) AS p, CHAR_LENGTH(?) AS n", ['é', s]).fetch_one()
+    r = ' '.join('%s/%s' % (str(x.v == s).lower(), x.same) for x in rows) + ' %s %s %s' % (row.h, row.p, row.n)
+$$;
+CREATE PROCEDURE java_sql(IN s VARCHAR(40), OUT r TEXT) LANGUAGE JAVA AS $$
+  var q = Mle.session();
+  q.runSql("INSERT INTO cs VALUES (21, 'java', 'héllo Київ 日本 😀')");
+  q.runSql("INSERT INTO cs VALUES (22, 'java', ?)", s);
+  q.runSql("INSERT INTO cs VALUES (23, 'java', ?)", "héllo Київ 日本 😀");
+  q.runSql("INSERT INTO l1 VALUES (?)", "café");
+  StringBuilder b = new StringBuilder();
+  for (Row x : q.runSql("SELECT v, v = ? AS same FROM cs WHERE who = 'java' ORDER BY id", s))
+    b.append(s.equals(x.get(0))).append('/').append(x.get(1)).append(' ');
+  Row row = q.runSql("SELECT HEX('é') AS h, HEX(?) AS p, CHAR_LENGTH(?) AS n", "é", s).fetchOne();
+  r[0] = b.toString() + row.get(0) + " " + row.get(1) + " " + row.get(2);
+$$;
+EOF
+--exec $MYSQL --default-character-set=utf8mb4 test < $MYSQLTEST_VARDIR/tmp/charset_1.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/charset_1.sql
+CALL js_sql(@s, @r);
+SELECT @r;
+CALL py_sql(@s, @r);
+SELECT @r;
+CALL java_sql(@s, @r);
+SELECT @r;
+SELECT COUNT(*) AS n, COUNT(DISTINCT HEX(v)) AS different, MIN(HEX(v)) = HEX(@s) AS as_expected FROM cs;
+SELECT HEX(v) AS latin1_bytes, COUNT(*) AS n FROM l1 GROUP BY HEX(v) ORDER BY 1;
+
+--echo # Identifiers and column names.
+CREATE TABLE `таблиця` (`назва` VARCHAR(20), `日本` INT);
+INSERT INTO `таблиця` VALUES ('Дніпро', 1);
+CREATE PROCEDURE js_names(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const res = session.runSql("SELECT `назва`, `日本` FROM `таблиця`")
+  const row = res.fetchOne()
+  r = res.getColumnNames().join(',') + ' ' + row['назва'] + ' ' + row['日本']
+$$;
+CALL js_names(@r);
+SELECT @r = 'назва,日本 Дніпро 1' AS names;
+
+--echo # Errors and printed text.
+CREATE FUNCTION js_fail() RETURNS INT LANGUAGE JAVASCRIPT AS $$ throw new Error('помилка 😀') $$;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_fail();
+--echo # The server's messages are utf8mb3: a plain SIGNAL, to compare.
+--error ER_SIGNAL_EXCEPTION
+SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'помилка 😀';
+SELECT mle_session_state('traceback') LIKE '%помилка 😀%' AS traceback_keeps_it;
+CREATE FUNCTION py_print() RETURNS INT LANGUAGE PYTHON AS $$
+    print('друк 日本 😀')
+    return 1
+$$;
+SELECT py_print();
+SELECT mle_session_state('last_output') = 'друк 日本 😀\n' AS printed;
+
+--disconnect con1
+--connection default
+DROP TABLE cs, l1, `таблиця`;
+DROP FUNCTION js_echo; DROP FUNCTION py_echo; DROP FUNCTION java_echo;
+DROP FUNCTION js_lit; DROP FUNCTION py_lit; DROP FUNCTION java_lit; DROP FUNCTION py_len;
+DROP PROCEDURE js_sql; DROP PROCEDURE py_sql; DROP PROCEDURE java_sql;
+DROP PROCEDURE js_names; DROP FUNCTION js_fail; DROP FUNCTION py_print;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
+--source include/wait_until_count_sessions.inc

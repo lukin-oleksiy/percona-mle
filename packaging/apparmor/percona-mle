@@ -1,0 +1,68 @@
+# AppArmor profile of Percona MLE's processes: mle_launcher, which mysqld
+# starts, and the workers that run the routines. mysqld's own profile gets the
+# few rules it needs from abstractions/percona-mle-mysqld.
+#
+# Workers are confined by Landlock and seccomp whatever AppArmor does; this
+# profile keeps them out of mysqld's files (the data directory, the keyring,
+# the configuration) at this layer too. They stay in the launcher's profile:
+# the launcher sets no_new_privs before it starts a worker, and AppArmor then
+# allows no change to another profile.
+#
+# The profile follows the mode of the server's profile as the package ships it
+# (complain); `aa-enforce /etc/apparmor.d/percona-mle` enforces it. Other
+# places for MLE's files (mle.dir, mle.java_home, mle.package_dir) go into
+# /etc/apparmor.d/local/percona-mle.
+
+abi <abi/3.0>,
+
+include <tunables/global>
+
+@{MLE_DIR}=/usr/lib/mysql/plugin/mle /usr/lib/mysql/plugin/debug/mle
+@{MLE_PACKAGES}=/var/lib/mysql-mle-packages
+
+profile percona-mle flags=(complain) {
+  include <abstractions/base>
+
+  # The launcher and the worker bootstrap.
+  @{MLE_DIR}/mle_launcher mr,
+  @{MLE_DIR}/mle_worker mrix,
+
+  # MLE's files: the JDK, the jars, the AOT cache, Python and numpy.
+  @{MLE_DIR}/ r,
+  @{MLE_DIR}/** mr,
+
+  # Third-party packages the DBA installed with mle_package.
+  @{MLE_PACKAGES}/ r,
+  @{MLE_PACKAGES}/** mr,
+
+  # The launcher builds each worker's Landlock rules: it lists the system
+  # directories that lead to mysqld's plugin directory, which workers must
+  # not read, to allow the entries around it one by one.
+  /{usr/,}lib{,64}/ r,
+  /usr/libexec/ r,
+  /usr/lib/mysql/ r,
+  /usr/lib/mysql/plugin/ r,
+
+  # A worker is the first to go when memory runs out, and watches its own
+  # memory.
+  @{PROC}/@{pid}/oom_score_adj w,
+  @{PROC}/@{pid}/statm r,
+
+  # The workers' cgroups, below mysqld's delegated cgroup.
+  @{PROC}/@{pid}/cgroup r,
+  @{sys}/fs/cgroup/** rw,
+
+  signal (send, receive) peer=percona-mle,
+  signal (receive) peer=/usr/sbin/mysqld,
+  unix (send, receive) type=seqpacket peer=(label=/usr/sbin/mysqld),
+
+  # What the launcher and the workers report goes to mysqld's error log,
+  # which they inherit. "w" and not "a": AppArmor checks mysqld's own later
+  # writes to this shared open file against this profile too, as writes; with
+  # less here mysqld's error log stops. An error log somewhere else goes
+  # into local/percona-mle (without it only MLE's messages are lost).
+  /var/log/mysql/** w,
+
+  # Site-specific additions and overrides.
+  include if exists <local/percona-mle>
+}

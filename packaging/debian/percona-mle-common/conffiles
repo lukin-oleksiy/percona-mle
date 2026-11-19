@@ -1,0 +1,2 @@
+/etc/apparmor.d/percona-mle
+/etc/apparmor.d/abstractions/percona-mle-mysqld

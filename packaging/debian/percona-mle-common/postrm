@@ -1,0 +1,30 @@
+#!/bin/sh
+set -e
+
+# AppArmor: take MLE's rules out of mysqld's profile and MLE's profile out of
+# the kernel (see postinst). The files in /etc/apparmor.d are configuration
+# files: they stay until the package is purged.
+LOCAL=/etc/apparmor.d/local/usr.sbin.mysqld
+
+case "$1" in
+	remove|purge)
+		if [ -f $LOCAL ]; then
+			sed -i '/<abstractions\/percona-mle-mysqld>/d' $LOCAL
+		fi
+		if command -v aa-enabled >/dev/null 2>&1 && aa-enabled --quiet 2>/dev/null; then
+			if [ -f /etc/apparmor.d/usr.sbin.mysqld ]; then
+				apparmor_parser -r -T -W /etc/apparmor.d/usr.sbin.mysqld || true
+			fi
+			if [ -d /sys/kernel/security/apparmor/policy/profiles ] &&
+				ls /sys/kernel/security/apparmor/policy/profiles | grep -q '^percona-mle\.'; then
+				echo -n percona-mle > /sys/kernel/security/apparmor/.remove 2>/dev/null || true
+			fi
+		fi
+		;;
+esac
+if [ "$1" = purge ]; then
+	rm -f /etc/apparmor.d/local/percona-mle
+fi
+
+# (no debhelper: packages built with CPack, cmake/packaging.cmake)
+exit 0

@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+# AppArmor (packaging/apparmor): the profile of MLE's launcher and workers,
+# and the rules mysqld's profile needs to start them, which the server's
+# profile takes from its file of local additions.
+LOCAL=/etc/apparmor.d/local/usr.sbin.mysqld
+RULES=abstractions/percona-mle-mysqld
+
+apparmor() {
+	[ -f /etc/apparmor.d/percona-mle ] || return 0
+	mkdir -p /etc/apparmor.d/local
+	if ! grep -qsF "<$RULES>" $LOCAL; then
+		echo "include <$RULES>  # added by percona-mle-common" >> $LOCAL
+	fi
+	if command -v aa-enabled >/dev/null 2>&1 && aa-enabled --quiet 2>/dev/null; then
+		apparmor_parser -r -T -W /etc/apparmor.d/percona-mle || true
+		if [ -f /etc/apparmor.d/usr.sbin.mysqld ]; then
+			apparmor_parser -r -T -W /etc/apparmor.d/usr.sbin.mysqld || true
+		fi
+	fi
+}
+
+case "$1" in
+	configure)
+		apparmor
+		;;
+esac
+
+# (no debhelper: packages built with CPack, cmake/packaging.cmake)
+exit 0

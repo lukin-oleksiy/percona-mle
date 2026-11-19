@@ -18,6 +18,8 @@
 # INSTALL_LAYOUT=DEB or RPM for packages (a standalone server build gives <prefix>/lib/plugin).
 #
 #   percona-mle-common         component_mle, mle_launcher, mle_worker            both builds
+#                              (and the AppArmor profile, -DMLE_APPARMOR=ON: the
+#                              default where /etc/apparmor.d exists)
 #   percona-mle                the JVM build: worker jar, runtime jars, AOT cache  -> common, jdk
 #   percona-mle-jdk            the trimmed GraalVM runtime (-DMLE_BUILD_JDK=ON)
 #   percona-mle-python-runtime Python's standard library and the numpy venv (both builds) -> common
@@ -65,6 +67,11 @@ SET(mle_deb_ver "${MLE_VERSION}-${MLE_PACKAGE_RELEASE}")
 SET(CPACK_DEBIAN_MLECOMMON_PACKAGE_NAME percona-mle-common)
 SET(CPACK_DEBIAN_MLECOMMON_PACKAGE_DEPENDS
   "percona-server-server-core (>= ${MLE_SERVER_VERSION}), libc6, libstdc++6, libgcc-s1")
+IF(MLE_APPARMOR)
+  # The AppArmor files are configuration files; the scripts load the profile.
+  SET(CPACK_DEBIAN_MLECOMMON_PACKAGE_CONTROL_EXTRA
+    "${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle-common/postinst;${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle-common/postrm;${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle-common/conffiles")
+ENDIF()
 SET(CPACK_DEBIAN_MLECORE_PACKAGE_NAME percona-mle)
 SET(CPACK_DEBIAN_MLECORE_PACKAGE_DEPENDS
   "percona-mle-common (= ${mle_deb_ver}), percona-mle-jdk (= ${mle_deb_ver}), zlib1g")

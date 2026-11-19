@@ -86,7 +86,7 @@ Packages (`cpack -G DEB` or `cpack -G RPM` in the build directory; the server mu
 
 | Package | Component | Contents | Needs |
 |---|---|---|---|
-| `percona-mle-common` | `MleCommon` | `component_mle`, `mle_launcher`, `mle_worker` | the server |
+| `percona-mle-common` | `MleCommon` | `component_mle`, `mle_launcher`, `mle_worker`; the AppArmor profile (`-DMLE_APPARMOR=ON`, the default where `/etc/apparmor.d` exists) | the server |
 | `percona-mle` | `MleCore` | the JVM build: worker jar, runtime jars, JavaScript and Java | common, jdk |
 | `percona-mle-jdk` | `MleJdk` | a trimmed GraalVM runtime (`-DMLE_BUILD_JDK=ON`) | |
 | `percona-mle-python-runtime` | `MlePythonRuntime` | Python's standard library and the numpy venv (both builds) | common |
@@ -102,7 +102,15 @@ jars or Python).
 SELinux (`packaging/selinux/percona_mle.te`): mysqld (`mysqld_t`) starts `mle_launcher` in `mle_launcher_t`
 (cgroups, mailboxes; no JIT), which starts workers in `mle_worker_t` (`execmem` for the JIT compilers); mysqld
 gains only the workers' descriptors and signals. On RHEL-like kernels Landlock must be enabled on the kernel
-command line (`lsm=landlock,...`). In the server:
+command line (`lsm=landlock,...`).
+
+AppArmor (`packaging/apparmor`, Debian and Ubuntu): `percona-mle` is the profile of `mle_launcher` and the workers
+(they start with `no_new_privs`, so they keep the launcher's profile); `abstractions/percona-mle-mysqld` holds the
+rules mysqld's profile needs, and the package's `postinst` includes it from `local/usr.sbin.mysqld`. Both follow the
+mode of the server's packaged profile (complain). Checked enforcing in an Ubuntu 26.04 VM with a server installed in
+the package layout: JVM and native workers, cgroups, packages, `KILL`, a dying worker, no denials.
+
+In the server:
 
     INSTALL COMPONENT 'file://component_lang_router';
     INSTALL COMPONENT 'file://component_mle';
