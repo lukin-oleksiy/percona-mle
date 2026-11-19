@@ -100,7 +100,8 @@ Packages (`cpack -G DEB` or `cpack -G RPM` in the build directory; the server mu
 
 | Package | Component | Contents | Needs |
 |---|---|---|---|
-| `percona-mle-common` | `MleCommon` | `component_mle`, `mle_launcher`, `mle_worker`; the AppArmor profile (`-DMLE_APPARMOR=ON`, the default where `/etc/apparmor.d` exists) | the server |
+| `percona-mle-common` | `MleCommon` | `component_mle`, `mle_launcher`, `mle_worker` | the server |
+| `percona-mle-apparmor` | `MleApparmor` | the AppArmor profile (DEB only; `-DMLE_APPARMOR=ON`, the default where `/etc/apparmor.d` exists) | common; recommended by it |
 | `percona-mle` | `MleCore` | the JVM build: worker jar, runtime jars, JavaScript and Java | common, jdk |
 | `percona-mle-jdk` | `MleJdk` | a trimmed GraalVM runtime (`-DMLE_BUILD_JDK=ON`) | |
 | `percona-mle-python-runtime` | `MlePythonRuntime` | Python's standard library and the numpy venv (both builds) | common |

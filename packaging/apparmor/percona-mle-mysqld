@@ -2,7 +2,7 @@
 # mysqld starts mle_launcher, which gets a profile of its own (percona-mle),
 # and talks to the launcher and the workers over inherited descriptors.
 #
-# The percona-mle-common package includes this file from
+# The percona-mle-apparmor package includes this file from
 # /etc/apparmor.d/local/usr.sbin.mysqld. A profile of mysqld that does not
 # include that file needs the line itself:
 #   include <abstractions/percona-mle-mysqld>

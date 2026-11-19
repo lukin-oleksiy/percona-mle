@@ -115,9 +115,10 @@ IF(MLE_SELINUX)
     DESTINATION share/selinux/packages/targeted COMPONENT MleSelinux)
 ENDIF()
 
-# The AppArmor profile (packaging/apparmor; in percona-mle-common, Debian and
+# The AppArmor profile (packaging/apparmor; percona-mle-apparmor, Debian and
 # Ubuntu): the launcher and the workers in a profile of their own, and the
-# rules mysqld's profile needs to start them.
+# rules mysqld's profile needs to start them. A component of its own: its
+# files go to /etc whatever the prefix, so only a package installs them.
 IF(EXISTS /etc/apparmor.d)
   SET(MLE_APPARMOR_DEFAULT ON)
 ELSE()
@@ -126,9 +127,9 @@ ENDIF()
 OPTION(MLE_APPARMOR "Install the AppArmor profile (/etc/apparmor.d)" ${MLE_APPARMOR_DEFAULT})
 IF(MLE_APPARMOR)
   INSTALL(FILES packaging/apparmor/percona-mle
-    DESTINATION /etc/apparmor.d COMPONENT MleCommon)
+    DESTINATION /etc/apparmor.d COMPONENT MleApparmor)
   INSTALL(FILES packaging/apparmor/percona-mle-mysqld
-    DESTINATION /etc/apparmor.d/abstractions COMPONENT MleCommon)
+    DESTINATION /etc/apparmor.d/abstractions COMPONENT MleApparmor)
 ENDIF()
 
 ADD_SUBDIRECTORY(component)

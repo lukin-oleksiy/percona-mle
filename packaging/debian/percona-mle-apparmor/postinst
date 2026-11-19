@@ -11,7 +11,7 @@ apparmor() {
 	[ -f /etc/apparmor.d/percona-mle ] || return 0
 	mkdir -p /etc/apparmor.d/local
 	if ! grep -qsF "<$RULES>" $LOCAL; then
-		echo "include <$RULES>  # added by percona-mle-common" >> $LOCAL
+		echo "include <$RULES>  # added by percona-mle-apparmor" >> $LOCAL
 	fi
 	if command -v aa-enabled >/dev/null 2>&1 && aa-enabled --quiet 2>/dev/null; then
 		apparmor_parser -r -T -W /etc/apparmor.d/percona-mle || true

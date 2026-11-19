@@ -18,8 +18,8 @@
 # INSTALL_LAYOUT=DEB or RPM for packages (a standalone server build gives <prefix>/lib/plugin).
 #
 #   percona-mle-common         component_mle, mle_launcher, mle_worker            both builds
-#                              (and the AppArmor profile, -DMLE_APPARMOR=ON: the
-#                              default where /etc/apparmor.d exists)
+#   percona-mle-apparmor       the AppArmor profile (DEB only; -DMLE_APPARMOR=ON, the
+#                              default where /etc/apparmor.d exists)               <- common
 #   percona-mle                the JVM build: worker jar, runtime jars, AOT cache  -> common, jdk
 #   percona-mle-jdk            the trimmed GraalVM runtime (-DMLE_BUILD_JDK=ON; without it no
 #                              such package, and percona-mle does not ask for one)
@@ -66,6 +66,9 @@ ENDIF()
 IF(MLE_SELINUX)
   LIST(APPEND CPACK_COMPONENTS_ALL MleSelinux)
 ENDIF()
+IF(MLE_APPARMOR)
+  LIST(APPEND CPACK_COMPONENTS_ALL MleApparmor)
+ENDIF()
 SET(CPACK_PROJECT_CONFIG_FILE ${CMAKE_SOURCE_DIR}/cmake/cpack_project_config.cmake)
 SET(CPACK_DEB_COMPONENT_INSTALL ON)
 SET(CPACK_RPM_COMPONENT_INSTALL ON)
@@ -83,9 +86,16 @@ SET(CPACK_DEBIAN_MLECOMMON_PACKAGE_NAME percona-mle-common)
 SET(CPACK_DEBIAN_MLECOMMON_PACKAGE_DEPENDS
   "percona-server-server-core (>= ${MLE_SERVER_VERSION}), libc6, libstdc++6, libgcc-s1")
 IF(MLE_APPARMOR)
-  # The AppArmor files are configuration files; the scripts load the profile.
-  SET(CPACK_DEBIAN_MLECOMMON_PACKAGE_CONTROL_EXTRA
-    "${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle-common/postinst;${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle-common/postrm;${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle-common/conffiles")
+  # Where AppArmor is in use, the profile for the launcher and the workers.
+  SET(CPACK_DEBIAN_MLECOMMON_PACKAGE_RECOMMENDS "percona-mle-apparmor (= ${mle_deb_ver})")
+  SET(CPACK_DEBIAN_MLEAPPARMOR_PACKAGE_NAME percona-mle-apparmor)
+  SET(CPACK_DEBIAN_MLEAPPARMOR_PACKAGE_ARCHITECTURE all)
+  SET(CPACK_DEBIAN_MLEAPPARMOR_PACKAGE_DEPENDS "percona-mle-common (= ${mle_deb_ver}), apparmor")
+  SET(CPACK_DEBIAN_MLEAPPARMOR_DESCRIPTION
+    "Percona MLE: AppArmor profile for the MLE launcher and workers")
+  # Its files are configuration files; the scripts load the profile.
+  SET(CPACK_DEBIAN_MLEAPPARMOR_PACKAGE_CONTROL_EXTRA
+    "${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle-apparmor/postinst;${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle-apparmor/postrm;${CMAKE_SOURCE_DIR}/packaging/debian/percona-mle-apparmor/conffiles")
 ENDIF()
 SET(CPACK_DEBIAN_MLECORE_PACKAGE_NAME percona-mle)
 SET(CPACK_DEBIAN_MLECORE_PACKAGE_DEPENDS
