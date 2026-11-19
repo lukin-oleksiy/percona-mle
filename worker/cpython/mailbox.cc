@@ -123,26 +123,40 @@ void header(uint32_t op, uint32_t status, uint32_t flags, uint32_t depth, uint32
   m.call_seq = seq;
 }
 
-/** Runs in the main thread (a pending call, between two bytecodes): KeyboardInterrupt in the request
-    the INTERRUPT was for, nothing if it has ended meanwhile (a late one never stops the next). */
-int raise_interrupt(void *arg) {
+/** The thread that runs requests (Python's main thread): where KILL raises. */
+unsigned long g_main_ident = 0;
+
+/** A helper thread per INTERRUPT: takes the GIL (a Python loop gives it up every few milliseconds),
+    and while the same request still runs (it cannot end meanwhile: the GIL is held here) raises
+    KeyboardInterrupt in the main thread at its next bytecode. Neither PyErr_SetInterruptEx nor
+    Py_AddPendingCall do that from another thread in CPython 3.12: they only mark the event, and a
+    busy loop ran on until the host's SIGKILL. A thread of its own, so that the control thread
+    still takes SHUTDOWN and EOF while the GIL is busy in native code. */
+void *interrupter(void *arg) {
   const auto seq = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(arg));
+  const PyGILState_STATE gil = PyGILState_Ensure();
+  bool running;
   {
     const std::lock_guard lock(g_interrupt_lock);
-    if (g_running != seq) return 0;
+    running = g_running == seq;
   }
-  PyErr_SetNone(PyExc_KeyboardInterrupt);
-  return -1;
+  if (running) PyThreadState_SetAsyncExc(g_main_ident, PyExc_KeyboardInterrupt);
+  PyGILState_Release(gil);
+  return nullptr;
 }
 
-/** With g_interrupt_lock held. A pending call, not PyErr_SetInterruptEx: from another thread,
-    CPython 3.12 only marks the signal and wakes nothing (the main thread alone flags its own
-    signals), so a Python loop ran on until the host's SIGKILL; a pending call wakes the main
-    thread's eval loop in every version, and needs neither the GIL nor a SIGINT handler. */
+/** With g_interrupt_lock held. */
 void interrupt_main() {
   if (g_interrupted) return;
   g_interrupted = true;
-  Py_AddPendingCall(raise_interrupt, reinterpret_cast<void *>(static_cast<uintptr_t>(g_running)));
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  pthread_attr_setstacksize(&attr, 256 << 10);
+  pthread_t t;
+  // If no thread can be made, the host's SIGKILL after the grace ends the request.
+  pthread_create(&t, &attr, interrupter, reinterpret_cast<void *>(static_cast<uintptr_t>(g_running)));
+  pthread_attr_destroy(&attr);
 }
 
 void *control_thread(void *) {
@@ -176,6 +190,7 @@ uint32_t Mailbox::open(int spin) {
     throw std::runtime_error("not an MLE mailbox of protocol version " + std::to_string(w::kVersion));
   void *r = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, w::kMailboxFd, 0);
   if (r == MAP_FAILED) throw std::system_error(errno, std::system_category(), "mmap of the mailbox");
+  g_main_ident = PyThread_get_thread_ident();  // open() runs in the thread that serves requests
   g_hdr = static_cast<w::RegionHeader *>(r);
   g_arena = static_cast<std::byte *>(r) + w::kHeaderSize;
   g_arena_size = g_hdr->arena_size;
@@ -273,9 +288,16 @@ void Interrupts::begin(uint64_t seq) {
 }
 
 bool Interrupts::end() {
-  const std::lock_guard lock(g_interrupt_lock);
-  g_running = 0;  // a pending call that has not run yet does nothing now (raise_interrupt)
-  return std::exchange(g_interrupted, false);
+  bool interrupted;
+  {
+    const std::lock_guard lock(g_interrupt_lock);
+    g_running = 0;  // an interrupter that has not taken the GIL yet does nothing now
+    interrupted = std::exchange(g_interrupted, false);
+  }
+  // A KeyboardInterrupt set but not raised yet (the request returned first) is dropped: it would
+  // raise in the code that sends the RESULT, or in the next request.
+  if (interrupted) PyThreadState_SetAsyncExc(g_main_ident, nullptr);
+  return interrupted;
 }
 
 }  // namespace mle::cpython
