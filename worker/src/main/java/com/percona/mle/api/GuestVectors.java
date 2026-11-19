@@ -24,8 +24,9 @@ import org.graalvm.polyglot.Value;
 /**
  * JavaScript and Python vectors as float[] for the vector helper. Guest numbers are doubles, so
  * the host's own conversion to float[] fails for most of them (it must be lossless); these
- * round to float. numpy arrays are read in bulk (astype float32, tobytes); a Float32Array, a
- * JavaScript array, a Python list or tuple element by element; a Java float[] as it is.
+ * round to float (integers beyond 2^53 too). numpy arrays are read in bulk (astype float32,
+ * tobytes); a Float32Array, a JavaScript array, a Python list or tuple element by element; a Java
+ * float[] as it is.
  */
 final class GuestVectors {
   private GuestVectors() {}
@@ -130,7 +131,9 @@ final class GuestVectors {
     if (v == null || v.isNull()) throw new IllegalArgumentException("the lists must not be null");
     if (v.isHostObject() && v.asHostObject() instanceof Matches[] hm) return hm;
     if (!v.hasArrayElements()) throw new IllegalArgumentException("the lists must be an array of Matches");
-    Matches[] m = new Matches[(int) v.getArraySize()];
+    long n = v.getArraySize();
+    if (n > Integer.MAX_VALUE - 8) throw new IllegalArgumentException("the array of lists is too long");
+    Matches[] m = new Matches[(int) n];
     for (int i = 0; i < m.length; i++) {
       Value e = v.getArrayElement(i);
       if (!e.isHostObject() || !(e.asHostObject() instanceof Matches x))
@@ -157,17 +160,36 @@ final class GuestVectors {
     Value meta = v.getMetaObject();
     if (meta == null || !"Float32Array".equals(meta.getMetaSimpleName())) return null;
     Value buffer = v.getMember("buffer");
-    long offset = v.getMember("byteOffset").asLong(), length = v.getMember("byteLength").asLong();
-    if (!buffer.hasBufferElements() || length > Integer.MAX_VALUE - 8) return null;
-    byte[] raw = new byte[(int) length];
-    buffer.readBuffer(offset, raw, 0, raw.length);
+    long[] range = typedArrayBytes(v, buffer, 4);
+    if (range == null) return null;
+    byte[] raw = new byte[(int) range[1]];
+    buffer.readBuffer(range[0], raw, 0, raw.length);
     float[] f = new float[raw.length / 4];
     ByteBuffer.wrap(raw).order(ByteOrder.nativeOrder()).asFloatBuffer().get(f);
     return f;
   }
 
+  /**
+   * {byteOffset, byteLength} of a typed array v over buffer when its bytes can be copied in one
+   * read, else null (the caller then reads element by element): the two are the guest's own
+   * properties (a routine can redefine them), so they must be integers that lie inside the buffer
+   * and hold whole elements of elementSize bytes.
+   */
+  static long[] typedArrayBytes(Value v, Value buffer, int elementSize) {
+    if (buffer == null || !buffer.hasBufferElements()) return null;
+    Value bo = v.getMember("byteOffset"), bl = v.getMember("byteLength");
+    if (bo == null || bl == null || !bo.fitsInLong() || !bl.fitsInLong()) return null;
+    long offset = bo.asLong(), length = bl.asLong();
+    if (offset < 0 || length < 0 || length > Integer.MAX_VALUE - 8 || length % elementSize != 0
+        || offset > buffer.getBufferSize() - length)
+      return null;
+    return new long[] {offset, length};
+  }
+
   private static float number(Value e, String what, int i) {
     if (e.isNumber() && e.fitsInDouble()) return (float) e.asDouble();
+    if (e.isNumber() && e.fitsInLong()) return (float) e.asLong();  // an integer beyond 2^53: rounded
+    if (e.isNumber() && e.fitsInBigInteger()) return e.asBigInteger().floatValue();
     if (e.canInvokeMember("item")) {  // a numpy scalar
       Value x = e.invokeMember("item");
       if (x.isNumber() && x.fitsInDouble()) return (float) x.asDouble();
@@ -176,7 +198,7 @@ final class GuestVectors {
   }
 
   /** The shape of a numpy array, or null. */
-  private static int[] numpyShape(Value v) {
+  static int[] numpyShape(Value v) {
     if (v.isHostObject() || !v.hasMember("tobytes") || !v.hasMember("dtype") || !v.hasMember("shape")) return null;
     Value s = v.getMember("shape");
     if (!s.hasArrayElements()) return null;

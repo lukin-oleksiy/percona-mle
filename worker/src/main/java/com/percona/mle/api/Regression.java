@@ -45,7 +45,7 @@ public final class Regression {
     double[] m = StatsMath.comoments(a, b);
     double ssxm = m[0] / n, ssym = m[1] / n, ssxym = m[2] / n, xmean = m[3], ymean = m[4];
     if (ssxm == 0) throw new IllegalArgumentException("all x values are equal: the slope is undefined");
-    double r = ssym == 0 ? 0 : Math.max(-1, Math.min(1, ssxym / Math.sqrt(ssxm * ssym)));
+    double r = ssym == 0 ? 0 : StatsMath.r(ssxm, ssym, ssxym);
     double slope = ssxym / ssxm, intercept = ymean - slope * xmean;
     double p, se, ise;
     if (n == 2) {

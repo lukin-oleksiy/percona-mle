@@ -61,6 +61,13 @@ js_related
 SELECT js_inline('dot') AS js_inline, py_inline() AS py_inline;
 js_inline	py_inline
 2 0 dot 11	2 0 1.0000
+CALL java_load_ids(@r);
+SELECT @r AS load_ids;
+load_ids
+VectorSet(1 vectors of 8 dimensions, 1 NULL skipped) id 2; DECIMAL ids 3, 4
+SELECT js_redefined_array() AS js_redefined_array;
+js_redefined_array
+norm 5 5 median 2
 # 4. Errors.
 SELECT js_bad_metric() AS js;
 js
@@ -74,6 +81,9 @@ k must be at least 1, not 0
 the query must return (id, vector, label), (id, vector) or (vector), not 4 columns
 the first column must be an integer id (row 0 has float[])
 no vector with id 999
+the first column must be an integer id (row 0 has 1.5: not a whole number in the BIGINT range)
+the first column must be an integer id (row 0 has 18446744073709551615: not a whole number in the BIGINT range)
+the query has 1 dimensions, the rows have 0
 # 5. KILL QUERY stops the work; the worker stays, and has no extra threads.
 SELECT vec_long();
 KILL QUERY CON1;
@@ -123,6 +133,8 @@ DROP PROCEDURE py_near_vec;
 DROP FUNCTION py_inline;
 DROP FUNCTION js_bad_metric;
 DROP PROCEDURE java_errors;
+DROP PROCEDURE java_load_ids;
+DROP FUNCTION js_redefined_array;
 DROP FUNCTION vec_long;
 DROP FUNCTION vec_pool;
 DROP FUNCTION vec_warm;

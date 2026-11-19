@@ -27,6 +27,9 @@ import java.util.Map;
  * A {@link Frame}'s rows grouped by a column ({@link Frame#groupBy}): statistics per group that
  * SQL's GROUP BY cannot compute in MySQL (median, quantiles, a summary, correlation). Each result
  * is a Frame: the key, then the statistic(s); groups in ascending order of the key, NULL first.
+ * Column names stay distinct: a statistic of the key column itself is named after the statistic
+ * too ({@code groupBy("price").median("price")}: price, price_median), and any other statistic
+ * named like the key gets a trailing underscore (a key called count: count, count_).
  */
 public final class Grouped {
   private final Frame t;
@@ -43,7 +46,8 @@ public final class Grouped {
     int n = t.size();
     Map<Object, List<Integer>> by = new HashMap<>();
     for (int i = 0; i < n; i++) {
-      Object k = nk != null ? (Object) (Double.isNaN(nk[i]) ? null : nk[i]) : tk[i];
+      // + 0.0: -0.0 and 0.0 are one key (as for GROUP BY), not two boxed Doubles
+      Object k = nk != null ? (Object) (Double.isNaN(nk[i]) ? null : nk[i] + 0.0) : tk[i];
       by.computeIfAbsent(k == null ? NULL : k, x -> new ArrayList<>()).add(i);
     }
     List<Object> keys = new ArrayList<>(by.keySet());
@@ -79,16 +83,16 @@ public final class Grouped {
   }
 
   public Frame mean(String column) {
-    return per(column, x -> StatsMath.mean(StatsMath.sorted(x)));
+    return per(column, "mean", x -> StatsMath.mean(StatsMath.sorted(x)));
   }
 
   public Frame median(String column) {
-    return per(column, x -> StatsMath.quantileSorted(StatsMath.sorted(x), 0.5));
+    return per(column, "median", x -> StatsMath.quantileSorted(StatsMath.sorted(x), 0.5));
   }
 
   public Frame quantile(String column, double q) {
     StatsMath.checkQ(q);
-    return per(column, x -> StatsMath.quantileSorted(StatsMath.sorted(x), q));
+    return per(column, "quantile", x -> StatsMath.quantileSorted(StatsMath.sorted(x), q));
   }
 
   /** A Summary per group, as columns count, missing, mean, std, min, q1, median, q3, max, skewness, kurtosis. */
@@ -112,11 +116,13 @@ public final class Grouped {
     return result(new String[] {"correlation"}, new double[][] {c});
   }
 
-  private Frame per(String column, java.util.function.ToDoubleFunction<double[]> f) {
+  private Frame per(String column, String statistic, java.util.function.ToDoubleFunction<double[]> f) {
     double[] x = t.numbers(column);
     double[] c = new double[members.length];
     for (int g = 0; g < c.length; g++) c[g] = f.applyAsDouble(pick(x, members[g]));
-    return result(new String[] {t.name(t.index(column))}, new double[][] {c});
+    String name = t.name(t.index(column));
+    if (name.equalsIgnoreCase(t.name(key))) name += "_" + statistic;  // the key column's own statistic
+    return result(new String[] {name}, new double[][] {c});
   }
 
   private static double[] pick(double[] x, int[] rows) {
@@ -133,7 +139,8 @@ public final class Grouped {
     if (numKeys != null) num[0] = numKeys.clone();
     else text[0] = textKeys.clone();
     for (int j = 0; j < names.length; j++) {
-      n2[j + 1] = names[j];
+      // Frame finds a column by its name: a statistic must not hide behind the key's
+      n2[j + 1] = names[j].equalsIgnoreCase(n2[0]) ? names[j] + "_" : names[j];
       num[j + 1] = cols[j];
     }
     return new Frame(n2, num, text, members.length);

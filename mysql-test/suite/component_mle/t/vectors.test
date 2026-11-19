@@ -181,12 +181,35 @@ Runnable[] cases = {
   () -> Vectors.load("SELECT id, v, 1, 2 FROM items"),
   () -> Vectors.load("SELECT v, id FROM items"),
   () -> Vectors.load("SELECT id, v FROM items").nearestTo(999, 1, "dot"),
+  // An id is a whole number in the BIGINT range: not truncated, not wrapped.
+  () -> Vectors.load("SELECT 1.5, v FROM items WHERE id = 1"),
+  () -> Vectors.load("SELECT 18446744073709551615, v FROM items WHERE id = 1"),
+  // Rows of no dimensions are still rows.
+  () -> Vectors.nearest(new float[] {1}, new float[][] {new float[0]}, 1, Vectors.Metric.DOT),
 };
 for (Runnable c : cases) {
   try { c.run(); b.append("no error\n"); }
   catch (IllegalArgumentException e) { b.append(e.getMessage()).append('\n'); }
 }
 r[0] = b.toString().trim();
+$$;
+-- A row without a vector is skipped whatever its id is (here NULL, from the outer join); a
+-- DECIMAL id that is a whole number is an id.
+CREATE PROCEDURE java_load_ids(OUT r TEXT) LANGUAGE JAVA AS $$
+VectorSet s = Vectors.load("SELECT b.id, b.v FROM items a LEFT JOIN items b ON b.id = a.id AND a.id = 2 "
+    + "WHERE a.id IN (1, 2) ORDER BY a.id");
+VectorSet d = Vectors.load("SELECT CAST(id AS DECIMAL(10,2)), v FROM items WHERE id IN (3, 4) ORDER BY id");
+r[0] = s + " id " + s.id(0) + "; DECIMAL ids " + d.id(0) + ", " + d.id(1);
+$$;
+-- A typed array whose byteLength or byteOffset the routine redefined is read element by element.
+CREATE FUNCTION js_redefined_array() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors');
+  const S = Java.type('com.percona.mle.api.Stats');
+  const a = new Float32Array([3, 4]), b = new Float32Array([3, 4]), c = new Float64Array([1, 2, 3]);
+  Object.defineProperty(a, 'byteLength', {value: -4});
+  Object.defineProperty(b, 'byteOffset', {value: 1 << 20});
+  Object.defineProperty(c, 'byteLength', {value: 7});
+  return `norm ${V.norm(a)} ${V.norm(b)} median ${S.median(c)}`;
 $$;
 -- Long enough to be killed: all pairs of 50000 x 768 (several seconds even with threads).
 CREATE FUNCTION vec_long() RETURNS TEXT LANGUAGE JAVA AS $$
@@ -249,6 +272,9 @@ SELECT @j AS java, @py AS python, JSON_EXTRACT(@js, '$[*].id') AS js;
 CALL js_related(@r);
 SELECT @r AS js_related;
 SELECT js_inline('dot') AS js_inline, py_inline() AS py_inline;
+CALL java_load_ids(@r);
+SELECT @r AS load_ids;
+SELECT js_redefined_array() AS js_redefined_array;
 
 --echo # 4. Errors.
 SELECT js_bad_metric() AS js;
@@ -330,6 +356,8 @@ DROP PROCEDURE py_near_vec;
 DROP FUNCTION py_inline;
 DROP FUNCTION js_bad_metric;
 DROP PROCEDURE java_errors;
+DROP PROCEDURE java_load_ids;
+DROP FUNCTION js_redefined_array;
 DROP FUNCTION vec_long;
 DROP FUNCTION vec_pool;
 DROP FUNCTION vec_warm;

@@ -24,7 +24,8 @@ import org.graalvm.polyglot.Value;
 /**
  * JavaScript and Python columns of numbers as double[] for the statistics helper (exp note 54): a
  * numpy array in bulk (astype float64, tobytes), a Float64Array or Float32Array in one copy, a
- * JavaScript array or Python list element by element (null / None: NaN, a missing value), a Java
+ * JavaScript array or Python list element by element (null / None: NaN, a missing value; a Python
+ * Decimal, as a DECIMAL column gives, or an integer beyond 2^63: the nearest double), a Java
  * double[], float[], int[] or long[] as they are or widened.
  */
 final class GuestColumns {
@@ -74,6 +75,8 @@ final class GuestColumns {
       else if (e.isBoolean()) d[i] = e.asBoolean() ? 1 : 0;
       else if (e.canInvokeMember("item")) d[i] = e.invokeMember("item").asDouble();  // a numpy scalar
       else if (e.isHostObject() && e.asHostObject() instanceof Number num) d[i] = num.doubleValue();
+      else if (e.isNumber() && e.fitsInBigInteger()) d[i] = e.asBigInteger().doubleValue();  // beyond 2^63
+      else if (!e.isString() && e.canInvokeMember("__float__")) d[i] = e.invokeMember("__float__").asDouble();  // Decimal
       else throw new IllegalArgumentException(what + ": element " + i + " is not a number: " + e);
     }
     return d;
@@ -105,10 +108,10 @@ final class GuestColumns {
     String name = meta == null ? "" : meta.getMetaSimpleName();
     if (!"Float64Array".equals(name) && !"Float32Array".equals(name)) return null;
     Value buffer = v.getMember("buffer");
-    long offset = v.getMember("byteOffset").asLong(), length = v.getMember("byteLength").asLong();
-    if (!buffer.hasBufferElements() || length > Integer.MAX_VALUE - 8) return null;
-    byte[] raw = new byte[(int) length];
-    buffer.readBuffer(offset, raw, 0, raw.length);
+    long[] range = GuestVectors.typedArrayBytes(v, buffer, name.equals("Float64Array") ? 8 : 4);
+    if (range == null) return null;
+    byte[] raw = new byte[(int) range[1]];
+    buffer.readBuffer(range[0], raw, 0, raw.length);
     ByteBuffer b = ByteBuffer.wrap(raw).order(ByteOrder.nativeOrder());
     double[] d;
     if (name.equals("Float64Array")) {
@@ -123,14 +126,21 @@ final class GuestColumns {
     return d;
   }
 
-  /** Several guest columns (an array of columns, or a 2-D numpy array of rows x columns). */
+  /**
+   * Several guest columns: an array (list) of columns, or a 2-D numpy array of rows x columns
+   * (shape (observations, variables), as numpy and pandas hold a table), read by its columns.
+   */
   static double[][] columns(Object o, String what) {
     if (o instanceof double[][] d) return d;
     Value v = GuestVectors.value(o);
     if (v == null || v.isNull()) throw new IllegalArgumentException(what + " must not be null");
     if (v.isHostObject() && v.asHostObject() instanceof double[][] d) return d;
+    int[] shape = GuestVectors.numpyShape(v);
+    if (shape != null && shape.length == 2) v = v.getMember("T");  // its elements are the columns
     if (!v.hasArrayElements()) throw new IllegalArgumentException(what + " must be an array of columns");
-    double[][] c = new double[(int) v.getArraySize()][];
+    long n = v.getArraySize();
+    if (n > Integer.MAX_VALUE - 8) throw new IllegalArgumentException(what + " has too many columns");
+    double[][] c = new double[(int) n][];
     for (int i = 0; i < c.length; i++) c[i] = doubles(v.getArrayElement(i), what + " " + i);
     return c;
   }

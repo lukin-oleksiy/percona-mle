@@ -89,6 +89,15 @@ describe_per_region
     "skewness": -1.0902905798280051
   }
 ]
+CALL java_frame_types(@j);
+SELECT @j AS java_frame_types;
+java_frame_types
+zero keys: 1 group
+count by a column called count: [count, count_]
+median of the key itself: [qty, qty_median]
+no rows: region numeric false, price numeric true
+only NULLs: region numeric false
+as text: [{"t": "01:30:00", "n": "-00:00:01.50", "d": "2026-01-02 03:04:05", "v": "[1.0, 2.5]", "region": null}]
 CALL js_stats(@js);
 SELECT @js AS js;
 js
@@ -111,6 +120,9 @@ linregress: {"slope": 1.9599999999999997, "intercept": 1.0600000000000005, "r": 
 predict: [8.9, 10.86]
 spearman: 0.033333
 matrix: [[1.0, 0.0095], [0.0095, 1.0]]
+matrix of a 2-D array: 2 x 2, as of its columns: True
+median of a DECIMAL column: 12.5
+median of big integers: 9.223372036854776e+18
 # The user guide's examples.
 CREATE PROCEDURE price_medians(OUT r TEXT) READS SQL DATA LANGUAGE PYTHON AS $$
 import java
@@ -144,6 +156,7 @@ a regression needs at least 2 pairs of values, not 1
 all x values are equal: the slope is undefined
 bins must be at least 1, not 0
 the edges must increase
+the values span too little for 10 bins (1.0 to 1.0000000000000002): give the edges or fewer bins
 unknown method 'mad' (iqr or zscore)
 column 'region' is not numbers
 no column 'cost' (region, price)
@@ -152,6 +165,7 @@ DROP TABLE sales;
 DROP FUNCTION stats_selfcheck;
 DROP PROCEDURE java_stats;
 DROP PROCEDURE java_group_describe;
+DROP PROCEDURE java_frame_types;
 DROP PROCEDURE js_stats;
 DROP PROCEDURE py_stats;
 DROP PROCEDURE java_stats_errors;

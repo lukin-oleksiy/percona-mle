@@ -18,6 +18,8 @@
 package com.percona.mle.api;
 
 import com.percona.mle.sql.Row;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -55,7 +57,8 @@ public final class VectorSet {
     List<String> labelList = new ArrayList<>();
     int skipped = 0, d = -1, n = 0;
     boolean withIds = false, withLabels = false;
-    for (Row row : Mle.session().runSql(sql, params == null ? new Object[0] : params)) {
+    for (Row row : Mle.session().runSql(sql, params == null ? new Object[0] : params,
+        new com.percona.mle.sql.SqlOptions().passResultToClient(false))) {
       int columns = row.getLength();
       if (n == 0 && skipped == 0) {
         if (columns < 1 || columns > 3)
@@ -65,11 +68,11 @@ public final class VectorSet {
         withLabels = columns == 3;
       }
       Object v = row.get(withIds ? 1 : 0);
-      long id = withIds ? id(row.get(0), n + skipped) : n + skipped;
-      if (v == null) {
+      if (v == null) {  // skipped whatever its id is (NULL too: an outer join without a vector)
         skipped++;
         continue;
       }
+      long id = withIds ? id(row.get(0), n + skipped) : n + skipped;
       if (!(v instanceof float[] f))
         throw new IllegalArgumentException("the " + (withIds ? "second" : "first") + " column must be a VECTOR, not "
             + v.getClass().getSimpleName());
@@ -92,10 +95,24 @@ public final class VectorSet {
         withLabels ? labelList.toArray(new String[0]) : null, skipped);
   }
 
+  /** An id as a long: a whole number in the BIGINT range, never truncated or wrapped. */
   private static long id(Object v, int row) {
-    if (v instanceof Number num) return num.longValue();
+    if (v instanceof Long l) return l;
+    if (v instanceof Integer || v instanceof Short || v instanceof Byte) return ((Number) v).longValue();
+    if (v instanceof BigInteger b && b.bitLength() < 64) return b.longValue();  // BIGINT UNSIGNED up to 2^63 - 1
+    if (v instanceof BigDecimal b) {  // DECIMAL: 5.00 is 5
+      try {
+        return b.longValueExact();
+      } catch (ArithmeticException e) {
+        // a fraction, or out of range: the error below
+      }
+    } else if (v instanceof Double || v instanceof Float) {
+      double d = ((Number) v).doubleValue();
+      if (d == Math.rint(d) && d >= -0x1p63 && d < 0x1p63) return (long) d;
+    }
     throw new IllegalArgumentException("the first column must be an integer id (row " + row + " has "
-        + (v == null ? "NULL" : v.getClass().getSimpleName()) + ")");
+        + (v == null ? "NULL" : v instanceof Number ? v + ": not a whole number in the BIGINT range"
+            : v.getClass().getSimpleName()) + ")");
   }
 
   /** The number of vectors. */
@@ -141,7 +158,7 @@ public final class VectorSet {
 
   /** The k vectors most similar to query. */
   public Matches nearest(float[] query, int k, Vectors.Metric metric) {
-    VectorEngine.checkQuery(query, dimensions(), "the query");
+    VectorEngine.checkQuery(query, rows, "the query");
     VectorEngine.checkK(k);
     int m = VectorEngine.code(metric);
     return VectorEngine.nearest(query, rows, terms(m), k, m, -1, ids);
@@ -163,7 +180,7 @@ public final class VectorSet {
   /** For each query, the k vectors most similar to it. */
   public Matches[] nearest(float[][] queries, int k, Vectors.Metric metric) {
     if (queries == null) throw new IllegalArgumentException("queries must not be null");
-    for (int i = 0; i < queries.length; i++) VectorEngine.checkQuery(queries[i], dimensions(), "query " + i);
+    for (int i = 0; i < queries.length; i++) VectorEngine.checkQuery(queries[i], rows, "query " + i);
     VectorEngine.checkK(k);
     int m = VectorEngine.code(metric);
     return VectorEngine.nearest(queries, rows, terms(m), k, m, false, ids);
@@ -209,7 +226,7 @@ public final class VectorSet {
    * pick order.
    */
   public Matches mmr(float[] query, int k, double lambda, int fetchK) {
-    VectorEngine.checkQuery(query, dimensions(), "the query");
+    VectorEngine.checkQuery(query, rows, "the query");
     VectorEngine.checkK(k);
     if (fetchK < k) throw new IllegalArgumentException("fetchK (" + fetchK + ") must be at least k (" + k + ")");
     Matches c = nearest(query, fetchK, Vectors.Metric.COSINE);
@@ -236,7 +253,7 @@ public final class VectorSet {
    * (euclidean), best first.
    */
   public Matches within(float[] query, double threshold, String metric) {
-    VectorEngine.checkQuery(query, dimensions(), "the query");
+    VectorEngine.checkQuery(query, rows, "the query");
     int m = VectorEngine.code(Vectors.Metric.of(metric));
     return VectorOps.within(query, rows, terms(m), m, threshold, ids);
   }

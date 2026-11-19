@@ -97,7 +97,7 @@ public final class Matches {
     for (Matches m : lists)
       for (int i = 0; i < m.size(); i++) {
         double[] e = by.get(m.id(i));
-        e[0] += 1.0 / (k + i + 1);
+        e[0] += 1.0 / ((double) k + i + 1);  // in double: k + i + 1 overflows int for a huge k
       }
     return ranked(by);
   }
@@ -110,12 +110,15 @@ public final class Matches {
   /**
    * Weighted sum of normalized scores, by id: each list's scores are scaled to [0, 1] (min-max;
    * distances flipped, so 1 is the best of the list; all equal: 1), missing ids count 0. Best first;
-   * ties as in {@link #fuse}. weights: one per list.
+   * ties as in {@link #fuse}. weights: one per list, finite and not negative.
    */
   public static Matches blend(Matches[] lists, double[] weights) {
     if (lists == null || weights == null) throw new IllegalArgumentException("lists and weights must not be null");
     if (lists.length != weights.length)
       throw new IllegalArgumentException(lists.length + " lists but " + weights.length + " weights");
+    for (int l = 0; l < weights.length; l++)
+      if (!(weights[l] >= 0) || Double.isInfinite(weights[l]))  // NaN too: its ids would rank first
+        throw new IllegalArgumentException("weight " + l + " must be a finite number, at least 0, not " + weights[l]);
     java.util.Map<Long, double[]> by = merge(lists);
     for (int l = 0; l < lists.length; l++) {
       Matches m = lists[l];

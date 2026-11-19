@@ -17,17 +17,33 @@
 
 package com.percona.mle.api;
 
+import com.percona.mle.sql.Column;
 import com.percona.mle.sql.Row;
 import com.percona.mle.sql.SqlResult;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Columns from SQL kept in Java ({@link Stats#load}), for statistics per column and per group
  * (exp note 54): numbers as double (NULL: NaN, missing), anything else as text (NULL: null).
  * Results that are tables (per group, a correlation matrix, a selection of rows) are Frames too;
  * {@code String(t)} / {@code str(t)} gives JSON rows, {@link #rows()} rows for executeMany.
+ *
+ * <p>A column holds numbers when its SQL type is numeric (integers, DECIMAL, FLOAT, DOUBLE, YEAR,
+ * BIT), also with no rows or only NULLs; any other column is text: strings as they are, DATE,
+ * TIME, DATETIME and TIMESTAMP as MySQL prints them, a VECTOR as [1.0, 2.0].
+ *
+ * <p>Every number is a double, BIGINT and DECIMAL values too: an integer beyond 2^53 (about 9e15)
+ * or a DECIMAL of more than 15 digits is rounded to the nearest double. Two such values that
+ * differ only in their last digits (64-bit ids: UUID_SHORT(), snowflake ids) become equal, fall
+ * into one group of {@link #groupBy} and come back rounded from {@link #rows()} and {@link
+ * #text}. Select such a column as text ({@code CAST(id AS CHAR)}) to keep it exact: it then
+ * groups by its exact value.
  */
 public final class Frame {
   private final String[] names;
@@ -44,8 +60,11 @@ public final class Frame {
 
   static Frame load(String sql, Object[] params) {
     if (sql == null) throw new IllegalArgumentException("the query must not be null");
-    SqlResult r = Mle.session().runSql(sql, params == null ? new Object[0] : params);
+    // The rows are for the frame, whatever the routine set for its own statements.
+    SqlResult r = Mle.session().runSql(sql, params == null ? new Object[0] : params,
+        new com.percona.mle.sql.SqlOptions().passResultToClient(false));
     String[] names = r.getColumnNames().toArray(new String[0]);
+    List<Column> meta = r.getColumns();
     int c = names.length;
     List<Object[]> rows = new ArrayList<>();
     for (Row row : r) rows.add(row.toArray());
@@ -53,14 +72,18 @@ public final class Frame {
     double[][] num = new double[c][];
     String[][] text = new String[c][];
     for (int j = 0; j < c; j++) {
-      boolean numbers = true;
-      for (Object[] row : rows) {
-        Object v = row[j];
-        if (v != null && !(v instanceof Number) && !(v instanceof Boolean)) {
-          numbers = false;
-          break;
+      // By the column's type, not only by its values: a text column with no rows, or with only
+      // NULLs, is text. The values are checked too (a numeric type whose values are not numbers).
+      Column column = j < meta.size() ? meta.get(j) : null;
+      boolean numbers = column == null || numericType(column);
+      if (numbers)
+        for (Object[] row : rows) {
+          Object v = row[j];
+          if (v != null && !(v instanceof Number) && !(v instanceof Boolean)) {
+            numbers = false;
+            break;
+          }
         }
-      }
       if (numbers) {
         double[] d = num[j] = new double[n];
         for (int i = 0; i < n; i++) {
@@ -71,11 +94,45 @@ public final class Frame {
         String[] t = text[j] = new String[n];
         for (int i = 0; i < n; i++) {
           Object v = rows.get(i)[j];
-          t[i] = v == null ? null : v instanceof byte[] b ? new String(b, StandardCharsets.UTF_8) : String.valueOf(v);
+          t[i] = v == null ? null : asText(v, column == null ? 0 : column.getFractionalDigits());
         }
       }
     }
     return new Frame(names, num, text, n);
+  }
+
+  /**
+   * Whether a result column's MySQL type holds numbers. A type without a name (a bare NULL, a
+   * string expression) may: unless it has a character set, its values decide.
+   */
+  private static boolean numericType(Column column) {
+    String type = column.getSqlType();
+    if (type == null) return true;
+    return switch (type) {
+      case "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "BIGINT", "YEAR", "BIT", "FLOAT", "DOUBLE", "DECIMAL" -> true;
+      case "" -> !"STRING".equals(column.getType());
+      default -> false;
+    };
+  }
+
+  /** A value of a text column as MySQL prints it (decimals: the column's fractional seconds). */
+  private static String asText(Object v, int decimals) {
+    if (v instanceof byte[] b) return new String(b, StandardCharsets.UTF_8);
+    if (v instanceof float[] f) return Arrays.toString(f);  // VECTOR
+    if (v instanceof Duration d) {  // TIME: [-]HH:MM:SS, hours up to 838
+      Duration a = d.isNegative() ? d.negated() : d;
+      long s = a.getSeconds();
+      return (d.isNegative() ? "-" : "") + clock(s / 3600, (int) (s / 60 % 60), (int) (s % 60), a.getNano(), decimals);
+    }
+    if (v instanceof LocalDateTime t)  // DATETIME, TIMESTAMP: a space, not ISO 8601's T
+      return t.toLocalDate() + " " + clock(t.getHour(), t.getMinute(), t.getSecond(), t.getNano(), decimals);
+    return String.valueOf(v);
+  }
+
+  private static String clock(long h, int m, int s, int nano, int decimals) {
+    String t = String.format(Locale.ROOT, "%02d:%02d:%02d", h, m, s);
+    int digits = Math.max(0, Math.min(6, decimals));
+    return digits == 0 ? t : t + "." + String.format(Locale.ROOT, "%06d", nano / 1000).substring(0, digits);
   }
 
   /** The number of rows. */

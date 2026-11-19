@@ -34,7 +34,11 @@ package com.percona.mle.api;
  * <p>Results: {@link Matches}, best first: highest cosine similarity or dot product, lowest
  * Euclidean distance (ranked by the exact distance, not by |q|² + |r|² - 2q·r, which loses close
  * vectors far from the origin). A zero vector has cosine similarity 0 with everything; a NaN score
- * is never a match. The JVM build only: the Python-only native build cannot look up Java classes. One query and a batch of queries are computed differently and may order near-ties
+ * is never a match. Lengths, dot products and distances are summed in float, as the vectors are
+ * (numpy on float32 arrays has the same range): a vector whose squared length underflows float
+ * (every component below about 1e-19) counts as a zero vector, and components or differences
+ * above about 1.8e19 overflow to Infinity (cosine then NaN, normalize a zero vector; rows at
+ * different such distances tie). The JVM build only: the Python-only native build cannot look up Java classes. One query and a batch of queries are computed differently and may order near-ties
  * (equal to ~1e-7) differently; the number of threads never changes a result. A killed
  * statement stops the work within milliseconds.
  */
@@ -130,8 +134,8 @@ public final class Vectors {
 
   /** The k rows most similar to query. */
   public static Matches nearest(float[] query, float[][] rows, int k, Metric metric) {
-    int d = VectorEngine.dimension(rows);
-    VectorEngine.checkQuery(query, d, "the query");
+    VectorEngine.dimension(rows);
+    VectorEngine.checkQuery(query, rows, "the query");
     VectorEngine.checkK(k);
     return VectorEngine.nearest(query, rows, null, k, VectorEngine.code(metric), -1, null);
   }
@@ -143,9 +147,9 @@ public final class Vectors {
 
   /** For each query, the k rows most similar to it (tiled, for many queries at once). */
   public static Matches[] nearest(float[][] queries, float[][] rows, int k, Metric metric) {
-    int d = VectorEngine.dimension(rows);
+    VectorEngine.dimension(rows);
     if (queries == null) throw new IllegalArgumentException("queries must not be null");
-    for (int i = 0; i < queries.length; i++) VectorEngine.checkQuery(queries[i], d, "query " + i);
+    for (int i = 0; i < queries.length; i++) VectorEngine.checkQuery(queries[i], rows, "query " + i);
     VectorEngine.checkK(k);
     return VectorEngine.nearest(queries, rows, null, k, VectorEngine.code(metric), false, null);
   }
@@ -276,15 +280,15 @@ public final class Vectors {
    * cosine with the query, in pick order.
    */
   public static Matches mmr(float[] query, float[][] rows, int k, double lambda) {
-    int d = VectorEngine.dimension(rows);
-    VectorEngine.checkQuery(query, d, "the query");
+    VectorEngine.dimension(rows);
+    VectorEngine.checkQuery(query, rows, "the query");
     return VectorOps.mmr(query, rows, null, k, lambda, null, null, null);
   }
 
   /** Rows at least threshold similar to query (cosine, dot) or at most threshold away (euclidean), best first. */
   public static Matches within(float[] query, float[][] rows, double threshold, String metric) {
-    int d = VectorEngine.dimension(rows);
-    VectorEngine.checkQuery(query, d, "the query");
+    VectorEngine.dimension(rows);
+    VectorEngine.checkQuery(query, rows, "the query");
     int m = VectorEngine.code(Metric.of(metric));
     return VectorOps.within(query, rows, null, m, threshold, null);
   }
@@ -348,9 +352,23 @@ public final class Vectors {
     return truncate(GuestVectors.vector(v, "the vector"), dims);
   }
 
-  /** {@link #normalizeAll(float[][])} for JavaScript or Python rows (normalized copies). */
+  /**
+   * {@link #normalize(float[])} for a JavaScript or Python vector: a normalized copy (the argument
+   * is not changed, also when it is a Java float[] the routine got from this helper).
+   */
+  public static float[] normalize(Object v) {
+    return normalize(GuestVectors.vector(v, "the vector").clone());
+  }
+
+  /**
+   * {@link #normalizeAll(float[][])} for JavaScript or Python rows: normalized copies (the rows
+   * passed are not changed, also when they are Java float[] the routine got from this helper).
+   */
   public static float[][] normalizeAll(Object rows) {
-    return normalizeAll(GuestVectors.matrix(rows, "the rows"));
+    float[][] m = GuestVectors.matrix(rows, "the rows");
+    float[][] copy = new float[m.length][];
+    for (int i = 0; i < copy.length; i++) copy[i] = m[i] == null ? null : m[i].clone();
+    return normalizeAll(copy);
   }
 
   /** {@link #mean(float[][])} for JavaScript or Python rows. */

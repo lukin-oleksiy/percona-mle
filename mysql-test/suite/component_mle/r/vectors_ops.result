@@ -13,6 +13,9 @@ CALL fill_ops();
 SELECT IF('ok DIGEST' LIKE 'ok %', 'ok', 'ok DIGEST') AS selfcheck;
 selfcheck
 ok
+SELECT ops_edges() AS edges;
+edges
+ok
 # 2. On a VectorSet from SQL: Java, JavaScript, Python.
 CALL java_ops(@j);
 SELECT @j AS java;
@@ -24,7 +27,7 @@ mmr 1: [11, 14, 13, 12]
 pairs: 5, first 12-14
 groups: [[11, 12, 13, 14], [21, 22, 23, 24], [31, 32, 33, 34], [41, 42, 43, 44], [51, 52, 53, 54], [61, 62, 63, 64]]
 dedup: [11, 21, 31, 41, 51, 61, 100, 101, 102, 103, 104, 105]
-kmeans 6 over 30: sizes [4, 9, 7, 4, 4, 2]
+kmeans 6 over 30: sizes [4, 7, 6, 4, 5, 4]
 classify: b4
 profile of blob 3 nearest: [32, 34, 33, 31]
 truncated: VectorSet(30 vectors of 8 dimensions) nearest [11, 14]
@@ -41,6 +44,9 @@ fuse: [{"id": 11, "score": S}, {"id": 33, "score": S}, {"id": 14, "score": S}, {
 blend: [11, 14, 33, 21, 13]
 inline: mean 0.6333333253860474,0.36666667461395264 pairs [{"first": 0, "second": 1, "score": 0.9938837}] mmr [0, 1]
 truncate: 0.6000000238418579,0.800000011920929
+normalize: 0.141,0.990
+normalizeAll: 0.6,0.8 of 3,4
+sparse lists: the array of lists is too long
 CALL py_ops(@py);
 SELECT @py AS python;
 python
@@ -53,6 +59,8 @@ profile: [32, 34, 33, 31]
 blend: [11, 14, 33, 21, 13]
 kmeans: {"k": 2, "iterations": 1, "inertia": 0.0030603408813476562, "sizes": [1, 2]}, assign [0.8, 0.2] -> 1
 similarity: [[1.0, 0.994, 0.0], [0.994, 1.0, 0.11], [0.0, 0.11, 1.0]]
+normalize: ['0.141', '0.990']
+norm of [2**63 + 1]: 9.223e+18
 # Hybrid search (the user guide's example).
 CREATE TABLE ops_docs (id BIGINT PRIMARY KEY, body TEXT, FULLTEXT (body)) ENGINE=InnoDB;
 INSERT INTO ops_docs VALUES (11, 'red apples and green pears'), (33, 'apples in autumn'),
@@ -78,6 +86,8 @@ dims must be in [1, 2], not 3
 no rows to average
 the weights sum to 0
 1 lists but 2 weights
+weight 0 must be a finite number, at least 0, not NaN
+the threshold must be a number, not NaN
 the set has no labels: load (id, vector, label) rows
 no vector with id 999
 fetchK (4) must be at least k (5)
@@ -91,6 +101,7 @@ SET GLOBAL mle.vector_threads = DEFAULT;
 DROP TABLE ops_items;
 DROP PROCEDURE fill_ops;
 DROP FUNCTION ops_selfcheck;
+DROP FUNCTION ops_edges;
 DROP PROCEDURE java_ops;
 DROP PROCEDURE js_ops;
 DROP PROCEDURE py_ops;

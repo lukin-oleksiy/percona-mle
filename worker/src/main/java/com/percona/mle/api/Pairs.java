@@ -72,14 +72,17 @@ public final class Pairs {
     return distance;
   }
 
-  /** JSON: [{"first": 3, "second": 9, "score": 0.98}, ...] (ids). */
+  /** JSON: [{"first": 3, "second": 9, "score": 0.98}, ...] (ids); a score that is not finite: null. */
   @Override
   public String toString() {
     StringBuilder b = new StringBuilder("[");
     for (int i = 0; i < first.length; i++) {
       if (i > 0) b.append(", ");
-      b.append("{\"first\": ").append(firstId(i)).append(", \"second\": ").append(secondId(i))
-          .append(", \"score\": ").append(score[i]).append('}');
+      b.append("{\"first\": ").append(firstId(i)).append(", \"second\": ").append(secondId(i)).append(", \"score\": ");
+      float s = score[i];
+      if (Float.isFinite(s)) b.append(s);
+      else b.append("null");  // NaN and Infinity are not JSON
+      b.append('}');
     }
     return b.append(']').toString();
   }

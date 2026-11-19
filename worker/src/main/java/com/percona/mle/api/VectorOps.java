@@ -233,15 +233,16 @@ final class VectorOps {
           b[size] = pb[i];
           key[size++] = pk[i];
         }
-      if (size >= 2 * max) {
+      if (size - max >= max) {  // size >= 2 max, without the int overflow of 2 * max
         prune(max);
         cut = key[max - 1];
       }
       return cut;
     }
 
-    /** Sorts and keeps the best keep pairs. */
+    /** Sorts and keeps the best keep pairs (all of them when there are fewer). */
     void prune(int keep) {
+      keep = Math.min(keep, size);
       Integer[] o = new Integer[size];
       for (int i = 0; i < size; i++) o[i] = i;
       Arrays.sort(o, (x, y) -> key[x] != key[y] ? Float.compare(key[y], key[x])
@@ -453,7 +454,7 @@ final class VectorOps {
     return pick;
   }
 
-  /** out[j] = D(row j, c)²: Euclidean, or 1 - cosine for 'cosine' (c of unit length). */
+  /** out[j] = D(row j, c)²: the squared Euclidean distance, or 1 - cosine for 'cosine' (c of unit length). */
   private static void distances(float[][] rows, float[] inv, float[] c, int metric, double[] out) {
     final int n = rows.length;
     final int parts = VectorEngine.parts((long) n * c.length, n);
@@ -464,8 +465,8 @@ final class VectorOps {
         if (metric == EUCLIDEAN) {
           out[j] = VectorEngine.rowDistanceSquared(rows[j], c, lanes);
         } else {
-          double dd = Math.max(0, 1 - (double) VectorEngine.rowDot(rows[j], c, lanes) * inv[j]);
-          out[j] = dd * dd;
+          // 1 - cosine is already D² (half the squared distance of unit vectors): not squared again
+          out[j] = Math.max(0, 1 - (double) VectorEngine.rowDot(rows[j], c, lanes) * inv[j]);
         }
       }
     });

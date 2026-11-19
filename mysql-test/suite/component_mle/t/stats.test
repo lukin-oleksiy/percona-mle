@@ -82,6 +82,22 @@ Summary none = Stats.describe(new double[] {N, N});
 eq.that("none count", none.count(), 0, 0); eq.that("none mean", none.mean(), N, 0); eq.that("none median", none.median(), N, 0);
 eq.that("flat corr", Stats.correlation(new double[] {1, 1, 1}, new double[] {1, 2, 3}, "pearson"), N, 0);
 eq.that("flat skew", Stats.describe(new double[] {2, 2, 2, 2}).skewness(), 0, 0);
+// Extreme magnitudes: a constant column of large values still has bins, and nothing overflows
+// between two values that are themselves in range.
+Histogram hl = Stats.histogram(new double[] {1.7e15, 1.7e15}, 10);
+long hsum = 0, hmax = 0;
+for (long c : hl.counts()) { hsum += c; hmax = Math.max(hmax, c); }
+eq.that("constant 1.7e15 histogram", hsum * 10 + hmax, 22, 0);
+double[] ends = {-Double.MAX_VALUE, Double.MAX_VALUE};
+eq.that("histogram -MAX..MAX", Arrays.toString(Stats.histogram(ends, 2).counts()).equals("[1, 1]") ? 1 : 0, 1, 0);
+eq.that("median -MAX..MAX", Stats.median(ends), 0, 0);
+double[] e150 = {0, 1e150, 2e150}, n150 = {0, -1e150, -2e150};
+eq.that("pearson 1e150", Stats.correlation(e150, e150, "pearson"), 1, 0);
+eq.that("pearson -1e150", Stats.correlation(e150, n150, "pearson"), -1, 0);
+Regression rp = Stats.linregress(e150, e150), rn = Stats.linregress(e150, n150);
+eq.that("r 1e150", rp.r(), 1, 0); eq.that("r -1e150", rn.r(), -1, 0);
+eq.that("slope -1e150", rn.slope(), -1, 1e-12); eq.that("stderr 1e150", rp.stderr(), 0, 0);
+eq.that("p 1e150", rp.pValue() < 1e-6 ? 0 : 1, 0, 0);
 return fail.length() > 0 ? "FAIL " + fail : "ok";
 $$;
 CREATE PROCEDURE java_stats(OUT r TEXT) LANGUAGE JAVA AS $$
@@ -100,6 +116,25 @@ r[0] = String.join("\n",
 $$;
 CREATE PROCEDURE java_group_describe(OUT r TEXT) LANGUAGE JAVA AS $$
 r[0] = Stats.load("SELECT region, price FROM sales").groupBy("region").describe("price").toString();
+$$;
+-- Review fixes on a Frame: -0.0 and 0.0 are one group; result columns keep distinct names; a
+-- column's SQL type decides whether it is numbers (no rows, only NULLs); TIME, DATETIME and
+-- VECTOR values as text.
+CREATE PROCEDURE java_frame_types(OUT r TEXT) LANGUAGE JAVA AS $$
+Frame z = Stats.load("SELECT 0e0 AS k, 1 AS x UNION ALL SELECT -0e0, 2");
+Frame c = Stats.load("SELECT region AS count, price FROM sales").groupBy("count").count();
+Frame m = Stats.load("SELECT qty, price FROM sales WHERE id <= 2").groupBy("qty").median("qty");
+Frame e = Stats.load("SELECT region, price FROM sales WHERE 1 = 0");
+Frame t = Stats.load("SELECT CAST('01:30:00' AS TIME) AS t, CAST('-00:00:01.5' AS TIME(2)) AS n, "
+    + "CAST('2026-01-02 03:04:05' AS DATETIME) AS d, STRING_TO_VECTOR('[1,2.5]') AS v, region "
+    + "FROM sales WHERE region IS NULL");
+r[0] = String.join("\n",
+    "zero keys: " + z.groupBy("k").size() + " group",
+    "count by a column called count: " + Arrays.toString(c.columns()),
+    "median of the key itself: " + Arrays.toString(m.columns()),
+    "no rows: region numeric " + e.numeric("region") + ", price numeric " + e.numeric("price"),
+    "only NULLs: region numeric " + t.numeric("region"),
+    "as text: " + t);
 $$;
 CREATE PROCEDURE js_stats(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
   const S = Java.type('com.percona.mle.api.Stats');
@@ -133,6 +168,15 @@ CREATE PROCEDURE py_stats(OUT r TEXT) LANGUAGE PYTHON AS $$
     out.append('predict: %s' % [round(v, 3) for v in lr.predict(np.array([4.0, 5.0]))])
     out.append('spearman: %.6f' % S.correlation(t.column('price'), t.column('qty'), 'spearman'))
     out.append('matrix: %s' % [[round(v, 4) for v in row] for row in S.correlationMatrix([t.column('price'), t.column('qty')], 'pearson')])
+    # A 2-D numpy array is rows x columns (observations x variables): the same as its columns.
+    m = np.array([[1.0, 2.0], [2.0, 4.5], [3.0, 5.0]])
+    c2 = [list(row) for row in S.correlationMatrix(m, 'pearson')]
+    c1 = [list(row) for row in S.correlationMatrix([m[:, 0], m[:, 1]], 'pearson')]
+    out.append('matrix of a 2-D array: %d x %d, as of its columns: %s' % (len(c2), len(c2[0]), c2 == c1))
+    # A DECIMAL column arrives as Decimal values (NULL: None); integers beyond 2^63.
+    prices = [row[0] for row in session.run_sql('SELECT CAST(price AS DECIMAL(10,2)) FROM sales ORDER BY id').fetch_all()]
+    out.append('median of a DECIMAL column: %s' % S.median(prices))
+    out.append('median of big integers: %s' % S.median([2**63 + 1, 2**64, 5]))
     r = '\n'.join(out)
 $$;
 CREATE PROCEDURE java_stats_errors(OUT r TEXT) LANGUAGE JAVA AS $$
@@ -146,6 +190,7 @@ Runnable[] cases = {
   () -> Stats.linregress(new double[] {2, 2, 2}, x),
   () -> Stats.histogram(x, 0),
   () -> Stats.histogramEdges(x, new double[] {0, 2, 1}),
+  () -> Stats.histogram(new double[] {1.0, Math.nextUp(1.0)}, 10),
   () -> Stats.outliers(x, "mad", 3),
   () -> Stats.load("SELECT region, price FROM sales").column("region"),
   () -> Stats.load("SELECT region, price FROM sales").median("cost"),
@@ -171,6 +216,8 @@ CALL java_stats(@j);
 SELECT @j AS java;
 CALL java_group_describe(@j);
 SELECT JSON_PRETTY(@j) AS describe_per_region;
+CALL java_frame_types(@j);
+SELECT @j AS java_frame_types;
 CALL js_stats(@js);
 SELECT @js AS js;
 CALL py_stats(@py);
@@ -208,6 +255,7 @@ DROP TABLE sales;
 DROP FUNCTION stats_selfcheck;
 DROP PROCEDURE java_stats;
 DROP PROCEDURE java_group_describe;
+DROP PROCEDURE java_frame_types;
 DROP PROCEDURE js_stats;
 DROP PROCEDURE py_stats;
 DROP PROCEDURE java_stats_errors;

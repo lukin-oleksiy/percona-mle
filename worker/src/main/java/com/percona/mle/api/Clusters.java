@@ -126,7 +126,7 @@ public final class Clusters {
 
   /** The cluster nearest to v. */
   public int assign(float[] v) {
-    VectorEngine.checkQuery(v, centroids[0].length, "the vector");
+    VectorEngine.checkQuery(v, centroids, "the vector");
     Matches m = VectorEngine.nearest(v, centroids, null, 1, metric, -1, null);
     if (m.size() == 0) throw new IllegalArgumentException("the vector has no finite score to any centroid");
     return m.index(0);
@@ -137,11 +137,14 @@ public final class Clusters {
     return assign(GuestVectors.vector(v, "the vector"));
   }
 
-  /** JSON: {"k": 8, "iterations": 12, "inertia": 1234.5, "sizes": [...]}. */
+  /** JSON: {"k": 8, "iterations": 12, "inertia": 1234.5, "sizes": [...]}; an inertia that is not finite is null. */
   @Override
   public String toString() {
     StringBuilder b = new StringBuilder("{\"k\": ").append(k()).append(", \"iterations\": ").append(iterations)
-        .append(", \"inertia\": ").append(inertia).append(", \"sizes\": [");
+        .append(", \"inertia\": ");
+    if (Double.isFinite(inertia)) b.append(inertia);
+    else b.append("null");  // NaN and Infinity are not JSON
+    b.append(", \"sizes\": [");
     int[] s = sizes();
     for (int c = 0; c < s.length; c++) b.append(c > 0 ? ", " : "").append(s[c]);
     return b.append("]}").toString();

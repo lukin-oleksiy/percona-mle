@@ -306,6 +306,34 @@ for (int[] nd : new int[][] {{500, 24}, {6000, 768}}) {
 }
 return fail.length() > 0 ? "FAIL " + fail : "ok " + Long.toHexString(digest[0]);
 $$;
+-- Review fixes at the edges of the arguments. 'ok' or the failures.
+CREATE FUNCTION ops_edges() RETURNS TEXT LANGUAGE JAVA AS $$
+StringBuilder fail = new StringBuilder();
+interface Check { void that(boolean ok, String what); }
+Check check = (ok, what) -> { if (!ok) fail.append(what).append("; "); };
+float[][] rows = {{1, 0}, {0.9f, 0.1f}, {0, 1}};
+// maxPairs = Integer.MAX_VALUE: no limit.
+check.that(Vectors.pairs(rows, 0.5, "cosine", Integer.MAX_VALUE).toString()
+    .equals(Vectors.pairs(rows, 0.5, "cosine", 1_000_000).toString()), "pairs without a limit");
+// A threshold between two floats: a score (a distance) on its wrong side is not a match.
+float[] q = {1, 0};
+float[][] same = {{1, 0}}, origin = {{0, 0}};
+check.that(Vectors.within(q, same, 1.0, "dot").size() == 1, "within: dot 1 at 1");
+check.that(Vectors.within(q, same, 1.00000001, "dot").size() == 0, "within: dot 1 at 1.00000001");
+check.that(Vectors.within(q, origin, 1.0, "euclidean").size() == 1, "within: distance 1 at 1");
+check.that(Vectors.within(q, origin, 0.99999999, "euclidean").size() == 0, "within: distance 1 at 0.99999999");
+// Reciprocal rank fusion with a huge k: small positive scores.
+Matches one = Matches.of(new long[] {7}, new float[] {1});
+check.that(Matches.fuse(Integer.MAX_VALUE, new Matches[] {one}).score(0) > 0, "fuse with k = Integer.MAX_VALUE");
+// A score that is not finite is null in the JSON.
+float[][] huge = {{3e38f, 3e38f}, {3e38f, 3e38f}};
+check.that(Vectors.pairs(huge, 0, "dot", 10).toString().endsWith("null}]"), "pairs JSON with Infinity");
+// normalize(Object), as JavaScript and Python call it: a copy.
+float[] v = {3, 4};
+Object guest = v;
+check.that(Math.abs(Vectors.normalize(guest)[0] - 0.6f) < 1e-6 && v[0] == 3, "normalize(Object) is a copy");
+return fail.length() > 0 ? "FAIL " + fail : "ok";
+$$;
 -- The jobs on a VectorSet from SQL, in each language.
 CREATE PROCEDURE java_ops(OUT r TEXT) LANGUAGE JAVA AS $$
 VectorSet s = Vectors.load("SELECT id, v, label FROM ops_items ORDER BY id");
@@ -349,6 +377,13 @@ CREATE PROCEDURE js_ops(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
   const rows = [[1, 0], [0.9, 0.1], [0, 1]];
   out.push(`inline: mean ${Array.from(V.mean(rows))} pairs ${V.pairs(rows, 0.9, 'cosine', 10)} mmr [${ids(V.mmr([1, 0], rows, 2, 0.5))}]`);
   out.push(`truncate: ${Array.from(V.truncate(new Float32Array([3, 4, 12]), 2))}`);
+  // A plain array of numbers; normalizeAll leaves the vectors it was given as they were.
+  out.push(`normalize: ${Array.from(V.normalize([0.1, 0.7])).map(x => x.toFixed(3))}`);
+  const a = V.vector([3, 4]), n = V.normalizeAll([a, a]);
+  out.push(`normalizeAll: ${Array.from(n[0]).map(x => x.toFixed(1))} of ${Array.from(a)}`);
+  const sparse = [];
+  sparse.length = 2 ** 31;
+  try { M.fuse(60, sparse); out.push('sparse lists: no error'); } catch (e) { out.push(`sparse lists: ${e.message}`); }
   r = out.join('\n');
 $$;
 CREATE PROCEDURE py_ops(OUT r TEXT) LANGUAGE PYTHON AS $$
@@ -374,6 +409,8 @@ CREATE PROCEDURE py_ops(OUT r TEXT) LANGUAGE PYTHON AS $$
     out.append('kmeans: %s, assign [0.8, 0.2] -> %d' % (c, c.assign(np.array([0.8, 0.2]))))
     sim = V.similarity(rows, rows, 'cosine')
     out.append('similarity: %s' % np.round(np.array([list(x) for x in sim]), 3).tolist())
+    out.append('normalize: %s' % ['%.3f' % x for x in V.normalize([0.1, 0.7])])
+    out.append('norm of [2**63 + 1]: %.4g' % V.norm([2**63 + 1]))
     r = '\n'.join(out)
 $$;
 -- The user guide's hybrid search: full-text ranks and a diverse vector top k, fused.
@@ -401,6 +438,8 @@ Runnable[] cases = {
   () -> Vectors.mean(new float[0][]),
   () -> Vectors.mean(rows, new float[] {0, 0, 0}),
   () -> Matches.blend(new Matches[] {Matches.of(new long[] {1}, new float[] {1})}, new double[] {1, 2}),
+  () -> Matches.blend(new Matches[] {Matches.of(new long[] {1}, new float[] {1})}, new double[] {Double.NaN}),
+  () -> Vectors.within(new float[] {1, 0}, rows, Double.NaN, "cosine"),
   () -> Vectors.load("SELECT id, v FROM ops_items").classify(new float[16], 3, "cosine"),
   () -> Vectors.load("SELECT id, v FROM ops_items").meanOf(new long[] {11, 999}),
   () -> Vectors.load("SELECT id, v FROM ops_items").mmr(new float[16], 5, 0.5, 4),
@@ -422,6 +461,8 @@ CALL fill_ops();
 --let $d4 = `SELECT ops_selfcheck()`
 --replace_regex /ok [0-9a-f]+/ok DIGEST/
 --eval SELECT IF('$d4' LIKE 'ok %', 'ok', '$d4') AS selfcheck
+
+SELECT ops_edges() AS edges;
 
 --echo # 2. On a VectorSet from SQL: Java, JavaScript, Python.
 CALL java_ops(@j);
@@ -463,6 +504,7 @@ SET GLOBAL mle.vector_threads = DEFAULT;
 DROP TABLE ops_items;
 DROP PROCEDURE fill_ops;
 DROP FUNCTION ops_selfcheck;
+DROP FUNCTION ops_edges;
 DROP PROCEDURE java_ops;
 DROP PROCEDURE js_ops;
 DROP PROCEDURE py_ops;

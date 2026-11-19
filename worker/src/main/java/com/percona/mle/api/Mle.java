@@ -28,7 +28,7 @@ public final class Mle {
 
   /**
    * The session for SQL from Java routines (the calling session, its transaction, the routine's
-   * privileges): Oracle's object model with Java values (Long, BigInteger, Double, Float,
+   * privileges): Oracle's object model with Java values (Long, BigInteger, Double (FLOAT columns too),
    * BigDecimal, String, byte[], MleJson, float[] for VECTOR, LocalDate, LocalDateTime, Duration).
    * Must be used on the routine's thread. Errors are {@link MleSqlException}s.
    */

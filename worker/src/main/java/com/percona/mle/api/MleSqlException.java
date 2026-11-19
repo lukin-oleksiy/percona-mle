@@ -19,7 +19,7 @@ package com.percona.mle.api;
 
 import java.io.Serial;
 
-/** A MySQL error from {@link Mle#sql}. Uncaught, it is raised to the caller unchanged. */
+/** A MySQL error from the SQL API ({@link Mle#session()}). Uncaught, it is raised to the caller unchanged. */
 public class MleSqlException extends RuntimeException {
   @Serial private static final long serialVersionUID = 1L;
 

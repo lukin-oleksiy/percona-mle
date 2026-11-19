@@ -54,7 +54,12 @@ final class StatsMath {
     double h = (n - 1) * q;
     int lo = (int) Math.floor(h), hi = Math.min(lo + 1, n - 1);
     double g = h - lo;
-    return g == 0 ? s[lo] : s[lo] + g * (s[hi] - s[lo]);
+    if (g == 0) return s[lo];
+    double d = s[hi] - s[lo];
+    // The difference of two finite values of opposite sign can overflow: weigh the two instead.
+    if (Double.isInfinite(d) && !Double.isInfinite(s[lo]) && !Double.isInfinite(s[hi]))
+      return (1 - g) * s[lo] + g * s[hi];
+    return s[lo] + g * d;
   }
 
   static double mean(double[] s) {
@@ -169,7 +174,20 @@ final class StatsMath {
     if (a.length < 2) return Double.NaN;
     double[] m = comoments(a, b);
     if (m[0] == 0 || m[1] == 0) return Double.NaN;
-    return Math.max(-1, Math.min(1, m[2] / Math.sqrt(m[0] * m[1])));
+    return r(m[0], m[1], m[2]);
+  }
+
+  /**
+   * Pearson's r = sxy / sqrt(sxx syy), kept in [-1, 1]. The product sxx syy overflows or underflows
+   * double for values around 1e77 (1e-77) and beyond although r does not, so the two sums are
+   * first scaled by powers of 4 (exact: other data gives the same bits as the plain formula).
+   */
+  static double r(double sxx, double syy, double sxy) {
+    int ex = Math.getExponent(sxx), ey = Math.getExponent(syy);
+    ex -= ex & 1;  // even, so that the square root's scale is a power of 2
+    ey -= ey & 1;
+    double p = Math.scalb(sxx, -ex) * Math.scalb(syy, -ey);
+    return Math.max(-1, Math.min(1, Math.scalb(sxy, -(ex + ey) / 2) / Math.sqrt(p)));
   }
 
   static double correlation(double[] x, double[] y, String method) {

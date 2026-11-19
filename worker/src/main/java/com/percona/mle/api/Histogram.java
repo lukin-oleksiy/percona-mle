@@ -31,7 +31,11 @@ public final class Histogram {
     this.counts = counts;
   }
 
-  /** Equal-width bins between the smallest and the largest value (±0.5 when they are equal). */
+  /**
+   * Equal-width bins between the smallest and the largest value. When they are equal: ±0.5 around
+   * the value, or wider when the value is so large that 0.5 is below its precision. Values too
+   * close together for this many distinct edges are an error.
+   */
   static Histogram of(double[] x, int bins) {
     if (bins < 1) throw new IllegalArgumentException("bins must be at least 1, not " + bins);
     double lo = Double.POSITIVE_INFINITY, hi = Double.NEGATIVE_INFINITY;
@@ -43,15 +47,29 @@ public final class Histogram {
     if (lo > hi) {  // no values
       lo = 0;
       hi = 1;
-    } else if (lo == hi) {
-      lo -= 0.5;
-      hi += 0.5;
-    }
-    if (Double.isInfinite(lo) || Double.isInfinite(hi))
+    } else if (Double.isInfinite(lo) || Double.isInfinite(hi)) {
       throw new IllegalArgumentException("the values include an infinity: give the edges");
+    } else if (lo == hi) {
+      double w = Math.max(0.5, 2 * Math.ulp(lo) * bins);
+      lo = Math.max(-Double.MAX_VALUE, lo - w);
+      hi = Math.min(Double.MAX_VALUE, hi + w);
+    }
     double[] e = new double[bins + 1];
-    for (int i = 0; i <= bins; i++) e[i] = lo + (hi - lo) * i / bins;
+    double width = hi - lo;
+    if (Double.isFinite(width * bins)) {
+      for (int i = 0; i <= bins; i++) e[i] = lo + width * i / bins;
+    } else {  // hi - lo (or its multiple) overflows: weigh the two ends instead
+      for (int i = 0; i <= bins; i++) {
+        double t = (double) i / bins;
+        e[i] = lo * (1 - t) + hi * t;
+      }
+    }
+    e[0] = lo;
     e[bins] = hi;
+    for (int i = 1; i <= bins; i++)
+      if (!(e[i] > e[i - 1]))
+        throw new IllegalArgumentException("the values span too little for " + bins
+            + " bins (" + lo + " to " + hi + "): give the edges or fewer bins");
     return of(x, e);
   }
 

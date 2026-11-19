@@ -106,10 +106,11 @@ final class VectorEngine {
     return d;
   }
 
-  static void checkQuery(float[] q, int d, String what) {
+  /** q against the rows' dimension (rows as checked by dimension(); no rows: any query). */
+  static void checkQuery(float[] q, float[][] rows, String what) {
     if (q == null) throw new IllegalArgumentException(what + " must not be null");
-    if (q.length != d && d > 0)
-      throw new IllegalArgumentException(what + " has " + q.length + " dimensions, the rows have " + d);
+    if (rows.length > 0 && q.length != rows[0].length)
+      throw new IllegalArgumentException(what + " has " + q.length + " dimensions, the rows have " + rows[0].length);
   }
 
   static void checkK(int k) {
@@ -165,6 +166,8 @@ final class VectorEngine {
   /**
    * |q - r|², summed directly. EUCLIDEAN ranks by it: |q|² + |r|² - 2q·r loses the difference
    * between close vectors far from the origin (a common offset), and so would pick the wrong rows.
+   * Summed in float (the kernel's speed): differences above about 1.8e19 give Infinity, so rows
+   * that far away tie (documented in Vectors).
    */
   static float rowDistanceSquared(float[] q, float[] r, float[] lanes) {
     int d = q.length, i = 0;
@@ -184,7 +187,7 @@ final class VectorEngine {
     return s;
   }
 
-  /** Euclidean distance, summed directly. */
+  /** Euclidean distance, summed directly, in float: Infinity for differences above about 1.8e19. */
   static float distance(float[] a, float[] b) {
     int d = a.length, i = 0;
     var s0 = FloatVector.zero(SP);
@@ -211,7 +214,11 @@ final class VectorEngine {
     return s;
   }
 
-  /** 1 / |v|, 0 for a zero vector (lanes: scratch of L floats). */
+  /**
+   * 1 / |v|, 0 for a zero vector (lanes: scratch of L floats). |v|² is summed in float (the
+   * kernel's speed), so 0 also when it underflows (every component below about 1e-19) or
+   * overflows (a component above about 1.8e19): documented in Vectors.
+   */
   static float inverseNorm(float[] v, float[] lanes) {
     float n = rowDot(v, v, lanes);
     return n > 0 ? (float) (1 / Math.sqrt(n)) : 0f;
@@ -598,11 +605,22 @@ final class VectorEngine {
     return metric == EUCLIDEAN ? (float) Math.sqrt(-key) : key;
   }
 
-  /** The key of a threshold in the metric's unit: a similarity, or a distance for EUCLIDEAN. */
+  /**
+   * The key of a threshold in the metric's unit: a similarity, or a distance for EUCLIDEAN. Keys
+   * are floats and a row matches with key >= this one, so the threshold is rounded up to float:
+   * rounded to the nearest it could fall below the threshold and let in a score less than it.
+   */
   static float keyOf(double threshold, int metric) {
-    if (metric != EUCLIDEAN) return (float) threshold;
-    if (!(threshold >= 0)) throw new IllegalArgumentException("a distance threshold must be at least 0, not " + threshold);
-    return (float) -(threshold * threshold);
+    if (Double.isNaN(threshold)) throw new IllegalArgumentException("the threshold must be a number, not NaN");
+    double key = threshold;
+    if (metric == EUCLIDEAN) {
+      if (!(threshold >= 0))
+        throw new IllegalArgumentException("a distance threshold must be at least 0, not " + threshold);
+      key = -(threshold * threshold);
+    }
+    float f = (float) key;
+    // -Infinity stays: a threshold below every float lets every row in, as it did.
+    return f < key && f != Float.NEGATIVE_INFINITY ? Math.nextUp(f) : f;
   }
 
   /** Every row's key for query q (higher is better), split over threads like nearest(). */
