@@ -29,6 +29,7 @@ comments cite the project's design notes by name (e.g. `14-phase6-libraries.md`)
 | `harness/` | a command-line driver for workers (development) |
 | `unittest/` | GoogleTest unit tests (8 binaries) |
 | `mysql-test/suite/component_mle` | the MTR suite |
+| `perf/` | the performance regression test: two builds side by side |
 | `docker/` | the server + MLE image, the DBA tools image, compose |
 | `packaging/`, `cmake/packaging.cmake` | packages (CPack, deb and rpm) and their scripts |
 | `cmake/server.cmake` | building against a configured Percona Server tree |
@@ -56,6 +57,19 @@ The build type follows the server build's (a debug server gives a debug MLE). Fo
 
     BUILD-mle/mtr --parallel=4                           # the MTR suite on the server build
     systemd-run --user --scope -q -p Delegate=yes BUILD-mle/runtime_output_directory/mle_codec-t   # each gtest
+
+Performance, a change against the commit before it (release builds, a quiet machine, the CPU governor
+`performance`; about 25 minutes for 5 rounds):
+
+    git worktree add ../percona-mle-base <commit>        # the code to compare with, built once:
+    cmake -S ../percona-mle-base -B ../BUILD-mle-base -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DMYSQL_SOURCE_DIR=... -DMYSQL_BUILD_DIR=<release server build> -DMLE_BUILD_JDK=ON \
+      -DMLE_LINK_INTO_SERVER_BUILD=OFF -DMLE_WITH_UNIT_TESTS=OFF && ninja -C ../BUILD-mle-base
+    perf/regression.py --server <release server build> --base ../BUILD-mle-base --new ../BUILD-mle-release
+
+It runs each case of `perf/setup.sql` (the call path, values of every kind, SQL from routines read and written,
+libraries, errors, vectors, a new connection's worker) on both builds in alternating order on the same data, and
+exits with status 1 when a case is slower beyond the threshold (5 %) in all rounds but one.
 
 ## Diagnostics
 
