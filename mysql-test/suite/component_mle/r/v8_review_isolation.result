@@ -1,0 +1,254 @@
+#
+# component_mle: regressions for the independent multi-model review
+# (exp note 60), isolation: C3 (another account's code gets a worker of
+# its own), C17 (libraries behind a kept library), C18 (source lines in
+# tracebacks only for those who may see the code).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE DATABASE s1;
+CREATE DATABASE s2;
+CREATE DATABASE s3;
+CREATE USER author@localhost, caller@localhost;
+GRANT CREATE ROUTINE, EXECUTE ON test.* TO author@localhost;
+GRANT CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO author@localhost;
+GRANT EXECUTE ON test.* TO caller@localhost;
+GRANT EXECUTE ON s2.* TO caller@localhost;
+GRANT EXECUTE ON s3.* TO caller@localhost;
+# (The default connection stays without an MLE session, for UNINSTALL.)
+#
+# C3. An SQL SECURITY INVOKER routine runs with its caller's privileges,
+# but not in the worker of the caller's own code: what it changes in the
+# language (JSON.parse, Python's builtins) stays with its author's code.
+#
+CREATE FUNCTION evil_js(x INT) RETURNS INT SQL SECURITY INVOKER LANGUAGE JS AS $$
+JSON.parse = () => ({ hacked: true })
+Array.prototype.join = () => 'hacked'
+  return x
+$$;
+CREATE FUNCTION evil_py(x INT) RETURNS INT SQL SECURITY INVOKER LANGUAGE PYTHON AS $$
+import builtins
+builtins.len = lambda v: 666
+return x
+$$;
+CREATE PROCEDURE evil_eval() SQL SECURITY INVOKER LANGUAGE JS AS $$
+session.runSql("SELECT mle_eval('js', 'String.prototype.trim = () => \"hacked\"; 1')")
+$$;
+CREATE FUNCTION author_sees() RETURNS VARCHAR(100) SQL SECURITY INVOKER LANGUAGE JS AS $$
+return JSON.stringify(JSON.parse('{"a":1}'))
+$$;
+CREATE FUNCTION author_definer() RETURNS VARCHAR(100) LANGUAGE JS AS $$
+return JSON.stringify(JSON.parse('{"a":1}'))
+$$;
+CREATE FUNCTION own_js(j JSON) RETURNS VARCHAR(100) LANGUAGE JS AS $$
+return [JSON.stringify(j), JSON.stringify(JSON.parse('{"a":1}')), [1, 2].join('-')].join(' ')
+$$;
+CREATE FUNCTION own_py() RETURNS INT LANGUAGE PYTHON AS $$ return len('abc') $$;
+SELECT own_js('{"k": 2}') AS before_js, own_py() AS before_py;
+before_js	before_py
+{"k":2} {"a":1} 1-2	3
+SELECT evil_js(1), evil_py(2);
+evil_js(1)	evil_py(2)
+1	2
+# What the author's code evaluates with mle_eval() (as the caller, who
+# may) is the author's code too.
+CALL evil_eval();
+SELECT mle_eval('js', '" x ".trim()') AS own_eval;
+own_eval
+x
+# The caller's own code is not affected, in this session ...
+SELECT own_js('{"k": 2}') AS after_js, own_py() AS after_py;
+after_js	after_py
+{"k":2} {"a":1} 1-2	3
+# ... while the author's code keeps what it did (its worker for this caller).
+SELECT author_sees() AS in_the_authors_worker;
+in_the_authors_worker
+{"hacked":true}
+# A DEFINER routine of the author runs as the author: not there either.
+SELECT author_definer() AS as_the_author;
+as_the_author
+{"a":1}
+the caller's own worker is the same process: 1
+# Both workers of root's session are kept: its own, and the one that ran
+# the author's code for it; the author's own (author_definer) too.
+# ... and not in a later session that gets the kept workers.
+SELECT own_js('{"k": 3}') AS later_js, own_py() AS later_py;
+later_js	later_py
+{"k":3} {"a":1} 1-2	3
+the kept worker was reused: 1
+SELECT author_sees() AS kept_authors_worker;
+kept_authors_worker
+{"hacked":true}
+#
+# C18. A traceback shows source lines to those who may see the code:
+# the routine's definer and holders of SHOW_ROUTINE; others get the
+# frames only, in mle_session_state('traceback') and in the warnings.
+#
+CREATE LIBRARY test.seclib LANGUAGE JS AS $$
+export function boom(v) { return v.missing.field /* library-secret */ }
+$$;
+CREATE FUNCTION js_secret(v INT) RETURNS INT LANGUAGE JS AS $$
+function helper(v) { return v.missing.field /* routine-secret */ }
+return helper(v)
+$$;
+CREATE FUNCTION js_lib_secret() RETURNS INT LANGUAGE JS USING (test.seclib AS l) AS $$
+return l.boom(null)
+$$;
+CREATE FUNCTION author_fails(v INT) RETURNS INT SQL SECURITY INVOKER LANGUAGE JS AS $$
+return v.missing.field /* author-secret */
+$$;
+# root (SHOW_ROUTINE): everything.
+SELECT js_secret(1);
+ERROR HY000: JavaScript> TypeError: Cannot read properties of undefined (reading 'field') (js_secret, line 2, in helper)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+TypeError: Cannot read properties of undefined (reading 'field')
+    at helper (js_secret:2:39)
+        function helper(v) { return v.missing.field /* routine-secret */ }
+    at js_secret:3:8
+        return helper(v)
+
+SELECT js_lib_secret();
+ERROR HY000: JavaScript> TypeError: Cannot read properties of null (reading 'missing') (js_lib_secret, line 2)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+TypeError: Cannot read properties of null (reading 'missing')
+    at js_lib_secret:2:10
+        return l.boom(null)
+
+# An account with EXECUTE only: the frames, no source lines.
+SET SESSION mle.console = WARNINGS;
+SELECT js_secret(1);
+ERROR HY000: JavaScript> TypeError: Cannot read properties of undefined (reading 'field') (js_secret, line 2, in helper)
+SHOW WARNINGS;
+Level	Code	Message
+Error	6113	JavaScript> TypeError: Cannot read properties of undefined (reading 'field') (js_secret, line 2, in helper)
+Warning	6000	js_secret traceback: TypeError: Cannot read properties of undefined (reading 'field')
+Warning	6000	js_secret traceback:     at helper (js_secret:2:39)
+Warning	6000	js_secret traceback:     at js_secret:3:8
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+TypeError: Cannot read properties of undefined (reading 'field')
+    at helper (js_secret:2:39)
+    at js_secret:3:8
+
+SELECT py_secret(0);
+ERROR HY000: Python> ZeroDivisionError: integer division or modulo by zero (py_secret, line 3, in helper)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+Traceback (most recent call last):
+  File "py_secret", line 4, in <routine>
+  File "py_secret", line 3, in helper
+ZeroDivisionError: integer division or modulo by zero
+
+SELECT js_lib_secret();
+ERROR HY000: JavaScript> TypeError: Cannot read properties of null (reading 'missing') (js_lib_secret, line 2)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+TypeError: Cannot read properties of null (reading 'missing')
+    at js_lib_secret:2:10
+
+# An INVOKER routine of another account: not its code either.
+SELECT author_fails(1);
+ERROR HY000: JavaScript> TypeError: Cannot read properties of undefined (reading 'field') (author_fails, line 2)
+SELECT mle_session_state('traceback') LIKE '%author-secret%' AS any_text;
+any_text
+0
+# The definer sees its own routine's lines, without SHOW_ROUTINE (and
+# in the warnings).
+SET SESSION mle.console = WARNINGS;
+SELECT author_fails(1);
+ERROR HY000: JavaScript> TypeError: Cannot read properties of undefined (reading 'field') (author_fails, line 2)
+SHOW WARNINGS;
+Level	Code	Message
+Error	6113	JavaScript> TypeError: Cannot read properties of undefined (reading 'field') (author_fails, line 2)
+Warning	6000	author_fails traceback: TypeError: Cannot read properties of undefined (reading 'field')
+Warning	6000	author_fails traceback:     at author_fails:2:18
+Warning	6000	author_fails traceback:         return v.missing.field /* author-secret */
+SELECT mle_session_state('traceback') LIKE '%author-secret%' AS own_text;
+own_text
+1
+#
+# C17. A library imported by a kept library: a changed or dropped one
+# is not used any more, and one that mysqld refuses the routine is
+# not reachable through an importer another routine evaluated.
+#
+CREATE LIBRARY s1.inner_lib LANGUAGE JS AS $$ export const x = 1 $$;
+CREATE LIBRARY s1.outer_lib LANGUAGE JS AS $$
+import { x } from '/s1/inner_lib'
+  export function get() { return x }
+$$;
+CREATE FUNCTION s1.f() RETURNS INT LANGUAGE JS USING (s1.outer_lib AS o) AS $$ return o.get() $$;
+SELECT s1.f(), s1.pf();
+s1.f()	s1.pf()
+1	1
+DROP LIBRARY s1.inner_lib;
+CREATE LIBRARY s1.inner_lib LANGUAGE JS AS $$ export const x = 2 $$;
+DROP LIBRARY s1.py_inner;
+CREATE LIBRARY s1.py_inner LANGUAGE PYTHON AS $$
+x = 2
+$$;
+SELECT s1.f() AS changed_js, s1.pf() AS changed_py;
+changed_js	changed_py
+2	2
+SELECT s1.f() AS again_js, s1.pf() AS again_py;
+again_js	again_py
+2	2
+DROP LIBRARY s1.inner_lib;
+SELECT s1.f() AS dropped;
+ERROR HY000: JavaScript> Error: library s1.inner_lib does not exist or cannot be read
+CREATE LIBRARY s1.inner_lib LANGUAGE JS AS $$ export const x = 3 $$;
+SELECT s1.f() AS created_again;
+created_again
+3
+DROP LIBRARY s1.inner_lib;
+CREATE LIBRARY s1.inner_lib LANGUAGE JS AS $$ export const x = 4 $$;
+SELECT s1.f() AS changed_between_sessions;
+changed_between_sessions
+4
+# s2.r1 may import s2.secret (its schema's) through s1.bridge; s3.r2
+# may not, also after s2.r1 evaluated the bridge in the same worker.
+CREATE LIBRARY s2.secret LANGUAGE JS AS $$ export const value = 'of s2' $$;
+CREATE LIBRARY s1.bridge LANGUAGE JS AS $$
+import { value } from '/s2/secret'
+  export function get() { return value }
+$$;
+CREATE FUNCTION s2.r1() RETURNS VARCHAR(20) LANGUAGE JS USING (s1.bridge AS b) AS $$ return b.get() $$;
+CREATE FUNCTION s3.r2() RETURNS VARCHAR(20) LANGUAGE JS USING (s1.bridge AS b) AS $$ return b.get() $$;
+SELECT s2.r1();
+s2.r1()
+of s2
+SELECT s3.r2();
+ERROR HY000: JavaScript> Error: library s2.secret is not importable from s3.r2 (import it with USING, or use a library of the routine's schema)
+SELECT s2.r1() AS still_works;
+still_works
+of s2
+SELECT s3.r2();
+ERROR HY000: JavaScript> Error: library s2.secret is not importable from s3.r2 (import it with USING, or use a library of the routine's schema)
+# C3: DROP USER of the author ends the kept workers that ran its code.
+DROP USER author@localhost;
+Warnings:
+Warning	4005	User 'author'@'localhost' is referenced as a definer account in a stored routine.
+fewer kept workers: 1
+DROP FUNCTION s1.f;
+DROP FUNCTION s1.pf;
+DROP FUNCTION s2.r1;
+DROP FUNCTION s3.r2;
+DROP DATABASE s1;
+DROP DATABASE s2;
+DROP DATABASE s3;
+DROP LIBRARY test.seclib;
+DROP FUNCTION evil_js;
+DROP FUNCTION evil_py;
+DROP PROCEDURE evil_eval;
+DROP FUNCTION author_sees;
+DROP FUNCTION author_definer;
+DROP FUNCTION author_fails;
+DROP FUNCTION own_js;
+DROP FUNCTION own_py;
+DROP FUNCTION js_secret;
+DROP FUNCTION js_lib_secret;
+DROP FUNCTION py_secret;
+DROP USER caller@localhost;
+REVOKE CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

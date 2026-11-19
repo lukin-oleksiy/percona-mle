@@ -28,8 +28,20 @@ our @KNOWN = (
   # Libraries created with LANGUAGE JS show it in information_schema.LIBRARIES.
   ['libraries', qr/(?<=jslib\tlib\d\t)JAVASCRIPT$/m, 'JS'],
   ['libraries', qr/SyntaxError: lib3:3:10 Expected an operand but found \*/, "SyntaxError: lib3:3:11 Unexpected token '*'"],
+  # Oracle's 1000-frame limit (see oracle_examples).
+  ['execute', qr/--error ER_LANGUAGE_COMPONENT_RUNTIME\nSELECT recursive_sum\(999\);/, 'SELECT recursive_sum(999);'],
+  ['execute', qr/SELECT recursive_sum\(999\);\nERROR HY000: JavaScript> Maximum frame limit[^\n]*/,
+   "SELECT recursive_sum(999);\nrecursive_sum(999)\n499500"],
+  # Positions: V8 points at the property read, GraalJS at the expression's start.
+  ['debugging', qr/at helper \(js_div:2:31\)/, 'at helper (js_div:2:41)'],
+  ['session_state', qr/<js> pc2:4:1-6/, '<js> pc2:4:3'],
+  ['review_isolation', qr/at helper \(js_secret:2:29\)/, 'at helper (js_secret:2:39)'],
+  ['review_isolation', qr/at js_lib_secret:2:8/, 'at js_lib_secret:2:10'],
+  ['review_isolation', qr/at author_fails:2:8/, 'at author_fails:2:18'],
+  # A session that runs JavaScript and Python holds a V8 and a JVM worker: one more kept.
+  ['review_isolation', qr/SELECT VARIABLE_VALUE = 3 FROM performance_schema\.global_status WHERE VARIABLE_NAME = 'mle_workers_cached'/,
+   "SELECT VARIABLE_VALUE = 4 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached'"],
   # GraalJS prefixes a failed import: "Error reading module '/other/secret' imported from peek: ".
-  ['libraries', qr/Error: Error reading module '\/other\/secret' imported from peek: library/, 'Error: library'],
   # The session holds a V8 worker (JavaScript) and a JVM worker (its Python).
   ['packages', qr/cannot refresh: 1 session workers are in use/, 'cannot refresh: 2 session workers are in use'],
 );
@@ -39,6 +51,13 @@ sub js_on_v8 {
   $t =~ s/LANGUAGE JAVASCRIPT/LANGUAGE JS/g;
   $t =~ s/CREATE_JAVASCRIPT_ROUTINE/CREATE_JS_ROUTINE/g;
   $t =~ s/mle_eval\('javascript'/mle_eval('js'/gi;
+  # V8's words in every test: a property of null or undefined, and a missing operand (V8: an
+  # unexpected token, one column later, the caret with it).
+  $t =~ s/Cannot read property '([^']*)' of (null|undefined)/Cannot read properties of $2 (reading '$1')/g;
+  $t =~ s{SyntaxError: ([\w.]+):(\d+):(\d+) Expected an operand but found (\S+)}
+         {"SyntaxError: $1:$2:" . ($3 + 1) . " Unexpected token '$4'"}ge;
+  # GraalJS prefixes a failed import with the module that imported it.
+  $t =~ s/Error: Error reading module '[^']*' imported from [^:]*: library/Error: library/g;
   for my $k (@KNOWN) {
     my ($name, $re, $to) = @$k;
     $t =~ s/$re/$to/g if $name eq $test;

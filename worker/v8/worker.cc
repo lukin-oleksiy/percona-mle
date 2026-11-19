@@ -688,7 +688,7 @@ std::string Worker::compile_error(Local<v8::Message> message, const std::string 
   std::string out = kind + ": " + name + ":" + std::to_string(line) + ":" + std::to_string(column) + " " + text;
   if (!source.empty() && source.size() < 400) {
     out += "\n" + source + "\n" + std::string(static_cast<size_t>(std::max(0, column - 1)), ' ') +
-           std::string(static_cast<size_t>(std::max(1, end - (column - 1) - 1)), '^');
+           std::string(static_cast<size_t>(std::max(1, end - (column - 1) - 1)), '^') + "\n";
   }
   return out;
 }

@@ -1,0 +1,98 @@
+#
+# component_mle: regressions for the second review (28-deep-review.md).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE USER u4@localhost, u5@localhost;
+GRANT EXECUTE ON test.* TO u4@localhost, u5@localhost;
+# 1: setpriority / ioprio_set only for the worker itself (the group and
+# user forms reach mysqld, which runs as the same OS user).
+SELECT py_prio() AS probes;
+probes
+setpriority(PROCESS,self):ok
+setpriority(PGRP,0):refused
+setpriority(USER,0):refused
+ioprio_set(PGRP,0):refused
+ioprio_set(USER,0):refused
+# 4: DROP USER while the account is connected: its session's worker is
+# not kept at disconnect, so a new account of that name starts fresh.
+SELECT py_mark2('old u5') AS old_u5_marks;
+old_u5_marks
+None
+DROP USER u5@localhost;
+CREATE USER u5@localhost;
+GRANT EXECUTE ON test.* TO u5@localhost;
+SELECT py_mark2('new u5') AS new_u5_sees;
+new_u5_sees
+None
+# Also a worker the old session takes after the DROP (here after a reset).
+SELECT py_mark2('old u5 again') AS old_u5_marks;
+old_u5_marks
+new u5
+DROP USER u5@localhost;
+CREATE USER u5@localhost;
+GRANT EXECUTE ON test.* TO u5@localhost;
+SELECT mle_session_reset() AS reset;
+reset
+The session state is successfully reset.
+SELECT py_mark2('taken after the drop') AS fresh_worker;
+fresh_worker
+None
+SELECT py_mark2('new u5') AS new_u5_sees;
+new_u5_sees
+None
+# 5: a result or SQL request larger than the host accepts is a clean
+# error; the worker goes on (no failure counted).
+SELECT LENGTH(py_big());
+ERROR HY000: MLE-Type> the routine's result with its output is larger than MLE allows (64 MiB) in 'py_big()'
+CALL js_big_sql(@r);
+SELECT @r AS sql_request;
+sql_request
+the SQL statement with its parameters is larger than MLE allows (64 MiB)
+SELECT py_mark2('still') IS NOT NULL AS same_session_goes_on;
+same_session_goes_on
+1
+workers lost: 0
+# 6: a missing library: the message says so; after a caught SQL error,
+# rethrowing that error still reports it.
+CALL js_import(@r);
+SELECT @r AS missing_library;
+missing_library
+Error: library test.no_such_library does not exist or cannot be read
+CALL js_rethrow();
+ERROR 42S02: Table 'test.no_such_table' doesn't exist
+# 8: a thread a Java routine leaves (named like the runtime's, a
+# platform or a virtual one) keeps the worker from being kept for the
+# account: the account's next session gets a new worker. Without a
+# thread, it gets the same one (the mark is still there).
+SET GLOBAL mle.worker_cache_timeout = 3600;
+SELECT java_mark('control', 'none') AS java_mark;
+java_mark
+marked control, thread: none
+SELECT java_seen() AS kept_without_thread;
+kept_without_thread
+control
+SELECT java_mark('platform', 'platform') AS java_mark;
+java_mark
+marked platform, thread: platform
+SELECT java_seen() AS after_platform_thread;
+after_platform_thread
+null
+SELECT java_mark('virtual', 'virtual') AS java_mark;
+java_mark
+marked virtual, thread: virtual
+SELECT java_seen() AS after_virtual_thread;
+after_virtual_thread
+null
+SET GLOBAL mle.worker_cache_timeout = DEFAULT;
+DROP FUNCTION py_prio;
+DROP FUNCTION py_mark2;
+DROP FUNCTION py_big;
+DROP PROCEDURE js_big_sql;
+DROP PROCEDURE js_import;
+DROP PROCEDURE js_rethrow;
+DROP FUNCTION java_mark;
+DROP FUNCTION java_seen;
+DROP USER u4@localhost, u5@localhost;
+REVOKE CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

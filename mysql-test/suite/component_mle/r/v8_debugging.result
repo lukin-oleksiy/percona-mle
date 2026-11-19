@@ -1,0 +1,219 @@
+#
+# component_mle: debugging routines (exp note 39). A runtime error names
+# where it happened; mle_session_state('traceback') shows the frames in
+# the language's own form with their source lines; 'last_output' is what
+# the last call printed; mle.console = WARNINGS adds a call's output and a
+# failure's traceback to the statement's warnings.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+# 1. The error message names the routine, the line and the function.
+SELECT py_div(1);
+ERROR HY000: Python> ZeroDivisionError: integer division or modulo by zero (py_div, line 3, in helper)
+SELECT js_div(1);
+ERROR HY000: JavaScript> TypeError: Cannot read properties of undefined (reading 'field') (js_div, line 2, in helper)
+SELECT java_div(1);
+ERROR HY000: Java> java.lang.ArrayIndexOutOfBoundsException: Index 6 out of bounds for length 2 (java_div, line 4)
+# 2. The traceback in each language's form, with source lines.
+SELECT py_div(1);
+ERROR HY000: Python> ZeroDivisionError: integer division or modulo by zero (py_div, line 3, in helper)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+Traceback (most recent call last):
+  File "py_div", line 5, in <routine>
+    return helper(a - a)
+  File "py_div", line 3, in helper
+    return 10 // v
+ZeroDivisionError: integer division or modulo by zero
+
+SELECT js_div(1);
+ERROR HY000: JavaScript> TypeError: Cannot read properties of undefined (reading 'field') (js_div, line 2, in helper)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+TypeError: Cannot read properties of undefined (reading 'field')
+    at helper (js_div:2:41)
+        function helper(v) { return v.missing.field }
+    at js_div:4:10
+        return helper({})
+
+SELECT java_div(1);
+ERROR HY000: Java> java.lang.ArrayIndexOutOfBoundsException: Index 6 out of bounds for length 2 (java_div, line 4)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+java.lang.ArrayIndexOutOfBoundsException: Index 6 out of bounds for length 2
+    at java_div:4
+        return arr[a + 5];
+
+# Oracle's stack_trace stays as it was.
+SELECT mle_session_state('stack_trace') AS stack_trace;
+stack_trace
+<java> java_div:4
+
+# 3. last_output: only what the last call printed (stdout: the session's).
+SELECT py_talk(2);
+py_talk(2)
+2
+SELECT mle_session_state('last_output') AS last_output;
+last_output
+step 0 square 0
+step 1 square 1
+done
+
+SELECT LENGTH(mle_session_state('stdout')) > LENGTH(mle_session_state('last_output')) AS stdout_has_more;
+stdout_has_more
+1
+# 4. mle.console = WARNINGS: the output and the traceback as warnings.
+SELECT @@session.mle.console;
+@@session.mle.console
+OFF
+SET SESSION mle.console = WARNINGS;
+SELECT py_talk(3);
+py_talk(3)
+3
+Warnings:
+Warning	6000	py_talk: step 0 square 0
+Warning	6000	py_talk: step 1 square 1
+Warning	6000	py_talk: step 2 square 4
+Warning	6000	py_talk stderr: done
+SHOW WARNINGS;
+Level	Code	Message
+Warning	6000	py_talk: step 0 square 0
+Warning	6000	py_talk: step 1 square 1
+Warning	6000	py_talk: step 2 square 4
+Warning	6000	py_talk stderr: done
+SELECT py_div(1);
+ERROR HY000: Python> ZeroDivisionError: integer division or modulo by zero (py_div, line 3, in helper)
+SHOW WARNINGS;
+Level	Code	Message
+Warning	6000	py_div: before, a = 1
+Error	6113	Python> ZeroDivisionError: integer division or modulo by zero (py_div, line 3, in helper)
+Warning	6000	py_div traceback: Traceback (most recent call last):
+Warning	6000	py_div traceback:   File "py_div", line 5, in <routine>
+Warning	6000	py_div traceback:     return helper(a - a)
+Warning	6000	py_div traceback:   File "py_div", line 3, in helper
+Warning	6000	py_div traceback:     return 10 // v
+Warning	6000	py_div traceback: ZeroDivisionError: integer division or modulo by zero
+# Only what the call printed: py_talk(0) writes only to stderr.
+SELECT py_talk(0);
+py_talk(0)
+0
+Warnings:
+Warning	6000	py_talk stderr: done
+SHOW WARNINGS;
+Level	Code	Message
+Warning	6000	py_talk stderr: done
+SET SESSION mle.console = DEFAULT;
+SET SESSION mle.console = 'loud';
+ERROR 42000: Variable 'mle.console' can't be set to the value of 'loud'
+# 5. mle_eval(language, code): a snippet without CREATE; what it printed,
+#    then the value of its last expression.
+SELECT mle_eval('python', 'import numpy as np\nnp.arange(5) * 2') AS python;
+python
+array([0, 2, 4, 6, 8])
+SELECT mle_eval('python', 'print("hello")\n6 * 7') AS printed_and_value;
+printed_and_value
+hello
+42
+SELECT mle_eval('js', 'const a = [1, 2, 3]; a.map(x => x * 2)') AS javascript;
+javascript
+[2,4,6]
+# let/const stay in the snippet: the same snippet again.
+SELECT mle_eval('js', 'const a = [1, 2, 3]; a.map(x => x * 2)') AS again;
+again
+[2,4,6]
+SELECT mle_eval('java', 'Math.max(3, 7)') AS java_expression;
+java_expression
+7
+SELECT mle_eval('java', 'int s = 0;\nfor (int i = 0; i < 4; i++) s += i;\nSystem.out.println("sum " + s);') AS java_statements;
+java_statements
+sum 6
+
+SELECT mle_eval('python', 'x = 1') IS NULL AS no_value;
+no_value
+1
+SELECT mle_eval('python', 'a = 1\nb = 0\na / b');
+ERROR HY000: Python> ZeroDivisionError: division by zero (mle_eval, line 3)
+SELECT mle_eval('js', 'let = ;');
+ERROR HY000: JavaScript> SyntaxError: mle_eval:1:7 Unexpected token ';'
+let = ;
+      ^
+
+SELECT mle_eval('python', 'x = (1,');
+ERROR HY000: Python> SyntaxError: '(' was never closed (mle_eval, line 1)
+SELECT mle_eval('python', 'session.run_sql("SELECT 1")');
+ERROR HY000: Python> mle_eval cannot run SQL: put the code in a procedure to run SQL (mle_eval, line 1)
+SELECT mle_eval('cobol', '1');
+ERROR HY000: mle_eval<string> UDF failed; the language must be JAVASCRIPT, PYTHON or JAVA
+# 6. CREATE checks Python code beyond its syntax: names that are read but
+#    never defined (a typo) are warnings; the routine is created.
+CREATE FUNCTION py_typo(word VARCHAR(20)) RETURNS INT LANGUAGE PYTHON AS $$
+n = len(word)
+return lenght if n > 3 else n
+$$;
+Warnings:
+Warning	6000	Python> py_typo, line 3: name 'lenght' is not defined
+SHOW WARNINGS;
+Level	Code	Message
+Warning	6000	Python> py_typo, line 3: name 'lenght' is not defined
+# Parameters, MLE's globals, imports, functions, comprehensions,
+# lambdas: no warnings.
+CREATE PROCEDURE py_clean(IN k INT) LANGUAGE PYTHON AS $$
+import math
+from collections import Counter
+def sq(v): return v * v
+cube = lambda x: x ** 3
+total = sum(sq(i) + cube(j) for i in range(k) for j in [i])
+c = Counter([1, 1, 2])
+print(math.sqrt(total), c[1], isinstance(session, object), mysql, [w for w in ['a'] if w])
+$$;
+SHOW WARNINGS;
+Level	Code	Message
+# exec(): no check (the names it defines are unknown).
+CREATE FUNCTION py_star() RETURNS INT LANGUAGE PYTHON AS $$
+ns = {}
+exec('x = 4', ns)
+return ns['x'] + unknown_but_unchecked if False else ns['x']
+$$;
+SHOW WARNINGS;
+Level	Code	Message
+# Errors that Python finds after parsing are compile errors too (the
+# body is a function body).
+CREATE FUNCTION py_star_import() RETURNS DOUBLE LANGUAGE PYTHON AS $$
+from math import *
+return sqrt(4)
+$$;
+ERROR HY000: Python> SyntaxError: import * only allowed at module level (py_star_import, line 2)
+# Java is compiled at CREATE; javac's messages name the routine, not MLE's
+# wrapper class.
+CREATE FUNCTION java_typo(a INT) RETURNS INT LANGUAGE JAVA AS $$ int total = a + 1; return totl; $$;
+ERROR HY000: Java> java_typo:1:28: cannot find symbol
+  symbol:   variable totl
+  location: routine java_typo
+# The routine runs; later loads do not repeat the warning, and the
+# findings are not in the session's stderr.
+SELECT py_typo('ab');
+py_typo('ab')
+2
+SHOW WARNINGS;
+Level	Code	Message
+SELECT LOCATE('mle-check', mle_session_state('stderr')) AS marker_in_stderr;
+marker_in_stderr
+0
+DROP FUNCTION py_typo;
+DROP PROCEDURE py_clean;
+DROP FUNCTION py_star;
+# The language's CREATE privilege is needed.
+CREATE USER u_eval@localhost;
+GRANT CREATE_JS_ROUTINE ON *.* TO u_eval@localhost;
+SELECT mle_eval('js', '1 + 1') AS allowed;
+allowed
+2
+SELECT mle_eval('python', '1 + 1');
+ERROR 42000: Access denied; you need (at least one of) the CREATE_PYTHON_ROUTINE privilege(s) for this operation
+DROP USER u_eval@localhost;
+DROP FUNCTION py_div;
+DROP FUNCTION js_div;
+DROP FUNCTION java_div;
+DROP FUNCTION py_talk;
+REVOKE CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
