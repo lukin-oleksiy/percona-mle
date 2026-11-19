@@ -17,8 +17,25 @@ image's `<name>:<tag>` (`percona-mle-tools:dev`): mle_package with npm, Maven an
 
 ## Run
 
+    docker/run.sh start          # the server; prints the accounts and how to connect
+    docker/run.sh sql            # the mysql client as the application account (also: run.sh sql < file.sql)
+    docker/run.sh status | logs | stop | rm
+
+`run.sh` needs only docker and the image, nothing else of this repository: it can be handed out with the image. It
+keeps the data in a volume (`mle-data`), publishes the port on this host only (`MLE_BIND=0.0.0.0` for other hosts),
+generates the passwords it is not given (`run.sh status` shows them) and takes its settings from the environment
+(`MLE_IMAGE`, `MLE_NAME`, `MLE_PORT`, `MLE_MEMORY`, `MLE_PRIVILEGED=yes`; see its head). What it runs is:
+
     docker run -d --name mle -e MYSQL_ROOT_PASSWORD=secret -m 8g \
       -v mle-data:/var/lib/mysql percona-mle:dev
+
+## Publish
+
+    docker login registry.example.com
+    docker/publish.sh push registry.example.com/team/percona-mle:0.1     # and ...-tools:0.1
+    docker/publish.sh save /some/dir          # percona-mle-dev.tar.gz for `docker load -i`, with SHA-256 sums
+
+Elsewhere: `MLE_IMAGE=registry.example.com/team/percona-mle:0.1 docker/run.sh start`.
 
 First start: initializes the datadir, installs component_mle and component_lang_router, grants the MLE privileges
 to root (and to `MLE_APP_USER`, optional, on its database). Passwords and names may hold any character. While
