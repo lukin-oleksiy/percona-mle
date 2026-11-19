@@ -201,7 +201,16 @@ Worker::Worker(const Config &config) : m_config(config) {
   m_allocator.reset(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
   v8::Isolate::CreateParams params;
   params.array_buffer_allocator = m_allocator.get();
+  // mle.v8_heap_max is the whole heap. V8 sizes the young generation from it (12 MB of 512 MB);
+  // V8's own default (Node, js_lang) is 48 MB (16 MB semi-spaces): allocation-heavy code is faster
+  // with it (JSON of 200k objects: -21 %, for +22 MB PSS after it; idle the same; exp note 63 §9).
+  // Young: 48 MB, at most an eighth of the heap.
   params.constraints.ConfigureDefaultsFromHeapSize(0, m_config.heap_max);
+  if (const size_t young = std::min<size_t>(48ULL << 20, m_config.heap_max / 8);
+      young > params.constraints.max_young_generation_size_in_bytes()) {
+    params.constraints.set_max_young_generation_size_in_bytes(young);
+    params.constraints.set_max_old_generation_size_in_bytes(m_config.heap_max - young);
+  }
   m_isolate = v8::Isolate::New(params);
   m_isolate->Enter();
   m_isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
@@ -967,7 +976,7 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
     iso->ThrowException(v8::Exception::TypeError(v8_string(iso, m)));
     return v8::MaybeLocal<Value>();
   };
-  if (info.Length() < 9) return throw_type("sql: 9 arguments");
+  if (info.Length() < 8) return throw_type("sql: 8 arguments");
   const auto action = static_cast<uint8_t>(u32(0));
   const auto sid = static_cast<uint64_t>(f64(1));
   const std::string text = info[2]->IsString() ? utf8(iso, info[2]) : std::string();
@@ -978,7 +987,6 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
   const auto i32 = [&](int i) { return info[i]->Int32Value(ctx).FromMaybe(-1); };
   if (const int it = i32(6); it >= 0 && it <= w::kMaxIntegerType) rules.integer_type = static_cast<w::IntegerType>(it);
   if (const int dt = i32(7); dt >= 0 && dt <= w::kMaxDecimalType) rules.decimal_type = static_cast<w::DecimalType>(dt);
-  const Local<Value> proto_for = info[8];
 
   // The message: in a buffer the size of the arena, larger when it does not fit (up to the host's limit).
   Local<v8::Array> params;
@@ -1060,22 +1068,15 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
         case w::SqlResultKind::kRows: {
           const auto ncols = r.get<uint32_t>();
           if (ncols > 4096) throw Malformed{"too many columns"};
-          std::vector<Local<v8::Name>> names;
           std::vector<std::string> types;
-          std::vector<bool> keep;  // a label's first column (labels repeat: SELECT 1 a, 2 a)
           const Local<v8::Array> labels = v8::Array::New(iso, static_cast<int>(ncols));
           const Local<v8::Array> columns = v8::Array::New(iso, static_cast<int>(ncols));
-          std::vector<std::string> seen;
           for (uint32_t i = 0; i < ncols; i++) {
             const std::string name(r.str()), table(r.str());
             const ParamType t = ParamType::read(r);
             const std::string org_name(r.str()), schema(r.str()), org_table(r.str()), charset(r.str()),
                 collation(r.str());
             const auto flags_ = r.get<uint32_t>();
-            const bool first = std::find(seen.begin(), seen.end(), name) == seen.end();
-            seen.push_back(name);
-            keep.push_back(first);
-            if (first) names.push_back(v8_string(iso, name));
             types.push_back(t.type_name);
             (void)labels->Set(ctx, i, v8_string(iso, name));
             Local<Value> c[] = {v8_string(iso, name),          v8_string(iso, table),
@@ -1089,31 +1090,20 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
           }
           const auto total = r.get<uint64_t>();
           const auto nrows = r.get<uint32_t>();
-          // The rows' prototype (getField, indexes, ...) from sql.js, once per reply.
-          Local<Value> proto = v8::Null(iso);
-          if (nrows > 0 && proto_for->IsFunction()) {
-            Local<Value> a = labels;
-            if (!proto_for.As<v8::Function>()->Call(ctx, v8::Undefined(iso), 1, &a).ToLocal(&proto)) return {};
-          }
-          const Local<v8::Array> rows = v8::Array::New(iso, static_cast<int>(nrows));
-          std::vector<Local<Value>> values(ncols);
+          // The rows' values in one flat array, row by row (nrows * ncols): sql.js makes the rows
+          // (arrays with the labels as properties, rowsOf), in JavaScript, where V8 compiles their
+          // shape once; built here through the API, each property costs a generic lookup.
+          if (static_cast<uint64_t>(nrows) * ncols > (1ULL << 27)) throw Malformed{"too many values"};
+          std::vector<Local<Value>> values(static_cast<size_t>(nrows) * ncols);
           try {
-            // A row is an array of its values with the labels as properties (GuestSql.GRow: array
-            // elements and members), its prototype sql.js's (getField ...).
-            for (uint32_t k = 0; k < nrows; k++) {
-              for (uint32_t i = 0; i < ncols; i++) values[i] = m_values->column(r, types[i], &rules);
-              const Local<v8::Array> row = v8::Array::New(iso, values.data(), ncols);
-              if (proto->IsObject()) (void)row->SetPrototype(ctx, proto);
-              for (uint32_t i = 0, j = 0; i < ncols; i++)
-                if (keep[i]) (void)row->CreateDataProperty(ctx, names[j++], values[i]);
-              (void)rows->Set(ctx, k, row);
-            }
+            for (size_t k = 0; k < values.size(); k++) values[k] = m_values->column(r, types[k % ncols], &rules);
           } catch (const ConversionError &c) {
             return throw_type(c.message);
           }
           const bool more = r.get<uint8_t>() != 0, more_results = r.get<uint8_t>() != 0;
           const Local<Value> warns = warnings_of(iso, r);
           const auto exec_us = r.get<uint64_t>();
+          const Local<v8::Array> rows = v8::Array::New(iso, values.data(), values.size());
           Local<Value> o[] = {v8::Number::New(iso, 2),     labels, columns, number(iso, total), rows,
                               v8::Boolean::New(iso, more), v8::Boolean::New(iso, more_results), warns,
                               v8::Number::New(iso, static_cast<double>(exec_us))};

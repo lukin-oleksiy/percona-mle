@@ -126,6 +126,31 @@ if (!$cgroups) {
   --echo ERROR HY000: MLE> the worker died: <reason>
 }
 SELECT js_double(5) AS after_oom;
+
+--echo #
+--echo # 7. Rows: an array with the labels as properties (made in sql.js, from the
+--echo #    values the C++ core sends flat), any label; built-ins the routine's code
+--echo #    replaced in its worker do not change them.
+--echo #
+CREATE PROCEDURE js_rows(OUT r TEXT) LANGUAGE JS AS $$
+  const row = session.runSql("SELECT 1 AS a, 2 AS a, 3 AS `length`, 4 AS `0`, 5 AS `x y`, " +
+                             "6 AS __proto__, 7 AS `constructor`").fetchOne()
+  r = [JSON.stringify(row), row.length, row.a, row['x y'], row[0], row.getField('length'),
+       row.getField('a'), row.getField('0'), Object.getPrototypeOf(row) !== Array.prototype,
+       Array.isArray(row), row.constructor].join(' ')
+$$;
+CREATE PROCEDURE js_tampered(OUT r TEXT) LANGUAGE JS AS $$
+  Array.prototype.join = () => 'hacked'
+  JSON.stringify = () => 'hacked'
+  Object.setPrototypeOf = () => { throw new Error('hacked') }
+  const rows = session.runSql('SELECT n, n * 2 AS twice FROM (SELECT 1 AS n UNION ALL SELECT 2) t ORDER BY n').fetchAll()
+  r = ''
+  for (const x of rows) r += x.n + ':' + x.twice + ':' + x.getField('twice') + ' '
+$$;
+CALL js_rows(@r);
+SELECT @r;
+CALL js_tampered(@r);
+SELECT @r;
 --disconnect con2
 --connection default
 --source include/wait_until_count_sessions.inc
@@ -142,5 +167,7 @@ DROP FUNCTION js_deep;
 DROP FUNCTION js_pid;
 DROP FUNCTION js_hog;
 DROP FUNCTION js_buffers;
+DROP PROCEDURE js_rows;
+DROP PROCEDURE js_tampered;
 REVOKE CREATE_JS_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
 UNINSTALL COMPONENT "file://component_mle";

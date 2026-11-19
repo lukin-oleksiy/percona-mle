@@ -145,26 +145,83 @@
 
   // ---------------------------------------------------------------- rows
   // GuestSql.GRow: an array of the values (JSON.stringify(row) is the array; its keys are the
-  // indexes, then the labels), with the columns by label as properties (set by the C++ core) and
-  // getField / getLength / toArray.
-  const protos = new Map();
-  const protoFor = (labels) => {
-    const key = labels.join('\u0000');
-    let p = protos.get(key);
-    if (p !== undefined) return p;
-    const index = new Set(labels);
-    p = Object.create(Array.prototype, {
+  // indexes, then the labels), with the columns by label as properties (a label's first column:
+  // SELECT 1 a, 2 a) and getField / getLength / toArray from the prototype. The C++ core sends a
+  // reply's values flat (row by row); a factory per label list, compiled once, makes the rows (V8
+  // gives all of them one shape). Routine code may replace built-ins in its worker
+  // (Array.prototype.join, JSON.parse ...): what makes rows uses only what it took here, at load.
+  const objectCreate = Object.create, setProto = Object.setPrototypeOf, defineProp = Object.defineProperty;
+  const quote = JSON.stringify, FunctionCtor = Function, arrayFrom = Array.from;
+  const RESERVED = objectCreate(null);
+  RESERVED.length = RESERVED.__proto__ = RESERVED.getField = RESERVED.getLength = RESERVED.toArray = true;
+  // A label that is a plain name (not reserved): a store the compiler knows.
+  const plainName = (l) => {
+    if (l.length === 0 || RESERVED[l] === true) return false;
+    for (let i = 0; i < l.length; i++) {
+      const c = l.charCodeAt(i);
+      const letter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36;
+      if (!letter && !(i > 0 && c >= 48 && c <= 57)) return false;
+    }
+    return true;
+  };
+  // A label that is an array index ("0", "12"): the row's elements are its values in order.
+  const arrayIndex = (l) => {
+    if (l.length === 0 || l.length > 10 || (l.length > 1 && l.charCodeAt(0) === 48)) return false;
+    for (let i = 0; i < l.length; i++) {
+      const c = l.charCodeAt(i);
+      if (c < 48 || c > 57) return false;
+    }
+    return +l < 4294967295;
+  };
+  const define = (r, k, v) => { defineProp(r, k, { value: v, writable: true, enumerable: true, configurable: true }); };
+  let makers = objectCreate(null), makerCount = 0;
+  const makerFor = (labels) => {
+    const n = labels.length;
+    let key = '';
+    for (let j = 0; j < n; j++) key += (j === 0 ? '' : '\u0000') + labels[j];
+    let m = makers[key];
+    if (m !== undefined) return m;
+    const index = objectCreate(null);  // label -> its first column
+    for (let j = n - 1; j >= 0; j--) index[labels[j]] = j;
+    const proto = objectCreate(Array.prototype, {
       getField: { value: function (name) {
         if (name === undefined || name === null) throw new TypeError('argument 1 is missing');
         const k = String(name);
-        if (!index.has(k)) throw new TypeError("no column '" + k + "' in the row");
-        return this[k];
+        const j = index[k];
+        if (j === undefined) throw new TypeError("no column '" + k + "' in the row");
+        return this[j];
       } },
       getLength: { value: function () { return this.length; } },
-      toArray: { value: function () { return Array.from(this); } },
+      toArray: { value: function () { return arrayFrom(this); } },
     });
-    if (protos.size < 1024) protos.set(key, p);
-    return p;
+    // (v, i): the row of the values from v[i]. Labels that are not plain names (a prototype's
+    // member, "x y") are defined as own properties; "length" and the indexes stay the array's
+    // (getField has them).
+    let body = 'const r = [';
+    for (let j = 0; j < n; j++) body += (j === 0 ? '' : ', ') + 'v[i + ' + j + ']';
+    body += '];\nsetProto(r, proto);\n';
+    const seen = objectCreate(null);
+    for (let j = 0; j < n; j++) {
+      const l = labels[j];
+      if (seen[l] === true || l === 'length' || arrayIndex(l)) continue;
+      seen[l] = true;
+      body += plainName(l) ? 'r.' + l + ' = r[' + j + '];\n' : 'define(r, ' + quote(l) + ', r[' + j + ']);\n';
+    }
+    body += 'return r;';
+    const make = new FunctionCtor('setProto', 'proto', 'define', 'return (v, i) => {\n' + body + '\n}')(
+      setProto, proto, define);
+    m = { n, make };
+    if (makerCount >= 1024) { makers = objectCreate(null); makerCount = 0; }
+    makers[key] = m; makerCount++;
+    return m;
+  };
+  // The rows of one reply: labels, the values flat.
+  const replyRows = (labels, values) => {
+    const { n, make } = makerFor(labels);
+    const rows = [];
+    if (n === 0) return rows;
+    for (let k = 0, i = 0; i < values.length; k++, i += n) rows[k] = make(values, i);
+    return rows;
   };
 
   // ---------------------------------------------------------------- columns, warnings
@@ -223,11 +280,11 @@
     drainOther(sid);
     const o = options || NO_OPTIONS;
     // -1: the session's integerType / decimalType (mle_set_session_state).
-    const t = N.sql(action, sid, text, params, flags, width, o.intCode, o.decCode, protoFor);
+    const t = N.sql(action, sid, text, params, flags, width, o.intCode, o.decCode);
     if (t[0] === 0) throw sqlError(t[1], t[2], t[3], t[4]);
+    if (t[0] === 2) t[4] = replyRows(t[1], t[4]);
     return t;
   };
-  const sessionDecimal = () => state()[4];
 
   const drainOther = (sid) => {
     const p = pending;
@@ -241,15 +298,24 @@
 
   // ---------------------------------------------------------------- results
   const REPLACED = 'the result was replaced by a new execution of its prepared statement';
+  // A batch of rows onto the rows read so far, in place (concat would copy them all per batch).
+  const appendRows = (rows, batch) => {
+    for (let i = 0; i < batch.length; i++) rows.push(batch[i]);
+  };
 
+  // A result's own state: one slot under a symbol (not in its keys or JSON; a plain store, where
+  // defineProperties per statement cost as much as the rest of the statement's JavaScript).
+  const RESULT = Symbol('result');
   class SqlResult {
     constructor(sid, owned, direct, options, reply) {
-      Object.defineProperties(this, {
-        $id: { value: sid }, $owned: { value: owned }, $direct: { value: direct }, $options: { value: options },
-        $s: { value: { replaced: false } },
-      });
+      this[RESULT] = { id: sid, owned, direct, options, s: { replaced: false } };
       this.$load(reply);
     }
+    get $id() { return this[RESULT].id; }
+    get $owned() { return this[RESULT].owned; }
+    get $direct() { return this[RESULT].direct; }
+    get $options() { return this[RESULT].options; }
+    get $s() { return this[RESULT].s; }
     $load(t) {
       const s = this.$s;
       if (pending === this) pending = null;
@@ -280,8 +346,8 @@
     $drain() {
       const s = this.$s;
       if (!s.more || s.replaced) return;
-      let rows = s.rows.slice(s.at);
-      while (s.more) rows = rows.concat(this.$fetch());
+      const rows = s.rows.slice(s.at);
+      while (s.more) appendRows(rows, this.$fetch());
       s.rows = rows; s.at = 0;
     }
     $replace() {
@@ -306,9 +372,9 @@
     fetchAll() {
       this.$live();
       const s = this.$s;
-      let rows = s.at === 0 ? s.rows : s.rows.slice(s.at);
+      const rows = s.at === 0 ? s.rows : s.rows.slice(s.at);
       s.rows = []; s.at = 0;
-      while (s.more) rows = rows.concat(this.$fetch());
+      while (s.more) appendRows(rows, this.$fetch());
       return rows;
     }
     hasData() { return this.$s.hasData; }
@@ -675,15 +741,15 @@
   // ---------------------------------------------------------------- session internals
   const quoteName = (name) => '`' + String(name).replace(/`/g, '``') + '`';
   const callOptions = new Map();  // depth -> [scope, options] (independent review C15)
-  const callScopeOptions = () => {
-    const [depth, scope] = state();
-    const e = callOptions.get(depth);
-    return e !== undefined && e[0] === scope ? e[1] : null;
+  const callScopeOptions = (st = state()) => {
+    const e = callOptions.get(st[0]);
+    return e !== undefined && e[0] === st[1] ? e[1] : null;
   };
   const effective = (o) => {
-    let base = callScopeOptions();
+    const st = state();
+    let base = callScopeOptions(st);
     if (base === null) {
-      const d = sessionDecimal();
+      const d = st[4];  // the session's decimalType
       base = new Options({ decimalType: d < DECIMAL_TYPES.length ? DECIMAL_TYPES[d] : null });
     }
     return o === null || o === undefined ? base.over(null) : o.over(base);
