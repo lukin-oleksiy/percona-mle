@@ -105,3 +105,15 @@ IF(TARGET mle_cpython_worker)
     MLE_CPYTHON_SITE="${MLE_CPYTHON_DIR}/site-packages")
   ADD_DEPENDENCIES(mle_cpython_codec-t mle_cpython_layout)
 ENDIF()
+
+# The V8 worker's values (exp design note 63), in an isolate of the distribution's V8.
+IF(TARGET mle_v8_worker)
+  GET_PROPERTY(MLE_V8_DIR GLOBAL PROPERTY MLE_V8_DIR)
+  SET(v8w ${PROJECT_SOURCE_DIR}/worker/v8)
+  MYSQL_ADD_EXECUTABLE(mle_v8_values-t v8_values-t.cc ${v8w}/values.cc
+    ADD_TEST mle_v8_values
+    LINK_LIBRARIES ${MLE_LIBNODE} ${MLE_GMOCK_LIB} ${MLE_GTEST_LIB} Threads::Threads
+    )
+  TARGET_INCLUDE_DIRECTORIES(mle_v8_values-t PRIVATE ${v8w} ${PROJECT_SOURCE_DIR}/worker ${PROJECT_SOURCE_DIR}/include)
+  TARGET_INCLUDE_DIRECTORIES(mle_v8_values-t SYSTEM PRIVATE ${MLE_V8_INCLUDE_DIR})
+ENDIF()
