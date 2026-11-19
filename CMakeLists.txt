@@ -35,6 +35,7 @@ ADD_SUBDIRECTORY(host)
 ADD_SUBDIRECTORY(launcher)
 ADD_SUBDIRECTORY(worker)
 ADD_SUBDIRECTORY(worker/cpython)
+ADD_SUBDIRECTORY(worker/v8)
 ADD_SUBDIRECTORY(harness)
 
 # The build tree gets the installed layout (include/mle/defaults.h) as
@@ -73,6 +74,14 @@ IF(MLE_CPYTHON_DIR)
     COMMAND ${CMAKE_COMMAND} -E create_symlink ${MLE_CPYTHON_DIR} ${MLE_BUILD_LAYOUT}/cpython
     VERBATIM)
   ADD_DEPENDENCIES(mle_build_layout mle_cpython_layout)
+ENDIF()
+# The V8 worker (-DMLE_V8=ON, the default with libnode's V8 headers; exp design note 63).
+GET_PROPERTY(MLE_V8_DIR GLOBAL PROPERTY MLE_V8_DIR)
+IF(MLE_V8_DIR)
+  ADD_CUSTOM_COMMAND(TARGET mle_build_layout POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink ${MLE_V8_DIR} ${MLE_BUILD_LAYOUT}/v8
+    VERBATIM)
+  ADD_DEPENDENCIES(mle_build_layout mle_v8_layout)
 ENDIF()
 
 # The DBA's tool for third-party packages (14-phase6-libraries.md §3), and
