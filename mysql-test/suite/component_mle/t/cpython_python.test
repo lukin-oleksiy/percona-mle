@@ -1,0 +1,301 @@
+--echo #
+--echo # component_mle: the CPython worker (exp design note 62; mle.worker =
+--echo # CPYTHON, the distribution's CPython embedded in mle_cpython_worker).
+--echo # Python routines, numpy, the SQL API, VECTOR values, Python libraries,
+--echo # mle_eval and the CREATE check; JavaScript and Java refused; the sandbox,
+--echo # KILL, a native crash and the cgroup memory limit as with the JVM build.
+--echo #
+--source ../include/have_mle_component.inc
+--source ../include/have_mle_cpython.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+
+call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+
+--echo #
+--echo # 1. The CPython worker runs Python only.
+--echo #
+SELECT @@mle.worker;
+SELECT VARIABLE_VALUE AS languages FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_languages_supported';
+--error ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE
+CREATE FUNCTION js_f() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+--error ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE
+CREATE FUNCTION java_f() RETURNS INT LANGUAGE JAVA AS $$ return 1; $$;
+--error ER_LIBRARIES_NOT_SUPPORTED
+CREATE LIBRARY jslib LANGUAGE JAVASCRIPT AS $$ export function f() { return 1 } $$;
+
+--echo #
+--echo # 2. Python routines, numpy, the SQL API, VECTOR values, libraries.
+--echo #
+CREATE TABLE items (id INT PRIMARY KEY, name VARCHAR(20), price DECIMAL(8,2), v VECTOR(3));
+INSERT INTO items VALUES (1, 'apple', 0.50, STRING_TO_VECTOR('[1, 0, 0]')),
+  (2, 'pear', 0.75, STRING_TO_VECTOR('[0.9, 0.1, 0]')), (3, 'car', 9000, STRING_TO_VECTOR('[0, 0, 1]'));
+--write_file $MYSQLTEST_VARDIR/tmp/cpython_python.sql
+CREATE FUNCTION py_add(a INT, b INT) RETURNS INT LANGUAGE PYTHON AS $$ return a + b $$;
+CREATE FUNCTION py_np() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import numpy as np
+    a = np.arange(6, dtype=np.float32).reshape(2, 3)
+    return f'{(a @ a.T).tolist()} {np.linalg.norm(np.array([3.0, 4.0]))}'
+$$;
+CREATE FUNCTION py_runtime() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import platform, sys
+    return '%s %d.%d, numpy %s' % (platform.python_implementation(), sys.version_info[0], sys.version_info[1],
+                                   __import__('numpy').__version__.split('.')[0] + '.x')
+$$;
+CREATE FUNCTION py_types(u BIGINT UNSIGNED, d DECIMAL(10,3), s VARCHAR(10), dt DATETIME, t TIME, j JSON,
+                         b VARBINARY(4), f FLOAT) RETURNS TEXT LANGUAGE PYTHON AS $$
+    return repr((u, d, s, dt, t, j, b, f))
+$$;
+CREATE FUNCTION py_cosine(a VECTOR(3), b VECTOR(3)) RETURNS DOUBLE DETERMINISTIC LANGUAGE PYTHON AS $$
+    import numpy as np
+    return round(float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b))), 4)
+$$;
+CREATE FUNCTION py_vec_ro(a VECTOR(3)) RETURNS TEXT LANGUAGE PYTHON AS $$
+    try:
+        a[0] = 5
+        return 'writable'
+    except ValueError as e:
+        return 'read-only: %s' % e
+$$;
+CREATE FUNCTION py_double(a VECTOR(3)) RETURNS VECTOR(3) LANGUAGE PYTHON AS $$ return a * 2 $$;
+CREATE PROCEDURE py_sql(OUT r TEXT) LANGUAGE PYTHON AS $$
+    out = []
+    for row in session.run_sql('SELECT id, name, price, v FROM items ORDER BY id'):
+        out.append(f'{row.id} {row.name} {row.price} {[round(x, 2) for x in row.v.tolist()]}')
+    ps = session.prepare('SELECT name FROM items WHERE price < ? ORDER BY id')
+    out.append('cheap: ' + ','.join(row.name for row in ps.bind(1).execute()))
+    c = session.run_sql('SELECT id, v FROM items ORDER BY id').fetch_columns()
+    out.append(f"columns: {c['v'].shape} {c['v'].dtype} {c['id'].tolist()}")
+    session.start_transaction()
+    session.run_sql("INSERT INTO items VALUES (4, 'plum', 1.10, STRING_TO_VECTOR('[1, 1, 0]'))")
+    session.rollback()
+    out.append('after rollback: ' + str(session.run_sql('SELECT COUNT(*) AS n FROM items').fetch_one().n))
+    r = session.run_sql('SELECT 7 AS n, 8 AS m').fetch_one()
+    out.append('row by label: %s %s, by index: %s, values: %s' % (r['n'], r['m'], r[1], list(r)))
+    r = '\n'.join(out)
+$$;
+CREATE FUNCTION py_twice(x INT) RETURNS INT LANGUAGE PYTHON AS $$ return 2 * x $$;
+CREATE PROCEDURE py_nested(OUT r TEXT) LANGUAGE PYTHON AS $$
+    r = ','.join(str(row.t) for row in session.run_sql('SELECT py_twice(id) AS t FROM items ORDER BY id'))
+$$;
+CREATE PROCEDURE py_sqlerr() LANGUAGE PYTHON AS $$
+    try:
+        session.run_sql('SELECT * FROM no_such_table')
+    except SqlError as e:
+        raise SqlError('45001', 'caught %d %s' % (e.code, e.sql_state), 5555)
+$$;
+CREATE LIBRARY pyprices LANGUAGE PYTHON AS $$
+def with_vat(price, rate=0.21):
+    return round(float(price) * (1 + rate), 2)
+$$;
+CREATE FUNCTION py_vat(p DECIMAL(8,2)) RETURNS DOUBLE LANGUAGE PYTHON USING (pyprices) AS $$
+    return pyprices.with_vat(p)
+$$;
+CREATE FUNCTION py_vat2(p DECIMAL(8,2)) RETURNS DOUBLE LANGUAGE PYTHON USING (pyprices AS pr) AS $$
+    return import_library('test.pyprices').with_vat(p, 0.1) + pr.with_vat(0)
+$$;
+CREATE LIBRARY pycounter LANGUAGE PYTHON AS $$
+calls = 0
+def bump():
+    global calls
+    calls += 1
+    return calls
+$$;
+CREATE FUNCTION py_state() RETURNS TEXT LANGUAGE PYTHON USING (pycounter) AS $$
+    global seen
+    try:
+        seen += 1
+    except NameError:
+        seen = 1
+    return 'routine global %d, library state %d' % (seen, pycounter.bump())
+$$;
+CREATE FUNCTION py_thread() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import threading
+    try:
+        threading.Thread(target=print).start()
+        return 'started'
+    except RuntimeError as e:
+        return str(e)
+$$;
+CREATE FUNCTION py_print() RETURNS INT LANGUAGE PYTHON AS $$
+    print('to stdout')
+    return 1
+$$;
+CREATE FUNCTION py_err(x INT) RETURNS INT LANGUAGE PYTHON AS $$
+    def helper(v):
+        return v // 0
+    return helper(x)
+$$;
+CREATE FUNCTION py_range(x BIGINT) RETURNS BIGINT UNSIGNED LANGUAGE PYTHON AS $$ return x $$;
+CREATE FUNCTION py_loop() RETURNS INT LANGUAGE PYTHON AS $$
+    while True:
+        pass
+$$;
+CREATE FUNCTION py_probe() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import os, socket
+    out = []
+    def t(name, f):
+        try:
+            f()
+            out.append(name + ': ALLOWED')
+        except OSError:
+            out.append(name + ': refused')
+    t('read /etc/passwd', lambda: open('/etc/passwd').read(1))
+    t('write /tmp', lambda: open('/tmp/mle_cpython_probe', 'w'))
+    t('socket', lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(('127.0.0.1', 1)))
+    t('fork', os.fork)
+    t('signal the parent', lambda: os.kill(os.getppid(), 0))
+    return ', '.join(out)
+$$;
+CREATE FUNCTION py_spawn() RETURNS INT LANGUAGE PYTHON AS $$
+    import subprocess
+    return subprocess.run(['/bin/true']).returncode
+$$;
+CREATE FUNCTION py_package(a DOUBLE, b DOUBLE, c DOUBLE) RETURNS VARCHAR(100) LANGUAGE PYTHON AS $$
+    import mle_demo_py
+    m, spread = mle_demo_py.mean_and_spread([a, b, c])
+    return '%s %.2f %.2f' % (mle_demo_py.__version__, m, spread)
+$$;
+CREATE FUNCTION py_crash() RETURNS INT LANGUAGE PYTHON AS $$
+    import ctypes
+    return ctypes.string_at(0)[0]
+$$;
+CREATE FUNCTION py_hog(mib INT) RETURNS INT LANGUAGE PYTHON AS $$
+    import numpy as np
+    a = np.ones(mib * 1024 * 1024 // 8)
+    return int(a.sum())
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/cpython_python.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/cpython_python.sql
+
+--connect (con1, localhost, root,,test)
+SELECT py_add(2, 3), py_np(), py_runtime();
+SELECT py_types(18446744073709551615, 12.345, 'héllo', '2026-11-19 12:34:56', '-838:59:59', '{"a": [1, 2]}',
+                0x41ff, 1.5) AS t;
+SELECT id, py_cosine(v, STRING_TO_VECTOR('[1, 0.05, 0]')) AS cosine FROM items ORDER BY id;
+SELECT py_vec_ro(v) FROM items WHERE id = 1;
+SELECT VECTOR_TO_STRING(py_double(v)) FROM items ORDER BY id;
+CALL py_sql(@r);
+SELECT @r;
+CALL py_nested(@r);
+SELECT @r;
+--error 5555
+CALL py_sqlerr();
+SELECT py_vat(price), py_vat2(price) FROM items ORDER BY id;
+--echo # Routine globals are fresh in every call; state lives in libraries.
+SELECT py_state();
+SELECT py_state();
+--echo # A library changed by DDL is used in its new version.
+DROP LIBRARY pycounter;
+CREATE LIBRARY pycounter LANGUAGE PYTHON AS $$bump = lambda: 100$$;
+SELECT py_state();
+SELECT py_thread();
+SELECT py_print();
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_err(1);
+--error ER_LANGUAGE_COMPONENT
+SELECT py_range(-1);
+--echo # A third-party package installed by the DBA (mle.package_dir).
+SELECT py_package(1, 2, 6);
+SELECT py_probe();
+--echo # Process creation is refused by the seccomp filter.
+--replace_regex /Python> .*/Python> (process creation refused)/
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_spawn();
+--echo # mle_eval and the CREATE check.
+SELECT mle_eval('python', 'import numpy as np\nnp.arange(5) * 2') AS python;
+SELECT mle_eval('python', 'print("hello")\n6 * 7') AS printed_and_value;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT mle_eval('python', 'a = 1\nb = 0\na / b');
+CREATE FUNCTION py_typo(word VARCHAR(20)) RETURNS INT LANGUAGE PYTHON AS $$
+    n = 0
+    return lenght(word) + n
+$$;
+DROP FUNCTION py_typo;
+--let $con1_id = `SELECT CONNECTION_ID()`
+--let $pid0 = `SELECT mle_debug_worker_pid()`
+
+--echo #
+--echo # 3. max_execution_time and KILL QUERY stop a Python loop; the worker stays.
+--echo #
+--error ER_QUERY_TIMEOUT
+SELECT /*+ MAX_EXECUTION_TIME(500) */ py_loop();
+--send SELECT py_loop()
+--connection default
+--let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE id = $con1_id AND info LIKE 'SELECT py_loop%'
+--source include/wait_condition.inc
+--sleep 0.5
+--replace_result $con1_id CON1
+--eval KILL QUERY $con1_id
+--connection con1
+--error ER_QUERY_INTERRUPTED
+--reap
+SELECT py_add(1, 1);
+--let $pid1 = `SELECT mle_debug_worker_pid()`
+--let $assert_text = The same worker after the timeout and KILL QUERY
+--let $assert_cond = $pid1 = $pid0
+--source include/assert.inc
+
+--echo #
+--echo # 4. A native crash ends the worker, not mysqld; the next call gets a new one.
+--echo #
+--replace_regex /died: .*/died: <reason>/
+--error ER_LANGUAGE_COMPONENT
+SELECT py_crash();
+SELECT py_add(20, 22);
+--let $pid2 = `SELECT mle_debug_worker_pid()`
+--let $assert_text = A new worker after the crash
+--let $assert_cond = $pid2 != $pid0
+--source include/assert.inc
+
+--echo #
+--echo # 5. Memory: numpy frees at once (no memory watcher needed), and the
+--echo #    cgroup limit (mle.memory_max) ends a worker that goes beyond it.
+--echo #
+SELECT py_hog(256) AS ones;
+SELECT py_hog(256) + py_hog(256) + py_hog(256) + py_hog(256) + py_hog(256) + py_hog(256) + py_hog(256)
+  + py_hog(256) + py_hog(256) + py_hog(256) AS many;
+--replace_regex /\(cgroup memory limit\).*/(cgroup memory limit)/
+--error ER_LANGUAGE_COMPONENT
+SELECT py_hog(4096);
+SELECT VARIABLE_VALUE >= 1 AS oom_counted FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_oom_errors';
+SELECT py_add(40, 2);
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION py_add;
+DROP FUNCTION py_np;
+DROP FUNCTION py_runtime;
+DROP FUNCTION py_types;
+DROP FUNCTION py_cosine;
+DROP FUNCTION py_vec_ro;
+DROP FUNCTION py_double;
+DROP PROCEDURE py_sql;
+DROP FUNCTION py_twice;
+DROP PROCEDURE py_nested;
+DROP PROCEDURE py_sqlerr;
+DROP FUNCTION py_vat;
+DROP FUNCTION py_vat2;
+DROP LIBRARY pyprices;
+DROP FUNCTION py_state;
+DROP LIBRARY pycounter;
+DROP FUNCTION py_thread;
+DROP FUNCTION py_print;
+DROP FUNCTION py_err;
+DROP FUNCTION py_range;
+DROP FUNCTION py_loop;
+DROP FUNCTION py_probe;
+DROP FUNCTION py_spawn;
+DROP FUNCTION py_package;
+DROP FUNCTION py_crash;
+DROP FUNCTION py_hog;
+DROP TABLE items;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

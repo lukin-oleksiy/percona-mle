@@ -24,10 +24,10 @@ comments cite the project's design notes by name (e.g. `14-phase6-libraries.md`)
 | `component/` | `component_mle`: the server side (language service, sessions, SQL for routines, UDFs, variables) |
 | `host/`, `include/mle/` | the host library: wire protocol and codec, launcher and worker clients, the installed layout |
 | `launcher/` | `mle_launcher`: starts and sandboxes workers (clone, Landlock, seccomp, cgroups) |
-| `worker/` | `mle_worker` (a JNI launcher of the JVM) and `mle-worker.jar` (GraalJS, GraalPy, Java routines, the SQL API); Maven; the numpy venv; the AOT cache; `native/`: the Python-only native build |
+| `worker/` | `mle_worker` (a JNI launcher of the JVM) and `mle-worker.jar` (GraalJS, GraalPy, Java routines, the SQL API); Maven; the numpy venv; the AOT cache; `native/`: the Python-only native build; `cpython/`: the CPython worker |
 | `tools/` | `mle_package` (the DBA's npm/PyPI/Maven tool), `mle_aot_cache` (makes the AOT cache at install) |
 | `harness/` | a command-line driver for workers (development) |
-| `unittest/` | GoogleTest unit tests (8 binaries) |
+| `unittest/` | GoogleTest unit tests (9 binaries) |
 | `mysql-test/suite/component_mle` | the MTR suite |
 | `perf/` | the performance regression test: two builds side by side |
 | `docker/` | the server + MLE image, the DBA tools image, compose |
@@ -47,7 +47,17 @@ JDK 25 (`MLE_JAVA_HOME`, default `$JAVA_HOME`), Maven, network access to Maven C
 library that `mle_worker` loads instead of the JVM — highly optimised for Python-only use: about half the memory
 per worker, a worker starts in about 0.2 s instead of about 2.5 s, no JDK. It runs Python routines only (no Java,
 no JavaScript). Building it takes a few minutes and about 12 GB of RAM. `mle.worker` (read-only) selects the build:
-`AUTO` (the JVM build when it is installed, else the native one), `JVM` or `NATIVE`.
+`AUTO` (the JVM build when it is installed, else the CPython worker, else the native one), `JVM`, `CPYTHON` or
+`NATIVE`.
+
+**The CPython worker** (`-DMLE_CPYTHON=ON`, the default when Python 3.12 or later with its headers is found,
+e.g. `python3-dev`): `mle_cpython_worker` embeds the distribution's CPython and runs Python routines only, with
+the same launcher, sandbox, protocol and SQL API (exp design note 62). A worker takes about 15 MB (PSS; 25 MB
+with numpy) instead of hundreds, starts in about 60 ms, and frees numpy memory at once. The build installs numpy
+(`MLE_CPYTHON_NUMPY`, default `numpy==2.4.4`) from PyPI into `cpython/site-packages`. In a build tree the
+worker's Python code (`worker/cpython/python`) is linked, not copied: an edit needs no build, the next worker
+reads it. Not on CPython: Java and JavaScript routines, cross-language libraries and the GraalVM-only helpers
+(`com.percona.mle.api`: Stats, Vectors, Frame).
 
 The build type follows the server build's (a debug server gives a debug MLE). For development the build links
 `component_mle.so` and `mle/` into the server build's `plugin_output_directory`
@@ -107,7 +117,8 @@ Packages (`cpack -G DEB` or `cpack -G RPM` in the build directory; the server mu
 | `percona-mle-python-runtime` | `MlePythonRuntime` | Python's standard library and the numpy venv (both builds) | common |
 | `percona-mle-python` | `MlePython` | GraalPy for the JVM build | percona-mle, python-runtime |
 | `percona-mle-python-native` | `MlePythonNative` | the Python-only native build (`-DMLE_PYTHON_NATIVE=ON`) | common, python-runtime |
-| `percona-mle-tools` | `MleTools` | `mle_package` (third-party npm, PyPI, Maven packages) | percona-mle |
+| `percona-mle-cpython` | `MleCPython` | the CPython worker, its Python code and numpy (`-DMLE_CPYTHON=ON`) | common, the distribution's libpython3.x |
+| `percona-mle-tools` | `MleTools` | `mle_package` (third-party npm, PyPI, Maven packages; `install cpython ...` for the CPython worker) | common |
 | `percona-mle-selinux` | `MleSelinux` | the SELinux policy module (RPM only; `-DMLE_SELINUX=ON`, the default with selinux-policy-devel) | pulled by common where SELinux policy is installed |
 
 With the JVM build, `<plugin dir>/mle/mle_aot_cache` makes the JDK AOT cache that workers start from (the

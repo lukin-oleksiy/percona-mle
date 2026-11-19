@@ -191,12 +191,24 @@ std::string mib(uint64_t bytes) {
     mle_worker is only checked to exist: the launcher executes it (and reports
     why it cannot), and under SELinux mysqld itself may not (it is
     mle_worker_exec_t, for the workers' domain). */
-std::string check_layout(const mle::Layout &l, const Settings &s, bool native) {
+std::string check_layout(const mle::Layout &l, const Settings &s, bool native, bool cpython) {
   struct Need {
     const std::string &path;
     int mode;
     const char *what;
   };
+  if (cpython) {
+    // The CPython worker (exp design note 62): no jar, no JDK.
+    if (access(l.launcher_exe.c_str(), X_OK) != 0)
+      return "the MLE files are not installed in mle.dir '" + s.dir + "': mle_launcher (" + l.launcher_exe +
+             ") is missing or not accessible";
+    if (l.cpython_exe.empty())
+      return "mle.worker is CPYTHON but the CPython worker is not installed (" + s.dir +
+             "/cpython/mle_cpython_worker)";
+    if (access(l.cpython_code.c_str(), R_OK | X_OK) != 0)
+      return "the CPython worker's Python code (" + l.cpython_code + ") is missing or not accessible";
+    return "";
+  }
   if (native) {
     // The Python-only native build (23): no jar, no JDK.
     const Need needs[] = {{l.launcher_exe, X_OK, "mle_launcher"},
@@ -310,18 +322,23 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   if (char real[PATH_MAX]; !s.package_dir.empty() &&
                            realpath(s.package_dir.c_str(), real) != nullptr)
     layout.package_dir = real;  // a missing directory: no packages
-  // mle.worker (23): the JVM build (Java, JavaScript, Python) or the
-  // Python-only native build; AUTO takes the JVM build when it is installed
-  // (its jar is there: a wrong mle.java_home is still an error, not a reason
-  // to run the native build instead).
+  // mle.worker: the JVM build (Java, JavaScript, Python), the CPython worker
+  // (Python only, exp design note 62) or the Python-only native build (23).
+  // AUTO takes the JVM build when it is installed (its jar is there: a wrong
+  // mle.java_home is still an error, not a reason to run another kind), else
+  // the CPython worker, else the native build.
   const bool jvm_installed = access(layout.worker_jar.c_str(), R_OK) == 0;
   bool native = false;
-  if (s.worker == "NATIVE") {
+  bool cpython = false;
+  if (s.worker == "CPYTHON") {
+    cpython = true;
+  } else if (s.worker == "NATIVE") {
     native = true;
   } else if (s.worker == "AUTO") {
-    native = !jvm_installed && !layout.native_lib.empty();
+    cpython = !jvm_installed && !layout.cpython_exe.empty();
+    native = !jvm_installed && !cpython && !layout.native_lib.empty();
   } else if (s.worker != "JVM") {
-    *error = "mle.worker must be AUTO, JVM or NATIVE, not '" + s.worker + "'";
+    *error = "mle.worker must be AUTO, JVM, NATIVE or CPYTHON, not '" + s.worker + "'";
     if (!g_launcher) g_error = *error;
     return false;
   }
@@ -329,10 +346,10 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   // unsupported language; the native build runs Python only.
   // Applied only when the new launcher runs (a failed restart keeps the
   // running engine as it is).
-  const unsigned languages = native          ? kPython
-                             : layout.python ? kAllLanguages
-                                             : kAllLanguages & ~kPython;
-  *error = check_layout(layout, s, native);
+  const unsigned languages = native || cpython ? kPython
+                             : layout.python   ? kAllLanguages
+                                               : kAllLanguages & ~kPython;
+  *error = check_layout(layout, s, native, cpython);
   if (!error->empty()) {
     if (!g_launcher) g_error = *error;
     return false;
@@ -410,8 +427,9 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
                   " (a diagnostic setting; unset it for production)");
     }
   }
-  config.classes = {native ? mle::native_worker_class(layout, options)
-                           : mle::jvm_worker_class(layout, options)};
+  config.classes = {cpython  ? mle::cpython_worker_class(layout, options)
+                    : native ? mle::native_worker_class(layout, options)
+                             : mle::jvm_worker_class(layout, options)};
 
   std::string launcher_error;
   std::unique_ptr<mle::Launcher> launcher =
@@ -443,12 +461,15 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   }
   *info = "Engine started: mle_launcher pid " + std::to_string(li.pid) +
           ", Landlock ABI " + std::to_string(li.landlock_abi) + ", " + cgroup +
-          ", Java heap " + mib(s.heap_max) + ", pool " +
+          (cpython ? "" : ", Java heap " + mib(s.heap_max)) + ", pool " +
           std::to_string(s.pool_size) + ", files in " + s.dir +
-          (native ? ", Python-only native build " + layout.native_lib
-                  : ", JDK " + layout.java_home +
+          (cpython  ? ", CPython worker " + layout.cpython_exe +
+                         (layout.cpython_site.empty() ? " (no site-packages: no numpy)" : "")
+           : native ? ", Python-only native build " + layout.native_lib
+                    : ", JDK " + layout.java_home +
                         (layout.aot_cache.empty() ? ", no AOT cache" : "")) +
-          (!native && !layout.python ? ", no Python (package percona-mle-python)"
+          (cpython                     ? ""
+           : !native && !layout.python ? ", no Python (package percona-mle-python)"
            : layout.python_venv.empty() ? ", no Python venv (no numpy)" : "") +
           (layout.package_dir.empty() ? "" : ", packages in " + layout.package_dir) +
           ".";

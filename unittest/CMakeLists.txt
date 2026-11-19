@@ -82,3 +82,26 @@ FOREACH(test java_worker polyglot_worker worker_failures body_forms)
     )
   ADD_DEPENDENCIES(mle_${test}-t mle_launcher mle_worker mle_worker_jar)
 ENDFOREACH()
+
+# The CPython worker's codec (exp design note 62), with the interpreter the
+# worker embeds, its code and its site-packages.
+IF(TARGET mle_cpython_worker)
+  FIND_PACKAGE(Python3 3.12 REQUIRED COMPONENTS Interpreter Development.Embed)
+  GET_PROPERTY(MLE_CPYTHON_DIR GLOBAL PROPERTY MLE_CPYTHON_DIR)
+  GET_PROPERTY(MLE_PYTHON_STDLIB GLOBAL PROPERTY MLE_PYTHON_STDLIB)
+  GET_PROPERTY(MLE_PYTHON_DYNLOAD GLOBAL PROPERTY MLE_PYTHON_DYNLOAD)
+  SET(cpy ${PROJECT_SOURCE_DIR}/worker/cpython)
+  MYSQL_ADD_EXECUTABLE(mle_cpython_codec-t cpython_codec-t.cc
+    ${cpy}/codec.cc ${cpy}/module.cc ${cpy}/mailbox.cc
+    ADD_TEST mle_cpython_codec
+    LINK_LIBRARIES mle_host Python3::Python ${MLE_GMOCK_LIB} ${MLE_GTEST_LIB} Threads::Threads
+    )
+  TARGET_INCLUDE_DIRECTORIES(mle_cpython_codec-t PRIVATE ${cpy})
+  TARGET_INCLUDE_DIRECTORIES(mle_cpython_codec-t SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
+  TARGET_COMPILE_DEFINITIONS(mle_cpython_codec-t PRIVATE
+    MLE_PYTHON_STDLIB="${MLE_PYTHON_STDLIB}"
+    MLE_PYTHON_DYNLOAD="${MLE_PYTHON_DYNLOAD}"
+    MLE_CPYTHON_CODE="${cpy}/python"
+    MLE_CPYTHON_SITE="${MLE_CPYTHON_DIR}/site-packages")
+  ADD_DEPENDENCIES(mle_cpython_codec-t mle_cpython_layout)
+ENDIF()

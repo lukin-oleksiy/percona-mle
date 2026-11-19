@@ -567,9 +567,9 @@ bool register_settings() {
           PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY |
               PLUGIN_VAR_NOPERSIST,
           "Which worker build runs routines: JVM (Java, JavaScript and "
-          "Python), NATIVE (the Python-only native build in "
-          "<mle.dir>/native, highly optimised for Python) or AUTO (the JVM "
-          "build when it is installed, else the native one).",
+          "Python), CPYTHON (Python only, on CPython: <mle.dir>/cpython), "
+          "NATIVE (the Python-only native build in <mle.dir>/native) or AUTO "
+          "(the JVM build when it is installed, else CPYTHON, else NATIVE).",
           nullptr, nullptr, &worker, &g_worker))
     return true;
   return false;

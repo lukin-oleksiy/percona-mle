@@ -34,6 +34,7 @@ SET(CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
 ADD_SUBDIRECTORY(host)
 ADD_SUBDIRECTORY(launcher)
 ADD_SUBDIRECTORY(worker)
+ADD_SUBDIRECTORY(worker/cpython)
 ADD_SUBDIRECTORY(harness)
 
 # The build tree gets the installed layout (include/mle/defaults.h) as
@@ -65,6 +66,14 @@ ADD_CUSTOM_TARGET(mle_build_layout ALL
   VERBATIM
   )
 ADD_DEPENDENCIES(mle_build_layout mle_launcher mle_worker mle_worker_jar)
+# The CPython worker (-DMLE_CPYTHON=ON, the default with Python 3.12+; exp design note 62).
+GET_PROPERTY(MLE_CPYTHON_DIR GLOBAL PROPERTY MLE_CPYTHON_DIR)
+IF(MLE_CPYTHON_DIR)
+  ADD_CUSTOM_COMMAND(TARGET mle_build_layout POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink ${MLE_CPYTHON_DIR} ${MLE_BUILD_LAYOUT}/cpython
+    VERBATIM)
+  ADD_DEPENDENCIES(mle_build_layout mle_cpython_layout)
+ENDIF()
 # The Python-only native build (-DMLE_PYTHON_NATIVE=ON; exp design note 23).
 GET_PROPERTY(MLE_NATIVE_DIR GLOBAL PROPERTY MLE_NATIVE_DIR)
 IF(MLE_NATIVE_DIR)

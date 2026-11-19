@@ -31,6 +31,8 @@
     resources/                 language resources, extracted at build time
     python-venv/               GraalPy venv with numpy
     mle.aot                    JDK AOT cache (optional)
+    cpython/                   the CPython worker (optional): mle_cpython_worker,
+                               python/ (its code), site-packages/ (numpy)
 */
 
 #include <cstdint>
@@ -60,6 +62,15 @@ struct Layout {
       <dir>/native/libmleworker.so, with its language resources beside it;
       empty: not installed. */
   std::string native_lib;
+  /** The CPython worker (exp design note 62): <dir>/cpython/mle_cpython_worker;
+      empty: not installed. */
+  std::string cpython_exe;
+  /** Its Python code: <dir>/cpython/python (the package mle_cpython). */
+  std::string cpython_code;
+  /** Its packages (numpy): <dir>/cpython/site-packages; empty: none. */
+  std::string cpython_site;
+  /** Bytecode of its code kept apart (a build tree): <dir>/cpython/pycache; empty: none. */
+  std::string cpython_pycache;
 
   /** The installed layout below dir; optional parts that do not exist are
       left empty. Symlinks are resolved (the build tree has a layout of
@@ -112,6 +123,13 @@ ClassConfig jvm_worker_class(const Layout &layout,
     the Landlock paths. */
 ClassConfig native_worker_class(const Layout &layout,
                                 const JvmClassOptions &options = {});
+
+/** The CPython worker class (exp design note 62; Python only):
+    mle_cpython_worker with its code, its site-packages and the DBA's CPython
+    packages (<package_dir>/cpython/site-packages) on sys.path; limits,
+    environment and hidden paths as for the JVM class. */
+ClassConfig cpython_worker_class(const Layout &layout,
+                                 const JvmClassOptions &options = {});
 
 }  // namespace mle
 

@@ -65,6 +65,14 @@ Layout Layout::installed(const std::string &dir, const std::string &java_home) {
   if (exists(dir + "/mle.aot")) l.aot_cache = resolve(dir + "/mle.aot");
   if (exists(dir + "/native/libmleworker.so"))
     l.native_lib = resolve(dir + "/native/libmleworker.so");
+  if (exists(dir + "/cpython/mle_cpython_worker")) {
+    l.cpython_exe = resolve(dir + "/cpython/mle_cpython_worker");
+    l.cpython_code = resolve(dir + "/cpython/python");
+    if (exists(dir + "/cpython/site-packages"))
+      l.cpython_site = resolve(dir + "/cpython/site-packages");
+    if (exists(dir + "/cpython/pycache"))
+      l.cpython_pycache = resolve(dir + "/cpython/pycache");
+  }
   if (glob_t g{}; glob((dir_of(l.worker_jar) + "/deps/python-language-*.jar").c_str(), 0,
                        nullptr, &g) == 0) {
     l.python = g.gl_pathc > 0;
@@ -184,6 +192,29 @@ ClassConfig native_worker_class(const Layout &layout, const JvmClassOptions &o) 
   c.read_paths = {lib_dir, layout.resource_cache};
   if (!layout.python_venv.empty()) c.read_paths.push_back(layout.python_venv);
   if (!layout.package_dir.empty()) c.read_paths.push_back(layout.package_dir);
+  return c;
+}
+
+ClassConfig cpython_worker_class(const Layout &layout, const JvmClassOptions &o) {
+  ClassConfig c = jvm_worker_class(layout, o);  // limits, environment, hidden paths
+  c.executable = layout.cpython_exe;
+  c.args = {"--class=" + o.name, "--code=" + layout.cpython_code};
+  // The standard library is the system's (under /usr/lib or /usr/lib64: the
+  // launcher's system paths); the worker knows where from its build.
+  c.exec_paths = {dir_of(layout.cpython_exe)};
+  c.read_paths = {layout.cpython_code};
+  if (!layout.cpython_pycache.empty()) {
+    c.args.push_back("--pycache=" + layout.cpython_pycache);
+    c.read_paths.push_back(layout.cpython_pycache);
+  }
+  const auto site = [&c](const std::string &dir) {
+    c.args.push_back("--site=" + dir);
+    c.read_paths.push_back(dir);
+  };
+  if (!layout.cpython_site.empty()) site(layout.cpython_site);
+  if (!layout.package_dir.empty() && exists(layout.package_dir + "/cpython/site-packages"))
+    site(resolve(layout.package_dir + "/cpython/site-packages"));
+  if (o.prewarm.find("numpy") != std::string::npos) c.env.push_back("MLE_PREWARM_NUMPY=1");
   return c;
 }
 
