@@ -78,8 +78,8 @@ WHERE VARIABLE_NAME IN ('mle_status', 'mle_heap_status',
 ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	VARIABLE_VALUE
 mle_heap_status	Allocated
-mle_languages_supported	JavaScript,Python,Java,CPython
-mle_pool_idle	4
+mle_languages_supported	JavaScript,Python,Java,JS,CPython
+mle_pool_idle	6
 mle_status	Active
 mle_stored_programs	0
 mle_workers	0

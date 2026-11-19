@@ -11,6 +11,8 @@
 INSTALL COMPONENT "file://component_js_lang";
 INSTALL COMPONENT "file://component_mle";
 INSTALL COMPONENT "file://component_lang_router";
+# js_lang runs LANGUAGE JS here (MLE's V8 worker supports it too: exp design note 63).
+SET GLOBAL lang_router.language_map = 'JS=js_lang';
 GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_JS_ROUTINE ON *.* TO root@localhost;
 #
 # 1. Arguments: what JavaScript sees for each SQL type.
@@ -189,6 +191,7 @@ DROP PROCEDURE mle_sql;
 DROP FUNCTION v8_deep;
 DROP FUNCTION mle_deep;
 REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_JS_ROUTINE ON *.* FROM root@localhost;
+SET GLOBAL lang_router.language_map = DEFAULT;
 UNINSTALL COMPONENT "file://component_lang_router";
 UNINSTALL COMPONENT "file://component_mle";
 UNINSTALL COMPONENT "file://component_js_lang";
