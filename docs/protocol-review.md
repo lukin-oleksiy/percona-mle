@@ -489,3 +489,17 @@ on a hot path when both sides poll. Proposed protocol changes, **not yet decided
 Applied now as wording only: the interrupt ordering on both sides is stated as outcomes (an
 atomic state is enough; no lock on a request's path); the host need not buffer a whole result set;
 `exec_us` only on request.
+
+Decided with the user (21 Nov), now in the specification:
+
+1. `TAINTED` is a flag of the RESULT's header (`msg.flags` bit 1); the statistics area has no
+   `tainted` any more, is never decided on, and is not written on every request.
+2. For a prepared statement the first batch of a result set may leave the columns out when they
+   are the ones last sent for that id.
+3. Kept statements: PREPARE with the KEEP flag makes a statement that belongs to the routine in
+   that worker and outlives the request (closed by CLOSE, DROP or a new PREPARE of the routine,
+   RESET). Whether the server's statement service lets a prepared statement outlive the stored
+   program call that made it is to be confirmed by the implementation.
+
+Held back: a RESET that carries the new options and keeps compiled routines — to be decided after
+cold-start measurements, since it changes what RESET means between sessions.

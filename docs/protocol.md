@@ -69,7 +69,7 @@ message of this document. Each concern lies on exactly one side.
 | Session state | Owns it all: variables, time zone, current schema, transaction, the session's settings for languages. Passes what a worker needs (OPTIONS, PREPARE's `schema`). | Holds only what messages gave it, plus guest state (globals, caches) that it may lose at any RESET or retirement without harm to the database. |
 | Errors | Turns outcomes into MySQL errors and warnings for the client (§10.8); owns error numbers and SQLSTATEs of the server. | Reports what happened (status, Error, stack frames); passes SQL errors back by id; may raise an SQL error by number and SQLSTATE. |
 | Console output | Stores and shows it. | Collects what guest code prints and returns it in RESULT. |
-| Resources | Limits what a worker makes mysqld hold (§10.7); sets the worker's limits through the launcher (memory, processes, files); enforces time (KILL, deadlines, grace). | Lives within its sandbox; reports exhaustion (EXHAUSTED, `tainted`); never needs anything from the operating system that the sandbox denies. |
+| Resources | Limits what a worker makes mysqld hold (§10.7); sets the worker's limits through the launcher (memory, processes, files); enforces time (KILL, deadlines, grace). | Lives within its sandbox; reports exhaustion (EXHAUSTED, `TAINTED`); never needs anything from the operating system that the sandbox denies. |
 | Isolation between users | Chooses which principal's code a worker runs and never gives a worker to another principal (§1, Principal). | Makes no decision about principals. |
 | Life cycle | Starts, reuses, resets and ends workers. | Serves until told or killed; never decides to stay. |
 
@@ -279,13 +279,15 @@ Line 0 exists for the worker; the host does not read it.
 | 8 | 8 | `heap_max`: the heap's limit |
 | 16 | 8 | `gc_count`: collections the worker forced since the last RESET |
 | 24 | 4 | `state`: 0 starting, 1 idle, 2 running, 3 compiling |
-| 28 | 4 | `tainted`: non-zero asks the host to retire the worker (§11.5) |
+| 28 | 4 | reserved |
 
 The worker writes the statistics whenever it likes, without
 synchronization. They are for reporting only: the host copies them in one
 read, replaces impossible values (`heap_used > heap_max`, an unknown
-`state`) and MUST NOT base any decision on them, except `tainted`, which it
-reads once, after it received the RESULT of a top-level request (§11.5).
+`state`) and MUST NOT base any decision on them. A worker SHOULD NOT
+write them on every request: each write costs both sides a cache line.
+It writes them when they have changed enough to matter, and when it
+becomes idle after a RESET.
 
 ## 4. Turns and synchronization
 
@@ -394,7 +396,7 @@ learns that the host is gone from the control socket (§6).
 |---:|---:|---|---|
 | 0 | 4 | `op` | operation, §9 |
 | 4 | 4 | `status` | RESULT: §9.4; READY: §9.1. Every other message: 0 |
-| 8 | 4 | `flags` | bit 0 `MORE`: more chunks of this message follow. Other bits: 0 |
+| 8 | 4 | `flags` | bit 0 `MORE`: more chunks of this message follow. Bit 1 `TAINTED`: only in a RESULT: the worker asks to be retired (§11.5). Other bits: 0 |
 | 12 | 4 | `depth` | nesting depth of the request this message belongs to (§8.2) |
 | 16 | 4 | `len` | bytes of this chunk in the arena |
 | 20 | 4 | reserved | 0 |
@@ -413,7 +415,7 @@ body and need not look for trailing bytes (§1).
 * Otherwise the sender splits the body in order: every chunk but the last
   has `len = arena_size` and `MORE` set; the last has `MORE` clear and
   carries the rest (1 to `arena_size` bytes). All chunks carry the same
-  `op`, `status`, `depth`, `call_seq` and `total_len`.
+  `op`, `status`, `depth`, `call_seq`, `total_len` and `TAINTED` flag.
 * After each chunk with `MORE`, the receiver copies it and posts
   **CONTINUE** (op 10): `status` 0, `flags` 0, `len` 0, `total_len` 0, and
   the `depth` and `call_seq` of the message being received. The sender
@@ -447,7 +449,7 @@ bytes still due) and, on the first, what §1 lists and whether it can hold
 * A worker that cannot hold a host message (its memory is smaller) MUST
   still complete the transfer, discarding the chunks, and then fail it
   where it belongs. A PREPARE, CALL or PARSE_LIBRARY: RESULT EXHAUSTED
-  (without `tainted`: the worker is sound); of a PREPARE it keeps the
+  (without `TAINTED`: the worker is sound); of a PREPARE it keeps the
   `routine_id` from the first chunk, for that id is then not prepared
   (§8.3). An SQL_RESULT: the worker
   sends CLOSE for that id (it cannot know the id's state) and raises an
@@ -984,12 +986,12 @@ with status OK (with another status: a violation).
 
 **Host reactions.** OK: the request succeeded. GUEST_ERROR, INTERRUPTED,
 EXHAUSTED: the request fails with that outcome; the worker stays in use
-unless it set `tainted` (§11.5). INTERNAL from PREPARE, CALL or
+unless it set `TAINTED` (§11.5). INTERNAL from PREPARE, CALL or
 PARSE_LIBRARY: the request fails with an internal error; the worker stays
-in use unless tainted. INTERNAL from DROP, RESET or OPTIONS: the host
+in use unless it set `TAINTED`. INTERNAL from DROP, RESET or OPTIONS: the host
 retires the worker (after the top-level request, if the DROP was nested).
 
-A worker MUST set `tainted` when it answers EXHAUSTED because its
+A worker MUST set `TAINTED` when it answers EXHAUSTED because its
 runtime's heap or stack was exhausted, and when it answers INTERNAL
 because its own state may be damaged.
 
@@ -1031,7 +1033,7 @@ principal is about to use it. The host MUST send RESET and receive OK
 before a worker serves another session; else it retires the worker. Whether guest global state (global
 variables, loaded modules and libraries) survives is the worker's
 documented choice; a worker that cannot be reused safely (guest threads
-left running, damaged state) MUST set `tainted`. RESET also ends the options (§9.8): the host sends
+left running, damaged state) MUST set `TAINTED`. RESET also ends the options (§9.8): the host sends
 OPTIONS again before it uses the worker. RESULT OK. Top level only.
 
 ### 9.8 OPTIONS (11)
@@ -1181,6 +1183,19 @@ when a request's RESULT arrives the host closes every id it left open. A
 worker MUST fail, in guest code, the use of a statement of another
 request (an earlier one, or the caller's), without sending anything.
 
+**Kept statements.** A statement prepared with the KEEP flag (§10.2)
+belongs not to the request but to the **routine** the request serves (its
+routine id), in this worker. It is not closed at the RESULT: the host
+discards its pending results and it is IDLE again. Any later request for
+the same routine id may use it, so a routine called many times prepares
+its statements once. It is closed by CLOSE, by DROP or a new PREPARE of
+its routine id, by RESET, and with the worker. Its id is unique among the
+kept ids of its routine and the worker's other open ids at that depth. A
+kept statement counts in the bounds of §10.7 for as long as it is open.
+Two activations of one routine (a recursion) share its kept statements: a
+worker MUST NOT execute a kept statement in one activation while another
+activation has results to read on it; it prepares another instead.
+
 SQL and LIBRARY come only from the guest code of the request (CALL or
 PREPARE) that the worker is serving at the innermost depth, on the
 serving thread. A worker MUST fail, in guest
@@ -1267,6 +1282,8 @@ MUST NOT pass these fields from guest code unchecked.
 
 * `flags` bit 0, PASS_RESULT_TO_CLIENT (§10.5). Given at EXECUTE or
   PREPARE, it holds for the life of that id.
+* `flags` bit 1, KEEP: only with PREPARE while serving a CALL: the
+  statement is a kept statement (§10.1).
 * `max_rows`: the most rows the worker wants in one batch (§10.3); 0
   leaves it to the host. The host MUST NOT send more rows than a non-zero
   `max_rows`.
@@ -1325,8 +1342,11 @@ the action that produced the set, the following ones in reply to FETCH.
 * **ROWS**: one batch.
   * Columns: the first batch of a set carries the set's columns (at least
     one); every later batch carries an empty column list and the worker
-    uses the first batch's. `ncolumns` is the set's column count in both
-    cases.
+    uses the first batch's. For a prepared id there is one exception: when
+    a set has exactly the columns the host last sent for that id, the
+    first batch may carry an empty list too, and the worker uses those (it
+    keeps, per prepared id, the columns it last received). `ncolumns` is
+    the set's column count in every case.
   * `more` = 1: FETCH returns a further batch; `nrows` ≥ 1 and
     `more_results` = 0 then. `more` = 0: the set is complete; this batch
     may have `nrows` 0 (always so for an empty set).
@@ -1574,7 +1594,7 @@ depth. The requirements:
   or INTERRUPTED (not every runtime can tell); the host reports the
   request as interrupted in both cases (step 4). A worker whose runtime
   cannot cancel a delivered interrupt absorbs it before it posts the
-  RESULT, or sets `tainted`: an interrupt never reaches a later request. (The grace period is the host's; a worker does not
+  RESULT, or sets `TAINTED`: an interrupt never reaches a later request. (The grace period is the host's; a worker does not
   know it.) Nested PREPARE and CALL end INTERRUPTED too, with the same
   allowance. A nested DROP is
   not guest code: it is completed and answered OK.
@@ -1637,9 +1657,10 @@ retires a worker when:
 * it answered INTERNAL to DROP, RESET or OPTIONS (for a nested DROP:
   after the top-level request, which keeps its own outcome);
 * its READY shows an incompatible worker (§9.1);
-* `tainted` is non-zero when the host reads it after the RESULT of a
-  top-level request (the request keeps its own outcome). A worker that
-  wants this MUST set `tainted` before it posts that RESULT;
+* a RESULT of it had the `TAINTED` flag (§5.1): the worker asks to be
+  retired. The host retires it when the top-level request is over; that
+  request and requests nested in it keep their own outcomes. A worker
+  that has set the flag once sets it in every later RESULT;
 * the session ends and the host does not keep the worker.
 
 ### 11.6 Ending a worker
@@ -1690,7 +1711,7 @@ What the host does with each thing a worker controls. "V" = violation
 |---|---|---|
 | `msg.op` | assigned, and allowed here by §8.1 | V |
 | `msg.status` | 0 unless RESULT or READY; then per §9 | V |
-| `msg.flags` | only MORE; MORE per §5.2 | V |
+| `msg.flags` | only MORE and TAINTED; MORE per §5.2 | V |
 | `msg.depth`, `msg.call_seq` | as expected (§8.2), on every chunk | V |
 | `msg.len`, `msg.total_len` | §5.2; limit of §12 for this op | V |
 | `msg` reserved | 0 | V |
@@ -1712,7 +1733,8 @@ What the host does with each thing a worker controls. "V" = violation
 | LIBRARY: `schema`, `name` | §9.10 | V |
 | LIBRARY: existence, permission | host policy | REFUSED |
 | LIBRARY: `known_version` | none | a version the host does not know gets BODY |
-| `stats` | none | replaced when impossible; `tainted` non-zero after a top-level RESULT retires the worker (§11.5) |
+| `stats` | none | replaced when impossible; never decided on |
+| `msg.flags` `TAINTED` | only in a RESULT | V elsewhere; retires the worker (§11.5) |
 | `Error.sql_error_id` | none | unknown or no longer held: rules 2 and 3 of §10.8 |
 | Sequence word, sleep flag, timing | none can be trusted | bounded sleeps, deadlines, grace |
 | Reserved bytes of the region outside `msg` | none | ignored |
@@ -1781,7 +1803,7 @@ what it finds.
    the protocol can see (§10.6).
 8. Makes violations unreachable from guest code (§10.6, §13).
 9. Implements interruption by the table of §11.1.
-10. Sets `tainted` before the RESULT when it must not be reused.
+10. Sets `TAINTED` in the RESULT when it must not be reused.
     Checks the host's messages as §1 lists, and never ignores one.
 11. Exits on end of file of the control socket, and on any protocol failure of the
     host, without letting guest code see it.
