@@ -503,3 +503,12 @@ Decided with the user (21 Nov), now in the specification:
 
 Held back: a RESET that carries the new options and keeps compiled routines — to be decided after
 cold-start measurements, since it changes what RESET means between sessions.
+
+**After the JVM path ran end to end** (fa03bf4: 8 unit-test binaries pass; 33 of 36 MySQL tests
+that need no native worker pass; none of the feared first-contact disagreements between host and
+worker occurred). Four more corrections, from its questions and Oracle's documentation of
+libraries: the library policy is Oracle's (USING, and by dynamic or library import any library
+the rights account may use, in any schema); a failure guest code brings about in the worker is
+GUEST_ERROR (with TAINTED if the worker cannot go on), INTERNAL only for what guest code did not
+cause; an argument with no form in the language fails the CALL as `MLE-Type`; GEOMETRY
+parameters are refused (Oracle lists no such type).

@@ -1430,7 +1430,10 @@ check, for whatever guest code asks or returns:
   `Error.language` is one of its READY languages or `""`;
 * that it answers INTERRUPTED only for an interrupt it was given (§11.1):
   what a runtime calls "interrupted" for its own reasons, or because guest
-  code provoked it, is GUEST_ERROR.
+  code provoked it, is GUEST_ERROR. So is every failure guest code brings
+  about in the worker itself (closing the runtime's context, exiting the
+  interpreter): GUEST_ERROR, with `TAINTED` if the worker cannot go on;
+  INTERNAL is for failures guest code did not cause.
 
 **Guest code outside a request.** Some runtimes run guest code at times
 of their own: finalizers, timers, threads guest code left behind. While a
@@ -1700,7 +1703,9 @@ The last column says who keeps the limit and what happens beyond it.
 
 A worker MUST NOT refuse a host message that is within this table for a
 limit of its own, except for lack of memory (§5.3) and for what its
-language cannot express, which it reports as GUEST_ERROR (§9.2).
+language cannot express, which it reports as GUEST_ERROR: at PREPARE
+(§9.2), or at CALL with language `MLE-Type` for an argument that has no
+form in the language.
 
 ## 13. Validation: violations and errors
 
@@ -2071,7 +2076,9 @@ takes it).
 
 **Declared character sets (Oracle's rule).** A routine's string
 parameters and return type must be declared utf8mb4 or binary; values in
-other character sets are converted by the server.
+other character sets are converted by the server. GEOMETRY parameters
+and return types are refused (a GEOMETRY column of a result arrives as
+BYTES).
 
 **TIMESTAMP.** The server gives and takes a TIMESTAMP only as local time
 in the session's current zone; the host converts with the system's zone
@@ -2096,10 +2103,11 @@ deadline of the DROP or RESET it sends.
 needs its principal; a stricter host gives it to sessions of one account
 only (§1).
 
-**Libraries.** A routine without a `USING` clause may import none. A
-routine with one may import its `USING` libraries and, because the host
-cannot see which libraries those import, any library that the account
-whose rights apply may use, by the catalog at the time of the answer
+**Libraries (Oracle's rule).** A routine may import its `USING` libraries
+and, by an import at run time or an import inside a library, any library
+in any schema that the account whose rights apply may use ("dynamic
+imports … do not have to be specified with a `USING` clause"). The host
+answers by the catalog and the rights at the time of the answer
 (§9.10). `CREATE LIBRARY` from
 a routine's SQL is refused (the check would need the worker that waits).
 
