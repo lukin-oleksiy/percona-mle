@@ -18,10 +18,14 @@
 /**
   @file worker/common/mailbox.hpp
 
-  A native worker's side of the shared memory mailbox (include/mle/protocol.h): spin, then sleep on
-  the futex; chunked messages both ways; WorkerStats. And the control socket: INTERRUPT of the
-  running top-level request, SHUTDOWN or EOF ends the process. Shared by the CPython and V8 workers
-  (exp design notes 62, 63); what an engine does around a sleep and on an interrupt are its hooks.
+  A native worker's side of the mailbox (docs/protocol.md; include/mle/protocol.h): the start-up
+  checks of §2, turns and waiting (§4), chunked messages both ways with the size limits (§5, §12),
+  the dialogue's grammar (§8.1), READY (§9.1), WorkerStats (§3.1), the control socket (§6) and the
+  interrupt variables of §11.1. Shared by the CPython and V8 workers; what an engine does around a
+  sleep and on an interrupt are its hooks.
+
+  Every protocol failure, here and in the workers, ends the process through
+  common::protocol_failure (wire.hpp).
 */
 
 #ifndef MLE_WORKER_COMMON_MAILBOX_HPP
@@ -31,8 +35,10 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <string_view>
 
 #include "mle/protocol.h"
+#include "wire.hpp"
 
 namespace mle::common {
 
@@ -41,61 +47,86 @@ struct EngineHooks {
   /** Around the futex sleep while waiting for the host (CPython: release and take the GIL). */
   void (*before_sleep)() = nullptr;
   void (*after_sleep)() = nullptr;
-  /** An INTERRUPT for the running top-level request seq: stop the guest code soon. Called by the
-      control thread with the interrupt lock held (Interrupts::running(seq) must not be called from
-      it); at most once per request. */
+  /** Delivers an interrupt of the running top-level request seq (§11.1): make its guest code stop
+      soon, at every depth. Called with the interrupt lock held, by the control thread or by
+      Interrupts::begin (no function of Interrupts may be called from it); at most once per
+      request. */
   void (*interrupt)(uint64_t seq) = nullptr;
-  /** The interrupted request ended: drop an interrupt not delivered yet. In the serving thread. */
+  /** The request an interrupt was delivered to has ended: cancel the interrupt if the runtime has
+      not acted on it. In the serving thread, from Interrupts::end. */
   void (*interrupted_end)() = nullptr;
 };
 
-/** A received message. body is the arena (one chunk: valid until the worker posts) or the
-    buffer the allocator gave (a reassembled message). */
+/** A received message. body is the arena (one chunk: valid until the worker's next write to the
+    arena) or the buffer the allocator gave (a message in chunks). */
 struct Message {
   uint32_t op;
-  uint32_t status;
   uint32_t depth;
   uint64_t call_seq;
   std::span<const std::byte> body;
   bool in_arena;
+  /** The worker could not hold the message (the allocator gave no buffer): the transfer was
+      completed and its chunks discarded (§5.3); body is empty. The caller fails it locally. */
+  bool discarded;
+  /** Of a discarded message: the first 8 bytes of the body (a PREPARE's routine_id). */
+  uint64_t head;
 };
 
 class Mailbox {
  public:
-  /** Maps the region (fd 3) and starts the control thread (fd 4); the arena's size. name prefixes
-      fatal messages ("mle_v8_worker"). */
+  /** Maps the region (fd 3) after the checks of §2 and starts the control thread (fd 4); returns
+      the arena's size. Ends the process with status 2 if the region is not one; posts a failed
+      READY and ends the process if the region has another major version; ends it with status 1 on
+      any other failure. name prefixes messages on stderr ("mle_v8_worker"). */
   static uint32_t open(int spin, const EngineHooks &hooks, const char *name);
 
-  /** Waits for the next message; a message in chunks goes into allocate(total) (answering
-      CONTINUE for each chunk). Ends the process on a malformed header (the host is gone or broken). */
+  /** Posts READY with status OK (§9.1): this version, no features. worker_class and each language
+      are 1 to 32 characters of [a-z0-9_]; at most 16 languages; the texts are well-formed UTF-8. */
+  static void ready(std::string_view info, std::string_view worker_class,
+                    std::span<const std::string_view> languages, std::string_view runtime);
+  /** Posts a failed READY (status INTERNAL, info the reason) and ends the process: the runtime
+      cannot serve (§2 step 5). info is cut to what READY may carry; bytes outside ASCII become '?'. */
+  [[noreturn]] static void failed_ready(std::string_view info);
+
+  /** Waits for the next message of the host and checks its header on the first chunk: the op the
+      dialogue allows here, depth, call_seq, sizes (§5.2, §8.1, §12); anything else is a protocol
+      failure. A message in chunks goes into allocate(total_len), CONTINUE answered for each chunk;
+      if allocate returns nullptr the chunks are discarded (Message::discarded). The buffer needs
+      no alignment unless the caller reads VECTOR elements in place (§7.2). */
   static Message receive(const std::function<std::byte *(size_t)> &allocate);
 
-  /** Posts body as one message, in chunks if it is larger than the arena. */
+  /** Posts body as one message, in chunks if it is larger than the arena. The message must be one
+      the dialogue allows here and within the limits of §12 (64 MiB; READY, LIBRARY and the RESULT
+      of DROP, RESET and OPTIONS one chunk of 64 KiB): the caller turns what guest code makes larger
+      into an error first. No guest code may run between composing body and this call. */
   static void send(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, std::span<const std::byte> body);
 
-  /** The arena, for messages written in place; post() sends the first len bytes. */
+  /** The arena, for a message of one chunk written in place; post() sends its first len bytes. */
   static std::span<std::byte> arena();
   static void post(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, uint32_t len);
 
   /** True if the host has posted a message receive() has not taken. */
   static bool pending();
 
+  /** Writes the statistics (§3.1). tainted must be set before the RESULT of the request (§11.5). */
   static void stats(uint32_t state, bool tainted, uint64_t heap_used = 0, uint64_t heap_max = 0,
                     uint64_t gc_count = 0);
 };
 
-/** KILL of top-level requests (Control.java's role). */
+/** Interruption of top-level requests: the worker's side of §11.1. */
 class Interrupts {
  public:
-  /** A top-level request starts; an INTERRUPT that came first applies now. */
-  static void begin(uint64_t seq);
-  /** The request ended; whether it was interrupted (calls EngineHooks::interrupted_end then). In
-      the thread that serves requests. */
+  /** The worker begins to serve top-level request seq (it has received it completely).
+      interruptible: PREPARE, CALL, PARSE_LIBRARY. An INTERRUPT that came first is delivered now. */
+  static void begin(uint64_t seq, bool interruptible);
+  /** The top-level request ends: the status of its RESULT is fixed from here on. True if an
+      interrupt was delivered to it (only then may the status be INTERRUPTED); then
+      EngineHooks::interrupted_end is called. In the thread that serves requests. */
   static bool end();
-  /** Whether seq is the running request (for an engine's interrupt helper thread). */
+  /** Whether seq is the running interruptible request (for an engine's interrupt helper thread). */
   static bool running(uint64_t seq);
-  /** The top-level request was interrupted (an INTERRUPT delivered, end() not called yet): a nested
-      request that the interrupt stopped may not leave the outer code running. */
+  /** An interrupt was delivered to the running top-level request (end() not called yet): guest
+      code of it, at any depth, must not run on. */
   static bool interrupted();
 };
 

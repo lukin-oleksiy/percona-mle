@@ -18,25 +18,31 @@
 /**
   @file worker/v8/modules.cc
 
-  ES modules in the V8 worker (exp design note 63): database libraries (CREATE LIBRARY ... LANGUAGE
-  JAVASCRIPT or JS; USING, import of "/schema/name", import()) and the DBA's npm packages
-  (import of a package name; require() is api.js's). The library rules are the JVM worker's
-  (LibraryFileSystem.java; the CPython worker's libraries.py is the same port):
+  ES modules in the V8 worker: database libraries (CREATE LIBRARY; USING, import of "/schema/name",
+  import()) by the rules of docs/protocol.md §9.10, and the DBA's npm packages (import of a package
+  name; require() is api.js's).
 
-  * Epochs: library DDL makes mysqld prepare the routines again, and each PREPARE starts an epoch;
-    within one, a library confirmed for a routine is used without asking mysqld again.
-  * Loadsets and generations (independent review C17): an evaluated library keeps the modules it
-    imported then. Every library has a loadset (the libraries with their hashes fetched in the
-    top-level request that first evaluated it, and their loadsets); when a library is confirmed for
-    a routine its loadset is confirmed too, and if one of those changed or is refused a new
-    generation starts: every library is evaluated again at its next use.
+  * Answers. An import is resolved for the request being served: the worker must hold a
+    LIBRARY_RESULT (BODY or UNCHANGED) that was given for this routine id under this request's
+    library_epoch, and asks with LIBRARY when it does not. One answer per routine id and library;
+    the answers of an id go at its PREPARE, its DROP and at RESET.
+  * Bodies. The most recent body of each library is kept with the host's version token, which is
+    the known_version of the next LIBRARY for it.
+  * Modules. V8 links a module once, with the modules it imports. So every import, also one V8
+    would take from the modules it has, first resolves the library and every library it reaches
+    through static imports; a module whose own version, or the version of anything it reaches,
+    differs from what it was linked with is compiled and linked anew. Guest code that keeps a
+    module namespace it imported earlier keeps that one (its own reference).
 */
 
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <fstream>
+#include <set>
 #include <sstream>
 
 #include "worker.hpp"
@@ -50,7 +56,6 @@ using v8::Local;
 using v8::Value;
 
 namespace {
-constexpr uint64_t kStampMix = 0x9E3779B97F4A7C15ULL;
 
 /** "/schema/name" (also "schema/name", "schema.name") split; false if it is not one. */
 bool library_path(std::string_view s, std::string *schema, std::string *name) {
@@ -63,122 +68,73 @@ bool library_path(std::string_view s, std::string *schema, std::string *name) {
   *name = p.substr(sep + 1);
   return name->find('/') == std::string::npos;
 }
+
+/** A library's schema or name as LIBRARY may carry it: 1 to 256 bytes without U+0000 (§9.10). */
+bool library_name(std::string_view s) {
+  return !s.empty() && s.size() <= w::kMaxLibraryName && s.find('\0') == std::string_view::npos;
+}
+
+/** A language identifier: 1 to 32 characters of [a-z0-9_] (§9.1). */
+bool identifier(std::string_view s) {
+  return !s.empty() && s.size() <= w::kMaxIdentifier && std::all_of(s.begin(), s.end(), [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+  });
+}
+
 }  // namespace
 
-uint64_t Worker::Library::stamp() const { return generation == 0 ? hash : hash ^ (generation * kStampMix); }
-
-void Worker::libraries_revalidate() {
-  ++m_lib_epoch;
-  m_lib_confirmed.clear();
-}
-
-void Worker::lib_touch(const std::string &key, const Library &lib) {
-  for (const auto &s : m_lib_open) {
-    if (s == lib.loadset) continue;
-    (*s)[key] = lib.hash;
-    for (const auto &[k, h] : *lib.loadset) (*s)[k] = h;
-  }
-}
-
-Worker::Library &Worker::lib_renewed(const std::string &key, const Library &lib) {
-  Library n = lib;
-  n.generation = m_lib_generation;
-  n.loadset = std::make_shared<std::map<std::string, uint64_t>>();
-  Library &kept = m_libraries[key] = std::move(n);
-  lib_touch(key, kept);
-  m_lib_open.push_back(kept.loadset);
-  return kept;
-}
-
-void Worker::lib_new_generation() {
-  ++m_lib_generation;
-  m_lib_confirmed.clear();
-}
-
-void Worker::lib_confirm_loadset(const Library &lib) {
-  const auto loadset = *lib.loadset;  // a copy: fetch() changes the maps
-  for (const auto &[key, h] : loadset) {
-    std::string schema, name;
-    if (!library_path(key, &schema, &name)) continue;
-    const Library *l = lib_fetch(schema, name, nullptr);
-    if (l == nullptr) return;  // dropped, or not for this routine: fetch started a generation
-    if (l->hash != h) {
-      lib_new_generation();
-      return;
-    }
-  }
-}
-
-const Worker::Library *Worker::lib_fetch(const std::string &schema, const std::string &name, std::string *why) {
-  const std::string key = schema + "/" + name;
-  const auto known_it = m_libraries.find(key);
-  const Library *known = known_it == m_libraries.end() ? nullptr : &known_it->second;
-  const std::string confirmation = std::to_string(m_routine) + ":" + key;
-  if (known != nullptr && known->checked == m_lib_epoch && m_lib_confirmed.count(confirmation) != 0) {
-    if (known->generation != m_lib_generation) return &lib_renewed(key, *known);
-    if (!m_lib_open.empty()) lib_touch(key, *known);
-    return known;
-  }
-  if (m_converting > 0) {
-    if (why != nullptr) *why = kNoHostWhileConverting;
-    return nullptr;
-  }
-  // LIBRARY: the body from mysqld (protocol.h kLibrary), unless the worker has the current one.
-  std::vector<std::byte> msg(16 + schema.size() + name.size() + 8);
+const Worker::Library *Worker::lib_resolve(const LibraryName &lib, std::string *why) {
+  Request &q = *m_request;
+  const std::string key = lib.key();
+  const auto known = m_libraries.find(key);
+  std::map<std::string, Answer> &answers = m_answers[q.routine_id];
+  if (const auto held = answers.find(key);
+      held != answers.end() && held->second.library_epoch == q.library_epoch && known != m_libraries.end() &&
+      known->second.version == held->second.version)
+    return &known->second;
+  // No answer holds for this request, or its body is no longer the one the worker has: LIBRARY.
+  const uint64_t known_version = known == m_libraries.end() ? 0 : known->second.version;
+  std::array<std::byte, 16 + 2 * w::kMaxLibraryName> msg;
   Writer wr(msg);
-  if (!(wr.str(schema) && wr.str(name) && wr.put<uint64_t>(known == nullptr ? 0 : known->hash))) {
-    if (why != nullptr) *why = "a library name too long";
+  if (!library_name(lib.schema) || !library_name(lib.name) ||
+      !(wr.str(lib.schema) && wr.str(lib.name) && wr.put(known_version))) {
+    *why = "a library's schema and name must each have 1 to " + std::to_string(w::kMaxLibraryName) +
+           " bytes and no U+0000";
     return nullptr;
   }
-  Mailbox::send(uint32_t(w::Op::kLibrary), uint32_t(w::Status::kOk), m_depth, m_seq, std::span(msg).first(wr.size()));
+  Mailbox::send(uint32_t(w::Op::kLibrary), 0, q.depth, m_seq, wr.written());
   std::vector<std::byte> assembled;
-  const Message m = Mailbox::receive([&assembled](size_t total) {
-    assembled.resize(total);
-    return assembled.data();
-  });
-  if (m.op != uint32_t(w::Op::kLibraryResult) || m.depth != m_depth) {
-    std::fprintf(stderr, "mle_v8_worker: fatal: unexpected message %u while loading a library\n", m.op);
-    _exit(1);
+  const Message m = Mailbox::receive([&](size_t total) { return allocate(assembled, total); });
+  if (m.discarded) {
+    // §5.3: as REFUSED. No answer is held, and a held one is unchanged.
+    *why = "the library " + lib.schema + "." + lib.name + " is larger than this MLE worker can hold";
+    return nullptr;
   }
-  Reader r(m.body, 0);
-  const auto status = static_cast<w::LibraryStatus>(r.get<uint8_t>());
-  const std::string language(r.str()), body(r.str());
-  const auto hash = r.get<uint64_t>();
-  const std::string message(r.str());
-  if (status == w::LibraryStatus::kUnchanged && known != nullptr) {
-    Library lib = *known;
-    lib.checked = m_lib_epoch;
-    Library &kept = m_libraries[key] = lib;
-    m_lib_confirmed.insert(confirmation);
-    if (kept.generation == m_lib_generation) {
-      lib_touch(key, kept);
-      lib_confirm_loadset(kept);
-    }
-    const auto again = m_libraries.find(key);  // the confirmation may have changed the maps
-    if (again == m_libraries.end()) return nullptr;
-    return again->second.generation != m_lib_generation ? &lib_renewed(key, again->second) : &again->second;
+  Reader r(m.body);
+  const auto status = r.get<uint8_t>();
+  const std::string_view language = r.str(), body = r.str();
+  const auto version = r.get<uint64_t>();
+  const std::string_view message = r.str();
+  r.finish();
+  switch (status) {
+    case uint8_t(w::LibraryStatus::kRefused):
+      if (!language.empty() || !body.empty() || version != 0) protocol_failure("a LIBRARY_RESULT REFUSED with a body");
+      *why = message.empty() ? "the library " + lib.schema + "." + lib.name + " is not available" : std::string(message);
+      return nullptr;
+    case uint8_t(w::LibraryStatus::kUnchanged):
+      if (known_version == 0 || version != known_version || !identifier(language) || !body.empty() || !message.empty())
+        protocol_failure("a LIBRARY_RESULT UNCHANGED outside its domain");
+      break;
+    case uint8_t(w::LibraryStatus::kBody):
+      if (version == 0 || !identifier(language) || !message.empty())
+        protocol_failure("a LIBRARY_RESULT BODY outside its domain");
+      m_libraries[key] = Library{version, std::string(language), std::string(body)};
+      break;
+    default:
+      protocol_failure("an unknown LIBRARY_RESULT status");
   }
-  if (status == w::LibraryStatus::kBody) {
-    Library lib;
-    lib.language = language;
-    lib.body = body;
-    lib.hash = hash;
-    lib.checked = m_lib_epoch;
-    lib.generation = m_lib_generation;
-    lib.loadset = std::make_shared<std::map<std::string, uint64_t>>();
-    const bool changed = known != nullptr;
-    Library &kept = m_libraries[key] = std::move(lib);
-    if (changed) m_lib_confirmed.clear();  // routines confirmed for the old body confirm again
-    m_lib_confirmed.insert(confirmation);
-    lib_touch(key, kept);
-    m_lib_open.push_back(kept.loadset);  // a new body: evaluated from here on
-    return &kept;
-  }
-  const bool had = known != nullptr;
-  m_libraries.erase(key);
-  if (had || !m_lib_open.empty()) lib_new_generation();
-  if (why != nullptr) *why = message.empty() ? "the library " + schema + "." + name + " is not available" : message;
-  return nullptr;
+  answers[key] = Answer{q.library_epoch, version};
+  return &m_libraries[key];
 }
 
 // ------------------------------------------------------------ modules
@@ -193,45 +149,111 @@ v8::MaybeLocal<v8::Module> Worker::compile_module(const std::string &text, const
   return m;
 }
 
-v8::MaybeLocal<v8::Module> Worker::library_module(const std::string &schema, const std::string &name) {
-  std::string why;
-  const Library *lib = lib_fetch(schema, name, &why);
-  if (lib == nullptr) {
-    m_isolate->ThrowException(v8::Exception::Error(v8_string(m_isolate, why)));
-    return {};
-  }
-  if (lib->language != "js") {
-    const std::string lang = lib->language == "python" ? "Python" : lib->language == "java" ? "Java" : lib->language;
-    m_isolate->ThrowException(v8::Exception::Error(
-        v8_string(m_isolate, "the library " + schema + "." + name + " is a " + lang +
-                                 " library: it needs the JVM worker (LANGUAGE JAVASCRIPT)")));
-    return {};
-  }
-  const std::string key = schema + "/" + name;
-  const uint64_t stamp = lib->stamp();
-  if (const auto hit = m_modules.find(key); hit != m_modules.end() && hit->second.stamp == stamp)
-    return hit->second.module.Get(m_isolate);
-  // A new library (or version) is evaluated within the loadsets of this request.
-  if (std::none_of(m_lib_open.begin(), m_lib_open.end(), [&](const auto &s) { return s == lib->loadset; }))
-    m_lib_open.push_back(lib->loadset);
+bool Worker::lib_compile(const LibraryName &lib, const Library &body, ModuleEntry &entry) {
+  const Local<v8::Context> ctx = m_context.Get(m_isolate);
+  if (!entry.module.IsEmpty()) m_module_paths.erase(entry.module.Get(m_isolate)->GetIdentityHash());
+  entry = ModuleEntry();
   Local<v8::Module> m;
-  if (!compile_module(lib->body, schema + "." + name, "/" + key).ToLocal(&m)) return {};
-  m_modules[key] = ModuleEntry{stamp, v8::Global<v8::Module>(m_isolate, m)};
-  return m;
+  try {
+    if (!compile_module(body.body, lib.schema + "." + lib.name, "/" + lib.schema + "/" + lib.name).ToLocal(&m))
+      return false;
+  } catch (const ConversionError &e) {  // a body longer than a JavaScript string can be
+    m_isolate->ThrowException(v8::Exception::RangeError(v8_string(m_isolate, e.message)));
+    return false;
+  }
+  // The libraries it imports statically; any other specifier is a package's.
+  const Local<v8::FixedArray> requests = m->GetModuleRequests();
+  for (int i = 0; i < requests->Length(); i++) {
+    const Local<v8::String> specifier = requests->Get(ctx, i).As<v8::ModuleRequest>()->GetSpecifier();
+    const std::optional<std::string> spec = utf8_exact(m_isolate, specifier);
+    LibraryName import;
+    if (spec && spec->starts_with("/") && library_path(*spec, &import.schema, &import.name))
+      entry.imports.push_back(std::move(import));
+  }
+  entry.version = body.version;
+  entry.module.Reset(m_isolate, m);
+  return true;
+}
+
+v8::MaybeLocal<v8::Module> Worker::library_module(const LibraryName &root) {
+  const auto fail = [this](const std::string &text) {
+    m_isolate->ThrowException(v8::Exception::Error(v8_string(m_isolate, text)));
+    return v8::MaybeLocal<v8::Module>();
+  };
+  // Imports come only from the guest code of the request being served (§10.1).
+  if (const char *why = host_unavailable(); why != nullptr) return fail(why);
+  // Every library the import reaches is resolved for this request, each once.
+  std::set<std::string> reached;
+  std::vector<LibraryName> todo{root};
+  while (!todo.empty()) {
+    const LibraryName lib = std::move(todo.back());
+    todo.pop_back();
+    const std::string key = lib.key();
+    if (reached.contains(key)) continue;
+    std::string why;
+    const Library *body = lib_resolve(lib, &why);
+    if (body == nullptr) return fail(why);
+    if (body->language != "js") {
+      const std::string language =
+          body->language == "python" ? "Python" : body->language == "java" ? "Java" : body->language;
+      return fail("the library " + lib.schema + "." + lib.name + " is a " + language +
+                  " library: the V8 worker runs JavaScript libraries only");
+    }
+    ModuleEntry &entry = m_modules[key];
+    if ((entry.module.IsEmpty() || entry.version != body->version) && !lib_compile(lib, *body, entry)) return {};
+    reached.insert(key);
+    for (const LibraryName &import : entry.imports) todo.push_back(import);
+  }
+  // What each module reaches, itself included, with the versions: a module that is linked with
+  // other versions is compiled anew, and V8 links it when it is instantiated.
+  for (const std::string &key : reached) {
+    std::map<std::string, uint64_t> closure;
+    std::vector<std::string> walk{key};
+    while (!walk.empty()) {
+      const std::string k = std::move(walk.back());
+      walk.pop_back();
+      const ModuleEntry &e = m_modules[k];
+      if (!closure.emplace(k, e.version).second) continue;
+      for (const LibraryName &import : e.imports) walk.push_back(import.key());
+    }
+    std::string linked_with;
+    for (const auto &[k, version] : closure) linked_with += k + '\0' + std::to_string(version) + '\0';
+    ModuleEntry &entry = m_modules[key];
+    const bool linked = entry.module.Get(m_isolate)->GetStatus() >= v8::Module::kInstantiated;
+    if (linked && entry.linked_with != linked_with) {
+      const size_t sep = key.find('\0');
+      if (!lib_compile(LibraryName{key.substr(0, sep), key.substr(sep + 1)}, m_libraries[key], entry)) return {};
+    }
+    entry.linked_with = linked_with;
+  }
+  return m_modules[root.key()].module.Get(m_isolate);
 }
 
 v8::MaybeLocal<v8::Module> Worker::resolve(Local<v8::Context> ctx, Local<v8::String> specifier,
                                            Local<v8::FixedArray>, Local<v8::Module> referrer) {
   Worker *self = current();
-  const std::string spec = utf8(self->m_isolate, specifier);
-  std::string schema, name;
-  // "/schema/name": a database library; anything else: an npm package (api.js resolves it).
-  if (spec.starts_with("/") && library_path(spec, &schema, &name)) return self->library_module(schema, name);
+  const std::optional<std::string> spec = utf8_exact(self->m_isolate, specifier);
+  if (!spec) {
+    self->m_isolate->ThrowException(v8::Exception::TypeError(
+        v8_string(self->m_isolate, "a module name must be well-formed Unicode (no unpaired surrogate)")));
+    return {};
+  }
   std::string from;
   if (!referrer.IsEmpty())
     if (const auto p = self->m_module_paths.find(referrer->GetIdentityHash()); p != self->m_module_paths.end())
       from = p->second;
-  return self->package_module(ctx, spec, from);
+  LibraryName lib;
+  // "/schema/name": a database library; anything else: an npm package (api.js resolves it).
+  if (spec->starts_with("/") && library_path(*spec, &lib.schema, &lib.name)) {
+    // A library that imports it was resolved with everything it reaches (library_module): this is
+    // the module of that resolution. A package's module comes here with nothing resolved.
+    const bool from_package = !self->m_config.packages.empty() && from.starts_with(self->m_config.packages + "/");
+    if (const auto resolved = self->m_modules.find(lib.key());
+        !from_package && resolved != self->m_modules.end() && !resolved->second.module.IsEmpty())
+      return resolved->second.module.Get(self->m_isolate);
+    return self->library_module(lib);
+  }
+  return self->package_module(ctx, *spec, from);
 }
 
 v8::MaybeLocal<v8::Module> Worker::package_module(Local<v8::Context> ctx, const std::string &spec,
@@ -299,7 +321,7 @@ v8::MaybeLocal<Value> Worker::module_namespace(Local<v8::Context> ctx, Local<v8:
 v8::MaybeLocal<Value> Worker::library_namespace(const std::string &schema, const std::string &name) {
   const Local<v8::Context> ctx = m_context.Get(m_isolate);
   Local<v8::Module> m;
-  if (!library_module(schema, name).ToLocal(&m)) return {};
+  if (!library_module(LibraryName{schema, name}).ToLocal(&m)) return {};
   return module_namespace(ctx, m);
 }
 
@@ -312,15 +334,26 @@ v8::MaybeLocal<v8::Promise> Worker::dynamic_import(Local<v8::Context> ctx, Local
   v8::TryCatch tc(iso);
   Local<v8::Module> m;
   Local<Value> ns;
-  // The importer: its resource name, a package module's path (relative names and node_modules
-  // resolve from it, as for a static import; package_module ignores any other name).
-  const std::string spec = utf8(iso, specifier);
-  std::string schema, name;
-  const bool ok = (spec.starts_with("/") && library_path(spec, &schema, &name)
-                       ? self->library_module(schema, name)
-                       : self->package_module(ctx, spec, resource->IsString() ? utf8(iso, resource) : std::string()))
-                      .ToLocal(&m) &&
-                  self->module_namespace(ctx, m).ToLocal(&ns);
+  bool ok = false;
+  // A module name is a name: it is not repaired (§7.1).
+  const std::optional<std::string> spec = utf8_exact(iso, specifier);
+  if (!spec) {
+    iso->ThrowException(v8::Exception::TypeError(
+        v8_string(iso, "a module name must be well-formed Unicode (no unpaired surrogate)")));
+  } else {
+    // The importer: its resource name, a package module's path (relative names and node_modules
+    // resolve from it, as for a static import; package_module ignores any other name).
+    LibraryName lib;
+    try {
+      ok = (spec->starts_with("/") && library_path(*spec, &lib.schema, &lib.name)
+                ? self->library_module(lib)
+                : self->package_module(ctx, *spec, resource->IsString() ? utf8(iso, resource) : std::string()))
+               .ToLocal(&m) &&
+           self->module_namespace(ctx, m).ToLocal(&ns);
+    } catch (const ConversionError &e) {
+      iso->ThrowException(v8::Exception::RangeError(v8_string(iso, e.message)));
+    }
+  }
   if (tc.HasTerminated()) {
     tc.ReThrow();
     return {};

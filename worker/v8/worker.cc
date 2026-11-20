@@ -22,9 +22,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <new>
+#include <optional>
 #include <regex>
 
 #include "api_js.h"
@@ -44,8 +48,18 @@ namespace {
 /** Name of the wrapper function around a body's arrow function (JsOracle.WRAPPER): its frames are
     not the routine's. */
 constexpr const char *kWrapper = "$mle$routine";
-/** Console output kept per stream until the RESULT (Console.java's LIMIT). */
+/** Console output the worker keeps per stream until a RESULT carries it: the end of the stream. */
 constexpr size_t kConsoleLimit = 1 << 20;
+/** The language identifier of READY, PREPARE and Error (Appendix B.1). */
+constexpr const char *kJs = "js";
+
+/** Cuts text to at most max bytes at a character boundary (§7.4). */
+void cut(std::string &s, size_t max) {
+  if (s.size() <= max) return;
+  size_t n = max;
+  while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) n--;
+  s.resize(n);
+}
 
 bool identifier(const std::string &s) {
   static const std::regex re("[A-Za-z_$][A-Za-z0-9_$]*");
@@ -82,14 +96,24 @@ std::vector<std::string> split_lines(const std::string &s) {
   return out;
 }
 
-/** A frame's source line as the protocol carries it (Dispatcher.Frame.line: trimmed, at most 200
-    characters). */
+/** A frame's source line as the protocol carries it: trimmed, at most 200 bytes. */
 std::string frame_line(std::string s) {
   while (!s.empty() && (s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
   size_t i = 0;
   while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
   s = s.substr(i);
-  if (s.size() > 200) s = s.substr(0, 200);
+  cut(s, 200);
+  return s;
+}
+
+/** The exact UTF-8 of a string argument that is a name; nullopt (and a TypeError thrown) if it is
+    not a well-formed string. */
+std::optional<std::string> name_argument(v8::Isolate *iso, Local<Value> v, const char *what) {
+  std::optional<std::string> s;
+  if (v->IsString()) s = utf8_exact(iso, v.As<v8::String>());
+  if (!s)
+    iso->ThrowException(v8::Exception::TypeError(
+        v8_string(iso, std::string(what) + " must be a string of well-formed Unicode (no unpaired surrogate)")));
   return s;
 }
 
@@ -106,6 +130,8 @@ void native_sql(const v8::FunctionCallbackInfo<Value> &info) {
   if (Worker::current()->sql(info).ToLocal(&v)) info.GetReturnValue().Set(v);
 }
 
+void native_hand_back(const v8::FunctionCallbackInfo<Value> &info) { Worker::current()->hand_back(info); }
+
 void native_state(const v8::FunctionCallbackInfo<Value> &info) {
   info.GetReturnValue().Set(Worker::current()->state());
 }
@@ -117,16 +143,23 @@ void native_nap(const v8::FunctionCallbackInfo<Value> &info) {
 
 void native_library(const v8::FunctionCallbackInfo<Value> &info) {
   v8::Isolate *iso = info.GetIsolate();
+  const std::optional<std::string> schema = name_argument(iso, info[0], "a library's schema");
+  if (!schema) return;
+  const std::optional<std::string> name = name_argument(iso, info[1], "a library's name");
+  if (!name) return;
   Local<Value> ns;
-  if (Worker::current()->library_namespace(utf8(iso, info[0]), utf8(iso, info[1])).ToLocal(&ns))
-    info.GetReturnValue().Set(ns);
+  if (Worker::current()->library_namespace(*schema, *name).ToLocal(&ns)) info.GetReturnValue().Set(ns);
 }
 
 void native_read_file(const v8::FunctionCallbackInfo<Value> &info) {
   v8::Isolate *iso = info.GetIsolate();
   const std::optional<std::string> text = Worker::current()->package_file(utf8(iso, info[0]));
-  if (text) info.GetReturnValue().Set(v8_string(iso, *text));
-  else info.GetReturnValue().SetNull();
+  info.GetReturnValue().SetNull();
+  if (!text) return;
+  try {
+    info.GetReturnValue().Set(v8_string(iso, *text));
+  } catch (const ConversionError &) {  // a file larger than a string can be: as if it were not there
+  }
 }
 
 void native_is_dir(const v8::FunctionCallbackInfo<Value> &info) {
@@ -192,6 +225,7 @@ void setup_icu(const std::vector<std::string> &dirs) {
 
 Worker::Worker(const Config &config) : m_config(config) {
   s_current = this;
+  Mailbox::stats(uint32_t(w::WorkerState::kStarting), false);
   setup_icu(m_config.icu_data);
   // Few background threads: a worker serves one session (compilation and GC helpers).
   m_platform = v8::platform::NewDefaultPlatform(2);
@@ -232,6 +266,7 @@ Worker::Worker(const Config &config) : m_config(config) {
   fn("clear", native_clear);
   fn("library", native_library);
   fn("sql", native_sql);
+  fn("handBack", native_hand_back);
   fn("state", native_state);
   fn("nap", native_nap);
   fn("readFile", native_read_file);
@@ -249,18 +284,22 @@ Worker::Worker(const Config &config) : m_config(config) {
   m_show.Reset(m_isolate,
                helpers->Get(ctx, v8_string(m_isolate, "show")).ToLocalChecked().As<v8::Function>());
   m_values = std::make_unique<Values>(m_isolate, ctx, &m_options);
-  // The SQL API (sql.js): the globals session, mysql, SqlError; its end-of-call hook.
+  // The SQL API (sql.js): the globals session, mysql, SqlError.
   const Local<v8::Function> sql_install =
       v8::Script::Compile(ctx, v8_string(m_isolate, kSqlJs)).ToLocalChecked()->Run(ctx).ToLocalChecked().As<v8::Function>();
-  const Local<v8::Object> sql_hooks =
-      sql_install->Call(ctx, v8::Undefined(m_isolate), 1, &arg).ToLocalChecked().As<v8::Object>();
-  m_call_ended.Reset(m_isolate, sql_hooks->Get(ctx, v8_string(m_isolate, "callEnded")).ToLocalChecked().As<v8::Function>());
+  (void)sql_install->Call(ctx, v8::Undefined(m_isolate), 1, &arg).ToLocalChecked();
+  m_probe.Reset(m_isolate, v8::Script::Compile(ctx, v8_string(m_isolate, "(function () {})"))
+                               .ToLocalChecked()
+                               ->Run(ctx)
+                               .ToLocalChecked()
+                               .As<v8::Function>());
+  m_handed.Reset(m_isolate, v8::Private::New(m_isolate));
 }
 
 Worker::~Worker() = default;
 
 size_t Worker::near_heap_limit(void *data, size_t current, size_t) {
-  // Out of heap: stop the routine (an error that retires the worker), with room to unwind.
+  // Out of heap: stop the guest code (EXHAUSTED, and the worker is retired), with room to unwind.
   auto *self = static_cast<Worker *>(data);
   self->m_exhausted = true;
   self->m_tainted = true;
@@ -269,34 +308,31 @@ size_t Worker::near_heap_limit(void *data, size_t current, size_t) {
 }
 
 void Worker::run() {
-  common::EngineHooks hooks;
-  hooks.interrupt = [](uint64_t) { Worker::current()->terminate(); };
-  hooks.interrupted_end = [] { Worker::current()->cancel_terminate(); };
-  const auto t0 = std::chrono::steady_clock::now();
-  Mailbox::open(m_config.spin, hooks, "mle_v8_worker");
-  ready(uint32_t(w::Status::kOk),
-        "ready in " +
-            std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
-                               .count()) +
-            " ms");
+  const std::string runtime = std::string("V8 ") + v8::V8::GetVersion();
+  const std::string info =
+      "class " + m_config.cls + ", ready in " +
+      std::to_string(
+          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_started).count()) +
+      " ms";
+  const std::string_view languages[] = {kJs};
+  stats(uint32_t(w::WorkerState::kIdle));
+  Mailbox::ready(info, "v8", languages, runtime);
   std::vector<std::byte> assembled;
   while (true) {
-    const Message m = Mailbox::receive([&assembled](size_t total) {
-      assembled.resize(total);
-      return assembled.data();
-    });
+    const Message m = Mailbox::receive([&](size_t total) { return allocate(assembled, total); });
     handle(m);
+    if (assembled.capacity() > (4U << 20)) std::vector<std::byte>().swap(assembled);
   }
 }
 
-void Worker::ready(uint32_t status, const std::string &info) {
-  Writer wr(Mailbox::arena());
-  const std::string version = std::string("V8 ") + v8::V8::GetVersion();
-  if (!(wr.put<uint32_t>(w::kVersion) && wr.str(m_config.cls) && wr.put<uint32_t>(1) && wr.str("js") &&
-        wr.str(version) && wr.str(info)))
-    _exit(1);
-  stats(uint32_t(w::WorkerState::kIdle));
-  Mailbox::post(uint32_t(w::Op::kReady), status, 0, 0, uint32_t(wr.size()));
+std::byte *Worker::allocate(std::vector<std::byte> &buffer, size_t total) {
+  if (m_config.message_max != 0 && total > m_config.message_max) return nullptr;
+  try {
+    buffer.resize(total);
+  } catch (const std::bad_alloc &) {
+    return nullptr;
+  }
+  return buffer.data();
 }
 
 void Worker::stats(uint32_t state) {
@@ -304,7 +340,7 @@ void Worker::stats(uint32_t state) {
   if (state == uint32_t(w::WorkerState::kIdle) && (m_calls++ % 64) == 0) {
     v8::HeapStatistics hs;
     m_isolate->GetHeapStatistics(&hs);
-    Mailbox::stats(state, m_tainted, hs.used_heap_size(), m_config.heap_max);
+    Mailbox::stats(state, m_tainted, std::min<uint64_t>(hs.used_heap_size(), m_config.heap_max), m_config.heap_max);
     return;
   }
   Mailbox::stats(state, m_tainted);
@@ -313,170 +349,247 @@ void Worker::stats(uint32_t state) {
 // ------------------------------------------------------------ requests
 
 void Worker::drop_routine(uint64_t id) {
-  const auto it = m_routines.find(id);
-  if (it == m_routines.end()) return;
-  m_scripts.erase(it->second.script_id);  // its frames' source lines
-  m_routines.erase(it);
+  m_routines.erase(id);  // a running activation keeps the code (§8.3)
+  m_answers.erase(id);   // and the library answers of the id are discarded (§9.10)
+}
+
+const char *Worker::host_unavailable() const {
+  if (m_converting > 0)
+    return "SQL and library imports are not available in toString or toJSON while MLE converts a value";
+  if (m_request == nullptr || !m_request->guest) return "SQL and library imports are available only while a routine runs";
+  return nullptr;
+}
+
+bool Worker::termination_pending() {
+  v8::TryCatch tc(m_isolate);
+  // Entering JavaScript acts on a termination that was requested and not acted on yet.
+  return m_probe.Get(m_isolate)->Call(m_context.Get(m_isolate), v8::Undefined(m_isolate), 0, nullptr).IsEmpty() &&
+         tc.HasTerminated();
+}
+
+void Worker::discard_microtasks() {
+  // V8 empties the queue when a termination stops it; a job that enters JavaScript is stopped at
+  // once, so no guest code runs here.
+  m_isolate->TerminateExecution();
+  {
+    v8::TryCatch tc(m_isolate);
+    m_isolate->PerformMicrotaskCheckpoint();
+  }
+  m_isolate->CancelTerminateExecution();
 }
 
 void Worker::handle(const Message &m) {
   v8::HandleScope scope(m_isolate);
-  const uint32_t saved_depth = m_depth;
-  const uint64_t saved_seq = m_seq;
-  const uint64_t saved_scope = m_scope;
-  m_scope = ++m_scopes;
-  m_depth = m.depth;
-  if (m.depth == 0) {
+  const auto op = static_cast<w::Op>(m.op);
+  const bool top = m.depth == 0;
+  const bool guest = op == w::Op::kPrepare || op == w::Op::kCall;
+  const bool interruptible = guest || op == w::Op::kParseLibrary;
+  if (top) {
+    // The worker begins to serve the request: it has received it completely (§11.1).
     m_seq = m.call_seq;
-    m_lib_open.clear();  // a top-level request starts (LibraryFileSystem.requestStart)
+    Interrupts::begin(m_seq, interruptible);
+    if (interruptible && !m_options_in_force)
+      protocol_failure("PREPARE, CALL or PARSE_LIBRARY without options in force");
   }
-  try {
-    switch (static_cast<w::Op>(m.op)) {
+  Request q;
+  q.op = m.op;
+  q.depth = m.depth;
+  q.scope = ++m_scopes;
+  q.outer = m_request;
+  m_request = &q;
+  Reply reply;
+  if (m.discarded) {
+    too_large(m, q, &reply);
+  } else {
+    switch (op) {
       case w::Op::kPrepare:
-        prepare(m);
+        prepare(m, q, &reply);
         break;
       case w::Op::kCall:
-        call(m);
-        break;
-      case w::Op::kDrop: {
-        Reader r(m.body, 0);
-        const auto id = r.get<uint64_t>();
-        drop_routine(id);
-        m_schemas.erase(id);
-        result(uint32_t(w::Status::kOk), nullptr);
-        break;
-      }
-      case w::Op::kReset:
-        m_routines.erase(m_routines.begin(), m_routines.end());
-        m_scripts.clear();
-        m_schemas.clear();
-        m_isolate->LowMemoryNotification();  // a reset worker waits for reuse: give memory back
-        result(uint32_t(w::Status::kOk), nullptr);
-        break;
-      case w::Op::kOptions:
-        options(m);
+        call(m, q, &reply);
         break;
       case w::Op::kParseLibrary:
-        parse_library(m);
+        parse_library(m, &reply);
         break;
-      default: {
-        ErrorInfo e{"", "unexpected message " + std::to_string(m.op), {}, 0, ""};
-        result(uint32_t(w::Status::kInternal), &e);
-      }
+      case w::Op::kDrop:
+        drop(m);
+        break;
+      case w::Op::kReset:
+        reset(m);
+        break;
+      case w::Op::kOptions:
+        options(m, &reply);
+        break;
+      default:
+        protocol_failure("a message that is not a request");
     }
-  } catch (const Malformed &e) {
-    std::fprintf(stderr, "mle_v8_worker: fatal: malformed message: %s\n", e.what);
-    _exit(1);
   }
-  m_depth = saved_depth;
-  m_seq = saved_seq;
-  m_scope = saved_scope;
+  q.guest = false;  // no guest code of the request runs from here on
+  if (interruptible) {
+    // The status is fixed here (§11.1). INTERRUPTED only for an interrupt that was delivered and
+    // that V8 acted on; one it has not acted on is cancelled, and the RESULT is what it is. A
+    // nested request leaves the cancelled termination to sql(), which requests it again for the
+    // outer code.
+    const bool delivered = top ? Interrupts::end() : Interrupts::interrupted();
+    if (std::exchange(m_exhausted, false)) {
+      m_tainted = true;
+      reply.fail(w::Status::kExhausted, kJs, "RangeError: out of memory (the V8 heap limit, mle.v8_heap_max)");
+    } else if (delivered) {
+      if (!termination_pending()) reply.fail(w::Status::kInterrupted, kJs, "interrupted");
+    } else if (reply.terminated) {
+      m_tainted = true;
+      reply.fail(w::Status::kInternal, "", "V8 terminated the routine without an interrupt");
+    }
+    m_isolate->CancelTerminateExecution();
+    if (top && guest && reply.status != w::Status::kOk) discard_microtasks();
+  }
+  post_result(q, reply);
+  m_request = q.outer;
 }
 
-void Worker::options(const Message &m) {
-  Reader r(m.body, 0);
-  const auto integer_type = r.get<uint8_t>();
-  const auto decimal_type = r.get<uint8_t>();
+void Worker::too_large(const Message &m, Request &q, Reply *reply) {
+  // §5.3: the transfer is complete and its chunks are gone; the worker itself is sound.
+  if (static_cast<w::Op>(m.op) == w::Op::kPrepare) {
+    q.routine_id = m.head;
+    drop_routine(m.head);  // the id is not prepared (§8.3)
+  }
+  reply->fail(w::Status::kExhausted, "", "the request is larger than this MLE worker can hold");
+}
+
+void Worker::drop(const Message &m) {
+  Reader r(m.body);
+  const auto id = r.get<uint64_t>();
+  r.finish();
+  drop_routine(id);
+}
+
+void Worker::reset(const Message &m) {
+  Reader(m.body).finish();  // an empty body
+  m_routines.clear();
+  m_answers.clear();
+  // RESET ends the options (§9.8) and discards the console output that waits (§9.4). globalThis
+  // and the loaded libraries stay (Appendix B.6).
+  m_options = Options();
+  m_options_in_force = false;
+  m_out.clear();
+  m_err.clear();
+  m_cleared = false;
+  m_isolate->LowMemoryNotification();  // a reset worker waits for reuse: give memory back
+}
+
+void Worker::options(const Message &m, Reply *reply) {
+  Reader r(m.body);
   const std::string zone(r.str());
-  if (integer_type > w::kMaxIntegerType || decimal_type > w::kMaxDecimalType) throw Malformed{"bad options"};
-  Options o = m_options;
+  const uint32_t n = r.count(w::kMaxSettings, 8);
+  // The message carries the complete set: a setting that is absent has its default.
+  Options o;
+  std::string refused;
+  for (uint32_t i = 0; i < n; i++) {
+    const std::string_view name = r.str(), value = r.str();
+    const auto choose = [&](std::initializer_list<std::string_view> values) {
+      const auto at = std::find(values.begin(), values.end(), value);
+      if (at != values.end()) return static_cast<int>(at - values.begin());
+      if (refused.empty()) refused = "'" + std::string(value) + "' is not a value of " + std::string(name);
+      return 0;
+    };
+    // Appendix B.2; a name of another language or worker kind is not this worker's.
+    if (name == "js.integer_type")
+      o.integer_type = static_cast<IntegerType>(choose({"unsafe_string", "unsafe_bigint", "string", "bigint"}));
+    else if (name == "js.decimal_type")
+      o.decimal_type = static_cast<DecimalType>(choose({"string", "number"}));
+  }
+  r.finish();
+  // On a failure the options in force stay as they are.
   if (!o.set_zone(zone)) {
-    ErrorInfo e{"MLE-TimeZone", "unknown time zone '" + zone + "'", {}, 0, ""};
-    result(uint32_t(w::Status::kGuestError), &e);
-    return;
+    reply->fail(w::Status::kGuestError, w::kLanguageTimeZone, "unknown time zone '" + zone + "'");
+  } else if (!refused.empty()) {
+    reply->fail(w::Status::kGuestError, w::kLanguageOption, refused);
+  } else {
+    m_options = o;
+    m_options_in_force = true;
   }
-  o.integer_type = static_cast<w::IntegerType>(integer_type);
-  o.decimal_type = static_cast<w::DecimalType>(decimal_type);
-  m_options = o;
-  result(uint32_t(w::Status::kOk), nullptr);
 }
 
-void Worker::parse_library(const Message &m) {
-  Reader r(m.body, 0);
+void Worker::parse_library(const Message &m, Reply *reply) {
+  Reader r(m.body);
   const std::string language(r.str()), name(r.str()), body(r.str());
-  if (language != "js") {
-    ErrorInfo e{language, "libraries in " + language + " are not supported", {}, 0, ""};
-    result(uint32_t(w::Status::kGuestError), &e);
-    return;
-  }
-  const Local<v8::Context> ctx = m_context.Get(m_isolate);
+  r.finish();
+  if (language != kJs) protocol_failure("PARSE_LIBRARY in a language that READY does not list");
   v8::TryCatch tc(m_isolate);
-  v8::ScriptOrigin origin(v8_string(m_isolate, name), 0, 0, false, -1, Local<Value>(), false, false, true);
-  v8::ScriptCompiler::Source src(v8_string(m_isolate, body), origin);
-  if (v8::ScriptCompiler::CompileModule(m_isolate, &src).IsEmpty()) {
-    // Oracle's form: "SyntaxError: name:line:col message" (the first line).
-    std::string message = compile_error(tc.Message(), name, 0);
-    message = message.substr(0, message.find('\n'));
-    ErrorInfo e{"js", message, {}, 0, ""};
-    result(uint32_t(w::Status::kGuestError), &e);
-    return;
+  try {
+    v8::ScriptOrigin origin(v8_string(m_isolate, name), 0, 0, false, -1, Local<Value>(), false, false, true);
+    v8::ScriptCompiler::Source src(v8_string(m_isolate, body), origin);
+    if (v8::ScriptCompiler::CompileModule(m_isolate, &src).IsEmpty()) {
+      // Oracle's form: "SyntaxError: name:line:col message" (the first line).
+      std::string message = compile_error(tc.Message(), name, 0);
+      message = message.substr(0, message.find('\n'));
+      reply->fail(w::Status::kGuestError, kJs, message);
+    }
+  } catch (const ConversionError &e) {
+    reply->fail(w::Status::kGuestError, kJs, e.message);
   }
-  (void)ctx;
-  result(uint32_t(w::Status::kOk), nullptr);
 }
 
-void Worker::prepare(const Message &m) {
-  Reader r(m.body, 0);
+void Worker::prepare(const Message &m, Request &q, Reply *reply) {
+  // The whole message is taken out of the arena before guest code, which may post, runs.
+  Reader r(m.body);
   const auto id = r.get<uint64_t>();
   const std::string language(r.str()), name(r.str()), entry(r.str()), source(r.str());
-  const auto n = r.get<uint32_t>();
-  if (n > w::kMaxValues) throw Malformed{"too many parameters"};
-  Routine routine;
+  const uint32_t n = r.count(w::kMaxParams, 23);
+  const std::shared_ptr<Routine> routine(new Routine, [this](Routine *gone) {
+    m_scripts.erase(gone->script_id);  // its frames' source lines
+    delete gone;
+  });
   std::vector<std::string> names;
   std::vector<uint8_t> modes;
   for (uint32_t i = 0; i < n; i++) {
     names.emplace_back(r.str());
     modes.push_back(r.get<uint8_t>());
-    routine.params.push_back(ParamType::read(r));
-    if (modes.back() != uint8_t(w::ParamMode::kIn)) routine.outs.push_back(i);
+    if (modes.back() > uint8_t(w::ParamMode::kInOut)) protocol_failure("an unknown Param mode");
+    routine->params.push_back(ParamType::read(r));
+    if (modes.back() != uint8_t(w::ParamMode::kIn)) routine->outs.push_back(i);
   }
-  routine.has_return = r.get<uint8_t>() != 0;
-  if (routine.has_return) routine.ret = ParamType::read(r);
-  const auto nimports = r.get<uint32_t>();
-  if (nimports > w::kMaxValues) throw Malformed{"too many imports"};
-  struct Import {
-    std::string schema, name, alias;
-  };
-  std::vector<Import> imports;
-  for (uint32_t i = 0; i < nimports; i++) {
-    Import imp;
-    imp.schema = r.str();
-    imp.name = r.str();
-    imp.alias = r.str();
-    imports.push_back(std::move(imp));
-  }
-  m_schemas[id] = std::string(r.str());
-  (void)r.get<uint8_t>();  // check (names never defined: Python's)
-  if (language != "js") {
-    ErrorInfo e{language, "the language " + language + " is not available in this worker", {}, 0, ""};
-    result(uint32_t(w::Status::kGuestError), &e);
-    return;
-  }
-  // A routine is (re)loaded: library DDL may have happened (LibraryFileSystem.revalidate).
-  libraries_revalidate();
+  routine->has_return = r.boolean();
+  if (routine->has_return) routine->ret = ParamType::read(r);
+  const uint32_t nimports = r.count(w::kMaxImports, 12);
   std::vector<std::string> usings;
-  for (const Import &imp : imports)
-    usings.push_back("const " + (imp.alias.empty() ? imp.name : imp.alias) + "=$c.lib(" + js_string(imp.schema) + "," +
-                     js_string(imp.name) + ");");
+  for (uint32_t i = 0; i < nimports; i++) {
+    const std::string schema(r.str()), library(r.str()), alias(r.str());
+    // USING: each library bound to its alias or name, loaded when the routine starts to run.
+    usings.push_back("const " + (alias.empty() ? library : alias) + "=$c.lib(" + js_string(schema) + "," +
+                     js_string(library) + ");");
+  }
+  routine->schema = r.str();
+  (void)r.boolean();  // check: this worker has no findings beyond syntax
+  q.library_epoch = r.get<uint64_t>();
+  r.finish();
+  if (language != kJs) protocol_failure("PREPARE in a language that READY does not list");
+  q.routine_id = id;
+  q.schema = routine->schema;
+  q.guest = true;
+  // The id is not prepared from here until this PREPARE answers OK (§8.3).
+  drop_routine(id);
   stats(uint32_t(w::WorkerState::kCompiling));
-  const bool top = m_depth == 0;
-  if (top) Interrupts::begin(m_seq);
-  drop_routine(id);  // prepared again after ALTER
   std::string compile_err;
   v8::TryCatch tc(m_isolate);
-  const uint64_t outer = std::exchange(m_routine, id);
-  compile(id, name.empty() ? "routine_" + std::to_string(id) : name, entry, source, routine, names, modes, usings,
-          &compile_err);
-  m_routine = outer;
-  const bool interrupted = top && Interrupts::end();
+  if (Interrupts::interrupted()) m_isolate->TerminateExecution();
+  try {
+    compile(name.empty() ? "routine_" + std::to_string(id) : name, entry, source, *routine, names, modes, usings,
+            &compile_err);
+  } catch (const ConversionError &e) {
+    compile_err = e.message;
+  }
   if (!compile_err.empty()) {
-    ErrorInfo e{"js", compile_err, {}, 0, ""};
-    result(uint32_t(w::Status::kGuestError), &e);
-  } else if (tc.HasCaught() || tc.HasTerminated() || routine.fn.IsEmpty()) {
-    failed(tc, interrupted);
+    reply->fail(w::Status::kGuestError, kJs, compile_err);
+  } else if (tc.HasCaught() || routine->fn.IsEmpty()) {
+    failed(tc, reply);
   } else {
-    m_routines.emplace(id, std::move(routine));
-    result(uint32_t(w::Status::kOk), nullptr);
+    // What loading the code queued runs within this request.
+    m_isolate->PerformMicrotaskCheckpoint();
+    if (tc.HasTerminated())
+      failed(tc, reply);
+    else
+      m_routines[id] = routine;
   }
 }
 
@@ -498,15 +611,14 @@ v8::MaybeLocal<Value> Worker::run_script(const std::string &text, const std::str
   return script->Run(ctx);
 }
 
-void Worker::compile(uint64_t, const std::string &name, const std::string &entry, const std::string &source,
-                     Routine &r, const std::vector<std::string> &names, const std::vector<uint8_t> &modes,
+void Worker::compile(const std::string &name, const std::string &entry, const std::string &source, Routine &r,
+                     const std::vector<std::string> &names, const std::vector<uint8_t> &modes,
                      const std::vector<std::string> &usings, std::string *error) {
   const Local<v8::Context> ctx = m_context.Get(m_isolate);
   v8::TryCatch tc(m_isolate);
   tc.SetVerbose(false);
   if (entry == "<eval>") {
-    // mle_eval (exp note 39): a strict-mode block; its completion value as text. Syntax errors of
-    // the code as written first.
+    // A strict-mode block; its completion value as text. Syntax errors of the code as written first.
     {
       v8::TryCatch check(m_isolate);
       v8::ScriptOrigin origin(v8_string(m_isolate, "mle_eval"));
@@ -551,8 +663,8 @@ void Worker::compile(uint64_t, const std::string &name, const std::string &entry
   std::string text;
   int prefix = 0;
   if (entry.empty()) {
-    // Oracle's form (JsOracle.prepare): the body in an arrow function inside a wrapper whose
-    // parameters are the routine's; globalThis fresh per call; all on the body's first line.
+    // Oracle's form: the body in an arrow function inside a wrapper whose parameters are the
+    // routine's; globalThis fresh per call; all on the body's first line.
     for (const std::string &p : names)
       if (!identifier(p)) {
         *error = "'" + p + "' is not a JavaScript identifier";
@@ -569,7 +681,6 @@ void Worker::compile(uint64_t, const std::string &name, const std::string &entry
              (modes[i] == uint8_t(w::ParamMode::kOut) ? std::string("null") : "$a" + std::to_string(i));
     }
     if (!names.empty()) pre += ";";
-    // USING (Phase 6): each library bound to its name or alias, loaded synchronously.
     for (const std::string &u : usings) pre += u;
     pre += std::string("const $r=") + (r.async ? "await(async($c,$G)=>{" : "(($c,$G)=>{");
     std::string post = "\n";
@@ -620,110 +731,123 @@ void Worker::compile(uint64_t, const std::string &name, const std::string &entry
   r.fn.Reset(m_isolate, made.As<v8::Function>());
 }
 
-void Worker::call(const Message &m) {
-  Reader r(m.body, 0);
-  const auto id = r.get<uint64_t>();
-  (void)r.get<uint32_t>();  // events
-  const auto n = r.get<uint32_t>();
-  const auto it = m_routines.find(id);
-  if (it == m_routines.end() || it->second.params.size() != n) {
-    ErrorInfo e{"", "routine " + std::to_string(id) + " is not prepared with " + std::to_string(n) + " parameters",
-                {}, 0, ""};
-    result(uint32_t(w::Status::kInternal), &e);
-    return;
-  }
-  const Routine &routine = it->second;
+void Worker::call(const Message &m, Request &q, Reply *reply) {
+  Reader r(m.body);
+  q.routine_id = r.get<uint64_t>();
+  q.library_epoch = r.get<uint64_t>();
+  const uint32_t n = r.count(w::kMaxValues, 1);
+  const auto it = m_routines.find(q.routine_id);
+  if (it == m_routines.end() || it->second->params.size() != n)
+    protocol_failure("a CALL of a routine that is not prepared with this number of parameters");
+  // This activation keeps the code it starts with, whatever a nested PREPARE or DROP does (§8.3).
+  q.routine = it->second;
+  const Routine &routine = *q.routine;
+  q.schema = routine.schema;
   const Local<v8::Context> ctx = m_context.Get(m_isolate);
-  const bool top = m_depth == 0;
-  v8::TryCatch tc(m_isolate);
-  Local<Value> args[64];
-  std::vector<Local<Value>> many;
-  Local<Value> *argv = args;
-  if (n > 64) {
-    many.resize(n);
-    argv = many.data();
+  // The arguments are copies: nothing refers to the arena once guest code, which may post, runs.
+  std::vector<Local<Value>> args(n);
+  std::string unconvertible;
+  for (uint32_t i = 0; i < n; i++) {
+    try {
+      args[i] = m_values->argument(r, routine.params[i]);
+    } catch (const ConversionError &e) {
+      if (unconvertible.empty()) unconvertible = e.message;
+    }
   }
-  try {
-    for (uint32_t i = 0; i < n; i++) argv[i] = m_values->argument(r, routine.params[i]);
-  } catch (const ConversionError &e) {
-    ErrorInfo info{"MLE-Type", e.message, {}, 0, ""};
-    result(uint32_t(w::Status::kGuestError), &info);
+  r.finish();
+  if (!unconvertible.empty()) {
+    reply->fail(w::Status::kGuestError, w::kLanguageType, unconvertible);
     return;
   }
-  if (top) Interrupts::begin(m_seq);
+  q.guest = true;
   stats(uint32_t(w::WorkerState::kRunning));
+  v8::TryCatch tc(m_isolate);
+  // A nested request that begins after the interrupt of its top-level request does not run.
+  if (Interrupts::interrupted()) m_isolate->TerminateExecution();
   Local<Value> ret;
-  const uint64_t outer = std::exchange(m_routine, id);
-  const bool ok = routine.fn.Get(m_isolate)->Call(ctx, v8::Undefined(m_isolate), static_cast<int>(n), argv)
-                      .ToLocal(&ret);
-  m_routine = outer;
-  // The SQL API's end of a call (sql.js: a nested call's unread result closed).
-  if (!m_call_ended.IsEmpty()) {
-    v8::TryCatch inner(m_isolate);
-    Local<Value> arg = v8::Boolean::New(m_isolate, top);
-    (void)m_call_ended.Get(m_isolate)->Call(ctx, v8::Undefined(m_isolate), 1, &arg);
-  }
-  bool settled = true;
-  if (ok) {
-    m_isolate->PerformMicrotaskCheckpoint();
-    if (routine.async && ret->IsPromise()) {
-      const Local<v8::Promise> p = ret.As<v8::Promise>();
-      if (p->State() == v8::Promise::kFulfilled) {
-        ret = p->Result();
-      } else if (p->State() == v8::Promise::kRejected) {
-        m_isolate->ThrowException(p->Result());
-        settled = false;
-      } else {
-        settled = false;
-      }
-    }
-  }
-  const bool interrupted = top && Interrupts::end();
-  if (m_exhausted) {
-    // The heap limit hit after the routine returned (callEnded, the microtasks, whose TryCatch may
-    // have taken the termination): the same error as during the call.
-    m_exhausted = false;
-    m_isolate->CancelTerminateExecution();
-    ErrorInfo e{"js", "RangeError: out of memory (the V8 heap limit, mle.v8_heap_max)", {}, 0, ""};
-    result(uint32_t(w::Status::kExhausted), &e);
-    return;
-  }
-  if (ok && settled && !tc.HasCaught() && !tc.HasTerminated()) {
-    if (interrupted) {
-      ErrorInfo e{"", "interrupted", {}, 0, ""};
-      result(uint32_t(w::Status::kInterrupted), &e);
+  bool ok = routine.fn.Get(m_isolate)->Call(ctx, v8::Undefined(m_isolate), static_cast<int>(n), args.data()).ToLocal(&ret);
+  Local<Value> thrown;
+  Local<v8::Message> thrown_message;
+  if (!ok) {
+    if (tc.HasTerminated() || !tc.HasCaught()) {
+      failed(tc, reply);
       return;
     }
-    if (routine.eval) {
-      Local<Value> v = ret;
-      Local<Value> shown;
-      if (!m_show.Get(m_isolate)->Call(ctx, v8::Undefined(m_isolate), 1, &v).ToLocal(&shown)) shown = v8::Null(m_isolate);
-      result(uint32_t(w::Status::kOk), nullptr, &routine, shown);
-      return;
-    }
-    if (!routine.outs.empty()) {
-      if (!ret->IsArray()) {
-        ErrorInfo e{"", "the routine's wrapper did not return its OUT values", {}, 0, ""};
-        result(uint32_t(w::Status::kInternal), &e);
-        return;
-      }
-      const Local<v8::Array> all = ret.As<v8::Array>();
-      result(uint32_t(w::Status::kOk), nullptr, &routine, all->Get(ctx, 0).ToLocalChecked(), all);
-      return;
-    }
-    result(uint32_t(w::Status::kOk), nullptr, &routine, ret);
+    thrown = tc.Exception();
+    thrown_message = tc.Message();
+    tc.Reset();
+  }
+  // What the routine queued (promise jobs) runs within its request, also after it threw.
+  m_isolate->PerformMicrotaskCheckpoint();
+  if (tc.HasTerminated()) {
+    failed(tc, reply);
     return;
   }
-  if (ok && !settled && !tc.HasCaught()) {
-    ErrorInfo e{"MLE-Type",
-                m_depth > 0 ? "an async JavaScript routine (one that uses await) cannot run while another routine "
-                              "of this worker runs (a nested call); its promise did not settle"
-                            : "the routine's promise did not settle",
-                {}, 0, ""};
-    result(uint32_t(w::Status::kGuestError), &e);
+  if (ok && routine.async && ret->IsPromise()) {
+    const Local<v8::Promise> p = ret.As<v8::Promise>();
+    if (p->State() == v8::Promise::kFulfilled) {
+      ret = p->Result();
+    } else if (p->State() == v8::Promise::kRejected) {
+      ok = false;
+      thrown = p->Result();
+    } else {
+      reply->fail(w::Status::kGuestError, w::kLanguageType,
+                  q.depth > 0 ? "an async JavaScript routine (one that uses await) cannot run while another routine "
+                                "of this worker runs (a nested call); its promise did not settle"
+                              : "the routine's promise did not settle");
+      return;
+    }
+  }
+  if (!ok) {
+    reply->status = w::Status::kGuestError;
+    reply->error = error_of(thrown, thrown_message);
+    if (tc.HasTerminated()) failed(tc, reply);
     return;
   }
-  failed(tc, interrupted);
+  // The values: has_return [, value], out_params. Converting them may run guest code (toString,
+  // toJSON), so it is done here, while the request can still be interrupted.
+  Local<v8::Array> outs;
+  if (routine.eval) {
+    Local<Value> shown;
+    if (!m_show.Get(m_isolate)->Call(ctx, v8::Undefined(m_isolate), 1, &ret).ToLocal(&shown)) shown = v8::Null(m_isolate);
+    ret = shown;
+  } else if (!routine.outs.empty()) {
+    if (!ret->IsArray()) {
+      m_tainted = true;
+      reply->fail(w::Status::kInternal, "", "the routine's wrapper did not return its OUT values");
+      return;
+    }
+    outs = ret.As<v8::Array>();
+    ret = outs->Get(ctx, 0).ToLocalChecked();
+  }
+  Writer wr(reply->values, w::kMaxWorkerMessage);
+  const auto need = [](bool fits) {
+    if (!fits) throw TooLarge{};
+  };
+  try {
+    const Converting converting(m_converting);
+    if (routine.has_return || routine.eval) {
+      need(wr.put<uint8_t>(1));
+      ParamType text;
+      text.tag = w::Tag::kString;
+      m_values->write_as(wr, ret, routine.eval ? text : routine.ret);
+    } else {
+      need(wr.put<uint8_t>(0));
+    }
+    // Every OUT and INOUT parameter, in ascending index (§9.4).
+    need(wr.put(static_cast<uint32_t>(routine.outs.size())));
+    for (size_t k = 0; k < routine.outs.size(); k++) {
+      const uint32_t i = routine.outs[k];
+      need(wr.put(i));
+      m_values->write_as(wr, outs->Get(ctx, static_cast<uint32_t>(k + 1)).ToLocalChecked(), routine.params[i]);
+    }
+    reply->values.resize(wr.size());
+  } catch (const ConversionError &c) {
+    reply->fail(w::Status::kGuestError, w::kLanguageType, c.message);
+  } catch (const TooLarge &) {
+    reply->fail(w::Status::kGuestError, w::kLanguageType, "the routine's result is larger than MLE allows (64 MiB)");
+  }
+  if (tc.HasTerminated()) failed(tc, reply);
 }
 
 // ------------------------------------------------------------ errors
@@ -759,30 +883,52 @@ std::string Worker::compile_error(Local<v8::Message> message, const std::string 
   return out;
 }
 
+void Worker::hand_back(const v8::FunctionCallbackInfo<Value> &info) {
+  if (info.Length() < 5 || !info[0]->IsObject() || !info[1]->IsBigInt()) return;
+  const Local<v8::Context> ctx = m_context.Get(m_isolate);
+  // The ERROR's own number, SQLSTATE and message, with the top-level request the id belongs to.
+  Local<Value> held[] = {info[1], v8::BigInt::NewFromUnsigned(m_isolate, m_seq), info[2], info[3], info[4]};
+  (void)info[0].As<v8::Object>()->SetPrivate(ctx, m_handed.Get(m_isolate), v8::Array::New(m_isolate, held, std::size(held)));
+}
+
 ErrorInfo Worker::error_of(Local<Value> exception, Local<v8::Message> message) {
   const Local<v8::Context> ctx = m_context.Get(m_isolate);
   ErrorInfo e;
-  e.language = "js";
+  e.language = kJs;
   e.message = m_values->str(exception);
-  // A SqlError (the SQL API's class: marked $mle$sql, with code and sqlState).
   if (exception->IsObject()) {
     const Local<v8::Object> o = exception.As<v8::Object>();
-    Local<Value> mark;
-    if (o->Get(ctx, v8_string(m_isolate, "$mle$sql")).ToLocal(&mark) && mark->IsTrue()) {
+    const auto valid_state = [](const std::string &s) {
+      return s.size() == 5 &&
+             std::all_of(s.begin(), s.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z'); });
+    };
+    Local<Value> held, mark;
+    if (o->GetPrivate(ctx, m_handed.Get(m_isolate)).ToLocal(&held) && held->IsArray()) {
+      // A SqlError made from an SQL_RESULT ERROR (§10.8): that ERROR's number, SQLSTATE and
+      // message, whatever guest code did to the object, and its id while the host can know it.
+      const Local<v8::Array> h = held.As<v8::Array>();
+      const auto at = [&](uint32_t i) { return h->Get(ctx, i).ToLocalChecked(); };
+      const double code = at(2)->IsNumber() ? at(2).As<v8::Number>()->Value() : 0;
+      e.sql_errno = code >= 1 && code <= w::kMaxSqlErrno ? static_cast<uint32_t>(code) : 0;
+      e.sql_state = utf8(m_isolate, at(3));
+      if (!valid_state(e.sql_state)) e.sql_state.clear();
+      e.message = utf8(m_isolate, at(4));
+      if (at(1).As<v8::BigInt>()->Uint64Value() == m_seq) e.sql_error_id = at(0).As<v8::BigInt>()->Uint64Value();
+    } else if (o->Get(ctx, v8_string(m_isolate, "$mle$sql")).ToLocal(&mark) && mark->IsTrue()) {
+      // A SqlError the routine raises itself (the SQL API's class: code and sqlState).
       Local<Value> code, state, text;
       if (o->Get(ctx, v8_string(m_isolate, "message")).ToLocal(&text)) e.message = m_values->str(text);
       if (o->Get(ctx, v8_string(m_isolate, "code")).ToLocal(&code) && code->IsNumber()) {
         // SIGNAL's MYSQL_ERRNO range; anything else (NaN from new SqlError(s, m, 'x')): 1644, SIGNAL's own.
         const double c = code.As<v8::Number>()->Value();
-        e.sql_errno = c >= 1 && c <= 65535 && c == std::floor(c) ? static_cast<uint32_t>(c) : 1644;
+        e.sql_errno = c >= 1 && c <= w::kMaxSqlErrno && c == std::floor(c) ? static_cast<uint32_t>(c) : 1644;
       }
       if (o->Get(ctx, v8_string(m_isolate, "sqlState")).ToLocal(&state) && state->IsString()) {
         e.sql_state = utf8(m_isolate, state);
-        const bool valid = e.sql_state.size() == 5 &&
-                           std::all_of(e.sql_state.begin(), e.sql_state.end(),
-                                       [](char c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z'); });
-        if (!valid) {
-          e.message += " (SqlError with the invalid SQLSTATE '" + e.sql_state + "')";
+        if (!valid_state(e.sql_state)) {
+          std::string shown = e.sql_state;
+          cut(shown, 64);
+          e.message += " (SqlError with the invalid SQLSTATE '" + shown + "')";
           e.sql_state.clear();
           e.sql_errno = 0;
         }
@@ -812,39 +958,32 @@ ErrorInfo Worker::error_of(Local<Value> exception, Local<v8::Message> message) {
   return e;
 }
 
-void Worker::failed(v8::TryCatch &tc, bool interrupted) {
-  if (tc.HasTerminated() || (interrupted && !tc.HasCaught())) {
-    const bool exhausted = std::exchange(m_exhausted, false);
-    m_isolate->CancelTerminateExecution();
-    if (exhausted) {
-      ErrorInfo e{"js", "RangeError: out of memory (the V8 heap limit, mle.v8_heap_max)", {}, 0, ""};
-      result(uint32_t(w::Status::kExhausted), &e);
-    } else {
-      ErrorInfo e{"js", "interrupted", {}, 0, ""};
-      result(uint32_t(w::Status::kInterrupted), &e);
-    }
-    return;
-  }
-  if (interrupted) {
-    ErrorInfo e{"js", "interrupted", {}, 0, ""};
-    result(uint32_t(w::Status::kInterrupted), &e);
-    return;
+bool Worker::failed(v8::TryCatch &tc, Reply *reply) {
+  if (tc.HasTerminated()) {
+    // By an interrupt or the heap limit: handle() knows which and sets the status.
+    reply->fail(w::Status::kInternal, "", "V8 terminated the routine");
+    reply->terminated = true;
+    return false;
   }
   if (!tc.HasCaught()) {
-    ErrorInfo e{"", "the routine failed without an exception", {}, 0, ""};
-    result(uint32_t(w::Status::kInternal), &e);
-    return;
+    m_tainted = true;
+    reply->fail(w::Status::kInternal, "", "the routine failed without an exception");
+    return true;
   }
-  ErrorInfo e = error_of(tc.Exception(), tc.Message());
-  result(uint32_t(w::Status::kGuestError), &e);
+  reply->status = w::Status::kGuestError;
+  reply->values.clear();
+  reply->error = error_of(tc.Exception(), tc.Message());
+  if (tc.HasTerminated()) return failed(tc, reply);  // while the error was described
+  return true;
 }
 
 // ------------------------------------------------------------ results
 
 void Worker::write(int stream, std::string_view text) {
   std::string &out = stream == 2 ? m_err : m_out;
-  const size_t room = out.size() < kConsoleLimit ? kConsoleLimit - out.size() : 0;
-  out.append(text.substr(0, room));
+  out.append(text);
+  // The end of the stream is kept; trimmed in steps, not at every write.
+  if (out.size() > 2 * kConsoleLimit) out.erase(0, out.size() - kConsoleLimit);
 }
 
 void Worker::clear_console() {
@@ -853,130 +992,101 @@ void Worker::clear_console() {
   m_cleared = true;
 }
 
-void Worker::write_result(Writer &wr, const ErrorInfo *error, const Routine *r, Local<Value> ret,
-                          Local<v8::Array> outs) {
-  const auto need = [](bool ok) {
-    if (!ok) throw ArenaFull{};
+void Worker::post_result(const Request &q, Reply &reply) {
+  const auto op = static_cast<w::Op>(q.op);
+  // Only the RESULTs of PREPARE and CALL carry console output: all that no RESULT has carried
+  // yet, at whatever depth it was printed (§9.4). Other output waits.
+  const bool console = op == w::Op::kPrepare || op == w::Op::kCall;
+  ErrorInfo &e = reply.error;
+  const bool has_error = reply.status != w::Status::kOk;
+  const auto error_size = [&e]() {
+    size_t n = 4 + e.language.size() + 4 + e.message.size() + 4 + 4 + 4 + e.sql_state.size() + 8;
+    for (const ErrorInfo::Frame &f : e.frames) n += 4 + f.function.size() + 4 + f.file.size() + 12 + 4 + f.text.size();
+    return n;
   };
-  if (r != nullptr && error == nullptr && (r->has_return || r->eval)) {
-    need(wr.put<uint8_t>(1));
-    if (r->eval) {
-      ParamType text;
-      text.tag = w::Tag::kString;
-      m_values->write_as(wr, ret, text);
-    } else {
-      m_values->write_as(wr, ret, r->ret);
+  if (has_error) {
+    // The caps of §7.4. An Error within them (16 KiB, and no frames outside PREPARE and CALL)
+    // also fits the 64 KiB of a RESULT of DROP, RESET and OPTIONS.
+    cut(e.message, w::kMaxErrorMessage);
+    if (e.frames.size() > w::kMaxStackFrames) e.frames.resize(w::kMaxStackFrames);
+    for (ErrorInfo::Frame &f : e.frames) {
+      cut(f.function, w::kMaxFrameText);
+      cut(f.file, w::kMaxFrameText);
+      cut(f.text, w::kMaxFrameText);
     }
+  }
+  // has_return, out_params count; stdout and stderr lengths, console_cleared; findings count; has_error.
+  constexpr size_t kFixed = 4 + 4 + 1 + 4 + 1;
+  if (reply.values.empty()) reply.values.assign(5, std::byte{0});  // no return value, no OUT values
+  if (reply.values.size() + kFixed > w::kMaxWorkerMessage) {
+    // The values alone leave no room (§9.4).
+    reply.fail(w::Status::kGuestError, w::kLanguageType, "the routine's result is larger than MLE allows (64 MiB)");
+    reply.values.assign(5, std::byte{0});
+  }
+  const size_t rest = reply.values.size() + kFixed + (reply.status != w::Status::kOk ? error_size() : 0);
+  // Console output beyond the message's limit is cut, the end of each stream kept, and dropped.
+  if (m_out.size() > kConsoleLimit) m_out.erase(0, m_out.size() - kConsoleLimit);
+  if (m_err.size() > kConsoleLimit) m_err.erase(0, m_err.size() - kConsoleLimit);
+  std::string_view out, err;
+  if (console) {
+    const size_t room = w::kMaxWorkerMessage - rest;
+    const size_t err_room = std::min(m_err.size(), std::max(room / 2, room - std::min(room, m_out.size())));
+    const size_t out_room = std::min(m_out.size(), room - err_room);
+    out = std::string_view(m_out).substr(m_out.size() - out_room);
+    err = std::string_view(m_err).substr(m_err.size() - err_room);
+  }
+  Writer wr(m_result_buf, w::kMaxWorkerMessage);
+  bool fits = wr.bytes(reply.values) && wr.str(out) && wr.str(err) &&
+              wr.put<uint8_t>(console && m_cleared ? 1 : 0) && wr.put<uint32_t>(0);  // no findings
+  if (reply.status == w::Status::kOk) {
+    fits = fits && wr.put<uint8_t>(0);
   } else {
-    need(wr.put<uint8_t>(0));
+    fits = fits && wr.put<uint8_t>(1) && wr.str(e.language) && wr.str(e.message) &&
+           wr.put(static_cast<uint32_t>(e.frames.size()));
+    for (const ErrorInfo::Frame &f : e.frames)
+      fits = fits && wr.str(f.function) && wr.str(f.file) && wr.put(f.line) && wr.put(f.column) &&
+             wr.put(f.end_column) && wr.str(f.text);
+    fits = fits && wr.put(e.sql_errno) && wr.str(e.sql_state) && wr.put(e.sql_error_id);
   }
-  if (error == nullptr && r != nullptr && !r->outs.empty() && !outs.IsEmpty()) {
-    const Local<v8::Context> ctx = m_context.Get(m_isolate);
-    need(wr.put(static_cast<uint32_t>(r->outs.size())));
-    for (size_t k = 0; k < r->outs.size(); k++) {
-      const uint32_t i = r->outs[k];
-      need(wr.put(i));
-      m_values->write_as(wr, outs->Get(ctx, static_cast<uint32_t>(k + 1)).ToLocalChecked(), r->params[i]);
-    }
-  } else {
-    need(wr.put<uint32_t>(0));
+  if (!fits) protocol_failure("worker error: a RESULT over the size limit");
+  // tainted is set before the RESULT (§11.5).
+  stats(q.depth == 0 ? uint32_t(w::WorkerState::kIdle) : uint32_t(w::WorkerState::kRunning));
+  Mailbox::send(uint32_t(w::Op::kResult), uint32_t(reply.status), q.depth, m_seq, wr.written());
+  if (console) {
+    m_out.clear();
+    m_err.clear();
+    m_cleared = false;
   }
-  need(wr.str(m_out) && wr.str(m_err) && wr.put<uint8_t>(m_cleared ? 1 : 0));
-  if (error == nullptr) {
-    need(wr.put<uint8_t>(0));
-    return;
-  }
-  need(wr.put<uint8_t>(1) && wr.str(error->language) && wr.str(error->message) &&
-       wr.put(static_cast<uint32_t>(error->frames.size())));
-  for (const ErrorInfo::Frame &f : error->frames)
-    need(wr.str(f.function) && wr.str(f.file) && wr.put(f.line) && wr.put(f.column) && wr.put(f.end_column) &&
-         wr.str(f.text));
-  need(wr.put(error->sql_errno) && wr.str(error->sql_state));
-}
-
-void Worker::result(uint32_t status, const ErrorInfo *error, const Routine *r, Local<Value> ret,
-                    Local<v8::Array> outs) {
-  ErrorInfo instead;
-  const auto attempt = [&](Writer &wr, const ErrorInfo *e, const Routine *rr) {
-    const Converting converting(m_converting);
-    write_result(wr, e, rr, ret, outs);
-    return wr.size();
-  };
-  const auto post = [&](const ErrorInfo *e, const Routine *rr) -> bool {
-    // In the arena if it fits; else in a buffer of up to the host's limit, sent in chunks.
-    {
-      Writer wr(Mailbox::arena());
-      try {
-        const size_t len = attempt(wr, e, rr);
-        stats(m_depth == 0 ? uint32_t(w::WorkerState::kIdle) : uint32_t(w::WorkerState::kRunning));
-        Mailbox::post(uint32_t(w::Op::kResult), status, m_depth, m_seq, uint32_t(len));
-        return true;
-      } catch (const ArenaFull &) {
-      }
-    }
-    m_big.resize(w::kMaxWorkerMessage);
-    Writer wr(m_big);
-    try {
-      const size_t len = attempt(wr, e, rr);
-      stats(m_depth == 0 ? uint32_t(w::WorkerState::kIdle) : uint32_t(w::WorkerState::kRunning));
-      Mailbox::send(uint32_t(w::Op::kResult), status, m_depth, m_seq, std::span(m_big).first(len));
-      m_big.clear();
-      m_big.shrink_to_fit();
-      return true;
-    } catch (const ArenaFull &) {
-      m_big.clear();
-      m_big.shrink_to_fit();
-      return false;
-    }
-  };
-  try {
-    if (post(error, r)) {
-      m_out.clear(), m_err.clear(), m_cleared = false;
-      return;
-    }
-    instead = ErrorInfo{"MLE-Type", "the routine's result with its output is larger than MLE allows (64 MiB)", {}, 0, ""};
-  } catch (const ConversionError &c) {
-    instead = ErrorInfo{"MLE-Type", c.message, {}, 0, ""};
-  }
-  status = uint32_t(w::Status::kGuestError);
-  if (!post(&instead, nullptr)) {
-    m_out.clear(), m_err.clear();  // the output alone is too large: dropped
-    instead.message = "the routine's output is larger than MLE allows (64 MiB)";
-    (void)post(&instead, nullptr);
-  }
-  m_out.clear(), m_err.clear(), m_cleared = false;
+  if (m_result_buf.capacity() > (4U << 20)) std::vector<std::byte>().swap(m_result_buf);
 }
 
 // ------------------------------------------------------------ SQL
 
 Local<Value> Worker::state() {
-  const Local<v8::Context> ctx = m_context.Get(m_isolate);
-  const auto schema = m_schemas.find(m_routine);
+  const Request *q = m_request;
   Local<Value> items[] = {
-      v8::Number::New(m_isolate, m_depth),
-      v8::Number::New(m_isolate, static_cast<double>(m_scope)),
-      schema == m_schemas.end() ? Local<Value>(v8::Null(m_isolate)) : Local<Value>(v8_string(m_isolate, schema->second)),
+      v8::Number::New(m_isolate, q == nullptr ? 0 : q->depth),
+      v8::Number::New(m_isolate, q == nullptr ? 0 : static_cast<double>(q->scope)),
+      q == nullptr || q->schema.empty() ? Local<Value>(v8::Null(m_isolate))
+                                        : Local<Value>(v8_string(m_isolate, q->schema)),
       v8::Number::New(m_isolate, static_cast<double>(m_options.integer_type)),
       v8::Number::New(m_isolate, static_cast<double>(m_options.decimal_type)),
-      v8::Number::New(m_isolate, static_cast<double>(Mailbox::arena().size())),
-      v8::Number::New(m_isolate, static_cast<double>(m_seq)),
   };
-  (void)ctx;
   return v8::Array::New(m_isolate, items, std::size(items));
 }
 
 namespace {
 
-/** u32 n + n x (u32 level, u32 code, str message) as [[level, code, message], ...]. */
+/** A list of Warning as [[level, code, message], ...]. */
 Local<Value> warnings_of(v8::Isolate *iso, Reader &r) {
-  const auto n = r.get<uint32_t>();
-  if (n > 65535) throw Malformed{"too many warnings"};
+  const uint32_t n = r.count(w::kMaxWarnings, 12);
   const Local<v8::Array> a = v8::Array::New(iso, static_cast<int>(n));
   const Local<v8::Context> ctx = iso->GetCurrentContext();
   for (uint32_t i = 0; i < n; i++) {
     const auto level = r.get<uint32_t>(), code = r.get<uint32_t>();
-    Local<Value> w[] = {v8::Number::New(iso, level), v8::Number::New(iso, code), v8_string(iso, r.str())};
-    (void)a->Set(ctx, i, v8::Array::New(iso, w, 3));
+    if (level > uint32_t(w::WarningLevel::kError)) protocol_failure("an unknown Warning level");
+    Local<Value> warning[] = {v8::Number::New(iso, level), v8::Number::New(iso, code), v8_string(iso, r.str())};
+    (void)a->Set(ctx, i, v8::Array::New(iso, warning, 3));
   }
   return a;
 }
@@ -988,169 +1098,344 @@ Local<Value> number(v8::Isolate *iso, uint64_t v) {
 
 }  // namespace
 
+Message Worker::sql_reply(std::vector<std::byte> &assembled) {
+  while (true) {
+    const Message m = Mailbox::receive([&](size_t total) { return allocate(assembled, total); });
+    if (static_cast<w::Op>(m.op) == w::Op::kSqlResult) return m;
+    // A nested PREPARE, CALL or DROP (the mailbox has checked that it is one), served on this
+    // thread from inside the wait (§10.6).
+    handle(m);
+  }
+}
+
+void Worker::sql_close(Request &q, uint64_t id) {
+  std::array<std::byte, w::kSqlCloseSize> close{};
+  Writer wr(close);
+  (void)(wr.put(uint8_t(w::SqlAction::kClose)) && wr.put(id));  // no text, no params, flags and the rest 0
+  Mailbox::send(uint32_t(w::Op::kSql), 0, q.depth, m_seq, close);
+  std::vector<std::byte> assembled;
+  const Message m = sql_reply(assembled);
+  if (m.discarded) protocol_failure("the SQL_RESULT of a CLOSE in chunks");
+  (void)sql_result(q, w::SqlAction::kClose, id, 0, 0, m, m_options);
+}
+
+v8::MaybeLocal<Value> Worker::sql_result(Request &q, w::SqlAction action, uint64_t id, uint8_t flags,
+                                         uint32_t rows_sent, const Message &m, const Options &rules) {
+  using State = Statement::State;
+  v8::Isolate *iso = m_isolate;
+  const Local<v8::Context> ctx = m_context.Get(iso);
+  Reader r(m.body);
+  const auto kind = r.get<uint8_t>();
+  if (kind > w::kMaxSqlResultKind) protocol_failure("an unknown SQL_RESULT kind");
+  const auto found = q.statements.find(id);
+  Statement *st = found == q.statements.end() ? nullptr : &found->second;  // nullptr: CLOSED
+  // §10.1: is the action allowed in the id's state, and may this kind answer it?
+  bool allowed = true;
+  if (action == w::SqlAction::kExecutePrepared || action == w::SqlAction::kExecuteMany)
+    allowed = st != nullptr && st->prepared;
+  else if (action == w::SqlAction::kFetch)
+    allowed = st != nullptr && st->state == State::kRows;
+  const bool to_client = st != nullptr ? st->to_client : (flags & w::kPassResultToClient) != 0;
+  const bool nothing_next = action == w::SqlAction::kNextResult && (st == nullptr || st->state == State::kIdle);
+  bool legal = false;
+  switch (static_cast<w::SqlResultKind>(kind)) {
+    case w::SqlResultKind::kError:
+      legal = action != w::SqlAction::kClose;
+      break;
+    case w::SqlResultKind::kOk:
+      legal = allowed && action != w::SqlAction::kFetch && !nothing_next;
+      break;
+    case w::SqlResultKind::kRows:
+      legal = allowed && !to_client && !nothing_next && action != w::SqlAction::kPrepare &&
+              action != w::SqlAction::kExecuteMany && action != w::SqlAction::kClose;
+      break;
+    case w::SqlResultKind::kEnd:
+      legal = action == w::SqlAction::kNextResult;
+      break;
+  }
+  if (!legal) protocol_failure("an SQL_RESULT of a kind that cannot answer the action in the statement's state");
+  // The id's home: IDLE for a prepared statement, CLOSED for a direct one.
+  const auto home = [&]() {
+    if (st == nullptr) return;
+    if (st->prepared) {
+      st->state = State::kIdle;
+      st->columns.clear();
+    } else {
+      q.statements.erase(id);
+    }
+    st = nullptr;
+  };
+  // The id has a result to read: a direct statement gets its entry now.
+  const auto open = [&]() -> Statement & {
+    if (st == nullptr) {
+      st = &q.statements[id];
+      st->to_client = to_client;
+    }
+    return *st;
+  };
+  const Local<Value> scope = v8::Number::New(iso, static_cast<double>(q.scope));
+  const Local<Value> handle = v8::Number::New(iso, static_cast<double>(id));
+  switch (static_cast<w::SqlResultKind>(kind)) {
+    case w::SqlResultKind::kError: {
+      const auto code = r.get<uint32_t>();
+      const std::string_view state = r.str(), message = r.str();
+      const auto row = r.get<uint32_t>();
+      const auto error_id = r.get<uint64_t>();
+      r.finish();
+      if (code < 1 || code > w::kMaxSqlErrno || state.size() != 5 || error_id == 0 ||
+          (action == w::SqlAction::kExecuteMany ? row > rows_sent : row != w::kNoRow))
+        protocol_failure("an SQL_RESULT ERROR outside its domain");
+      Local<Value> e[] = {v8::Number::New(iso, 0), v8::Number::New(iso, code), v8_string(iso, state),
+                          v8_string(iso, message),
+                          v8::Number::New(iso, row == w::kNoRow ? -1.0 : static_cast<double>(row)),
+                          v8::BigInt::NewFromUnsigned(iso, error_id)};
+      // Rule 2: an action that is not allowed changes nothing. Rule 3: the id goes home.
+      if (allowed) home();
+      return v8::Array::New(iso, e, std::size(e));
+    }
+    case w::SqlResultKind::kOk: {
+      const auto affected = r.get<uint64_t>(), insert_id = r.get<uint64_t>();
+      const size_t before = r.pos();
+      const Local<Value> warns = warnings_of(iso, r);
+      const bool no_warnings = r.pos() == before + 4;
+      const bool more_results = r.boolean();
+      const auto pcount = r.get<uint32_t>();
+      const auto exec_us = r.get<uint64_t>();
+      r.finish();
+      const bool bare = action == w::SqlAction::kPrepare || action == w::SqlAction::kClose;
+      if ((action == w::SqlAction::kPrepare ? pcount > w::kMaxParams : pcount != 0) ||
+          (bare && (affected != 0 || insert_id != 0 || !no_warnings || more_results)) ||
+          ((to_client || action == w::SqlAction::kExecuteMany) && more_results))
+        protocol_failure("an SQL_RESULT OK outside its domain");
+      if (action == w::SqlAction::kClose) {
+        q.statements.erase(id);
+      } else if (action == w::SqlAction::kPrepare) {
+        open().prepared = true;
+      } else if (more_results) {
+        open().state = State::kNext;
+        st->columns.clear();
+      } else {
+        home();
+      }
+      Local<Value> o[] = {v8::Number::New(iso, 1), number(iso, affected), number(iso, insert_id), warns,
+                          v8::Boolean::New(iso, more_results), v8::Number::New(iso, pcount),
+                          v8::Number::New(iso, static_cast<double>(exec_us)), scope, handle};
+      return v8::Array::New(iso, o, std::size(o));
+    }
+    case w::SqlResultKind::kRows: {
+      // The first batch of a result set carries its columns; a batch that answers FETCH has none
+      // and the set's total_rows again (§10.3).
+      const bool first = action != w::SqlAction::kFetch;
+      const uint32_t ncols = r.count(w::kMaxColumns, 50);
+      if (first ? ncols == 0 : ncols != 0) protocol_failure("a batch of rows with its columns out of place");
+      std::vector<ParamType> types;
+      Local<Value> labels = v8::Null(iso), columns = v8::Null(iso);
+      if (first) {
+        const Local<v8::Array> label_list = v8::Array::New(iso, static_cast<int>(ncols));
+        const Local<v8::Array> column_list = v8::Array::New(iso, static_cast<int>(ncols));
+        for (uint32_t i = 0; i < ncols; i++) {
+          const std::string_view name = r.str(), table = r.str();
+          ParamType t = ParamType::read(r);
+          const std::string_view org_name = r.str(), schema = r.str(), org_table = r.str(), charset = r.str(),
+                                 collation = r.str();
+          const auto column_flags = r.get<uint32_t>();
+          const Local<v8::String> label = v8_string(iso, name);
+          (void)label_list->Set(ctx, i, label);
+          Local<Value> c[] = {label,                          v8_string(iso, table),
+                              v8::Number::New(iso, static_cast<double>(t.tag)), v8::Boolean::New(iso, t.is_unsigned),
+                              v8::Number::New(iso, t.length), v8::Number::New(iso, t.precision),
+                              v8::Number::New(iso, t.scale),  v8_string(iso, t.type_name),
+                              v8_string(iso, org_name),       v8_string(iso, schema),
+                              v8_string(iso, org_table),      v8_string(iso, charset),
+                              v8_string(iso, collation),      v8::Number::New(iso, column_flags)};
+          (void)column_list->Set(ctx, i, v8::Array::New(iso, c, std::size(c)));
+          types.push_back(std::move(t));
+        }
+        labels = label_list;
+        columns = column_list;
+      }
+      const std::vector<ParamType> &set = first ? types : st->columns;
+      const auto total = r.get<uint64_t>();
+      if (!first && total != st->total_rows) protocol_failure("a later batch with another total_rows");
+      const auto nrows = r.get<uint32_t>();
+      const uint64_t count = uint64_t{nrows} * set.size();
+      if (count > r.left()) protocol_failure("more row values than the message holds");
+      // The rows' values in one flat array, row by row: sql.js makes the rows, in JavaScript,
+      // where V8 compiles their shape once. A value JavaScript cannot hold fails the statement in
+      // guest code after the whole reply is read, so that the id's state is known.
+      std::vector<Local<Value>> values(static_cast<size_t>(count));
+      std::string unconvertible;
+      for (size_t k = 0; k < values.size(); k++) {
+        try {
+          values[k] = m_values->column(r, set[k % set.size()], &rules);
+        } catch (const ConversionError &c) {
+          if (unconvertible.empty()) unconvertible = c.message;
+          values[k] = v8::Undefined(iso);
+        }
+      }
+      const bool more = r.boolean(), more_results = r.boolean();
+      const Local<Value> warns = warnings_of(iso, r);
+      const auto exec_us = r.get<uint64_t>();
+      r.finish();
+      if (more && (nrows == 0 || more_results)) protocol_failure("a batch with more = 1 that is empty or has more_results");
+      Local<Value> o[] = {v8::Number::New(iso, 2),
+                          labels,
+                          columns,
+                          total == w::kUnknownTotalRows ? Local<Value>(v8::Null(iso)) : number(iso, total),
+                          v8::Array::New(iso, values.data(), values.size()),
+                          v8::Boolean::New(iso, more),
+                          v8::Boolean::New(iso, more_results),
+                          warns,
+                          v8::Number::New(iso, static_cast<double>(exec_us)),
+                          scope,
+                          handle};
+      if (more || more_results) {
+        Statement &s = open();
+        s.state = more ? State::kRows : State::kNext;
+        if (first) {
+          s.columns = std::move(types);
+          s.total_rows = total;
+        }
+        if (!more) s.columns.clear();
+      } else {
+        home();
+      }
+      if (!unconvertible.empty()) {
+        iso->ThrowException(v8::Exception::TypeError(v8_string(iso, unconvertible)));
+        return {};
+      }
+      return v8::Array::New(iso, o, std::size(o));
+    }
+    case w::SqlResultKind::kEnd: {
+      r.finish();
+      home();
+      Local<Value> o[] = {v8::Number::New(iso, 3)};
+      return v8::Array::New(iso, o, 1);
+    }
+  }
+  protocol_failure("an unknown SQL_RESULT kind");
+}
+
 v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
   v8::Isolate *iso = m_isolate;
   const Local<v8::Context> ctx = m_context.Get(iso);
-  const auto u32 = [&](int i) { return info[i]->Uint32Value(ctx).FromMaybe(0); };
-  const auto f64 = [&](int i) { return info[i]->NumberValue(ctx).FromMaybe(0); };
-  const auto throw_type = [&](const std::string &m) {
-    iso->ThrowException(v8::Exception::TypeError(v8_string(iso, m)));
+  const auto fail = [&](Local<Value> exception) {
+    iso->ThrowException(exception);
     return v8::MaybeLocal<Value>();
   };
-  if (info.Length() < 8) return throw_type("sql: 8 arguments");
-  if (m_converting > 0) return throw_type(kNoHostWhileConverting);
-  // A KILL that stopped a nested routine (its failure cancels the termination) stops this one too,
-  // once back in JavaScript: it could catch the SqlError and run on.
+  const auto type_error = [&](const std::string &text) { return fail(v8::Exception::TypeError(v8_string(iso, text))); };
+  // SQL comes only from the guest code of the request being served (§10.1).
+  if (const char *why = host_unavailable(); why != nullptr) return fail(v8::Exception::Error(v8_string(iso, why)));
+  Request &q = *m_request;
+  // Everything of the message is decided here: what guest code may have changed in sql.js or in
+  // the built-ins it uses cannot make the worker send an illegal action, flag or field (§10.6).
+  if (info.Length() < 9) return type_error("sql: 9 arguments");
+  const auto integer = [&](int i, double max) -> std::optional<uint64_t> {
+    if (!info[i]->IsNumber()) return std::nullopt;
+    const double v = info[i].As<v8::Number>()->Value();
+    if (!(v >= 0 && v <= max && v == std::floor(v))) return std::nullopt;
+    return static_cast<uint64_t>(v);
+  };
+  const std::optional<uint64_t> action_code = integer(0, w::kMaxSqlAction);
+  if (!action_code) return type_error("sql: unknown action");
+  const auto action = static_cast<w::SqlAction>(*action_code);
+  const bool opens = action == w::SqlAction::kExecute || action == w::SqlAction::kPrepare;
+  const bool has_params = action == w::SqlAction::kExecute || action == w::SqlAction::kExecutePrepared ||
+                          action == w::SqlAction::kExecuteMany;
+  uint64_t id = 0;
+  if (!opens) {
+    // A statement belongs to the request that opened it: the handle of another request (an
+    // earlier one, or the caller's) fails here, and nothing is sent.
+    const std::optional<uint64_t> scope = integer(1, 9e15), handle = integer(2, static_cast<double>(q.statement_ids));
+    if (!scope || *scope != q.scope)
+      return fail(v8::Exception::Error(
+          v8_string(iso, "the SQL statement or result belongs to another routine call (one that ended, or the caller)")));
+    if (!handle || *handle == 0) return type_error("sql: unknown statement");
+    id = *handle;
+  }
+  std::string text;
+  uint8_t flags = 0;
+  if (opens) {
+    // SQL text is code: it is never repaired (§7.1).
+    if (!info[3]->IsString()) return type_error("sql: the statement must be a string");
+    std::optional<std::string> exact = utf8_exact(iso, info[3].As<v8::String>());
+    if (!exact) return type_error("the SQL statement is not well-formed Unicode (an unpaired surrogate)");
+    text = std::move(*exact);
+    const std::optional<uint64_t> f = integer(5, w::kKnownSqlFlags);
+    if (!f) return type_error("sql: unknown flags");
+    flags = static_cast<uint8_t>(*f);
+  }
+  uint32_t width = 0;
+  if (action == w::SqlAction::kExecuteMany) {
+    const std::optional<uint64_t> v = integer(6, w::kMaxValues);
+    if (!v) return type_error("sql: bad row width");
+    width = static_cast<uint32_t>(*v);
+  }
+  Local<v8::Array> params;
+  uint32_t nparams = 0;
+  if (has_params && info[4]->IsArray()) {
+    params = info[4].As<v8::Array>();
+    nparams = params->Length();
+  }
+  if (nparams > w::kMaxValues)
+    return type_error("Incorrect arguments: " + std::to_string(nparams) + " values in one statement (at most " +
+                      std::to_string(w::kMaxValues) + ")");
+  // The statement's integerType and decimalType; anything else: the session's.
+  Options rules = m_options;
+  if (const std::optional<uint64_t> v = integer(7, kMaxIntegerType); v) rules.integer_type = static_cast<IntegerType>(*v);
+  if (const std::optional<uint64_t> v = integer(8, kMaxDecimalType); v) rules.decimal_type = static_cast<DecimalType>(*v);
+  if (opens) id = ++q.statement_ids;
+
+  // The message, composed where guest code (a parameter's toJSON) cannot post.
+  Writer wr(m_sql_buf, w::kMaxWorkerMessage);
+  try {
+    const Converting converting(m_converting);
+    if (!(wr.put(static_cast<uint8_t>(action)) && wr.put(id) && wr.str(text) && wr.put(nparams))) throw TooLarge{};
+    for (uint32_t i = 0; i < nparams; i++) {
+      Local<Value> p;
+      if (!params->Get(ctx, i).ToLocal(&p)) return {};
+      m_values->write_param(wr, p);
+    }
+    if (!(wr.put(flags) && wr.put(uint32_t{0}) && wr.put(width))) throw TooLarge{};
+  } catch (const TooLarge &) {
+    // A statement that does not fit a message gets an error from the worker, not a message
+    // (§10.6): MySQL's error for a packet over max_allowed_packet, which sql.js makes a SqlError.
+    std::vector<std::byte>().swap(m_sql_buf);
+    Local<Value> e[] = {v8::Number::New(iso, 0),
+                        v8::Number::New(iso, 1153),
+                        v8_string(iso, "HY000"),
+                        v8_string(iso, "the SQL statement with its parameters is larger than MLE allows (" +
+                                           std::to_string(w::kMaxWorkerMessage >> 20) + " MiB)"),
+                        v8::Number::New(iso, -1),
+                        v8::BigInt::New(iso, 0)};
+    return v8::Array::New(iso, e, std::size(e));
+  } catch (const ConversionError &c) {
+    return type_error(c.message);
+  }
+  if (iso->IsExecutionTerminating()) return {};
+  Mailbox::send(uint32_t(w::Op::kSql), 0, q.depth, m_seq, wr.written());
+  if (m_sql_buf.capacity() > (4U << 20)) std::vector<std::byte>().swap(m_sql_buf);
+  // An interrupt that stopped a nested routine stops this one too, once back in JavaScript: it
+  // could catch the error of its statement and run on (§11.1).
   struct Rearm {
     v8::Isolate *iso;
     ~Rearm() {
       if (Interrupts::interrupted()) iso->TerminateExecution();
     }
   } rearm{iso};
-  const auto action = static_cast<uint8_t>(u32(0));
-  const auto sid = static_cast<uint64_t>(f64(1));
-  const std::string text = info[2]->IsString() ? utf8(iso, info[2]) : std::string();
-  const auto flags = static_cast<uint8_t>(u32(4));
-  const auto width = u32(5);
-  // The statement's integerType and decimalType; -1: the session's.
-  Options rules = m_options;
-  const auto i32 = [&](int i) { return info[i]->Int32Value(ctx).FromMaybe(-1); };
-  if (const int it = i32(6); it >= 0 && it <= w::kMaxIntegerType) rules.integer_type = static_cast<w::IntegerType>(it);
-  if (const int dt = i32(7); dt >= 0 && dt <= w::kMaxDecimalType) rules.decimal_type = static_cast<w::DecimalType>(dt);
-
-  // The message: in a buffer the size of the arena, larger when it does not fit (up to the host's limit).
-  Local<v8::Array> params;
-  uint32_t nparams = 0;
-  if (info[3]->IsArray()) {
-    params = info[3].As<v8::Array>();
-    nparams = params->Length();
-  }
-  if (nparams > w::kMaxValues)
-    return throw_type("Incorrect arguments: " + std::to_string(nparams) + " values in one statement (at most " +
-                      std::to_string(w::kMaxValues) + ")");
-  size_t size = Mailbox::arena().size();
-  size_t len = 0;
-  while (true) {
-    m_sql_buf.resize(size);
-    Writer wr(m_sql_buf);
-    const Converting converting(m_converting);
-    try {
-      bool ok = wr.put(action) && wr.put(sid) && wr.str(text) && wr.put(nparams);
-      for (uint32_t i = 0; ok && i < nparams; i++) {
-        Local<Value> p;
-        if (!params->Get(ctx, i).ToLocal(&p)) return {};
-        m_values->write_param(wr, p);
-      }
-      ok = ok && wr.put(flags) && wr.put(uint32_t{0}) && wr.put(width);
-      if (!ok) throw ArenaFull{};
-      len = wr.size();
-      break;
-    } catch (const ArenaFull &) {
-      if (size >= w::kMaxWorkerMessage) {
-        // MySQL's error for a packet over max_allowed_packet (not its SQLSTATE 08S01): sql.js makes it a SqlError.
-        Local<Value> e[] = {v8::Number::New(iso, 0), v8::Number::New(iso, 1153), v8_string(iso, "HY000"),
-                            v8_string(iso, "the SQL statement with its parameters is larger than MLE allows (" +
-                                               std::to_string(w::kMaxWorkerMessage >> 20) + " MiB)"),
-                            v8::Number::New(iso, -1)};
-        m_sql_buf.clear();
-        m_sql_buf.shrink_to_fit();
-        return v8::Array::New(iso, e, 5);
-      }
-      size = std::min<size_t>(size * 4, w::kMaxWorkerMessage);
-    } catch (const ConversionError &c) {
-      return throw_type(c.message);
-    }
-  }
-  Mailbox::send(uint32_t(w::Op::kSql), uint32_t(w::Status::kOk), m_depth, m_seq, std::span(m_sql_buf).first(len));
-  if (m_sql_buf.size() > (4U << 20)) {
-    m_sql_buf.clear();
-    m_sql_buf.shrink_to_fit();
-  }
   std::vector<std::byte> assembled;
-  while (true) {
-    const Message m = Mailbox::receive([&assembled](size_t total) {
-      assembled.resize(total);
-      return assembled.data();
-    });
-    if (m.op == uint32_t(w::Op::kSqlResult) && m.depth == m_depth) {
-      Reader r(m.body, 0);
-      switch (static_cast<w::SqlResultKind>(r.get<uint8_t>())) {
-        case w::SqlResultKind::kError: {
-          const auto code = r.get<uint32_t>();
-          const std::string state(r.str()), message(r.str());
-          const auto row = r.get<uint32_t>();
-          Local<Value> e[] = {v8::Number::New(iso, 0), v8::Number::New(iso, code), v8_string(iso, state),
-                              v8_string(iso, message),
-                              v8::Number::New(iso, row == w::kNoRow ? -1.0 : static_cast<double>(row))};
-          return v8::Array::New(iso, e, 5);
-        }
-        case w::SqlResultKind::kOk: {
-          const auto affected = r.get<uint64_t>(), insert_id = r.get<uint64_t>();
-          const Local<Value> warns = warnings_of(iso, r);
-          const bool more_results = r.get<uint8_t>() != 0;
-          const auto pcount = r.get<uint32_t>();
-          const auto exec_us = r.get<uint64_t>();
-          Local<Value> o[] = {v8::Number::New(iso, 1),       number(iso, affected),
-                              number(iso, insert_id),        warns,
-                              v8::Boolean::New(iso, more_results), v8::Number::New(iso, pcount),
-                              v8::Number::New(iso, static_cast<double>(exec_us))};
-          return v8::Array::New(iso, o, 7);
-        }
-        case w::SqlResultKind::kRows: {
-          const auto ncols = r.get<uint32_t>();
-          if (ncols > 4096) throw Malformed{"too many columns"};
-          std::vector<std::string> types;
-          const Local<v8::Array> labels = v8::Array::New(iso, static_cast<int>(ncols));
-          const Local<v8::Array> columns = v8::Array::New(iso, static_cast<int>(ncols));
-          for (uint32_t i = 0; i < ncols; i++) {
-            const std::string name(r.str()), table(r.str());
-            const ParamType t = ParamType::read(r);
-            const std::string org_name(r.str()), schema(r.str()), org_table(r.str()), charset(r.str()),
-                collation(r.str());
-            const auto flags_ = r.get<uint32_t>();
-            types.push_back(t.type_name);
-            (void)labels->Set(ctx, i, v8_string(iso, name));
-            Local<Value> c[] = {v8_string(iso, name),          v8_string(iso, table),
-                                v8::Number::New(iso, static_cast<double>(t.tag)), v8::Boolean::New(iso, t.is_unsigned),
-                                v8::Number::New(iso, t.length), v8::Number::New(iso, t.precision),
-                                v8::Number::New(iso, t.scale),  v8_string(iso, t.type_name),
-                                v8_string(iso, org_name),       v8_string(iso, schema),
-                                v8_string(iso, org_table),      v8_string(iso, charset),
-                                v8_string(iso, collation),      v8::Number::New(iso, flags_)};
-            (void)columns->Set(ctx, i, v8::Array::New(iso, c, std::size(c)));
-          }
-          const auto total = r.get<uint64_t>();
-          const auto nrows = r.get<uint32_t>();
-          // The rows' values in one flat array, row by row (nrows * ncols): sql.js makes the rows
-          // (arrays with the labels as properties, rowsOf), in JavaScript, where V8 compiles their
-          // shape once; built here through the API, each property costs a generic lookup.
-          if (static_cast<uint64_t>(nrows) * ncols > (1ULL << 27)) throw Malformed{"too many values"};
-          std::vector<Local<Value>> values(static_cast<size_t>(nrows) * ncols);
-          try {
-            for (size_t k = 0; k < values.size(); k++) values[k] = m_values->column(r, types[k % ncols], &rules);
-          } catch (const ConversionError &c) {
-            return throw_type(c.message);
-          }
-          const bool more = r.get<uint8_t>() != 0, more_results = r.get<uint8_t>() != 0;
-          const Local<Value> warns = warnings_of(iso, r);
-          const auto exec_us = r.get<uint64_t>();
-          const Local<v8::Array> rows = v8::Array::New(iso, values.data(), values.size());
-          Local<Value> o[] = {v8::Number::New(iso, 2),     labels, columns, number(iso, total), rows,
-                              v8::Boolean::New(iso, more), v8::Boolean::New(iso, more_results), warns,
-                              v8::Number::New(iso, static_cast<double>(exec_us))};
-          return v8::Array::New(iso, o, std::size(o));
-        }
-      }
-      throw Malformed{"bad SQL result kind"};
-    }
-    const bool nested = m.op == uint32_t(w::Op::kCall) || m.op == uint32_t(w::Op::kPrepare) ||
-                        m.op == uint32_t(w::Op::kDrop);
-    if (nested && m.depth == m_depth + 1) {
-      handle(m);
-      continue;
-    }
-    std::fprintf(stderr, "mle_v8_worker: fatal: unexpected message %u at depth %u during SQL\n", m.op, m.depth);
-    _exit(1);
+  const Message m = sql_reply(assembled);
+  if (m.discarded) {
+    // §5.3: the worker cannot know the id's state: it closes the id and fails the statement.
+    sql_close(q, id);
+    return fail(v8::Exception::RangeError(
+        v8_string(iso, "the result of the SQL statement is larger than this MLE worker can hold")));
+  }
+  try {
+    const uint32_t rows_sent = action == w::SqlAction::kExecuteMany && width != 0 ? nparams / width : 0;
+    return sql_result(q, action, id, flags, rows_sent, m, rules);
+  } catch (const ConversionError &c) {
+    return type_error(c.message);
   }
 }
 

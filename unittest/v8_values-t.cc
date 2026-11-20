@@ -15,9 +15,10 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
-// The V8 worker's values (worker/v8/values.cc; exp design note 63): DECIMAL text within MySQL's
-// limits, TIME text, time zones, arguments to JavaScript and results back by Oracle's rules (as
-// the JVM worker's JsOracle), bounds of malformed messages. In an isolate of the distribution's V8.
+// The V8 worker's values (worker/v8/values.cc): DECIMAL text within MySQL's limits, TIME text,
+// time zones, arguments to JavaScript and results back by Oracle's rules (as the JVM worker's
+// JsOracle), the domains of docs/protocol.md §7.2 in both directions, text that is not well-formed,
+// and malformed messages, which are protocol failures. In an isolate of the distribution's V8.
 
 #include <gtest/gtest.h>
 #include <libplatform/libplatform.h>
@@ -31,6 +32,12 @@
 #include <vector>
 
 #include "values.hpp"
+
+/** What ends the worker (worker/common/mailbox.cc) is an exception here, so that a test can see it. */
+struct ProtocolFailure {
+  std::string what;
+};
+void mle::common::protocol_failure(std::string_view what) { throw ProtocolFailure{std::string(what)}; }
 
 namespace {
 
@@ -88,7 +95,29 @@ class V8Values : public ::testing::Test {
     Writer wr(buf);
     m_values->write_as(wr, js(src), t);
     Reader r(std::span<const std::byte>(buf.data(), wr.size()), 0);
-    return str(m_values->column(r, t.type_name));
+    const v8::Local<v8::Value> back = m_values->column(r, t);
+    r.finish();
+    return str(back);
+  }
+
+  /** The bytes of a value written as type t. */
+  std::vector<std::byte> written(const char *src, ParamType t) {
+    std::array<std::byte, 4096> buf{};
+    Writer wr(buf);
+    m_values->write_as(wr, js(src), t);
+    return {buf.begin(), buf.begin() + wr.size()};
+  }
+
+  template <class... T>
+  static std::vector<std::byte> bytes(T... b) {
+    return {static_cast<std::byte>(b)...};
+  }
+  /** A message of a tag and a str. */
+  static std::vector<std::byte> text_value(w::Tag tag, std::string_view text) {
+    std::vector<std::byte> out(5 + text.size());
+    Writer wr(out);
+    EXPECT_TRUE(wr.put(static_cast<uint8_t>(tag)) && wr.str(text));
+    return out;
   }
 
   static ParamType type(w::Tag tag, const char *name = "", bool is_unsigned = false) {
@@ -137,6 +166,12 @@ TEST_F(V8Values, Zones) {
   EXPECT_TRUE(o.set_zone("+05:30"));
   EXPECT_EQ(o.epoch_ms(1970, 1, 1, 5, 30, 0, 0), 0);
   EXPECT_FALSE(o.set_zone("Mars/Olympus"));
+  // offsets from -13:59 to +14:00, in the form +hh:mm only
+  EXPECT_TRUE(o.set_zone("+14:00"));
+  EXPECT_TRUE(o.set_zone("-13:59"));
+  EXPECT_EQ(o.epoch_ms(1970, 1, 1, 0, 0, 0, 0), (13 * 60 + 59) * 60000.0);
+  for (const char *bad : {"+14:01", "-14:00", "+5:30", "+05:60", "+0530", "+05:30x", "SYSTEM", ""})
+    EXPECT_FALSE(o.set_zone(bad)) << bad;
   EXPECT_TRUE(o.set_zone("Europe/Kyiv"));
   // a local time in the spring gap moves forward (Java's atZone): 03:30 -> 04:30 EEST
   const double gap = o.epoch_ms(2026, 3, 29, 3, 30, 0, 0);
@@ -158,12 +193,12 @@ TEST_F(V8Values, Integers) {
   EXPECT_THROW(round_trip("-1", type(w::Tag::kU64, "INT", true)), ConversionError);
   EXPECT_THROW(round_trip("'abc'", type(w::Tag::kI64, "INT")), ConversionError);
   EXPECT_THROW(round_trip("NaN", type(w::Tag::kI64, "INT")), ConversionError);
-  m_opt.integer_type = w::IntegerType::kUnsafeBigint;
+  m_opt.integer_type = mle::v8w::IntegerType::kUnsafeBigint;
   std::array<std::byte, 16> buf{};
   Writer wr(buf);
   ASSERT_TRUE(wr.put(uint8_t(w::Tag::kI64)) && wr.put(int64_t{1} << 60));
   Reader r(std::span<const std::byte>(buf.data(), wr.size()), 0);
-  EXPECT_TRUE(m_values->column(r, "BIGINT")->IsBigInt());
+  EXPECT_TRUE(m_values->column(r, type(w::Tag::kI64, "BIGINT"))->IsBigInt());
 }
 
 TEST_F(V8Values, Others) {
@@ -202,7 +237,7 @@ TEST_F(V8Values, Dates) {
   Reader zr(std::span<const std::byte>(zero.data(), zw.size()), 0);
   EXPECT_THROW(m_values->argument(zr, type(w::Tag::kDate, "DATE")), ConversionError);
   Reader zr2(std::span<const std::byte>(zero.data(), zw.size()), 0);
-  EXPECT_TRUE(std::isnan(m_values->column(zr2, "DATE").As<v8::Date>()->ValueOf()));
+  EXPECT_TRUE(std::isnan(m_values->column(zr2, type(w::Tag::kDate, "DATE")).As<v8::Date>()->ValueOf()));
   // results back: the session's local date-time (00:00 on 2 July in Kyiv), the same instant again
   std::array<std::byte, 64> back{};
   Writer bw(back);
@@ -212,17 +247,120 @@ TEST_F(V8Values, Dates) {
   EXPECT_EQ(stored.day, 2);
   EXPECT_EQ(stored.hour, 0u);
   Reader br2(std::span<const std::byte>(back.data(), bw.size()), 0);
-  v8::Local<v8::Value> again = m_values->column(br2, "DATETIME");
+  v8::Local<v8::Value> again = m_values->column(br2, dt);
   EXPECT_EQ(again.As<v8::Date>()->ValueOf(), 1782939600000.0);
 }
 
+TEST_F(V8Values, Timestamps) {
+  // A TIMESTAMP is an instant in microseconds, whatever the session's zone (§7.2).
+  const ParamType ts = type(w::Tag::kTimestamp, "TIMESTAMP");
+  const std::vector<std::byte> jan = bytes(0x0B, 0x00, 0x20, 0x21, 0x10, 0xD7, 0x0D, 0x06, 0x00);  // the spec's vector
+  Reader r(jan);
+  EXPECT_EQ(m_values->argument(r, ts).As<v8::Date>()->ValueOf(), 1704067200000.0);
+  EXPECT_EQ(written("new Date(Date.UTC(2024, 0, 1))", ts), jan);
+  EXPECT_EQ(round_trip("new Date(0)", ts), str(js("new Date(0)")));
+  EXPECT_THROW(written("new Date(-1)", ts), ConversionError);
+  EXPECT_THROW(written("new Date(Date.UTC(10000, 0, 1))", ts), ConversionError);
+  EXPECT_THROW(written("new Date(NaN)", ts), ConversionError);
+  EXPECT_THROW(written("'2024-01-01'", ts), ConversionError);
+  // the zero timestamp: an error as an argument, an invalid Date in a row
+  const std::vector<std::byte> zero = bytes(0x0B, 0, 0, 0, 0, 0, 0, 0, 0x80);
+  Reader z(zero);
+  EXPECT_THROW(m_values->argument(z, ts), ConversionError);
+  EXPECT_EQ(z.left(), 0u);  // read completely before the error
+  Reader z2(zero);
+  EXPECT_TRUE(std::isnan(m_values->column(z2, ts).As<v8::Date>()->ValueOf()));
+  // outside the wire's range
+  const std::vector<std::byte> negative = bytes(0x0B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
+  Reader n(negative);
+  EXPECT_THROW(m_values->argument(n, ts), ProtocolFailure);
+}
+
+TEST_F(V8Values, Text) {
+  // Ill-formed UTF-8 of the server's data is repaired: one U+FFFD per maximal subpart (§7.1).
+  const std::vector<std::byte> ill = text_value(w::Tag::kString, "a\xF0\x80\x80z\xC3");
+  Reader r(ill);
+  const v8::Local<v8::Value> s = m_values->argument(r, type(w::Tag::kString, "TEXT"));
+  EXPECT_EQ(mle::v8w::utf8(m_iso, s), "a\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBDz\xEF\xBF\xBD");
+  // Guest text: an unpaired surrogate becomes U+FFFD in data, and is refused in code and names.
+  EXPECT_EQ(mle::v8w::utf8(m_iso, js("'a\\uD800b\\uDFFF'")), "a\xEF\xBF\xBD" "b\xEF\xBF\xBD");
+  EXPECT_EQ(mle::v8w::utf8(m_iso, js("'\\uD83D\\uDE00'")), "\xF0\x9F\x98\x80");
+  EXPECT_FALSE(mle::v8w::utf8_exact(m_iso, js("'SELECT \\uD800'").As<v8::String>()).has_value());
+  EXPECT_FALSE(mle::v8w::utf8_exact(m_iso, js("'\\uDE00\\uD83D'").As<v8::String>()).has_value());
+  EXPECT_EQ(mle::v8w::utf8_exact(m_iso, js("'gr\\u00FC\\u00DF \\uD83D\\uDE00'").As<v8::String>()).value(),
+            "gr\xC3\xBC\xC3\x9F \xF0\x9F\x98\x80");
+}
+
+TEST_F(V8Values, Domains) {
+  using mle::v8w::Temporal;
+  using mle::v8w::valid_decimal;
+  using mle::v8w::valid_temporal;
+  for (const char *good : {"0", "-0", "007", "-12.50", "1.0"}) EXPECT_TRUE(valid_decimal(good)) << good;
+  for (const char *bad : {"", "-", "+1", "1.", ".5", "1e3", "1.2.3", " 1", "1 "}) EXPECT_FALSE(valid_decimal(bad)) << bad;
+  EXPECT_TRUE(valid_decimal(std::string(100, '9')));
+  EXPECT_FALSE(valid_decimal(std::string(101, '9')));
+  EXPECT_TRUE(valid_temporal(Temporal{w::Tag::kDate, 0, 0, 0, 0, 0, 0, 0, false}));
+  EXPECT_TRUE(valid_temporal(Temporal{w::Tag::kDate, 9999, 12, 31, 0, 0, 0, 0, false}));
+  EXPECT_FALSE(valid_temporal(Temporal{w::Tag::kDate, 2024, 13, 1, 0, 0, 0, 0, false}));
+  EXPECT_FALSE(valid_temporal(Temporal{w::Tag::kDate, 2024, 1, 1, 1, 0, 0, 0, false}));
+  EXPECT_TRUE(valid_temporal(Temporal{w::Tag::kTime, 0, 0, 0, 838, 59, 59, 0, true}));
+  EXPECT_FALSE(valid_temporal(Temporal{w::Tag::kTime, 0, 0, 0, 838, 59, 59, 1, false}));
+  EXPECT_FALSE(valid_temporal(Temporal{w::Tag::kTime, 0, 0, 1, 1, 0, 0, 0, false}));
+  EXPECT_FALSE(valid_temporal(Temporal{w::Tag::kDatetime, 2024, 1, 1, 24, 0, 0, 0, false}));
+  EXPECT_FALSE(valid_temporal(Temporal{w::Tag::kDatetime, 2024, 1, 1, 0, 0, 0, 0, true}));
+  // The spec's vectors: DATE 2024-02-29, TIME -01:02:03.5, DECIMAL "-12.50".
+  EXPECT_EQ(written("'-01:02:03.5'", type(w::Tag::kTime, "TIME")),
+            bytes(0x09, 0, 0, 0, 0, 1, 0, 0, 0, 2, 3, 0x20, 0xA1, 0x07, 0x00, 0x01));
+  EXPECT_EQ(written("'-12.50'", type(w::Tag::kDecimal, "DECIMAL")),
+            bytes(0x05, 6, 0, 0, 0, 0x2D, 0x31, 0x32, 0x2E, 0x35, 0x30));
+  m_opt.set_zone("+00:00");
+  EXPECT_EQ(written("new Date(Date.UTC(2024, 1, 29))", type(w::Tag::kDate, "DATE")),
+            bytes(0x08, 0xE8, 0x07, 0x02, 0x1D, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+  // A VECTOR has 1 to 16383 dimensions; its elements are padded to 16 bytes from the body's start.
+  EXPECT_THROW(written("[]", type(w::Tag::kVector)), ConversionError);
+  EXPECT_THROW(written("new Float32Array(16384)", type(w::Tag::kVector)), ConversionError);
+  const std::vector<std::byte> v = written("new Float32Array([1, 2])", type(w::Tag::kVector));
+  EXPECT_EQ(v.size(), 24u);
+  EXPECT_EQ(v[16], std::byte{0});
+  EXPECT_EQ(v[19], std::byte{0x3F});
+  // -0.0 is kept; any bit pattern is accepted from the host.
+  EXPECT_EQ(written("-0", type(w::Tag::kF64)), bytes(0x03, 0, 0, 0, 0, 0, 0, 0, 0x80));
+  const std::vector<std::byte> nan = bytes(0x03, 1, 0, 0, 0, 0, 0, 0xF0, 0x7F);
+  Reader r(nan);
+  EXPECT_TRUE(std::isnan(m_values->argument(r, type(w::Tag::kF64)).As<v8::Number>()->Value()));
+}
+
 TEST_F(V8Values, Malformed) {
-  const std::array<std::byte, 3> short_msg{std::byte{6}, std::byte{10}, std::byte{0}};  // a string of 10: cut
-  Reader r(short_msg, 0);
-  EXPECT_THROW(m_values->argument(r, type(w::Tag::kString)), mle::v8w::Malformed);
-  const std::array<std::byte, 1> bad{std::byte{99}};
-  Reader r2(bad, 0);
-  EXPECT_THROW(m_values->argument(r2, type(w::Tag::kString)), mle::v8w::Malformed);
+  const auto fails = [this](const std::vector<std::byte> &message, w::Tag tag = w::Tag::kString) {
+    Reader r(message);
+    try {
+      m_values->argument(r, type(tag));
+      r.finish();
+    } catch (const ProtocolFailure &) {
+      return true;
+    }
+    return false;
+  };
+  EXPECT_TRUE(fails(bytes(6, 10, 0)));                    // a string of 10: cut
+  EXPECT_TRUE(fails(bytes(99)));                          // an unknown tag
+  EXPECT_TRUE(fails(bytes(0, 0)));                        // a trailing byte
+  EXPECT_FALSE(fails(bytes(0)));
+  EXPECT_TRUE(fails(text_value(w::Tag::kDecimal, "1e5"), w::Tag::kDecimal));
+  EXPECT_TRUE(fails(bytes(13, 0, 0, 0, 0), w::Tag::kVector));                 // no dimensions
+  // a VECTOR whose padding is not zero
+  std::vector<std::byte> v = bytes(13, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x3F);
+  EXPECT_FALSE(fails(v, w::Tag::kVector));
+  v[7] = std::byte{1};
+  EXPECT_TRUE(fails(v, w::Tag::kVector));
+  // a DATE with a time, a bool that is 2
+  EXPECT_TRUE(fails(bytes(8, 0xE8, 0x07, 2, 29, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), w::Tag::kDate));
+  EXPECT_TRUE(fails(bytes(8, 0xE8, 0x07, 2, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2), w::Tag::kDate));
+  // a count beyond the bytes left
+  const std::vector<std::byte> list = bytes(5, 0, 0, 0, 1);
+  Reader r(list);
+  EXPECT_THROW(r.count(100, 1), ProtocolFailure);
+  Reader r2(list);
+  EXPECT_THROW(r2.count(4, 0x100), ProtocolFailure);
 }
 
 }  // namespace

@@ -18,13 +18,14 @@
 /**
   @file worker/common/wire.hpp
 
-  Reading and writing protocol messages (include/mle/protocol.h) in the native workers (CPython,
-  V8): bounds-checked, over spans of the arena or of a reassembled message (exp design note 63).
+  Reading and writing protocol messages (docs/protocol.md §7, include/mle/protocol.h) in the native
+  workers (CPython, V8): bounds-checked, over spans of the arena or of a reassembled message.
 */
 
 #ifndef MLE_WORKER_COMMON_WIRE_HPP
 #define MLE_WORKER_COMMON_WIRE_HPP
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -32,6 +33,7 @@
 #include <cstring>
 #include <span>
 #include <string_view>
+#include <vector>
 
 #include "mle/protocol.h"
 
@@ -39,15 +41,16 @@ namespace mle::common {
 
 static_assert(std::endian::native == std::endian::little, "the wire is little-endian");
 
-/** A message that does not follow the protocol. */
-struct Malformed {
-  const char *what;
-};
+/** A protocol failure (§1): the host sent something that breaks the protocol, or the worker's own
+    code would. Writes what to stderr and ends the process with a non-zero status at once: no
+    exception, no unwinding, no guest code. The one path for every such failure (mailbox.cc). */
+[[noreturn]] void protocol_failure(std::string_view what);
 
+/** Reads a message body of the host. Anything malformed is a protocol failure. */
 class Reader {
  public:
-  Reader(std::span<const std::byte> b, size_t pos) : m_b(b), m_p(pos) {
-    if (pos > b.size()) throw Malformed{"position beyond the message"};
+  explicit Reader(std::span<const std::byte> b, size_t pos = 0) : m_b(b), m_p(pos) {
+    if (pos > b.size()) protocol_failure("position beyond the message");
   }
   template <class T>
   T get() {
@@ -56,18 +59,39 @@ class Reader {
     return std::bit_cast<T>(a);
   }
   std::span<const std::byte> take(size_t n) {
-    if (n > m_b.size() - m_p) throw Malformed{"message too short"};
+    if (n > m_b.size() - m_p) protocol_failure("message too short");
     auto s = m_b.subspan(m_p, n);
     m_p += n;
     return s;
   }
+  /** A str, an lstr or bytes: the bytes as they are. */
   std::string_view str() {
     const auto n = get<uint32_t>();
     auto s = take(n);
     return {reinterpret_cast<const char *>(s.data()), s.size()};
   }
-  /** VECTOR data starts at kVectorAlignment relative to the message start. */
-  void align() { take((wire::kVectorAlignment - m_p % wire::kVectorAlignment) % wire::kVectorAlignment); }
+  /** A bool: 0 or 1. */
+  bool boolean() {
+    const auto v = get<uint8_t>();
+    if (v > 1) protocol_failure("a bool that is neither 0 nor 1");
+    return v != 0;
+  }
+  /** The count of a list of at most max elements of at least min_size bytes each, checked against
+      the bytes left before anything is allocated for it (§7.1). */
+  uint32_t count(uint32_t max, size_t min_size) {
+    const auto n = get<uint32_t>();
+    if (n > max || n > left() / min_size) protocol_failure("a list longer than the message or its limit");
+    return n;
+  }
+  /** Skips a VECTOR's padding: zero bytes up to kVectorAlignment, counted from the body's start. */
+  void align() {
+    for (const std::byte b : take((wire::kVectorAlignment - m_p % wire::kVectorAlignment) % wire::kVectorAlignment))
+      if (b != std::byte{0}) protocol_failure("VECTOR padding that is not zero");
+  }
+  /** The body is consumed exactly (§5.1). */
+  void finish() const {
+    if (m_p != m_b.size()) protocol_failure("trailing bytes in a message");
+  }
   size_t pos() const { return m_p; }
   size_t left() const { return m_b.size() - m_p; }
   std::span<const std::byte> all() const { return m_b; }
@@ -77,23 +101,29 @@ class Reader {
   size_t m_p;
 };
 
-/** Writes into a fixed span (the arena); false from put() and the others when it is full. */
+/** Writes a message body: into a fixed span (the arena), or into a buffer that grows up to a limit.
+    put() and the others return false when the span is full or the limit would be exceeded; what
+    was written before stays. */
 class Writer {
  public:
   explicit Writer(std::span<std::byte> b) : m_b(b) {}
+  /** Into buffer, from its start; it grows as needed, to at most limit bytes. written() is the
+      message (the buffer may be larger). */
+  Writer(std::vector<std::byte> &buffer, size_t limit) : m_b(buffer), m_grow(&buffer), m_limit(limit) {}
   template <class T>
   bool put(T v) {
     const auto a = std::bit_cast<std::array<std::byte, sizeof(T)>>(v);
     return bytes(a);
   }
   bool bytes(std::span<const std::byte> s) {
-    if (s.size() > m_b.size() - m_p) return false;
-    std::memcpy(m_b.data() + m_p, s.data(), s.size());
+    if (s.size() > m_b.size() - m_p && !grow(s.size())) return false;
+    if (!s.empty()) std::memcpy(m_b.data() + m_p, s.data(), s.size());
     m_p += s.size();
     return true;
   }
   bool str(std::string_view s) {
-    return put(static_cast<uint32_t>(s.size())) && bytes(std::as_bytes(std::span(s.data(), s.size())));
+    return s.size() <= UINT32_MAX && put(static_cast<uint32_t>(s.size())) &&
+           bytes(std::as_bytes(std::span(s.data(), s.size())));
   }
   /** Zero bytes up to the next kVectorAlignment (relative to the message start). */
   bool align() {
@@ -105,7 +135,17 @@ class Writer {
   std::span<std::byte> written() const { return m_b.first(m_p); }
 
  private:
+  bool grow(size_t n) {
+    if (m_grow == nullptr || n > m_limit - m_p) return false;
+    const size_t need = m_p + n;
+    m_grow->resize(std::min(m_limit, std::max({need, m_b.size() * 2, size_t{4096}})));
+    m_b = *m_grow;
+    return true;
+  }
+
   std::span<std::byte> m_b;
+  std::vector<std::byte> *m_grow = nullptr;
+  size_t m_limit = 0;
   size_t m_p = 0;
 };
 

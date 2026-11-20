@@ -18,9 +18,11 @@
 /**
   @file worker/v8/values.hpp
 
-  MySQL values and JavaScript values in the V8 worker (exp design note 63), by Oracle's rules as the
-  JVM worker's GraalJS has them (JsOracle.java): wire values of arguments, SQL rows and parameters
-  to V8 values, and V8 results to wire values of the declared SQL type.
+  MySQL values and JavaScript values in the V8 worker, by Oracle's rules as the JVM worker's GraalJS
+  has them (JsOracle.java): wire values (docs/protocol.md §7.2) of arguments, SQL rows and
+  parameters to V8 values, and V8 results to wire values of the declared SQL type. What the host
+  sends outside the wire's domains is a protocol failure (common::protocol_failure); what guest
+  code gives outside them is a ConversionError, so that no value of guest code breaks the protocol.
 */
 
 #ifndef MLE_V8_VALUES_HPP
@@ -39,7 +41,7 @@
 
 namespace mle::v8w {
 
-using common::Malformed;
+using common::protocol_failure;
 using common::Reader;
 using common::Writer;
 
@@ -48,10 +50,10 @@ struct ConversionError {
   std::string message;
 };
 
-/** The arena is full (the RESULT goes in chunks, through a larger buffer). */
-struct ArenaFull {};
+/** The message being written would exceed the limit of a worker's message (64 MiB, §12). */
+struct TooLarge {};
 
-/** A parameter's or result's SQL type (protocol.h: ParamType). */
+/** A parameter's, result's or column's SQL type (§7.4: Type). */
 struct ParamType {
   wire::Tag tag = wire::Tag::kNull;
   bool is_unsigned = false;
@@ -64,16 +66,24 @@ struct ParamType {
   bool is(std::string_view name) const { return type_name == name; }
 };
 
-/** The session's options (OPTIONS): Oracle's integer_type and decimal_type, and the time zone of
-    DATE and DATETIME values. */
+/** The setting js.integer_type (Appendix B.2): how JavaScript receives I64 and U64. The values are
+    also sql.js's codes of a statement's integerType. */
+enum class IntegerType : uint8_t { kUnsafeString = 0, kUnsafeBigint = 1, kString = 2, kBigint = 3 };
+constexpr int kMaxIntegerType = 3;
+/** The setting js.decimal_type: how JavaScript receives DECIMAL. */
+enum class DecimalType : uint8_t { kString = 0, kNumber = 1 };
+constexpr int kMaxDecimalType = 1;
+
+/** The options in force (OPTIONS, §9.8): the settings of JavaScript and the session's time zone,
+    in which DATE and DATETIME values are Dates. */
 struct Options {
-  wire::IntegerType integer_type = wire::IntegerType::kUnsafeString;
-  wire::DecimalType decimal_type = wire::DecimalType::kString;
+  IntegerType integer_type = IntegerType::kUnsafeString;
+  DecimalType decimal_type = DecimalType::kString;
   /** The zone (nullptr: a fixed offset). */
   const std::chrono::time_zone *zone = nullptr;
   std::chrono::seconds offset{0};
 
-  /** An IANA name or +hh:mm / -hh:mm; false if unknown. */
+  /** An IANA name or an offset +hh:mm / -hh:mm from -13:59 to +14:00; false if it is neither. */
   bool set_zone(std::string_view text);
   /** Milliseconds since the epoch of a local date-time in the zone (Java's atZone: a gap moves
       forward, an overlap takes the earlier offset). */
@@ -84,7 +94,7 @@ struct Options {
              unsigned *second, unsigned *micro) const;
 };
 
-/** A temporal value as on the wire. */
+/** A Civil value as on the wire (§7.2): a DATE, TIME or DATETIME. */
 struct Temporal {
   wire::Tag tag;
   uint16_t year;
@@ -105,14 +115,16 @@ class Values {
       its converters do them). */
   v8::Local<v8::Value> argument(Reader &r, const ParamType &t);
 
-  /** A SQL value (a row's column, an OUT value) without a declared parameter type: the value's
-      own tag decides (Oracle's SQL API rules). type_name: the column's SQL type ("SET", "BIT",
-      "YEAR"; empty if unknown). rules: the statement's integerType and decimalType (nullptr: the
-      session's). */
-  v8::Local<v8::Value> column(Reader &r, std::string_view type_name, const Options *rules = nullptr);
+  /** A value of an SQL row under its column's type t (Oracle's SQL API rules: a SET stays a
+      string, a zero date is an invalid Date). rules: the statement's integerType and decimalType
+      (nullptr: the session's).
+
+      argument() and column() throw ConversionError for a value JavaScript cannot hold, and only
+      after they have read the value completely: the caller can go on reading the message. */
+  v8::Local<v8::Value> column(Reader &r, const ParamType &t, const Options *rules = nullptr);
 
   /** Writes result v as type t (JsOracle.toJava, then Values.writeAs); ConversionError if it
-      cannot be one, ArenaFull if it does not fit. */
+      cannot be one, TooLarge if the message would exceed its limit. */
   void write_as(Writer &w, v8::Local<v8::Value> v, const ParamType &t);
 
   /** Writes v as a SQL parameter (its own JavaScript type decides; Oracle's binding rules). */
@@ -126,7 +138,8 @@ class Values {
 
  private:
   v8::Local<v8::Value> integer(int64_t v, bool is_unsigned, const ParamType *t);
-  v8::Local<v8::Value> temporal(const Temporal &t, bool as_date);
+  v8::Local<v8::Value> value(Reader &r, const ParamType &t, bool argument);
+  v8::Local<v8::Value> temporal(const Temporal &t, bool argument);
   [[noreturn]] void cannot(v8::Local<v8::Value> v, const ParamType &t);
 
   const Options *rules() const { return m_rules != nullptr ? m_rules : m_opt; }
@@ -137,12 +150,21 @@ class Values {
   const Options *m_rules = nullptr;  // a statement's, while its rows are decoded
 };
 
-/** A UTF-8 std::string of a V8 string (or of String(v)). */
+/** A UTF-8 std::string of a V8 string (or of String(v)), repaired (§7.1): each unpaired surrogate
+    becomes U+FFFD. For data and messages, never for code or names. */
 std::string utf8(v8::Isolate *iso, v8::Local<v8::Value> v);
-/** A V8 string of UTF-8 text (internalized when short). */
+/** The UTF-8 of a V8 string that is code or a name (SQL text, a library's name), which is never
+    repaired; nullopt if it has an unpaired surrogate. */
+std::optional<std::string> utf8_exact(v8::Isolate *iso, v8::Local<v8::String> s);
+/** A V8 string of UTF-8 text (internalized when short); ill-formed sequences are repaired as §7.1
+    says (U+FFFD per maximal subpart). ConversionError if it is longer than V8's strings can be. */
 v8::Local<v8::String> v8_string(v8::Isolate *iso, std::string_view s);
 
-/** Reads a Temporal (after its tag). */
+/** The domain of a Civil value under its tag (§7.2). */
+bool valid_temporal(const Temporal &t);
+/** The domain of a DECIMAL's text (§7.2). */
+bool valid_decimal(std::string_view s);
+/** Reads a Civil (after its tag); outside its domain it is a protocol failure. */
 Temporal read_temporal(Reader &r, wire::Tag tag);
 void write_temporal(Writer &w, const Temporal &t);
 /** "[-]hh:mm:ss[.ffffff]" of a TIME. */

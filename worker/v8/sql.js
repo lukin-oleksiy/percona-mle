@@ -1,7 +1,8 @@
-// The SQL API of the V8 worker (exp design note 63): Oracle's JavaScript API (session, mysql,
-// SqlError) with the JVM worker's behaviour (GuestSql.java, JsSql.java, com.percona.mle.sql; the
-// CPython worker's sql.py is the same port in Python). Messages, values and rows are C++ (N.sql);
-// this is the API on top. Called once with the natives; returns the C++ core's hooks.
+// The SQL API of the V8 worker: Oracle's JavaScript API (session, mysql, SqlError) with the JVM
+// worker's behaviour (GuestSql.java, JsSql.java, com.percona.mle.sql; the CPython worker's sql.py
+// is the same port in Python). Messages, values, rows and the statement states of the protocol
+// (docs/protocol.md §10) are C++ (N.sql, which checks all it is given); this is the API on top.
+// Called once with the natives.
 (function (N) {
   'use strict';
 
@@ -35,6 +36,14 @@
   const sqlError = (code, state, message, row) => {
     const e = new SqlError(state, message, code);
     if (row !== undefined && row !== null && row >= 0) e.row = row;
+    return e;
+  };
+  // The error of an SQL_RESULT ERROR t. A routine that ends with this object hands the server's
+  // error back by its id (§10.8): N.handBack keeps the id with the error's own number, SQLSTATE
+  // and message where routine code cannot change them. An error the worker made itself has id 0.
+  const replyError = (t) => {
+    const e = sqlError(t[1], t[2], t[3], t[4]);
+    if (t[5] !== 0n) N.handBack(e, t[5], t[1], t[2], t[3]);
     return e;
   };
   const bindError = (message, row) => sqlError(1210, 'HY000', message, row);
@@ -263,38 +272,28 @@
   const warningsOf = (ws) => (ws && ws.length ? ws.map(([l, c, m]) => freeze({ level: l + 1, code: c, message: m })) : []);
 
   // ---------------------------------------------------------------- the requests
-  let nextId = 0;
-  const newId = () => ++nextId;
+  // [depth, scope, routine schema, integer type, decimal type] of the request being served.
+  const state = () => N.state();
 
-  // A statement run from text whose rows are not all read yet (exp note 44 step 3): mysqld buffers
-  // the whole result, so before any other statement runs its rows are drained into the worker
-  // (mysqld holds at most one buffered result). One at a time.
-  let pending = null, pendingScope = 0, pendingDepth = 0;
-
-  // The session's decimal default (mle_set_session_state); the call's options by depth.
-  const state = () => N.state();  // [depth, scope, routine schema, integer type, decimal type, arena, call seq]
-
-  // One reply: [0, code, state, message, row] | [1, affected, insertId, warnings, moreResults,
-  // paramCount, execUs] | [2, labels, columns, total, rows, more, moreResults, warnings, execUs].
-  const send = (action, sid, text, params, options, flags = 0, width = 0) => {
-    drainOther(sid);
+  // One SQL message and its reply. A statement is known by the scope of the request that opened
+  // it and its id there; EXECUTE and PREPARE open one, and the reply says which. The reply:
+  // [0, code, state, message, row, errorId] (thrown as a SqlError) |
+  // [1, affected, insertId, warnings, moreResults, paramCount, execUs, scope, id] |
+  // [2, labels, columns, total, rows, more, moreResults, warnings, execUs, scope, id]: one batch of
+  //    a result set; labels and columns only in the set's first batch (later: null, and the rows
+  //    are made with the labels given here); total null if the host does not know it |
+  // [3]: no further result (NEXT_RESULT).
+  const send = (action, scope, id, text, params, options, flags = 0, width = 0, labels = null) => {
     const o = options || NO_OPTIONS;
-    // -1: the session's integerType / decimalType (mle_set_session_state).
-    const t = N.sql(action, sid, text, params, flags, width, o.intCode, o.decCode);
-    if (t[0] === 0) throw sqlError(t[1], t[2], t[3], t[4]);
-    if (t[0] === 2) t[4] = replyRows(t[1], t[4]);
+    // -1: the session's integerType / decimalType (OPTIONS).
+    const t = N.sql(action, scope, id, text, params, flags, width, o.intCode, o.decCode);
+    if (t[0] === 0) throw replyError(t);
+    if (t[0] === 2) t[4] = replyRows(t[1] !== null ? t[1] : labels, t[4]);
     return t;
   };
-
-  const drainOther = (sid) => {
-    const p = pending;
-    if (p === null || p.$id === sid) return;
-    pending = null;
-    if (pendingScope === currentTop()) p.$drain();  // statements of an earlier call are closed by the host
-  };
-  // The top-level call (its call sequence): statements of one top-level call (any depth) share
-  // mysqld's statement table.
-  const currentTop = () => state()[6];
+  // The statement a reply opened or answered: its scope and id are the reply's last two items.
+  const scopeOf = (t) => t[t.length - 2];
+  const idOf = (t) => t[t.length - 1];
 
   // ---------------------------------------------------------------- results
   const REPLACED = 'the result was replaced by a new execution of its prepared statement';
@@ -313,52 +312,44 @@
   // defineProperties per statement cost as much as the rest of the statement's JavaScript).
   const RESULT = Symbol('result');
   class SqlResult {
-    constructor(sid, owned, direct, options, reply) {
-      this[RESULT] = { id: sid, owned, direct, options, s: { replaced: false } };
+    constructor(scope, sid, owned, options, reply) {
+      this[RESULT] = { scope, id: sid, owned, options, s: { replaced: false, labels: [], columns: [], warnings: [] } };
       this.$load(reply);
     }
+    get $scope() { return this[RESULT].scope; }
     get $id() { return this[RESULT].id; }
     get $owned() { return this[RESULT].owned; }
-    get $direct() { return this[RESULT].direct; }
     get $options() { return this[RESULT].options; }
     get $s() { return this[RESULT].s; }
+    // A new result of the statement: the first batch of a result set, a row count, or the end.
     $load(t) {
       const s = this.$s;
-      if (pending === this) pending = null;
       s.rows = []; s.at = 0;
       if (t[0] === 2) {
-        s.hasData = true; s.labels = t[1]; s.columns = t[2]; s.total = t[3]; s.rows = t[4];
+        s.hasData = true; s.labels = t[1]; s.columns = t[2]; s.rows = t[4];
         s.more = t[5]; s.moreResults = t[6]; s.warnings = warningsOf(t[7]); s.execUs = t[8];
         s.affected = 0; s.insertId = 0;
+      } else if (t[0] === 3) {
+        s.hasData = false; s.labels = []; s.columns = []; s.more = false; s.moreResults = false;
+        s.affected = 0; s.insertId = 0; s.warnings = []; s.execUs = 0;
       } else {
-        s.hasData = false; s.labels = []; s.columns = []; s.total = 0; s.more = false;
+        s.hasData = false; s.labels = []; s.columns = []; s.more = false;
         s.affected = t[1]; s.insertId = t[2]; s.warnings = warningsOf(t[3]); s.moreResults = t[4]; s.execUs = t[6];
       }
-      if (this.$direct && s.more && s.total > 0) {
-        drainOther(this.$id);
-        pending = this; pendingScope = currentTop(); pendingDepth = state()[0];
-      }
     }
+    // The next batch of the result set (§10.3). Its warnings: a list in a batch that is not the
+    // last is empty ("nothing new") or the complete list so far; the last batch's list is complete.
     $fetch() {
       const s = this.$s;
-      const t = send(FETCH, this.$id, null, null, this.$options);
-      s.more = t[0] === 2 ? t[5] : false;
-      s.moreResults = t[0] === 2 ? t[6] : t[4];
-      const ws = warningsOf(t[0] === 2 ? t[7] : t[3]);
-      if (ws.length) s.warnings = ws;
-      if (!s.more && pending === this) pending = null;
-      return t[0] === 2 ? t[4] : [];
-    }
-    $drain() {
-      const s = this.$s;
-      if (!s.more || s.replaced) return;
-      const rows = rowsFrom(s.rows, s.at);
-      while (s.more) appendRows(rows, this.$fetch());
-      s.rows = rows; s.at = 0;
+      const t = send(FETCH, this.$scope, this.$id, null, null, this.$options, 0, 0, s.labels);
+      s.more = t[5];
+      s.moreResults = t[6];
+      const ws = warningsOf(t[7]);
+      if (!s.more || ws.length) s.warnings = ws;
+      return t[4];
     }
     $replace() {
       const s = this.$s;
-      if (s.more && pending === this) pending = null;
       s.replaced = true; s.rows = []; s.at = 0; s.more = false; s.moreResults = false;
     }
     $live() { if (this.$s.replaced) throw new Error(REPLACED); }
@@ -391,7 +382,7 @@
         s.hasData = false; s.rows = []; s.at = 0;
         return false;
       }
-      this.$load(send(NEXT_RESULT, this.$id, null, null, this.$options));
+      this.$load(send(NEXT_RESULT, this.$scope, this.$id, null, null, this.$options));
       return s.hasData;
     }
     getColumns() { return this.$s.columns.map((c) => new Column(c)); }
@@ -404,8 +395,8 @@
     getExecutionTime() { return (this.$s.execUs / 1e6).toFixed(4) + ' sec'; }
     close() {
       const s = this.$s;
-      if (s.more && pending === this) pending = null;
-      if (this.$owned && (s.more || s.moreResults) && !s.replaced) send(CLOSE, this.$id, null, null, this.$options);
+      if (this.$owned && (s.more || s.moreResults) && !s.replaced)
+        send(CLOSE, this.$scope, this.$id, null, null, this.$options);
       s.rows = []; s.at = 0; s.more = false; s.moreResults = false; s.hasData = false;
     }
     fetchColumns(...names) {
@@ -448,10 +439,13 @@
   };
 
   class PreparedStatement {
-    constructor(sid, sql, options, count) {
+    // bound: the values of the last execution. The host keeps no values between executions
+    // (§10.2): every EXECUTE_PREPARED carries all of them, and a later execution that binds fewer
+    // takes the others from here.
+    constructor(scope, sid, sql, options, count) {
       Object.defineProperty(this, '$s', { value: {
-        id: sid, sql, options, count, pending: [], executed: false, deallocated: false, last: null,
-        formChecked: false, form: null, chunks: new Map(),
+        scope, id: sid, sql, options, count, pending: [], bound: null, executed: false, deallocated: false,
+        last: null, formChecked: false, form: null, chunks: new Map(),
       } });
     }
     $open() { if (this.$s.deallocated) throw new Error('the prepared statement was deallocated'); }
@@ -476,11 +470,14 @@
       this.$dropLast();
       checkArgs(s.pending);
       const params = s.pending;
+      if (s.executed && s.bound !== null)
+        for (let i = params.length; i < s.count && i < s.bound.length; i++) params[i] = s.bound[i];
       s.pending = [];
-      const t = send(EXECUTE_PREPARED, s.id, null, params, s.options);
+      const t = send(EXECUTE_PREPARED, s.scope, s.id, null, params, s.options);
       s.executed = true;
+      s.bound = params;
       if (s.options.toClient) return null;
-      s.last = new SqlResult(s.id, false, false, s.options, t);
+      s.last = new SqlResult(s.scope, s.id, false, s.options, t);
       return s.last;
     }
     executeMany(rows) { return this.$executeMany(rowsOf(rows)); }
@@ -500,7 +497,8 @@
       return this.$result(...this.$executeRows(rows, 0));
     }
     $result(affected, execUs, warnings) {
-      return new SqlResult(this.$s.id, false, false, this.$s.options, [1, affected, 0, warnings, false, 0, execUs]);
+      const s = this.$s;
+      return new SqlResult(s.scope, s.id, false, s.options, [1, affected, 0, warnings, false, 0, execUs, s.scope, s.id]);
     }
     // The rows in chunks of the multi-row form (exp note 52); a chunk that fails because of a row's
     // values is replayed row by row, which stops at the failing row with its index.
@@ -511,6 +509,7 @@
       const pc = s.count;
       const maxRows = Math.min(REWRITE_MAX_ROWS, Math.floor(MAX_VALUES / pc));
       s.executed = false;  // the chunks run on statements of their own
+      s.bound = null;
       let affected = 0, execUs = 0, warnings = [];
       for (let i = 0; i < rows.length;) {
         const start = i;
@@ -570,11 +569,14 @@
       const s = this.$s;
       this.$dropLast();
       s.pending = [];
-      const t = send(EXECUTE_PREPARED, s.id, null, params, s.options);
+      const t = send(EXECUTE_PREPARED, s.scope, s.id, null, params, s.options);
       s.executed = true;
+      s.bound = null;  // a chunk's statement is never executed with fewer values
       return t;
     }
     // execute_many row by row on mysqld's side (EXECUTE_MANY) in messages of up to MAX_VALUES values.
+    // An ERROR to EXECUTE_MANY says how many rows of its message ran before it (§10.2): the error's
+    // row is that count from the first row of the whole batch.
     $executeRows(rows, offset) {
       this.$open();
       const s = this.$s;
@@ -582,7 +584,7 @@
       s.pending = [];
       const pc = s.count;
       let affected = 0, execUs = 0, done = offset, warnings = [];
-      let bad = null;
+      let bad = null, lastRow = null;
       const perMessage = Math.max(1, Math.min(Math.floor(MAX_VALUES / Math.max(pc, 1)), 4096));
       for (let i = 0; i < rows.length && bad === null;) {
         const params = [];
@@ -596,20 +598,22 @@
             break;
           }
           params.push(...row);
+          lastRow = row;
           n++; i++;
         }
         if (n === 0) break;
         let t;
         try {
-          t = send(EXECUTE_MANY, s.id, null, params, s.options, 0, pc);
+          t = send(EXECUTE_MANY, s.scope, s.id, null, params, s.options, 0, pc);
         } catch (e) {
-          if (!(e instanceof SqlError) || e.row === null) throw e;
-          throw sqlError(e.code, e.sqlState, e.message, done + e.row);
+          if (e instanceof SqlError && e.row !== null) e.row += done;
+          throw e;
         }
         affected += Number(t[1]); execUs += t[6]; warnings = t[3];
         done += n;
       }
-      s.executed = s.executed || done > offset;
+      // Rows ran on this statement: its last row stays bound.
+      if (done > offset) { s.executed = true; s.bound = lastRow; }
       if (bad !== null) throw bad;
       return [affected, execUs, warnings];
     }
@@ -620,7 +624,7 @@
       for (const p of s.chunks.values()) p.deallocate();
       s.chunks.clear();
       if (s.last !== null) s.last.$replace();
-      send(CLOSE, s.id, null, null, s.options);
+      send(CLOSE, s.scope, s.id, null, null, s.options);
     }
     getParameterCount() { return this.$s.count; }
     getOption(...a) { return this.$s.options.get(str(a, 0)); }
@@ -762,34 +766,34 @@
   };
   const internal = () => effective(new Options({ passResult: false }));
 
+  // PASS_RESULT_TO_CLIENT is given where a statement is opened, at EXECUTE or PREPARE, and holds
+  // for the life of its id (§10.2).
   const run = (sql, params, o) => {
     if (params) checkArgs(params);
-    const sid = newId();
-    const t = send(EXECUTE, sid, sql, params, o, o.toClient ? TO_CLIENT : 0);
-    return o.toClient ? null : new SqlResult(sid, true, true, o, t);
+    const t = send(EXECUTE, 0, 0, sql, params, o, o.toClient ? TO_CLIENT : 0);
+    return o.toClient ? null : new SqlResult(scopeOf(t), idOf(t), true, o, t);
   };
   const exec = (sql, params = null) => {
-    const sid = newId();
-    const t = send(EXECUTE, sid, sql, params, internal());
-    if ((t[0] === 2 && t[5]) || (t[0] === 2 ? t[6] : t[4])) send(CLOSE, sid, null, null, null);
+    const t = send(EXECUTE, 0, 0, sql, params, internal());
+    if ((t[0] === 2 && t[5]) || (t[0] === 2 ? t[6] : t[4])) send(CLOSE, scopeOf(t), idOf(t), null, null, null);
   };
   const column = (sql, ...params) => {
-    const sid = newId();
-    let t = send(EXECUTE, sid, sql, params, internal());
+    const o = internal();
+    const first = send(EXECUTE, 0, 0, sql, params, o);
     const values = [];
+    let t = first;
     for (;;) {
       if (t[0] === 2) for (const r of t[4]) values.push(r[0]);
       if (t[0] !== 2 || !t[5]) break;
-      t = send(FETCH, sid, null, null, internal());
+      t = send(FETCH, scopeOf(first), idOf(first), null, null, o, 0, 0, first[1]);
     }
-    if (t[0] === 2 ? t[6] : t[4]) send(CLOSE, sid, null, null, null);
+    if (t[0] === 2 ? t[6] : t[4]) send(CLOSE, scopeOf(first), idOf(first), null, null, null);
     return values;
   };
   const prepare = (sql, options) => {
     const o = effective(options);
-    const sid = newId();
-    const t = send(PREPARE, sid, sql, null, o, o.toClient ? TO_CLIENT : 0);
-    return new PreparedStatement(sid, sql, o, t[5]);
+    const t = send(PREPARE, 0, 0, sql, null, o, o.toClient ? TO_CLIENT : 0);
+    return new PreparedStatement(scopeOf(t), idOf(t), sql, o, t[5]);
   };
   const innodbCache = new Map();
   const innodb = (schema, table, fresh) => {
@@ -807,10 +811,9 @@
   const replayable = (schema, table) => {
     const name = (schema === null ? '' : quoteName(schema) + '.') + quoteName(table);
     try {
-      const sid = newId();
-      const t = send(EXECUTE, sid, 'SHOW CREATE TABLE ' + name, null, internal());
+      const t = send(EXECUTE, 0, 0, 'SHOW CREATE TABLE ' + name, null, internal());
       const rows = t[0] === 2 ? t[4] : [];
-      if (t[0] === 2 && (t[5] || t[6])) send(CLOSE, sid, null, null, null);
+      if (t[0] === 2 && (t[5] || t[6])) send(CLOSE, scopeOf(t), idOf(t), null, null, null);
       if (!rows.length || String(rows[0][1]).startsWith('CREATE TEMPORARY')) return 'the table is a temporary one';
     } catch (e) {
       if (e instanceof SqlError) return "the table's definition cannot be read";
@@ -1020,8 +1023,7 @@
     },
     set: (t, k, v) => {
       if (typeof k === 'symbol' || METHODS.has(k) || k.startsWith('__')) throw new TypeError('cannot set ' + String(k));
-      const sid = newId();
-      send(EXECUTE, sid, 'SET @' + quoteName(k) + ' = ?', [v], internal());
+      send(EXECUTE, 0, 0, 'SET @' + quoteName(k) + ' = ?', [v], internal());
       return true;
     },
     has: (t, k) => typeof k === 'string' && (METHODS.has(k) || !k.startsWith('__')),
@@ -1035,20 +1037,4 @@
   for (const [k, v] of [['session', session], ['mysql', mysql], ['SqlError', SqlError]])
     Object.defineProperty(globalThis, k, { value: v, writable: false, configurable: false });
 
-  return {
-    // The end of a routine call (Api.call_ended): the host closes the statements of a top-level
-    // call; a nested call's unread result is closed now.
-    callEnded: (top) => {
-      const p = pending;
-      if (p === null) return;
-      if (pendingDepth < state()[0]) return;
-      pending = null;
-      if (top || pendingScope !== currentTop()) return;
-      try {
-        send(CLOSE, p.$id, null, null, null);
-      } catch (e) {
-        if (!(e instanceof SqlError)) throw e;
-      }
-    },
-  };
 })

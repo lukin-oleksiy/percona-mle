@@ -150,21 +150,45 @@ struct Decimal {
 
 std::string utf8(v8::Isolate *iso, Local<Value> v) {
   if (v.IsEmpty()) return "";
+  Local<v8::String> s;
   if (v->IsString()) {
-    const Local<v8::String> s = v.As<v8::String>();
-    std::string out(s->Utf8Length(iso), '\0');
-    s->WriteUtf8(iso, out.data(), static_cast<int>(out.size()), nullptr, v8::String::NO_NULL_TERMINATION | v8::String::REPLACE_INVALID_UTF8);  // a lone surrogate: U+FFFD (3 bytes too)
-    return out;
+    s = v.As<v8::String>();
+  } else {
+    const v8::TryCatch tc(iso);
+    if (!v->ToString(iso->GetCurrentContext()).ToLocal(&s)) return "?";
   }
-  const v8::String::Utf8Value u(iso, v);
-  return *u == nullptr ? std::string("?") : std::string(*u, u.length());
+  std::string out(s->Utf8Length(iso), '\0');
+  // An unpaired surrogate becomes U+FFFD (3 bytes, as Utf8Length counted it).
+  s->WriteUtf8(iso, out.data(), static_cast<int>(out.size()), nullptr,
+               v8::String::NO_NULL_TERMINATION | v8::String::REPLACE_INVALID_UTF8);
+  return out;
+}
+
+std::optional<std::string> utf8_exact(v8::Isolate *iso, Local<v8::String> s) {
+  if (!s->ContainsOnlyOneByte()) {
+    const v8::String::Value units(iso, s);
+    const auto high = [](uint16_t c) { return c >= 0xD800 && c <= 0xDBFF; };
+    const auto low = [](uint16_t c) { return c >= 0xDC00 && c <= 0xDFFF; };
+    for (int i = 0; i < units.length(); i++) {
+      const uint16_t c = (*units)[i];
+      if (high(c) && i + 1 < units.length() && low((*units)[i + 1]))
+        i++;
+      else if (high(c) || low(c))
+        return std::nullopt;
+    }
+  }
+  return utf8(iso, s);
 }
 
 Local<v8::String> v8_string(v8::Isolate *iso, std::string_view s) {
-  return v8::String::NewFromUtf8(iso, s.data(), s.size() < 32 ? v8::NewStringType::kInternalized
-                                                               : v8::NewStringType::kNormal,
-                                 static_cast<int>(s.size()))
-      .ToLocalChecked();
+  Local<v8::String> out;
+  if (s.size() > static_cast<size_t>(v8::String::kMaxLength) ||
+      !v8::String::NewFromUtf8(iso, s.data(),
+                               s.size() < 32 ? v8::NewStringType::kInternalized : v8::NewStringType::kNormal,
+                               static_cast<int>(s.size()))
+           .ToLocal(&out))
+    throw ConversionError{"a text of " + std::to_string(s.size()) + " bytes is longer than a JavaScript string can be"};
+  return out;
 }
 
 // ------------------------------------------------------------ ParamType
@@ -172,9 +196,9 @@ Local<v8::String> v8_string(v8::Isolate *iso, std::string_view s) {
 ParamType ParamType::read(Reader &r) {
   ParamType t;
   const auto tag = r.get<uint8_t>();
-  if (tag > w::kMaxTag) throw Malformed{"bad type tag"};
+  if (tag > w::kMaxTag) protocol_failure("an unknown tag in a Type");
   t.tag = static_cast<w::Tag>(tag);
-  t.is_unsigned = r.get<uint8_t>() != 0;
+  t.is_unsigned = r.boolean();
   t.length = r.get<uint32_t>();
   t.precision = r.get<uint32_t>();
   t.scale = r.get<uint32_t>();
@@ -191,17 +215,17 @@ std::string ParamType::sql_name() const {
 
 bool Options::set_zone(std::string_view text) {
   if (!text.empty() && (text[0] == '+' || text[0] == '-')) {
-    // +hh:mm (MySQL's offsets: -13:59 .. +14:00)
-    const std::string t(text.substr(1));
-    int h = 0, m = 0;
-    char extra = 0;
-    if (std::sscanf(t.c_str(), "%d:%d%c", &h, &m, &extra) != 2 || h > 14 || m > 59) return false;
-    offset = std::chrono::seconds((h * 3600 + m * 60) * (text[0] == '-' ? -1 : 1));
+    const auto digit = [&](size_t i) { return text[i] >= '0' && text[i] <= '9'; };
+    if (text.size() != 6 || !digit(1) || !digit(2) || text[3] != ':' || !digit(4) || !digit(5)) return false;
+    const int h = (text[1] - '0') * 10 + (text[2] - '0'), m = (text[4] - '0') * 10 + (text[5] - '0');
+    const int minutes = h * 60 + m;
+    if (m > 59 || minutes > (text[0] == '-' ? 13 * 60 + 59 : 14 * 60)) return false;
+    offset = std::chrono::seconds(minutes * 60 * (text[0] == '-' ? -1 : 1));
     zone = nullptr;
     return true;
   }
   try {
-    zone = std::chrono::locate_zone(text == "SYSTEM" ? std::string_view("UTC") : text);
+    zone = std::chrono::locate_zone(text);
     offset = std::chrono::seconds(0);
     return true;
   } catch (const std::runtime_error &) {
@@ -247,6 +271,38 @@ void Options::local(double ms, int *year, unsigned *month, unsigned *day, unsign
 
 // ------------------------------------------------------------ temporal values
 
+bool valid_temporal(const Temporal &t) {
+  const bool date = t.year <= 9999 && t.month <= 12 && t.day <= 31;
+  const bool clock = t.minute <= 59 && t.second <= 59 && t.micro <= 999999;
+  switch (t.tag) {
+    case w::Tag::kDate:
+      return date && t.hour == 0 && t.minute == 0 && t.second == 0 && t.micro == 0 && !t.negative;
+    case w::Tag::kDatetime:
+      return date && clock && t.hour <= 23 && !t.negative;
+    case w::Tag::kTime:
+      return t.year == 0 && t.month == 0 && t.day == 0 && clock && t.hour <= w::kMaxTimeHour &&
+             !(t.hour == w::kMaxTimeHour && t.minute == 59 && t.second == 59 && t.micro != 0);
+    default:
+      return false;
+  }
+}
+
+bool valid_decimal(std::string_view s) {
+  if (s.empty() || s.size() > w::kMaxDecimalChars) return false;
+  if (s[0] == '-') s.remove_prefix(1);
+  const auto digits = [&s]() {
+    size_t n = 0;
+    while (n < s.size() && s[n] >= '0' && s[n] <= '9') n++;
+    s.remove_prefix(n);
+    return n != 0;
+  };
+  if (!digits()) return false;
+  if (s.empty()) return true;
+  if (s[0] != '.') return false;
+  s.remove_prefix(1);
+  return digits() && s.empty();
+}
+
 Temporal read_temporal(Reader &r, w::Tag tag) {
   Temporal t{};
   t.tag = tag;
@@ -257,7 +313,8 @@ Temporal read_temporal(Reader &r, w::Tag tag) {
   t.minute = r.get<uint8_t>();
   t.second = r.get<uint8_t>();
   t.micro = r.get<uint32_t>();
-  t.negative = r.get<uint8_t>() != 0;
+  t.negative = r.boolean();
+  if (!valid_temporal(t)) protocol_failure("a DATE, TIME or DATETIME outside its domain");
   return t;
 }
 
@@ -265,7 +322,7 @@ void write_temporal(Writer &wr, const Temporal &t) {
   if (!(wr.put(static_cast<uint8_t>(t.tag)) && wr.put(t.year) && wr.put(t.month) && wr.put(t.day) &&
         wr.put(t.hour) && wr.put(t.minute) && wr.put(t.second) && wr.put(t.micro) &&
         wr.put(static_cast<uint8_t>(t.negative ? 1 : 0))))
-    throw ArenaFull{};
+    throw TooLarge{};
 }
 
 std::string time_text(const Temporal &t) {
@@ -357,13 +414,13 @@ Local<Value> Values::integer(int64_t v, bool is_unsigned, const ParamType *t) {
     return is_safe && v >= 0 ? Local<Value>(v8::Number::New(m_iso, static_cast<double>(v)))
                              : Local<Value>(v8::BigInt::NewFromUnsigned(m_iso, static_cast<uint64_t>(v)));
   switch (rules()->integer_type) {
-    case w::IntegerType::kString:
+    case IntegerType::kString:
       return as_string();
-    case w::IntegerType::kBigint:
+    case IntegerType::kBigint:
       return as_bigint();
-    case w::IntegerType::kUnsafeBigint:
+    case IntegerType::kUnsafeBigint:
       return is_safe ? Local<Value>(v8::Number::New(m_iso, static_cast<double>(v))) : as_bigint();
-    case w::IntegerType::kUnsafeString:
+    case IntegerType::kUnsafeString:
     default:
       return is_safe ? Local<Value>(v8::Number::New(m_iso, static_cast<double>(v))) : as_string();
   }
@@ -398,9 +455,11 @@ Local<v8::ArrayBuffer> buffer_of(v8::Isolate *iso, std::span<const std::byte> da
   return v8::ArrayBuffer::New(iso, std::move(store));
 }
 
+/** A VECTOR as a Float32Array with a copy of the elements: guest code may keep it, and a view of
+    the arena would be valid only until the worker's next write there (§7.2). */
 Local<Value> vector_of(v8::Isolate *iso, Reader &r) {
   const auto dims = r.get<uint32_t>();
-  if (dims > w::kMaxVectorDimensions) throw Malformed{"VECTOR too large"};
+  if (dims < 1 || dims > w::kMaxVectorDimensions) protocol_failure("a VECTOR with an illegal number of dimensions");
   r.align();
   const auto data = r.take(size_t{dims} * 4);
   return v8::Float32Array::New(buffer_of(iso, data), 0, dims);
@@ -408,36 +467,48 @@ Local<Value> vector_of(v8::Isolate *iso, Reader &r) {
 
 }  // namespace
 
-Local<Value> Values::argument(Reader &r, const ParamType &t) {
-  const auto tag = static_cast<w::Tag>(r.get<uint8_t>());
-  switch (tag) {
+Local<Value> Values::argument(Reader &r, const ParamType &t) { return value(r, t, true); }
+
+Local<Value> Values::column(Reader &r, const ParamType &t, const Options *rules) {
+  struct Use {
+    const Options *&slot, *saved;
+    ~Use() { slot = saved; }
+  } use{m_rules, m_rules};
+  if (rules != nullptr) m_rules = rules;
+  return value(r, t, false);
+}
+
+Local<Value> Values::value(Reader &r, const ParamType &t, bool argument) {
+  const auto tag = r.get<uint8_t>();
+  switch (static_cast<w::Tag>(tag)) {
     case w::Tag::kNull:
       return v8::Null(m_iso);
     case w::Tag::kI64:
       return integer(r.get<int64_t>(), false, &t);
     case w::Tag::kU64:
       return integer(static_cast<int64_t>(r.get<uint64_t>()), true, &t);
-    case w::Tag::kF64:
+    case w::Tag::kF64:  // any bit pattern (§7.2)
       return v8::Number::New(m_iso, r.get<double>());
     case w::Tag::kF32:
       return v8::Number::New(m_iso, r.get<float>());
     case w::Tag::kDecimal: {
       const std::string_view s = r.str();
-      if (rules()->decimal_type == w::DecimalType::kNumber)
+      if (!valid_decimal(s)) protocol_failure("a DECIMAL outside its domain");
+      if (rules()->decimal_type == DecimalType::kNumber)
         return v8::Number::New(m_iso, std::strtod(std::string(s).c_str(), nullptr));
       return v8_string(m_iso, s);
     }
     case w::Tag::kString: {
+      // An lstr: ill-formed UTF-8 of the server's data is repaired by v8_string (§7.1).
       const std::string_view s = r.str();
-      if (t.is("SET")) {
+      if (argument && t.is("SET")) {  // in a row a SET stays a string (Oracle's SQL API)
         const Local<v8::Set> set = v8::Set::New(m_iso);
         if (!s.empty()) {
           size_t start = 0;
           while (true) {
             const size_t comma = s.find(',', start);
             const std::string_view item = s.substr(start, comma == std::string_view::npos ? s.npos : comma - start);
-            (void)set->Add(context(), v8_string(m_iso, item));
-            if (comma == std::string_view::npos) break;
+            if (set->Add(context(), v8_string(m_iso, item)).IsEmpty() || comma == std::string_view::npos) break;
             start = comma + 1;
           }
         }
@@ -453,9 +524,19 @@ Local<Value> Values::argument(Reader &r, const ParamType &t) {
     case w::Tag::kDate:
     case w::Tag::kTime:
     case w::Tag::kDatetime:
-    case w::Tag::kTimestamp:
-      return temporal(read_temporal(r, tag), true);
+      return temporal(read_temporal(r, static_cast<w::Tag>(tag)), argument);
+    case w::Tag::kTimestamp: {
+      // An instant: a Date, whatever the session's zone. Date counts milliseconds.
+      const auto us = r.get<int64_t>();
+      if (us == w::kZeroTimestamp) {
+        if (argument) throw ConversionError{"the zero TIMESTAMP has no JavaScript equivalent"};
+        return v8::Date::New(context(), std::nan("")).ToLocalChecked();  // in a row: an invalid Date
+      }
+      if (us < 0 || us > w::kMaxTimestamp) protocol_failure("a TIMESTAMP outside its domain");
+      return v8::Date::New(context(), static_cast<double>(us / 1000)).ToLocalChecked();
+    }
     case w::Tag::kJson: {
+      const v8::TryCatch tc(m_iso);
       Local<Value> parsed;
       if (!v8::JSON::Parse(context(), v8_string(m_iso, r.str())).ToLocal(&parsed))
         throw ConversionError{"invalid JSON from MySQL"};
@@ -464,39 +545,7 @@ Local<Value> Values::argument(Reader &r, const ParamType &t) {
     case w::Tag::kVector:
       return vector_of(m_iso, r);
   }
-  throw Malformed{"bad value tag"};
-}
-
-Local<Value> Values::column(Reader &r, std::string_view type_name, const Options *rules) {
-  struct Use {
-    const Options *&slot, *saved;
-    ~Use() { slot = saved; }
-  } use{m_rules, m_rules};
-  if (rules != nullptr) m_rules = rules;
-  ParamType t;
-  t.type_name = std::string(type_name);
-  const auto tag = static_cast<w::Tag>(r.get<uint8_t>());
-  switch (tag) {
-    case w::Tag::kI64:
-      return integer(r.get<int64_t>(), false, &t);
-    case w::Tag::kU64:
-      return integer(static_cast<int64_t>(r.get<uint64_t>()), true, &t);
-    case w::Tag::kString:
-      return v8_string(m_iso, r.str());  // a SET column stays a string (Oracle's SQL API)
-    case w::Tag::kDate:
-    case w::Tag::kTime:
-    case w::Tag::kDatetime:
-    case w::Tag::kTimestamp:
-      return temporal(read_temporal(r, tag), false);
-    default: {
-      // The others convert as arguments do (DECIMAL by decimal_type, JSON parsed, ...): step back
-      // over the tag.
-      Reader back(r.all(), r.pos() - 1);
-      Local<Value> v = argument(back, t);
-      r = back;
-      return v;
-    }
-  }
+  protocol_failure("an unknown value tag");
 }
 
 // ------------------------------------------------------------ from JavaScript
@@ -522,7 +571,7 @@ std::pair<__int128, __int128> int_range(const ParamType &t) {
 bool put_tag(Writer &wr, w::Tag tag) { return wr.put(static_cast<uint8_t>(tag)); }
 
 void need(bool ok) {
-  if (!ok) throw ArenaFull{};
+  if (!ok) throw TooLarge{};
 }
 
 /** A whole decimal string (sign, digits) as a 128-bit integer; false if it does not fit. */
@@ -640,7 +689,7 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
         cannot(v, t);
       }
       std::optional<std::string> d = decimal_text(text, t.sql_name());
-      if (!d) cannot(v, t);
+      if (!d || !valid_decimal(*d)) cannot(v, t);
       need(put_tag(wr, w::Tag::kDecimal) && wr.str(*d));
       return;
     }
@@ -702,19 +751,27 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
             Local<v8::Number> num;
             if (e->ToNumber(ctx).ToLocal(&num)) x = num->Value();
           }
-          f[i] = static_cast<float>(x);
+          f[i] = static_cast<float>(x);  // the host checks that the elements are finite (§7.2)
         }
       } else {
         cannot(v, t);
       }
       if (f.size() > w::kMaxVectorDimensions) throw ConversionError{"VECTOR too large: " + std::to_string(f.size())};
+      if (f.empty()) throw ConversionError{"a VECTOR needs at least one dimension"};
       need(put_tag(wr, w::Tag::kVector) && wr.put(static_cast<uint32_t>(f.size())) && wr.align() &&
            wr.bytes(std::as_bytes(std::span<const float>(f))));
       return;
     }
-    case w::Tag::kDate:
-    case w::Tag::kDatetime:
     case w::Tag::kTimestamp: {
+      // The instant itself (§7.2), within the wire's range.
+      if (!v->IsDate()) cannot(v, t);
+      const double ms = v.As<v8::Date>()->ValueOf();
+      if (!std::isfinite(ms) || ms < 0 || ms > static_cast<double>(w::kMaxTimestamp / 1000)) cannot(v, t);
+      need(put_tag(wr, w::Tag::kTimestamp) && wr.put(static_cast<int64_t>(ms) * 1000));
+      return;
+    }
+    case w::Tag::kDate:
+    case w::Tag::kDatetime: {
       if (!v->IsDate()) cannot(v, t);
       const double ms = v.As<v8::Date>()->ValueOf();
       if (!std::isfinite(ms)) cannot(v, t);
@@ -733,6 +790,7 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
         out.second = static_cast<uint8_t>(second);
         out.micro = micro;
       }
+      if (!valid_temporal(out)) cannot(v, t);
       write_temporal(wr, out);
       return;
     }
@@ -743,6 +801,7 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
       if (tm->hour > w::kMaxTimeHour || (tm->hour == w::kMaxTimeHour && tm->minute == 59 && tm->second == 59 &&
                                           tm->micro > 0))
         throw ConversionError{"TIME value out of range: " + s};
+      if (!valid_temporal(*tm)) cannot(v, t);
       write_temporal(wr, *tm);
       return;
     }
@@ -777,8 +836,9 @@ void Values::write_param(Writer &wr, Local<Value> v) {
       if (lossless) {
         need(put_tag(wr, w::Tag::kU64) && wr.put(u));
       } else {
-        std::optional<std::string> d = decimal_text(str(v), "SQL");
-        need(put_tag(wr, w::Tag::kDecimal) && wr.str(d.value_or("0")));
+        const std::optional<std::string> d = decimal_text(str(v), "SQL");
+        if (!d || !valid_decimal(*d)) throw ConversionError{"cannot bind " + str(v)};
+        need(put_tag(wr, w::Tag::kDecimal) && wr.str(*d));
       }
     }
   } else if (v->IsDate()) {
