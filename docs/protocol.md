@@ -116,10 +116,37 @@ The host MUST obey these rules towards the region:
   same bytes of the region twice for one decision.
 * It never reads back anything it wrote into the region.
 
-A worker trusts the host. A worker that receives something that breaks
-this protocol MUST exit with a non-zero status, at once, without running
-further guest code and without letting guest code observe the failure
-(this document calls it a **protocol failure**).
+A worker trusts the host, and the host owes it correct messages: every
+value within its domain (§7.2), every str well-formed, every rule of this
+document that binds the host. A worker therefore need not validate the
+host as the host validates a worker. It MUST check only what keeps a
+*mistaken* host from making it unsafe:
+
+1. every length and count against the bytes it has, and every count whose
+   elements can be empty against the limits of §12 (a first batch of a
+   result set has at least one column);
+2. every tag, kind, status, mode, action and operation it reads; it
+   decodes each value by the value's own tag (a value that is not NULL
+   and whose tag differs from its Column's or Param's is a protocol
+   failure);
+3. every number it uses to find its own state: the argument count of a
+   CALL against the routine's Params, a routine id against what is
+   prepared, the values of a row against the set's column count,
+   `failed_row` against the rows it sent, UNCHANGED against a body it
+   holds;
+4. that the message is one its state can take: the operation, `depth`,
+   `call_seq`, and the reply kind for the action (§10.1).
+
+It need not check the domains of §7.2, the well-formedness of the host's
+str, reserved or unused fields, or what the host guarantees about order
+and uniqueness. A host value outside its domain may give guest code an
+unspecified value or end the worker, but never an access outside the
+message. A worker never ignores a message: every post of the host is
+followed by a post of the worker or by its exit.
+
+When a worker finds that a message breaks this protocol (a **protocol
+failure**), it MUST exit with a non-zero status, at once, without running
+further guest code and without letting guest code observe the failure.
 The exceptions, where a worker goes on, are named where they apply:
 ill-formed text in SQL data (§7.1), any float bit pattern (§7.2), unknown
 control datagrams (§6), and a host message too large for the worker to
@@ -130,14 +157,28 @@ life: a pair (the account that owns the code, the account whose rights
 the code runs with). For a routine that runs with its definer's rights
 both are the definer; for one that runs with the invoker's rights the
 pair is (definer, invoker); for code a session submits directly, and for
-PARSE_LIBRARY, both are the session's account. An account here is one
+PARSE_LIBRARY, both are the session's account; for code that a routine's
+SQL submits (a routine it creates included), the pair is that routine's.
+When a session creates a routine, the code is checked in the worker of
+(definer, creating account): the creator wrote the code, and the
+routine's own rights apply only when it is called. (To name another
+definer the creator needs the privilege that already lets it run code as
+that definer; its code then runs in a worker that also serves that
+definer's invoker-rights routines for it. That is accepted.) "The account
+whose rights apply" is always the one whose privileges the server's
+security context holds at the call — under a definer-rights procedure,
+view or trigger that is their definer, not the session's user. The host
+never substitutes rights: it only refuses a worker whose principal
+differs. An account here is one
 incarnation of it: the host retires every worker whose principal names an
-account that was dropped or renamed. The host MUST NOT send a worker a PREPARE, CALL or
+account that was dropped, renamed, or created after the worker started. The host MUST NOT send a worker a PREPARE, CALL or
 PARSE_LIBRARY of another principal, nor a library body that its
 principal's routine may not have (§9.10), and runs a worker's SQL only
 with the rights of its principal's second account. So code that took over
 a worker can do only what its owner's code may already do with those
-rights. RESET does not change the principal.
+rights. RESET does not change the principal. A host MAY treat a set of
+owner accounts that an administrator declared to trust each other as one
+owner (Appendix A); the principal is never on the wire.
 
 The rule protects against the code's owner. It does not protect a
 principal from its callers: a caller who takes over a worker through the
@@ -265,9 +306,15 @@ worker can write it). Initially W = H = 0.
 * A side reads `msg` and the arena only between observing the other
   side's post and its own next write to the arena. What it needs later it
   MUST copy first.
-* A side MUST NOT run code that can post a message (guest code, a nested
-  request) between the moment it begins to compose a message and the
-  moment it posts it.
+* While a side composes a message, nothing else may be posted and the
+  message must not be disturbed. A worker that converts guest values
+  while it writes (a conversion can run guest code) meets this either by
+  converting first and writing afterwards, or by refusing, with an error
+  in guest code, any SQL or import that guest code attempts during the
+  conversion. In both cases the body is complete before its first chunk
+  is posted; views of the arena that guest code holds are copied or
+  detached before the worker writes the arena; and a request is not over
+  for interrupts (§11.1) before its conversions are done.
 
 So the worker begins (READY), and every message, CONTINUE included, passes
 the turn. There is never more than one message outstanding.
@@ -355,8 +402,9 @@ learns that the host is gone from the control socket (§6).
 | 32 | 8 | `call_seq` | sequence number of the top-level request (§8.2) |
 
 A message is a header and a body of `total_len` bytes. The body's layout
-depends on `op` (§9). A receiver MUST consume a body exactly: missing or
-trailing bytes are malformed.
+depends on `op` (§9). The host MUST consume a worker's body exactly:
+missing or trailing bytes are malformed. A worker never reads past a
+body and need not look for trailing bytes (§1).
 
 ### 5.2 Chunks
 
@@ -378,8 +426,11 @@ The receiver of a chunked message MUST check, **on the first chunk**,
 everything it would check on a whole message (op allowed here, `depth`,
 `call_seq`, `total_len` within the limit for this op, §12), and on every
 chunk the rules above, including that `op`, `status`, `depth`, `call_seq`
-and `total_len` repeat the first chunk's. The sender MUST check every CONTINUE in full (all
-header fields as given above).
+and `total_len` repeat the first chunk's; as sender it MUST check every
+CONTINUE in full (all header fields as given above). These are the host's
+duties. A worker checks of each chunk its `len` (at most the arena and the
+bytes still due) and, on the first, what §1 lists and whether it can hold
+`total_len` (§5.3); of a CONTINUE, its `op`.
 
 ### 5.3 Size limits
 
@@ -457,8 +508,8 @@ sends; it never reads.
 nothing above U+10FFFF. U+0000 is allowed.
 
 A receiver MUST check a count against the bytes left in the body (every
-element has a minimum size) and against the limits of §12 before it
-allocates for it.
+element has a minimum size) before it allocates for it; the host also
+checks it against the limits of §12 (a worker: §1, item 1).
 
 **Text from a worker.** Every str and lstr a worker sends MUST be
 well-formed; the host checks it and anything else is a violation. Text that guest code
@@ -525,13 +576,28 @@ date and clock time without a time zone. Month 0 and day 0 are legal
 A TIME with all fields zero and negative = 1 is legal and equals zero;
 senders SHOULD send negative = 0 for it.
 
-**TIMESTAMP** is an instant. It does not depend on any time zone: the
-host converts between the instant and the session's zone when it talks to
+**TIMESTAMP** is an instant. The host converts between the instant and the session's zone when it talks to
 the server; a worker converts to its language's instant type, or to local
 time in the zone of OPTIONS (§9.8) where a language requires that. The
-host MUST take the instant from the server's stored value, not from a
-local time it would have to convert back (a local time is ambiguous in
-the hour a zone repeats). Wire value 0 is 1970-01-01 00:00:00 UTC. The
+host takes the instant from the server's stored value where the server
+gives it; where the server gives only a local time, the host converts it
+with the session's current zone, and a local time in an hour that the
+zone repeats is taken as its first occurrence, one that the zone skips as
+the server takes it (Appendix A); in the other direction an instant in a
+repeated hour reaches the server as a local time and is stored as its
+first occurrence. Both
+directions use the server's own rules for zones and for a repeated local
+time. If the host cannot convert in the session's current zone, a result
+fails with SQL_RESULT ERROR, an argument fails the statement before CALL
+is sent, and a returned value fails as a conversion error. Wire value 0
+is 1970-01-01 00:00:00 UTC.
+
+A worker sends a language value that is an instant as TIMESTAMP and one
+without a zone as DATETIME. DATETIME has no zone on the wire: a worker
+that maps it to an instant type uses the zone of OPTIONS, which is the
+session's zone only as long as the session has not changed it since its
+options were fixed (Appendix A); after such a change, DATETIME values the
+server computes in the new zone are read in the old one. The
 wire's range is wider than what a TIMESTAMP column stores; a value the
 server does not accept is an error (§9.4, §10.4).
 
@@ -623,7 +689,7 @@ Warning = u32 level, u32 code, str message
   failed in that language; `""` for an error of the worker itself, or of
   guest code in a language outside that list; or, only with status
   GUEST_ERROR, a marker: `MLE-Type` (a value did not convert; only in the
-  RESULT of a CALL), `MLE-TimeZone` and `MLE-Option` (OPTIONS named a zone
+  RESULT of a PREPARE or CALL), `MLE-TimeZone` and `MLE-Option` (OPTIONS named a zone
   the worker does not know, or gave a setting a value it does not accept;
   only in the RESULT of OPTIONS). Anything else is a violation. Where the
   host's reaction depends on the kind of error, it MUST decide by
@@ -672,8 +738,8 @@ InPrep(d,s) = w:SQL(d,s)                      h:SQL_RESULT(d,s)
   an error, not a dead worker.
 * The host MUST treat any message of a worker that the grammar does not
   allow at that point as a violation.
-* A worker that receives a message the grammar does not allow MUST exit
-  (§1).
+* A worker that receives a message its state cannot take exits (§1,
+  item 4).
 
 ### 8.2 Depth and call sequence
 
@@ -746,7 +812,8 @@ Requests at a glance (status names: §9.4; deadlines and interruption:
 | RESET | 0 | none | OK, INTERNAL | no | no | no | no | one chunk, 64 KiB |
 | OPTIONS | 0 | none | OK, GUEST_ERROR (`MLE-TimeZone`, `MLE-Option` only), INTERNAL | no | no | no | no | one chunk, 64 KiB |
 
-"if `check`": empty when PREPARE's `check` is 0, otherwise a violation.
+"if `check`": empty unless PREPARE's `check` is 1 and the status is OK;
+otherwise a violation.
 A status not listed for a request is a violation. "no" in a column means
 the field MUST be absent or empty; otherwise a violation.
 
@@ -768,7 +835,8 @@ most 64 KiB.
   the worker sends 0. Minor versions assign bits; a host ignores bits it
   does not know.
 * `info`: free text; with a failed READY, the reason.
-* `worker_class`: the kind of worker, 1 to 32 characters of `[a-z0-9_]`
+* `worker_class`: the kind of worker, fixed by its implementation (not a
+  name from the host's configuration), 1 to 32 characters of `[a-z0-9_]`
   (Appendix B.1).
 * `languages`: the language identifiers the worker accepts in PREPARE and
   PARSE_LIBRARY, at least one, each 1 to 32 characters of `[a-z0-9_]`, no
@@ -813,7 +881,8 @@ Compile a routine and prepare it under `routine_id` (§8.3).
   language's).
 * `imports`: the libraries of the routine's `USING` clause; an empty
   `alias` means the library's own name.
-* `schema`: the routine's schema: the current schema while it runs.
+* `schema`: the routine's schema: the current schema while it runs. For
+  `<eval>` it is the session's current schema and may be empty.
 * `check`: the worker also looks for problems beyond syntax and reports
   them as findings (§9.4); they do not fail the PREPARE.
 * `library_epoch`: §9.10.
@@ -821,7 +890,8 @@ Compile a routine and prepare it under `routine_id` (§8.3).
 The host guarantees: Param names are not empty and differ; `imports`
 have non-empty names (as §9.10) and effective aliases (the alias, or the
 library's name when the alias is empty) that differ; `schema` is not
-empty; with `<eval>` there are no Params and `has_return` is 1.
+empty (except for `<eval>`); with `<eval>` there are no Params and
+`has_return` is 1.
 
 RESULT: OK; GUEST_ERROR with the compile error; others per the table.
 What the language cannot take as it is (parameter names that are not its
@@ -896,18 +966,21 @@ is larger than MLE allows"). For DROP, RESET and OPTIONS the worker cuts
 the Error (frames first, then the message) so that the RESULT fits its
 64 KiB.
 
-**Console.** `stdout` and `stderr` are everything guest code printed in
+**Console.** `stdout` and `stderr` are everything (within the bound
+below) that guest code printed in
 this worker that no earlier RESULT carried, at whatever depth it was
 printed (any bytes): so with nested requests the host receives output in
 the order it was printed. The order between the two streams is not kept.
 Only the RESULTs of PREPARE and CALL carry console output; output printed
 at another time (by guest code that runs outside a request, §10.6) waits
-for the next of them, and RESET discards what waits.
+for the next of them, and RESET discards what waits. A worker may bound
+the output it keeps per stream (not below 64 KiB), keeping the end.
 `console_cleared` = 1: guest code cleared the console before it printed
 what this message carries; the host drops all output it kept for the
 session.
 
-**Findings.** One str per problem a PREPARE with `check` found.
+**Findings.** One str per problem a PREPARE with `check` found; only
+with status OK (with another status: a violation).
 
 **Host reactions.** OK: the request succeeded. GUEST_ERROR, INTERRUPTED,
 EXHAUSTED: the request fails with that outcome; the worker stays in use
@@ -967,32 +1040,40 @@ OPTIONS again before it uses the worker. RESULT OK. Top level only.
 str time_zone, list of (str name, str value) settings (≤ 256)
 ```
 
-Session settings a worker needs.
+What a worker needs to know of the session.
 
-* `time_zone`: the session's time zone, 1 to 64 bytes: an IANA name or
-  an offset `+hh:mm` / `-hh:mm` from −13:59 to +14:00. A worker uses it wherever a language shows local time.
-* `settings`: the session's language settings, as names and values. The
-  protocol defines none: each name belongs to a language or worker kind
-  and is defined with it (Appendix B.2). Names are 1 to 64 characters of
-  `[a-z0-9_.]`, sorted ascending by bytes, no duplicates; a value is at
-  most 1024 bytes. The whole message is one chunk (§12). The message carries the
-  complete set: a setting that is absent has its default. A worker ignores
-  names it does not know, and answers GUEST_ERROR with language
-  `MLE-Option` for a value it does not accept for a name it knows.
+* `time_zone`: a time zone, 1 to 64 bytes: an IANA name or an offset
+  `+hh:mm` / `-hh:mm` from −13:59 to +14:00. A worker uses it wherever a
+  language shows local time.
+* `settings`: names and values. The protocol defines none; the names in
+  use are listed in Appendix B.2. Names are 1 to
+  64 characters of `[a-z0-9_.]`, sorted ascending by bytes, no
+  duplicates; a value is at most 1024 bytes. The whole message is one
+  chunk (§12). A setting that is absent has its default; the host may
+  leave out those that have it. A worker ignores names it does not know,
+  and answers GUEST_ERROR with language `MLE-Option` for a value it does
+  not accept for a name it knows.
 
 A worker has **options in force** from an OPTIONS it answered OK until
 RESET. The host MUST NOT send PREPARE, CALL or PARSE_LIBRARY to a worker
-without options in force, and MUST send OPTIONS before the next top-level
-PREPARE, CALL or PARSE_LIBRARY whenever the session's zone or settings
-differ from the options in force. DROP and RESET need no options. (A change made by a routine's own SQL therefore reaches the worker
-with the next top-level request; until then DATETIME values and the
-worker's idea of local time may disagree.) The options in force apply to
-every request served under them, also to routines prepared earlier.
+without options in force; DROP and RESET need none. The options in force
+apply to every request served under them.
+
+A session has one set of **fixed options** at a time. The host fixes
+them before the session's first PREPARE, CALL or PARSE_LIBRARY (for
+MySQL: the zone and settings then in effect) and keeps them until the
+session's state is reset (Appendix A); an OPTIONS that failed fixes
+nothing. Every worker the session uses gets the same fixed options: the
+host MUST NOT send PREPARE, CALL or PARSE_LIBRARY to a worker whose
+options in force differ from them. It sends OPTIONS only to a worker in
+which no id is prepared (after READY or RESET), so options never change
+under prepared routines. A statement that would change the fixed options
+while a request of the session is in progress fails with an error.
 
 RESULT OK: these options are in force. GUEST_ERROR with language
-`MLE-TimeZone` (the worker does not know the zone) or `MLE-Option`: the
-options in force are unchanged (possibly none), and the host fails the
-user's statement.
+`MLE-TimeZone` (the worker does not know the zone, or the text is not a
+zone) or `MLE-Option`: the options in force are unchanged (possibly
+none), and the host fails the user's statement.
 
 ### 9.9 PARSE_LIBRARY (12)
 
@@ -1056,9 +1137,10 @@ Other values are malformed.
   a library, a routine's `USING` clause or the right to use a library
   changes, the host changes the epoch after the change is visible to its
   LIBRARY answers and before the statement that made the change reports
-  success; it may change it more often. It answers LIBRARY from the
-  current catalog, for the routine id of the request at that depth
-  (REFUSED if that routine no longer exists). So a routine costs no
+  success; it may change it more often. It answers LIBRARY with the
+  current libraries and rights, for the routine as it knew it when it
+  sent that routine's PREPARE (at its creation: the routine being
+  created, with the creator's rights). So a routine costs no
   LIBRARY messages while the epoch stands, and a routine never uses an
   answer given to another.
 * A worker may keep bodies, and what it compiled from each, as long as it
@@ -1131,7 +1213,8 @@ Each action is allowed in some states and has a fixed set of replies:
 | NEXT_RESULT | any | OK, ROWS, ERROR, END |
 | CLOSE | any | OK |
 
-A reply kind outside this table is a protocol failure for the worker.
+A reply kind outside this table is a protocol failure for the worker
+(§1, item 4).
 The next state follows from the action and the reply:
 
 1. **CLOSE** is always answered OK, in every state and situation (also
@@ -1139,7 +1222,8 @@ The next state follows from the action and the reply:
    id is CLOSED.
 2. An action **not allowed** in the id's state is answered ERROR and
    changes nothing. (A worker knows the state, so it knows this case; it
-   is an error, not a violation.)
+   is an error, not a violation. A worker may also fail such an action in
+   guest code without sending it.)
 3. An **allowed** action first discards what it replaces: EXECUTE_PREPARED
    and EXECUTE_MANY all pending results of the id, NEXT_RESULT the rest of
    the current result set, FETCH nothing. Then:
@@ -1153,8 +1237,9 @@ The next state follows from the action and the reply:
 | ROWS with `more` = 1 | ROWS |
 
 For NEXT_RESULT in IDLE or CLOSED there is nothing to move to, and the reply is END, so a loop "while there
-is a next result" needs no special case. Under NEXT_RESULT a CLOSED id
-stays CLOSED whatever the reply.
+is a next result" needs no special case: in these two states the only
+replies are END and, where the host refuses all SQL, ERROR; the state
+does not change.
 
 Where the host refuses all SQL (while serving PREPARE; from the moment an
 interrupt is noticed, §11.1 step 2), that refusal comes first: every action but CLOSE
@@ -1220,7 +1305,8 @@ Actions:
     warnings.
 
 In an OK that does not answer PREPARE, `param_count` is 0; in an OK that
-answers PREPARE or CLOSE, every other field is 0 or empty. `failed_row`
+answers PREPARE or CLOSE, every other field is 0 or empty (`exec_us`
+excepted: it is informative everywhere). `failed_row`
 is 0xFFFFFFFF in every ERROR that does not answer an EXECUTE_MANY.
 `param_count` is at most 65535. `affected_rows` is the server's count as
 it reports it.
@@ -1255,8 +1341,8 @@ the action that produced the set, the following ones in reply to FETCH.
     either empty, meaning "nothing new", or the complete list of this
     result so far. The list in the batch with `more` = 0 is the complete
     list and replaces any earlier one, also when it is empty.
-  * A later batch with columns, or with another `total_rows`, is a
-    protocol failure for the worker.
+  * A later batch never carries columns, nor another `total_rows`. (A
+    worker need not check `total_rows`.)
 * **END**: there is no further result.
 * `exec_us`: the server's execution time in microseconds for the action,
   0 if not measured. Informative.
@@ -1349,10 +1435,12 @@ When a request ends with status GUEST_ERROR, its Error says what the
 client gets:
 
 1. `sql_error_id` ≠ 0 and it is the `error_id` of an ERROR the host sent
-   during this top-level request, and the host still holds that error: the
-   client gets **that error unchanged** (number, SQLSTATE, full message).
-   The host holds at least the 16 most recent ERRORs of a top-level
-   request. Other fields of the Error are ignored for the outcome.
+   to this worker during this top-level request, and the host still holds
+   that error (it holds at least the 16 most recent per worker): the
+   client gets **that error**: its number and SQLSTATE always, and its
+   message in full where the server lets the host raise it so. Where the
+   server lets the host raise no condition of its choice (Appendix A),
+   rule 3 applies. Other fields of the Error are ignored for the outcome.
 2. Otherwise, `sql_errno` in 1..65535 and `sqlstate` of 5 characters whose
    class (first two) is neither `00` nor `01`: the routine raises its own
    SQL error; the client gets this number and SQLSTATE and the message,
@@ -1380,11 +1468,13 @@ the following for each, with a clock per worker.
 
 1. It records "interrupt requested" for the request's `call_seq` *s*,
    then sends INTERRUPT(*s*) (once or more, §6). The record stands even if
-   the send fails. Three things are serialized between the host's threads:
-   making the record, posting the first chunk of request *s*, and
-   receiving the last chunk of its RESULT. A record is made only between
-   the last two: an INTERRUPT never names a request that was not sent,
-   and a request that is complete is not interrupted.
+   the send fails. The host's threads are ordered so that a record is
+   made only between the post of the first chunk of request *s* and the
+   receipt of the last chunk of its RESULT: an INTERRUPT never names a
+   request that was not sent, and a request that is complete is not
+   interrupted. (One atomic state per worker — idle, running *s*,
+   interrupt requested for *s* — gives this order; no lock is needed on
+   the path of a request.)
 2. From the moment the session's thread notices the record it does no
    new work for the request: every SQL_RESULT is ERROR (to CLOSE: OK,
    §10.1), also for a statement that was running and succeeded meanwhile;
@@ -1439,8 +1529,11 @@ the following for each, with a clock per worker.
    and answering them, and every turn of a chunked message of the worker,
    other than a RESULT, whose first chunk the host observes after the
    moment of notice. Products are exact, rounded up to the clock's unit.
-   When the clock's limit or a bound of (b) is exceeded, the host ends
-   the worker; the request's outcome in the host is "killed" (§11.3). The
+   The limit is tested when a post is observed and at every bounded
+   sleep: a RESULT observed after the limit does not save the worker.
+   While it waits for a chunk the worker is to post, the host takes n as
+   the smaller of the arena and the bytes still due. When the clock's
+   limit or a bound of (b) is exceeded, the host ends the worker; the request's outcome in the host is "killed" (§11.3). The
    time a worker can add after a kill is thus bounded (Appendix A).
 4. To the client the request is **interrupted** in every case: whatever
    the RESULT's status, and also when the host had to end the worker.
@@ -1448,11 +1541,14 @@ the following for each, with a clock per worker.
 The host looks for a kill at least at every bounded sleep (§4.3), after
 each message of the worker it observed (before it acts on it, step 3),
 and between chunks in both directions. If the session is already killed, or its statement already
-out of time, when a top-level request would start, the host sends
-nothing.
+out of time, when a top-level PREPARE, CALL or PARSE_LIBRARY (or the
+OPTIONS before it) would start, the host sends nothing. DROP and RESET
+are still sent: they run no guest code and keep the worker usable.
 
-**The worker's side.** A worker keeps three variables under one lock,
-shared by the thread that serves requests and the control thread:
+**The worker's side.** A worker behaves as if it kept three variables
+under one lock, shared by the thread that serves requests and the control
+thread (what is required are the outcomes listed after the table; a
+worker may reach them without a lock on the path of a request):
 `running` (the `call_seq` of the interruptible top-level request being
 served, or none), `last` (the highest `call_seq` it began to serve,
 initially 0) and `pending` (a `call_seq`, or none). A worker *begins to
@@ -1463,7 +1559,7 @@ serve* a top-level request when it has received it completely.
 | begin to serve interruptible top-level request *s* | `last` = *s*, `running` = *s*; if `pending` = *s*: deliver the interrupt now. `pending` = none |
 | begin to serve any other top-level request *s* | `last` = *s*; `pending` = none |
 | INTERRUPT(*q*) | if *q* = `running`: deliver the interrupt (once per request); else if *q* > `last`: `pending` = *q*; else ignore |
-| the top-level request ends: the worker has fixed the status of its RESULT | `running` = none; an interrupt delivered but not yet acted on is cancelled |
+| the top-level request ends: the worker has fixed the status of its RESULT | `running` = none; an interrupt delivered but not yet acted on by the runtime is cancelled |
 
 "Deliver" means: make the guest code of this request stop soon, at every
 depth. The requirements:
@@ -1473,17 +1569,21 @@ depth. The requirements:
   later request, and never the code that sends the RESULT.
 * After delivery the worker ends the top-level request as soon as its
   runtime allows, with status INTERRUPTED unless the request had already
-  completed or failed otherwise (the last row of the table: an interrupt
-  the runtime had not acted on is cancelled, and the RESULT is what it
-  would have been). (The grace period is the host's; a worker does not
-  know it.) Nested PREPARE and CALL end INTERRUPTED too. A nested DROP is
+  failed otherwise. If the guest code completed before the runtime acted
+  on the interrupt, the worker may answer either what the code produced
+  or INTERRUPTED (not every runtime can tell); the host reports the
+  request as interrupted in both cases (step 4). A worker whose runtime
+  cannot cancel a delivered interrupt absorbs it before it posts the
+  RESULT, or sets `tainted`: an interrupt never reaches a later request. (The grace period is the host's; a worker does not
+  know it.) Nested PREPARE and CALL end INTERRUPTED too, with the same
+  allowance. A nested DROP is
   not guest code: it is completed and answered OK.
 * Guest code does not go on after an interrupt: if a nested routine was
   interrupted and the outer guest code catches the resulting error, the
   worker stops the outer code as well. What a language runs while it
   unwinds (cleanup handlers) may run; it gets ERROR for all SQL except
-  CLOSE — from the host, or from the worker itself without a message —
-  and the worker bounds it.
+  CLOSE, and for imports — from the host, or from the worker itself
+  without a message — and the worker bounds it.
 * INTERRUPTED is only for a delivered interrupt (§10.6).
 
 DROP, RESET and OPTIONS are not interruptible; they have a deadline
@@ -1574,7 +1674,7 @@ The last column says who keeps the limit and what happens beyond it.
 | DECIMAL text | 100 bytes | sender; from a worker a violation (the worker checks guest values, §10.6) |
 | VECTOR dimensions | 1 to 16383 | as DECIMAL |
 | Nesting depth | 0 to 31 | host; error (§8.2) |
-| ERRORs the host holds for §10.8 | ≥ 16 per top-level request | host |
+| ERRORs the host holds for §10.8 | ≥ 16 per top-level request and worker | host |
 | Open statements, result memory, request bytes per session | host policy | host; error (§10.7) |
 
 A worker MUST NOT refuse a host message that is within this table for a
@@ -1617,8 +1717,8 @@ What the host does with each thing a worker controls. "V" = violation
 | Sequence word, sleep flag, timing | none can be trusted | bounded sleeps, deadlines, grace |
 | Reserved bytes of the region outside `msg` | none | ignored |
 
-A worker treats every malformed or out-of-place message of the host as a
-protocol failure and exits, with the exceptions listed in §1.
+A worker checks the host's messages only as far as §1 lists, and exits on
+what it finds.
 
 ## 14. Versioning and evolution
 
@@ -1648,7 +1748,8 @@ protocol failure and exits, with the exceptions listed in §1.
   needs at least a minor version; towards an older worker the host fails
   the statement that would need it.
 * **Reserved** fields and bits of messages: the sender writes 0; the
-  receiver treats non-zero as malformed (except READY's `features`, whose
+  host treats non-zero as malformed; a worker need not check (§1). (The
+  exception: READY's `features`, whose
   unknown bits the host ignores, as it ignores a minor version above its
   own). Unassigned ops, tags, actions,
   kinds and status values are malformed. Bodies have no optional trailing
@@ -1660,8 +1761,8 @@ protocol failure and exits, with the exceptions listed in §1.
 
 1. Starts as §2; a runtime that cannot serve gives a failed READY and an
    exit (§2 step 5); any other failed start exits non-zero.
-2. Takes turns exactly (§4): posts only on its turn; never composes a
-   message while guest code that could post can run; uses the orderings of
+2. Takes turns exactly (§4): posts only on its turn; lets nothing be
+   posted while it composes a message (§4.1); uses the orderings of
    §4.2 and shared futexes; wakes the host when `h_sleep` is set.
 3. Chunks as §5.2 and respects the size limits of §12; completes a
    transfer it cannot hold and fails it locally (§5.3).
@@ -1681,6 +1782,7 @@ protocol failure and exits, with the exceptions listed in §1.
 8. Makes violations unreachable from guest code (§10.6, §13).
 9. Implements interruption by the table of §11.1.
 10. Sets `tainted` before the RESULT when it must not be reused.
+    Checks the host's messages as §1 lists, and never ignores one.
 11. Exits on end of file of the control socket, and on any protocol failure of the
     host, without letting guest code see it.
 
@@ -1699,7 +1801,9 @@ protocol failure and exits, with the exceptions listed in §1.
    session (§9.7); keeps the epoch rule of §9.10.
 5. Implements the statement states of §10.1 and the bounds of §10.7
    (discarding as §5.3).
-6. Sends values with exactly the tags of §7.3, and no non-finite floats.
+6. Sends correct messages, which a worker does not validate: values with
+   exactly the tags of §7.3 and within the domains of §7.2, no non-finite
+   floats, every str well-formed.
 7. Resolves a routine's final error by §10.8.
 
 ## 16. Sequence diagrams
@@ -1801,7 +1905,7 @@ sequenceDiagram
   W->>H: SQL EXECUTE id 2 "DELETE ..."
   H->>W: SQL_RESULT OK
   W->>H: RESULT GUEST_ERROR, Error.sql_error_id = 1
-  Note over H: the client gets error 1062 unchanged
+  Note over H: the client gets error 1062 / 23000
 ```
 
 ## 17. Test vectors
@@ -1931,18 +2035,56 @@ These are choices of the current host, not rules of the protocol.
 | Console output kept | 64 KiB per session |
 | Routine error message when raised as SQL error | cut to 128 characters |
 
+**Reading results.** The host need not buffer a whole result set before
+it sends the first batch: `total_rows` may be unknown. `exec_us` costs
+two clock reads per statement and is measured only on request.
+
+**Session options (Oracle's rule).** A session's time zone and settings
+are fixed when it first runs a stored program and hold until
+`mle_session_reset()`; `mle_set_session_state()` is refused while the
+session has stored programs cached. OPTIONS is therefore sent once per
+worker and session. `mle_session_reset()` releases the session's workers
+(a kept one gets RESET, and OPTIONS with the new values when a session
+takes it).
+
+**Declared character sets (Oracle's rule).** A routine's string
+parameters and return type must be declared utf8mb4 or binary; values in
+other character sets are converted by the server.
+
+**TIMESTAMP.** The server gives and takes a TIMESTAMP only as local time
+in the session's current zone; the host converts with the system's zone
+data. Wanted: a server service that exposes the stored instant.
+
+**A handed-back SQL error.** While it is still the session's current
+error it reaches the client unchanged. An older one is raised anew with
+its number and SQLSTATE and its message cut to 128 characters; inside a
+stored function the server lets the host raise none, and it becomes a
+routine error. Wanted: a server service that raises a condition by
+number, SQLSTATE and text.
+
+**Owners that trust each other.** An administrator may declare a set of
+accounts whose code may share workers; the host then treats them as one
+owner in a principal. Without it, invoker-rights routines of different
+definers run in different workers for the same invoker.
+
+**A killed session** still waits, for each worker it keeps, up to the
+deadline of the DROP or RESET it sends.
+
 **Workers and sessions.** A kept worker is given to any session that
 needs its principal; a stricter host gives it to sessions of one account
 only (§1).
 
-**Libraries.** The host allows a routine to import the libraries named in
-its `USING` clause and the libraries those import. A body is never given
-to a routine whose definer may not use the library. `CREATE LIBRARY` from
+**Libraries.** A routine without a `USING` clause may import none. A
+routine with one may import its `USING` libraries and, because the host
+cannot see which libraries those import, any library that the account
+whose rights apply may use, by the catalog at the time of the answer
+(§9.10). `CREATE LIBRARY` from
 a routine's SQL is refused (the check would need the worker that waits).
 
 **Time zone.** `SYSTEM` is sent as the IANA name of mysqld's zone if the
 host can determine one, else as the current offset (which is then wrong
-across a change of daylight saving time). The server's zone names and a
+after a change of daylight saving time, for as long as the session's
+options stay fixed). The server's zone names and a
 worker's come from different zone data; a name the worker lacks fails the
 statement (`MLE-TimeZone`). Zones the
 host cannot express (leap-second zones) fail the user's statement before
@@ -1956,6 +2098,12 @@ triggers; the host answers such SQL with ERROR
 
 The protocol itself knows no guest language: it carries routine source,
 SQL values and settings. Everything specific to a language is here.
+
+For JavaScript, what guest code sees is defined by Oracle's documentation
+of JavaScript stored programs in MySQL (the SQL API, the type
+conversions, the session functions, libraries, the forms of errors): that
+documentation, not this appendix, is the reference. Python and Java
+follow the same model, adapted to the language.
 
 ### B.1 Identifiers
 
@@ -1973,10 +2121,16 @@ SQL values and settings. Everything specific to a language is here.
 
 ### B.2 Settings in OPTIONS
 
+The session's options are those of Oracle's `mle_set_session_state()`;
+they are not tied to one language.
+
 | Name | Values | Meaning |
 |---|---|---|
-| `js.integer_type` | `unsafe_string` (default), `unsafe_bigint`, `string`, `bigint` | how JavaScript receives I64 and U64: a number when \|n\| ≤ 2^53 − 1 and otherwise a string / a BigInt; always a string; always a BigInt |
-| `js.decimal_type` | `string` (default), `number` | how JavaScript receives DECIMAL |
+| `integer_type` | `unsafe_string` (default), `unsafe_bigint`, `string`, `bigint` | JavaScript: how I64 and U64 arrive: a number when \|n\| ≤ 2^53 − 1 and otherwise a string / a BigInt; always a string; always a BigInt. Other languages have 64-bit integers and ignore it. |
+| `decimal_type` | `string` (default), `number` | JavaScript: DECIMAL as a string or a number. Python: DECIMAL as `Decimal` or `float`. Java ignores it (`BigDecimal`). |
+
+A setting of one language only would be named with its prefix
+(`python.…`).
 
 ### B.3 Routine source forms (`entry` of PREPARE)
 
@@ -1992,8 +2146,9 @@ Loading runs guest code in JavaScript (module top level) and Python
 ### B.4 Types
 
 A worker documents how each tag appears in its languages (for
-JavaScript: I64 and U64 by `js.integer_type`, DECIMAL by
-`js.decimal_type`, TIMESTAMP and DATETIME as `Date`, VECTOR as
+JavaScript: I64 and U64 by `integer_type`, DECIMAL by
+`decimal_type`; DATE, DATETIME and TIMESTAMP as `Date`, a zero date or
+zero timestamp as an Invalid Date; TIME as a string; VECTOR as
 `Float32Array`; and so on per language). The mapping is not part of the
 protocol; the MySQL test suite fixes it per language.
 

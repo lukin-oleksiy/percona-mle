@@ -410,3 +410,82 @@ REFUSED's meaning widened. Copy before: `protocol-r6.md`.
 uncommitted on branch v8-worker. Work list for the code: §9 of this note plus the changes of
 rounds 2–6 (§10–§14): principal pairs, library epoch, statement states and END, error ids,
 TIMESTAMP as an instant, OPTIONS as settings, grace clock, absolute deadlines, discards.
+
+## 16. First implementation: what it taught the specification (21 Nov)
+
+Rule from the user: this is an MVP, not a POC; when implementing exposes a weakness, inconsistency
+or mistake, the specification is corrected first, then every implementation. For JavaScript,
+Oracle's documentation of JavaScript stored programs is the specification of what guest code sees.
+
+Implemented against 1.0 (branch `protocol-1.0`, local commits): the wire, host codec and host
+library (f1f1c0b; unit tests pass, all vectors byte-exact), the component (acdb518; compiles and
+links, not run), the JVM worker (b1f5e78; vectors checked in-process), the native mailbox and the
+V8 worker (da1077a; 451 checks against the host library, 41 protocol-failure cases). CPython is
+not started; the JVM path is being integrated. The implementers reported about 50 questions.
+
+**Corrections made to the specification from them**
+
+| Section | Was | Now | Why |
+|---|---|---|---|
+| §9.8 | OPTIONS re-sent before a top-level request whenever the session's zone or settings differ | options are fixed per session and sent once per worker; the host may replace them, need not | Oracle: the zone in effect at first invocation holds until `mle_session_reset()`; `mle_set_session_state()` is refused while programs are cached. The per-call comparison was my answer to a problem that TIMESTAMP-as-instant already removed. |
+| B.2 | `js.integer_type`, `js.decimal_type` | `integer_type`, `decimal_type` (session options, used by each language that has the distinction) | Oracle's option names are not language-specific; Python lost its decimal default under the `js.` names. |
+| §1 | a worker exits on anything that breaks the protocol (read as: validate everything) | a worker checks what its own safety needs and need not validate a trusted host's domains, text or grammar | per-value validation on every fetched row, for nothing |
+| §4.1 | no code that can post between composing and posting | converting first, or refusing SQL and imports during conversion, both conform | the JVM worker paid two passes; V8's guard is as safe |
+| §1 | principal of a routine | plus: at CREATE the check runs as (definer, creator); code submitted by a routine's SQL has that routine's principal | the host cannot see SQL SECURITY at CREATE |
+| §7.2 | TIMESTAMP MUST be taken from the stored value | where the server gives it; else converted with the session's zone, first occurrence in a repeated hour | the server's services give local time only (a server service is wanted) |
+| §10.8 | the client gets the handed-back error unchanged | number and SQLSTATE always, the full message where the server lets the host raise it | no service to raise a condition by number, state and text |
+| §7.4 | `MLE-Type` only in the RESULT of a CALL | of a PREPARE or CALL | a conversion can fail while a routine is loaded |
+| §11.1 | INTERRUPTED unless the request "completed" | the worker may answer either if the code completed before the runtime acted | not every runtime can tell |
+| §11.1 | nothing is sent for a killed session | no PREPARE, CALL, PARSE_LIBRARY (or the OPTIONS before them); DROP and RESET still | else a killed session's workers could never be kept |
+| §9.1 | `worker_class` | fixed by the implementation, not the host's class name | two workers disagreed |
+| §9.2 | `schema` not empty | may be empty for `<eval>` | a session without a current schema |
+| §9.4 | findings | only with status OK; a worker may bound the console it keeps (≥ 64 KiB per stream) | undefined before |
+| §10.1 | — | a worker may fail a not-allowed action locally; NEXT_RESULT in IDLE/CLOSED is answered END or (refusal) ERROR only | two workers disagreed |
+| §10.2 | every other field of an OK to PREPARE/CLOSE is 0 | except `exec_us` | informative field |
+| App. A | library policy "USING and what those import" | USING, plus what the rights account may use | the host cannot parse sources |
+| App. A, B | — | Oracle's rules named: options fixed per session; declared character sets utf8mb4 or binary; Oracle's JS documentation is the reference for JavaScript | |
+
+**Still open, to decide with measurements** (performance check of old against new once the JVM
+path runs):
+
+* TIMESTAMP as an instant: two conversions per value (host through zone data, worker to the
+  language). The alternative is a wall-clock value in the zone of the options in force, which the
+  host converts only when the session's current zone differs from it.
+* Principal pairs: invoker-rights routines of different definers no longer share a worker.
+
+**Implementation defects to fix after the revision** (not protocol): two mutex acquisitions per
+top-level request in the host library; the epoch callback's string lookup per statement; a
+request object allocated per call in the JVM and V8 workers; domain validation of host values in
+the workers; the component accepts parameters declared in other character sets (Oracle refuses);
+V8 fails a CALL with a zero date argument (Oracle: an Invalid Date); six gaps in the host
+library's hook interface reported by the component.
+
+**Review of this revision** (Mythos 5.2 for consistency and holes, Fable 5.2 for consistency and a
+performance reading; text only). Mythos: "not yet consistent" — the relaxed worker rule still
+stood in its old form in six places and was too loose for a mistaken host; fixed options left six
+cases open; values after a zone change, the handed-back error and the principal needed exact
+wording. All applied: §1 now lists the four kinds of checks a worker must make and the host's
+matching duty; one set of fixed options per session, the same for every worker, sent only to a
+worker with nothing prepared; DATETIME after a zone change stated (Oracle's rule); the pair is
+kept and owners that trust each other may share workers (host policy).
+
+Decided with the user (21 Nov): **TIMESTAMP stays an instant** (the host caches the zone's
+offset per session; a wall-clock value would move the conversion into every JavaScript worker and
+make a wire value depend on options); **the principal stays a pair**, with coarsening as host
+policy.
+
+Fable's performance reading: the specification forces no clock read, system call or allocation
+on a hot path when both sides poll. Proposed protocol changes, **not yet decided**:
+
+1. `tainted` in the RESULT header (a flag) and no per-request writes to `stats`: saves a cache
+   line transfer per call each way. A further step — word, header and a small inline body on one
+   line pair per direction — to be measured before the offsets are frozen.
+2. Columns once per prepared statement: an empty column list in the first batch of a
+   re-execution means "as last sent for this id".
+3. Prepared statements that outlive a request ("kept" ids belonging to the routine in that
+   worker), and a RESET that carries the new options and may keep prepared routines: saves the
+   server's prepare on every call and a compile per routine per session.
+
+Applied now as wording only: the interrupt ordering on both sides is stated as outcomes (an
+atomic state is enough; no lock on a request's path); the host need not buffer a whole result set;
+`exec_us` only on request.
