@@ -19,8 +19,9 @@
   @file component/component.cc
 
   component_mle: stored programs in LANGUAGE JAVASCRIPT (Oracle MySQL MLE
-  compatible), PYTHON and JAVA, run in MLE worker processes (Phase 3) that
-  a launcher started by this component provides. Next to Percona's V8
+  compatible), PYTHON and JAVA, run in MLE worker processes that a launcher
+  started by this component provides. It is the host of the MLE worker
+  protocol (docs/protocol.md): the MySQL side of the border. Next to Percona's V8
   LANGUAGE JS behind component_lang_router. Design: 11-phase4-component.md.
 
   Parts: the language services (here), routines (routine.cc: metadata,
@@ -60,6 +61,8 @@
 #include <mysql/components/services/security_context.h>
 #include <mysql/components/util/event_tracking/event_tracking_authentication_consumer_helper.h>
 #include <mysql/components/util/event_tracking/event_tracking_connection_consumer_helper.h>
+#include <mysql/components/util/event_tracking/event_tracking_global_variable_consumer_helper.h>
+#include <mysql/components/util/event_tracking/event_tracking_query_consumer_helper.h>
 #include <mysqld_error.h>
 
 #include "mle_component.h"
@@ -83,6 +86,11 @@ REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_float);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_string);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_string_charset);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_null);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_timestamp);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_timestamp);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_string_factory);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_string_copy_converter);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_string_get_data_in_charset);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_int);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_unsigned_int);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_float);
@@ -356,7 +364,11 @@ class Libraries {
 };
 
 /* COM_CHANGE_USER: the session's MLE state belonged to the old account.
-   DROP USER / RENAME USER: that account's kept workers go. */
+   DROP USER / RENAME USER: that account's kept workers go, and the workers
+   sessions hold for it are retired at their next use.
+   The end of a statement, before it reports success, and a change of a
+   global variable: the library epoch changes unless the statement can have
+   changed no library, routine or right (protocol §9.10). */
 namespace Event_tracking_implementation {
 mysql_event_tracking_connection_subclass_t
     Event_tracking_connection_implementation::filtered_sub_events =
@@ -390,10 +402,41 @@ bool Event_tracking_authentication_implementation::callback(
   }
   return false;
 }
+
+mysql_event_tracking_query_subclass_t
+    Event_tracking_query_implementation::filtered_sub_events =
+        (EVENT_TRACKING_QUERY_ALL) &
+        ~(EVENT_TRACKING_QUERY_STATUS_END |
+          EVENT_TRACKING_QUERY_NESTED_STATUS_END);
+
+bool Event_tracking_query_implementation::callback(
+    const mysql_event_tracking_query_data *data) {
+  // Whether the statement failed or not: one that fails may have changed
+  // something before.
+  mle_component::statement_ended(data->sql_command == nullptr
+                                     ? std::string_view()
+                                     : std::string_view(data->sql_command));
+  return false;
+}
+
+mysql_event_tracking_global_variable_subclass_t
+    Event_tracking_global_variable_implementation::filtered_sub_events =
+        (EVENT_TRACKING_GLOBAL_VARIABLE_ALL) &
+        ~EVENT_TRACKING_GLOBAL_VARIABLE_SET;
+
+bool Event_tracking_global_variable_implementation::callback(
+    const mysql_event_tracking_global_variable_data *) {
+  // Rights can depend on global variables (mandatory_roles,
+  // activate_all_roles_on_login, partial_revokes).
+  mle_component::library_epoch_changed();
+  return false;
+}
 }  // namespace Event_tracking_implementation
 
 IMPLEMENTS_SERVICE_EVENT_TRACKING_CONNECTION(mle);
 IMPLEMENTS_SERVICE_EVENT_TRACKING_AUTHENTICATION(mle);
+IMPLEMENTS_SERVICE_EVENT_TRACKING_QUERY(mle);
+IMPLEMENTS_SERVICE_EVENT_TRACKING_GLOBAL_VARIABLE(mle);
 
 BEGIN_SERVICE_IMPLEMENTATION(mle, external_program_capability_query)
   Services::get,
@@ -422,6 +465,8 @@ BEGIN_COMPONENT_PROVIDES(mle)
   PROVIDES_SERVICE(mle, external_library_ext),
   PROVIDES_SERVICE_EVENT_TRACKING_CONNECTION(mle),
   PROVIDES_SERVICE_EVENT_TRACKING_AUTHENTICATION(mle),
+  PROVIDES_SERVICE_EVENT_TRACKING_QUERY(mle),
+  PROVIDES_SERVICE_EVENT_TRACKING_GLOBAL_VARIABLE(mle),
 END_COMPONENT_PROVIDES();
 
 BEGIN_COMPONENT_REQUIRES(mle)
@@ -442,6 +487,11 @@ BEGIN_COMPONENT_REQUIRES(mle)
   REQUIRES_SERVICE(mysql_stored_program_runtime_argument_string),
   REQUIRES_SERVICE(mysql_stored_program_runtime_argument_string_charset),
   REQUIRES_SERVICE(mysql_stored_program_runtime_argument_null),
+  REQUIRES_SERVICE(mysql_stored_program_runtime_argument_timestamp),
+  REQUIRES_SERVICE(mysql_stored_program_return_value_timestamp),
+  REQUIRES_SERVICE(mysql_string_factory),
+  REQUIRES_SERVICE(mysql_string_copy_converter),
+  REQUIRES_SERVICE(mysql_string_get_data_in_charset),
   REQUIRES_SERVICE(mysql_stored_program_return_value_int),
   REQUIRES_SERVICE(mysql_stored_program_return_value_unsigned_int),
   REQUIRES_SERVICE(mysql_stored_program_return_value_float),

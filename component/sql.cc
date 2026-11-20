@@ -17,6 +17,7 @@
 
 #include "sql.h"
 
+#include <algorithm>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -30,7 +31,6 @@
 #include <mysql/components/services/mysql_thd_attributes.h>
 #include <mysqld_error.h>
 
-#include "mle/worker.h"
 #include "mle_component.h"
 #include "routine.h"
 
@@ -52,6 +52,7 @@ extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
 
 namespace mle_component {
 
+using mle::SqlRefusal;
 using mle::SqlResultMsg;
 using mle::Tag;
 using mle::Value;
@@ -60,12 +61,15 @@ using mle::wire::SqlResultKind;
 
 namespace {
 
-/** How a column's values are read (S-3: the getter must match the type;
-    the string getter on a non-string column reports NULL). */
+/** How a column's values are read (the getter must match the type: the
+    string getter on a column that is not a string reports NULL) and which
+    tag they are sent with (§7.3). */
 enum class Reader {
+  kNull,  // a column without a type: only NULLs
   kSigned,
   kUnsigned,  // BIGINT UNSIGNED: U64
   kUnsignedSmall,
+  kFloat,
   kDouble,
   kDecimal,
   kText,
@@ -86,12 +90,15 @@ bool set_attribute(my_h_statement h, const char *name, const T &value) {
   return mysql_service_mysql_stmt_attributes->set(h, cstr(name), &value);
 }
 
+/** A text of the result set's metadata, for a str field: repaired. */
 std::string text_info(my_h_field f, const char *key) {
   const char *v = nullptr;
   if (mysql_service_mysql_stmt_resultset_metadata->field_info(f, key, &v) ||
       v == nullptr)
     return "";
-  return v;
+  std::string text = v;
+  repair_utf8(&text);
+  return text;
 }
 
 template <typename T>
@@ -108,44 +115,77 @@ uint64_t now_us() {
           .count());
 }
 
+/** Forgets the error in the diagnostics area. */
+void clear_diagnostics(MYSQL_THD thd) {
+  uint16_t empty = STATUS_DA_EMPTY;
+  (void)mysql_service_mysql_thd_attributes->set(thd, "da_status", &empty);
+}
+
+/** The statement's warnings, at most as many as one list carries (§12);
+    their messages may quote column bytes: repaired. */
+void read_warnings(my_h_statement h, std::vector<mle::Warning> *warnings) {
+  uint32_t n = 0;
+  (void)mysql_service_mysql_stmt_diagnostics->num_warnings(h, &n);
+  n = std::min(n, mle::wire::kMaxWarnings);
+  for (uint32_t i = 0; i < n; i++) {
+    my_h_warning w = nullptr;
+    if (mysql_service_mysql_stmt_diagnostics->get_warning(h, i, &w)) break;
+    mle::Warning warning;
+    mysql_cstring_with_length msg{"", 0};
+    (void)mysql_service_mysql_stmt_diagnostics->warning_level(w, &warning.level);
+    (void)mysql_service_mysql_stmt_diagnostics->warning_code(w, &warning.code);
+    (void)mysql_service_mysql_stmt_diagnostics->warning_message(w, &msg);
+    warning.message.assign(msg.str, msg.length);
+    repair_utf8(&warning.message);
+    warnings->push_back(std::move(warning));
+  }
+}
+
 }  // namespace
 
 struct SqlRunner::Statement {
   my_h_statement h = nullptr;
-  /** From PREPARE: kept until CLOSE (or the end of the call). */
+  /** Opened by PREPARE: at home in IDLE, kept until CLOSE or the end of the
+      request. Else opened by EXECUTE: at home in CLOSED. */
   bool prepared = false;
+  /** PASS_RESULT_TO_CLIENT, for the life of the id. */
   bool to_client = false;
   uint32_t param_count = 0;
-  /** The current result set has rows not sent yet. */
-  bool rows_open = false;
-  /** The next result set is current but not reported yet. */
+  /** An id in the runner is IDLE, ROWS or NEXT (§10.1); a direct statement
+      is never IDLE. */
+  enum class State { kIdle, kRows, kNext } state = State::kIdle;
+  /** NEXT: the following result is current in the server already. */
   bool next_pending = false;
-  /** Moving to the next result set failed: nextResult() reports the error. */
+  /** NEXT: moving to the following result failed; NEXT_RESULT reports it. */
   bool next_failed = false;
-  /** After a result set: makes the next one current, if there is one. A
-      failure counts as a next result, which nextResult() reports. */
+  /** An execution of it produced a result set (EXECUTE_MANY refuses it). */
+  bool returns_rows = false;
+  /** After a result: makes the next one current, if there is one. A
+      failure counts as a next result, which NEXT_RESULT reports. */
   void advance() {
     bool more = false;
     next_failed = mysql_service_mysql_stmt_result->next_result(h, &more);
     if (next_failed || more) next_pending = true;
   }
+  /** The current result set. */
   std::vector<mle::Column> columns;
   std::vector<Reader> readers;
-  /** One row read ahead (to know whether more rows follow). */
-  std::vector<Value> lookahead;
-  /** A row fetched but not sent yet (the direct path's read-ahead: the
-      server keeps it until the next fetch). At most one of lookahead and
-      pending is set. */
+  /** Its columns went to the worker with an earlier batch. */
+  bool columns_sent = false;
+  /** The session's zone when the set has a TIMESTAMP column. */
+  TimeZone zone;
+  /** A row fetched but not sent yet (the server keeps it until the next
+      fetch). */
   my_h_row pending = nullptr;
   /** The server holds the whole result (a direct statement, or a prepared
       one without a cursor): every row handle of the current result set is
-      collected when it starts (so its row count is known, exp note 44 step
-      3) and stays valid until the statement is closed or run again. */
+      collected when it starts, so its row count is known, and stays valid
+      until the statement is closed or run again. */
   bool buffered = true;
   std::vector<my_h_row> all;
   size_t next = 0;
-  /** The current result set's row count; 0: unknown (a cursor). */
-  uint64_t total = 0;
+  /** The current result set's row count, or that it is not known. */
+  uint64_t total = mle::wire::kUnknownTotalRows;
 
   /** The current result set's next row (nullptr at its end): a collected
       handle, else the server's fetch; true on a server failure. */
@@ -159,15 +199,41 @@ struct SqlRunner::Statement {
     return mysql_service_mysql_stmt_result->fetch(h, row);
   }
 
-  /** The bytes its buffered results hold in the server, counted in
-      *held_in (independent review C4). */
+  /** Forgets every result it has: IDLE. */
+  void discard() {
+    state = State::kIdle;
+    next_pending = false;
+    next_failed = false;
+    columns_sent = false;
+    pending = nullptr;
+    all.clear();
+    next = 0;
+  }
+
+  /** The bytes its buffered results hold in the server, and the open
+      statement itself, counted in *budget once it has an id. */
   size_t held = 0;
-  size_t *held_in = nullptr;
+  SqlBudget *budget = nullptr;
 
   ~Statement() {
-    if (held_in != nullptr) *held_in -= held;
+    if (budget != nullptr) {
+      budget->results_held -= held;
+      budget->statements--;
+    }
     if (h != nullptr) (void)mysql_service_mysql_stmt_factory->close(h);
   }
+};
+
+/** One batch of rows being made. */
+struct SqlRunner::Batch {
+  uint32_t max_rows = 1;
+  uint64_t exec_us = 0;
+  /** The result set's first batch: it carries the columns. */
+  bool first = false;
+  /** The statement's warnings so far. */
+  std::vector<mle::Warning> warnings;
+  /** A TIMESTAMP could not be turned into an instant. */
+  bool bad_timestamp = false;
 };
 
 void sql_error(SqlResultMsg *result, uint32_t sql_errno,
@@ -179,11 +245,60 @@ void sql_error(SqlResultMsg *result, uint32_t sql_errno,
   result->message = message;
 }
 
-SqlRunner::SqlRunner(MYSQL_THD thd, size_t *results_held)
-    : m_thd(thd), m_results_held(results_held) {}
+void refusal_error(SqlRefusal why, const char *no_sql, SqlResultMsg *error) {
+  error->sqlstate = "HY000";
+  switch (why) {
+    case SqlRefusal::kInterrupted:
+      error->sql_errno = ER_QUERY_INTERRUPTED;
+      error->sqlstate = "70100";
+      error->message = "Query execution was interrupted";
+      return;
+    case SqlRefusal::kPreparing:
+      error->sql_errno = ER_LANGUAGE_COMPONENT_INTERNAL;
+      error->message = no_sql;
+      return;
+    case SqlRefusal::kRequestTooLarge:
+      error->sql_errno = ER_LANGUAGE_COMPONENT_INTERNAL;
+      error->message =
+          "the SQL statements in progress in this session hold too much "
+          "memory for this one (its text and parameter values)";
+      return;
+    case SqlRefusal::kNonFiniteParameter:
+      error->sql_errno = ER_WRONG_ARGUMENTS;
+      error->message =
+          "a parameter is a number that is not finite (NaN or an infinity)";
+      return;
+    case SqlRefusal::kReplyTooLarge:
+      error->sql_errno = ER_LANGUAGE_COMPONENT_INTERNAL;
+      error->message = "the result is larger than MLE allows";
+      return;
+  }
+}
+
+SqlRunner::SqlRunner(MYSQL_THD thd, SqlBudget *budget)
+    : m_thd(thd), m_budget(budget) {}
+
+SqlRunner::~SqlRunner() { m_statements.clear(); }
+
+SqlRunner::Statement *SqlRunner::find(uint64_t id) {
+  const auto it = m_statements.find(id);
+  return it == m_statements.end() ? nullptr : it->second.get();
+}
+
+void SqlRunner::close(uint64_t id) { m_statements.erase(id); }
+
+void SqlRunner::send_home(uint64_t id) {
+  const auto it = m_statements.find(id);
+  if (it == m_statements.end()) return;
+  if (it->second->prepared)
+    it->second->discard();
+  else
+    m_statements.erase(it);
+}
 
 bool SqlRunner::over_budget(const Statement *except, SqlResultMsg *result) {
-  const size_t others = *m_results_held - (except != nullptr ? except->held : 0);
+  const size_t others =
+      m_budget->results_held - (except != nullptr ? except->held : 0);
   if (others < sql_call_results_max()) return false;
   sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
             "the results of the open statements hold too much memory "
@@ -191,12 +306,19 @@ bool SqlRunner::over_budget(const Statement *except, SqlResultMsg *result) {
   return true;
 }
 
+bool SqlRunner::too_many_statements(SqlResultMsg *result) {
+  if (m_budget->statements < sql_statements_max()) return false;
+  sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
+            "too many open statements (mle.sql_statements_max)");
+  return true;
+}
+
 void SqlRunner::count_results(Statement &s) {
-  // What the server really holds for all result sets of the execution
-  // (rows, metadata, overhead). A statement keeps its results until it is
-  // closed or executed again, read or not; mysqld's memory for them is
-  // outside the worker's limits, so the call has a budget for it. A server
-  // without the attribute: not counted (each result is still bounded by
+  // What the server really holds for all results of the execution (rows,
+  // metadata, overhead). A statement keeps its results until it is closed
+  // or executed again, read or not; mysqld's memory for them is outside the
+  // worker's limits, so the session has a budget for it. A server without
+  // the attribute: not counted (each result is still bounded by
   // mle.sql_result_max).
   size_t now = 0;
 #ifdef MYSQL_STMT_ATTR_RESULT_MEMORY
@@ -205,19 +327,14 @@ void SqlRunner::count_results(Statement &s) {
           s.h, cstr(MYSQL_STMT_ATTR_RESULT_MEMORY), &now))
     now = 0;
 #endif
-  s.held_in = m_results_held;
-  *m_results_held += now - s.held;
+  if (s.budget == nullptr) return;
+  s.budget->results_held += now - s.held;
   s.held = now;
 }
 
-SqlRunner::~SqlRunner() { m_statements.clear(); }
-
-void SqlRunner::close(uint64_t id) { m_statements.erase(id); }
-
 void SqlRunner::clear_pending_error() {
   if (!m_pending) return;
-  uint16_t empty = STATUS_DA_EMPTY;
-  (void)mysql_service_mysql_thd_attributes->set(m_thd, "da_status", &empty);
+  clear_diagnostics(m_thd);
   m_pending = false;
 }
 
@@ -227,7 +344,7 @@ void SqlRunner::statement_error(Statement &s, SqlResultMsg *result) {
   if (mysql_service_mysql_stmt_diagnostics->error_number(s.h, &err_no) ||
       mysql_service_mysql_stmt_diagnostics->error(s.h, &msg) ||
       mysql_service_mysql_stmt_diagnostics->sqlstate(s.h, &state) ||
-      err_no == 0) {
+      err_no == 0 || err_no > mle::wire::kMaxSqlErrno) {
     sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
               "the statement failed without diagnostics");
     return;
@@ -236,8 +353,12 @@ void SqlRunner::statement_error(Statement &s, SqlResultMsg *result) {
   result->kind = SqlResultKind::kError;
   result->sql_errno = static_cast<uint32_t>(err_no);
   result->sqlstate.assign(state.str, state.length);
+  if (result->sqlstate.size() != 5 || !mle::is_valid_sqlstate(result->sqlstate))
+    result->sqlstate = "HY000";
+  // The server's message can quote column bytes.
   result->message.assign(msg.str, msg.length);
-  // The error is in the caller's diagnostics area now (S-3).
+  repair_utf8(&result->message);
+  // The error is in the caller's diagnostics area now.
   m_pending = true;
   m_pending_errno = result->sql_errno;
   m_pending_sqlstate = result->sqlstate;
@@ -246,7 +367,7 @@ void SqlRunner::statement_error(Statement &s, SqlResultMsg *result) {
 
 void SqlRunner::handle(const mle::SqlMsg &request, SqlResultMsg *result,
                        mle::DirectReply *direct) {
-  // The worker sent another request: it went on after an error it got, so
+  // The worker sent another message: it went on after an error it got, so
   // that error must not stay in the caller's diagnostics area.
   clear_pending_error();
   struct Scope {
@@ -254,24 +375,106 @@ void SqlRunner::handle(const mle::SqlMsg &request, SqlResultMsg *result,
     ~Scope() { *slot = nullptr; }
   } scope{&m_direct};
   m_direct = direct;
+  m_ran = false;
+  const uint64_t id = request.stmt_id;
+  Statement *const s = find(id);
+
+  // Rule 1: CLOSE closes, whatever the state. Rule 2: an action that is not
+  // allowed in the id's state gets an ERROR and changes nothing.
+  const auto not_allowed = [&](const char *why) {
+    sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL, why);
+    if (request.action == SqlAction::kExecuteMany) result->failed_row = 0;
+  };
   switch (request.action) {
-    case SqlAction::kExecute:
-      return execute_text(request, result);
-    case SqlAction::kPrepare:
-      return prepare(request, result);
-    case SqlAction::kExecutePrepared:
-      return execute_prepared(request, result);
-    case SqlAction::kFetch:
-      return fetch(request, result);
-    case SqlAction::kNextResult:
-      return next_result(request, result);
     case SqlAction::kClose:
-      close(request.stmt_id);
+      close(id);
       *result = SqlResultMsg();
       result->kind = SqlResultKind::kOk;
       return;
+    case SqlAction::kExecute:
+      if (s != nullptr) return not_allowed("the statement id is in use");
+      execute_text(request, result);
+      break;
+    case SqlAction::kPrepare:
+      if (s != nullptr) return not_allowed("the statement id is in use");
+      prepare(request, result);
+      break;
+    case SqlAction::kExecutePrepared:
+      if (s == nullptr || !s->prepared)
+        return not_allowed("no prepared statement with this id");
+      execute_prepared(request, *s, result);
+      break;
     case SqlAction::kExecuteMany:
-      return execute_many(request, result);
+      if (s == nullptr || !s->prepared)
+        return not_allowed("no prepared statement with this id");
+      execute_many(request, *s, result);
+      break;
+    case SqlAction::kFetch:
+      if (s == nullptr || s->state != Statement::State::kRows)
+        return not_allowed("no rows to fetch for this statement id");
+      batch(id, *s,
+            request.max_rows != 0 ? request.max_rows : sql_chunk_rows(), 0,
+            result);
+      break;
+    case SqlAction::kNextResult:
+      // Nothing to move to: END, and the id stays as it is.
+      if (s == nullptr || s->state == Statement::State::kIdle) {
+        *result = SqlResultMsg();
+        result->kind = SqlResultKind::kEnd;
+        return;
+      }
+      next_result(request, *s, result);
+      break;
+  }
+
+  // Rule 3: an ERROR to an allowed action, whatever its reason, sends the id
+  // home. (The statement may be closed by now: only the id is used.)
+  const bool written = direct != nullptr && direct->length > 0;
+  if (!written && result->kind == SqlResultKind::kError) {
+    send_home(id);
+    if (request.action == SqlAction::kExecuteMany &&
+        result->failed_row == mle::wire::kNoRow)
+      result->failed_row = 0;
+  } else {
+    m_ran = true;
+    m_ran_id = id;
+  }
+}
+
+void SqlRunner::refused(SqlRefusal why, SqlAction action, uint64_t stmt_id,
+                        SqlResultMsg *error) {
+  const bool ran = m_ran && m_ran_id == stmt_id;
+  m_ran = false;
+  if (action == SqlAction::kClose) {
+    close(stmt_id);
+    return;
+  }
+  refusal_error(why, "SQL cannot run while a routine is loaded", error);
+  // The reply is an ERROR: by rule 3 if the action ran or is allowed in the
+  // id's state (the id goes home, its results are discarded), else by rule
+  // 2 (nothing changes).
+  switch (action) {
+    case SqlAction::kExecute:
+    case SqlAction::kPrepare:
+      // Allowed only for an id that is CLOSED; an ERROR leaves it CLOSED,
+      // also when the statement was opened meanwhile.
+      if (ran) close(stmt_id);
+      return;
+    case SqlAction::kExecutePrepared:
+    case SqlAction::kExecuteMany:
+      if (const Statement *s = find(stmt_id); s != nullptr && s->prepared)
+        send_home(stmt_id);
+      return;
+    case SqlAction::kFetch:
+      if (const Statement *s = find(stmt_id);
+          ran || (s != nullptr && s->state == Statement::State::kRows))
+        send_home(stmt_id);
+      return;
+    case SqlAction::kNextResult:
+      send_home(stmt_id);  // allowed in every state
+      return;
+    case SqlAction::kClose:
+      return;
   }
 }
 
@@ -280,11 +483,11 @@ void SqlRunner::handle(const mle::SqlMsg &request, SqlResultMsg *result,
 namespace {
 
 /** A new statement handle with our attributes; nullptr on failure. A
-    prepared one (parameters, session.prepare) runs without a cursor (exp
-    note 44): execution collects the whole result, within `capacity`, with no
-    temporary table and no row-by-row fetches, like a direct statement. A
-    server without the statement service's "use_cursor" attribute keeps the
-    cursor, rows up to mle.sql_row_max (*buffered = false). */
+    prepared one (parameters, PREPARE) runs without a cursor: execution
+    collects the whole result, within `capacity`, with no temporary table
+    and no row-by-row fetches, like a direct statement. A server without the
+    statement service's "use_cursor" attribute keeps the cursor, rows up to
+    mle.sql_row_max (*buffered = false). */
 my_h_statement new_statement(bool to_client, size_t capacity,
                              bool prepared = false, bool *buffered = nullptr) {
   my_h_statement h = nullptr;
@@ -293,7 +496,9 @@ my_h_statement new_statement(bool to_client, size_t capacity,
     capacity = sql_row_max();
     if (buffered != nullptr) *buffered = false;
   }
-  // S-3: the value must be a mysql_cstring_with_length (a char* crashes).
+  // The value must be a mysql_cstring_with_length (a char* crashes). The
+  // server converts every character value of a result to utf8mb4 and takes
+  // text parameters as utf8mb4 (§7.1).
   const mysql_cstring_with_length utf8mb4 = cstr("utf8mb4");
   bool failed = set_attribute(h, "charset_name", utf8mb4) ||
                 set_attribute(h, "buffer_capacity", capacity);
@@ -305,7 +510,8 @@ my_h_statement new_statement(bool to_client, size_t capacity,
   return h;
 }
 
-/** Binds value v to marker index (S-11: all kinds bind). */
+/** Binds value v to marker index; the server converts it to what the
+    marker needs. */
 bool bind_value(my_h_statement h, uint32_t index, const Value &v) {
   auto bind = [&](bool is_null, uint64_t type, bool is_unsigned,
                   const void *data, unsigned long length) {
@@ -339,15 +545,33 @@ bool bind_value(my_h_statement h, uint32_t index, const Value &v) {
       return bind(false, MYSQL_SP_ARG_TYPE_BLOB, false, v.as_text().data(),
                   v.as_text().size());
     case Tag::kVector: {
-      // A VECTOR binds as its binary floats (S-11).
+      // A VECTOR binds as its binary floats.
       const auto &f = v.as_vector();
       return bind(false, MYSQL_SP_ARG_TYPE_BLOB, false, f.data(),
                   f.size() * sizeof(float));
     }
+    case Tag::kTimestamp: {
+      // An instant: UTC fields with a zero displacement, which the server
+      // converts to the session's zone. The zero timestamp is no instant.
+      mle_time m{};
+      m.time_type = MYSQL_TIMESTAMP_TYPE_DATETIME;
+      if (v.as_timestamp() != mle::wire::kZeroTimestamp) {
+        const mle::Temporal t = utc_fields(v.as_timestamp());
+        m.year = t.year;
+        m.month = t.month;
+        m.day = t.day;
+        m.hour = t.hour;
+        m.minute = t.minute;
+        m.second = t.second;
+        m.second_part = t.microsecond;
+        m.time_type = MYSQL_TIMESTAMP_TYPE_DATETIME_TZ;
+        m.time_zone_displacement = 0;
+      }
+      return bind(false, MYSQL_SP_ARG_TYPE_DATETIME, false, &m, sizeof m);
+    }
     case Tag::kDate:
     case Tag::kTime:
-    case Tag::kDatetime:
-    case Tag::kTimestamp: {
+    case Tag::kDatetime: {
       const mle::Temporal &t = v.as_temporal();
       if (v.tag() == Tag::kTime && t.negative) {
         // The service drops mle_time::neg (convert_to_mysql_time, server
@@ -381,17 +605,11 @@ bool bind_value(my_h_statement h, uint32_t index, const Value &v) {
   return true;
 }
 
-bool bind_values(my_h_statement h, const std::vector<Value> &values) {
-  for (uint32_t i = 0; i < values.size(); i++)
-    if (bind_value(h, i, values[i])) return true;
-  return false;
-}
-
-/** values[from, from + n) to markers 0..n-1 (a row of a batch). */
-bool bind_row(my_h_statement h, const std::vector<Value> &values, size_t from,
-              uint32_t n) {
-  for (uint32_t i = 0; i < n; i++)
-    if (bind_value(h, i, values[from + i])) return true;
+/** values[from, from + n) to markers 0..n-1. */
+bool bind_values(my_h_statement h, const std::vector<Value> &values,
+                 size_t from, size_t n) {
+  for (size_t i = 0; i < n; i++)
+    if (bind_value(h, static_cast<uint32_t>(i), values[from + i])) return true;
   return false;
 }
 
@@ -401,8 +619,8 @@ bool SqlRunner::refused_here(SqlResultMsg *result) {
   // The server refuses statements in stored functions and triggers, but its
   // check for direct statements misses a function called by a trigger
   // (in_sub_stmt compared with ==, not as a mask); the prepared path checks
-  // it right. Ask that path once per call (and again while it refuses, so
-  // that each refusal is reported).
+  // it right. Ask that path once per request (and again while it refuses,
+  // so that each refusal is reported).
   if (m_context_checked && !m_refused) return false;
   m_context_checked = true;
   {
@@ -431,8 +649,8 @@ void SqlRunner::explain_refusal(SqlResultMsg *result) {
     return;
   // The server's text names its statement interface ("Prepared Statement
   // Handle Interface"), which tells a routine's author nothing: the same
-  // error, in their terms. It leaves the diagnostics area; uncaught, it is
-  // reported as the routine's error, with where it happened.
+  // error, in their terms. It leaves the diagnostics area; handed back, it
+  // is reported as the routine's error, with where it happened.
   clear_pending_error();
   result->message =
       "SQL statements are not allowed in stored functions and triggers: "
@@ -442,19 +660,13 @@ void SqlRunner::explain_refusal(SqlResultMsg *result) {
 void SqlRunner::execute_text(const mle::SqlMsg &request,
                              SqlResultMsg *result) {
   if (request.params.empty() && refused_here(result)) return;
-  if (m_statements.count(request.stmt_id) != 0)
-    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-                     "the statement id is in use");
-  if (m_statements.size() >= sql_statements_max())
-    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-                     "too many open statements (mle.sql_statements_max)");
-  if (over_budget(nullptr, result)) return;
+  if (too_many_statements(result) || over_budget(nullptr, result)) return;
   const bool to_client =
       (request.flags & mle::wire::kPassResultToClient) != 0;
   const bool with_params = !request.params.empty();
   auto s = std::make_unique<Statement>();
-  // S-11: the server buffers the whole result (buffer_capacity bytes), with
-  // or without parameters (no cursor: new_statement).
+  // The server buffers the whole result (buffer_capacity bytes), with or
+  // without parameters (no cursor: new_statement).
   s->h = new_statement(to_client, sql_result_max(), with_params, &s->buffered);
   if (s->h == nullptr)
     return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
@@ -467,7 +679,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
   if (with_params) {
     failed = mysql_service_mysql_stmt_execute->prepare(text, s->h);
     if (!failed) {
-      // As for a prepared statement: a value for each marker, no more.
+      // A one-shot prepared execution: exactly one value per marker.
       uint32_t markers = 0;
       (void)mysql_service_mysql_stmt_metadata->param_count(s->h, &markers);
       if (request.params.size() != markers)
@@ -475,14 +687,17 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
                          request.params.size() > markers
                              ? "more values than parameter markers"
                              : "fewer values than parameter markers");
-      failed = bind_values(s->h, request.params) ||
+      failed = bind_values(s->h, request.params, 0, request.params.size()) ||
                mysql_service_mysql_stmt_execute->execute(s->h);
     }
   } else {
     failed = mysql_service_mysql_stmt_execute_direct->execute(text, s->h);
   }
+  // A failed EXECUTE never gets its id.
   if (failed) return statement_failed(std::move(s), result);
   Statement &st = *s;
+  st.budget = m_budget;
+  m_budget->statements++;
   count_results(st);
   m_statements[request.stmt_id] = std::move(s);
   reply(request.stmt_id, st,
@@ -491,12 +706,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
 }
 
 void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
-  if (m_statements.count(request.stmt_id) != 0)
-    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-                     "the statement id is in use");
-  if (m_statements.size() >= sql_statements_max())
-    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-                     "too many open statements (mle.sql_statements_max)");
+  if (too_many_statements(result)) return;
   const bool to_client =
       (request.flags & mle::wire::kPassResultToClient) != 0;
   auto s = std::make_unique<Statement>();
@@ -514,31 +724,26 @@ void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
   *result = SqlResultMsg();
   result->kind = SqlResultKind::kOk;
   result->param_count = s->param_count;
+  s->budget = m_budget;
+  m_budget->statements++;
   m_statements[request.stmt_id] = std::move(s);
 }
 
-void SqlRunner::execute_prepared(const mle::SqlMsg &request,
+void SqlRunner::execute_prepared(const mle::SqlMsg &request, Statement &s,
                                  SqlResultMsg *result) {
-  const auto it = m_statements.find(request.stmt_id);
-  if (it == m_statements.end() || !it->second->prepared)
-    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-                     "no prepared statement with this id");
-  Statement &s = *it->second;
-  if (request.params.size() > s.param_count)
+  // All pending results of the id go first; an ERROR from here on leaves it
+  // IDLE.
+  s.discard();
+  if (request.params.size() != s.param_count)
     return sql_error(result, ER_WRONG_ARGUMENTS,
-                     "more values than parameter markers");
+                     request.params.size() > s.param_count
+                         ? "more values than parameter markers"
+                         : "fewer values than parameter markers");
   if (over_budget(&s, result)) return;  // its own results go when it runs
-  s.rows_open = false;
-  s.next_pending = false;
-  s.next_failed = false;
-  s.lookahead.clear();
-  s.pending = nullptr;
-  s.all.clear();  // the handles of the last execution's rows
-  s.next = 0;
   const uint64_t t0 = now_us();
-  // Partial binding: the markers not given keep their values (S-11).
-  const bool failed = bind_values(s.h, request.params) ||
-                      mysql_service_mysql_stmt_execute->execute(s.h);
+  const bool failed =
+      bind_values(s.h, request.params, 0, request.params.size()) ||
+      mysql_service_mysql_stmt_execute->execute(s.h);
   count_results(s);
   if (failed) return statement_error(s, result);
   reply(request.stmt_id, s,
@@ -546,53 +751,35 @@ void SqlRunner::execute_prepared(const mle::SqlMsg &request,
         now_us() - t0, result);
 }
 
-namespace {
-
-/** The statement's warnings into result. */
-void read_warnings(my_h_statement h, SqlResultMsg *result) {
-  uint32_t n = 0;
-  (void)mysql_service_mysql_stmt_diagnostics->num_warnings(h, &n);
-  for (uint32_t i = 0; i < n; i++) {
-    my_h_warning w = nullptr;
-    if (mysql_service_mysql_stmt_diagnostics->get_warning(h, i, &w)) break;
-    mle::Warning warning;
-    mysql_cstring_with_length msg{"", 0};
-    (void)mysql_service_mysql_stmt_diagnostics->warning_level(w, &warning.level);
-    (void)mysql_service_mysql_stmt_diagnostics->warning_code(w, &warning.code);
-    (void)mysql_service_mysql_stmt_diagnostics->warning_message(w, &msg);
-    warning.message.assign(msg.str, msg.length);
-    result->warnings.push_back(std::move(warning));
-  }
-}
-
-}  // namespace
-
-void SqlRunner::execute_many(const mle::SqlMsg &request,
+void SqlRunner::execute_many(const mle::SqlMsg &request, Statement &s,
                              SqlResultMsg *result) {
-  // A batch (exp note 51): the prepared statement once per row, in the
-  // caller's session and transaction, without a round trip to the worker in
-  // between; stops at the first failing row, whose index the error carries
-  // (the rows before it stay: the transaction is the caller's).
-  const auto it = m_statements.find(request.stmt_id);
-  if (it == m_statements.end() || !it->second->prepared)
-    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-                     "no prepared statement with this id");
-  Statement &s = *it->second;
+  // The prepared statement once per row, in the caller's session and
+  // transaction, without a round trip to the worker in between. It stops at
+  // the first failing row; the rows before it stay executed (the
+  // transaction is the caller's). In every ERROR failed_row is the number
+  // of rows executed before it.
+  s.discard();
+  const auto refuse = [&](uint32_t sql_errno, const std::string &why) {
+    sql_error(result, sql_errno, why);
+    result->failed_row = 0;
+  };
   if (s.to_client)
-    return sql_error(result, ER_WRONG_ARGUMENTS,
-                     "executeMany cannot send results to the client");
-  if (request.row_width != s.param_count)
-    return sql_error(result, ER_WRONG_ARGUMENTS,
-                     "each row of executeMany must have one value per "
-                     "parameter marker (" +
-                         std::to_string(s.param_count) + ")");
-  s.rows_open = false;
-  s.next_pending = false;
-  s.next_failed = false;
-  s.lookahead.clear();
-  s.pending = nullptr;
-  s.all.clear();
-  s.next = 0;
+    return refuse(ER_WRONG_ARGUMENTS,
+                  "executeMany cannot send results to the client");
+  if (request.row_width == 0 || request.row_width != s.param_count ||
+      request.params.size() % request.row_width != 0)
+    return refuse(ER_WRONG_ARGUMENTS,
+                  "each row of executeMany must have one value per parameter "
+                  "marker, and the statement at least one marker (it has " +
+                      std::to_string(s.param_count) + ")");
+  if (s.returns_rows)
+    return refuse(ER_WRONG_ARGUMENTS,
+                  "executeMany runs statements that return no rows; this one "
+                  "returns a result set");
+  if (over_budget(&s, result)) {
+    result->failed_row = 0;
+    return;
+  }
   // However it ends: the statement's earlier results are gone, and what it
   // holds now (a refused result set) is counted.
   struct Counted {
@@ -605,79 +792,72 @@ void SqlRunner::execute_many(const mle::SqlMsg &request,
   const uint64_t t0 = now_us();
   uint64_t affected = 0;
   for (size_t i = 0; i < rows; i++) {
-    if (bind_row(s.h, request.params, i * width, width) ||
+    const auto failed_at_row = [&] {
+      result->failed_row = static_cast<uint32_t>(i);
+    };
+    if (bind_values(s.h, request.params, i * width, width) ||
         mysql_service_mysql_stmt_execute->execute(s.h)) {
       statement_error(s, result);
-      result->failed_row = static_cast<uint32_t>(i);
-      return;
+      return failed_at_row();
     }
-    uint32_t fields = 0;
-    (void)mysql_service_mysql_stmt_resultset_metadata->field_count(s.h,
-                                                                   &fields);
-    if (fields != 0) {
-      sql_error(result, ER_WRONG_ARGUMENTS,
-                "executeMany runs statements that return no rows; this one "
-                "returned a result set (its first row was executed)");
-      result->failed_row = static_cast<uint32_t>(i);
-      return;
+    // A row's execution can yield several results: their counts add up.
+    while (true) {
+      uint32_t fields = 0;
+      (void)mysql_service_mysql_stmt_resultset_metadata->field_count(s.h,
+                                                                     &fields);
+      if (fields != 0) {
+        // The row was executed, but it counts as failing.
+        s.returns_rows = true;
+        sql_error(result, ER_WRONG_ARGUMENTS,
+                  "executeMany runs statements that return no rows; this one "
+                  "returned a result set (the row was executed)");
+        return failed_at_row();
+      }
+      uint64_t n = 0;
+      (void)mysql_service_mysql_stmt_diagnostics->affected_rows(s.h, &n);
+      affected += n;
+      bool more = false;
+      if (mysql_service_mysql_stmt_result->next_result(s.h, &more)) {
+        statement_error(s, result);
+        return failed_at_row();
+      }
+      if (!more) break;
     }
-    uint64_t n = 0;
-    (void)mysql_service_mysql_stmt_diagnostics->affected_rows(s.h, &n);
-    affected += n;
   }
   *result = SqlResultMsg();
   result->kind = SqlResultKind::kOk;
   result->affected_rows = affected;
   result->exec_us = now_us() - t0;
-  read_warnings(s.h, result);  // the last row's
+  if (rows > 0) {  // the last row's
+    (void)mysql_service_mysql_stmt_diagnostics->insert_id(s.h,
+                                                          &result->insert_id);
+    read_warnings(s.h, &result->warnings);
+  }
 }
 
-void SqlRunner::fetch(const mle::SqlMsg &request, SqlResultMsg *result) {
-  const auto it = m_statements.find(request.stmt_id);
-  if (it == m_statements.end() || !it->second->rows_open)
-    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-                     "no rows to fetch for this statement id");
-  Statement &s = *it->second;
-  const uint32_t max_rows =
-      request.max_rows != 0 ? request.max_rows : sql_chunk_rows();
-  *result = SqlResultMsg();
-  result->kind = SqlResultKind::kRows;
-  result->columns = s.columns;
-  result->total_rows = s.total;
-  rows(request.stmt_id, s, max_rows, /*first=*/false, result);
-}
-
-void SqlRunner::next_result(const mle::SqlMsg &request, SqlResultMsg *result) {
-  const auto it = m_statements.find(request.stmt_id);
-  if (it == m_statements.end())
-    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-                     "no statement with this id");
-  Statement &s = *it->second;
-  if (!s.next_pending) {
-    // Rows of the current set may be left: skip them.
-    if (s.rows_open) {
-      my_h_row row = nullptr;
-      while (!s.next_row(&row) && row != nullptr) {
-      }
-      s.rows_open = false;
-      s.lookahead.clear();
-      s.pending = nullptr;
+void SqlRunner::next_result(const mle::SqlMsg &request, Statement &s,
+                            SqlResultMsg *result) {
+  if (s.state == Statement::State::kRows) {
+    // The rest of the current result set goes.
+    my_h_row row = nullptr;
+    while (!s.next_row(&row) && row != nullptr) {
     }
+    s.pending = nullptr;
+    s.all.clear();
+    s.next = 0;
     s.advance();
     if (!s.next_pending) {
       *result = SqlResultMsg();
-      result->kind = SqlResultKind::kOk;
-      if (!s.prepared) close(request.stmt_id);
+      result->kind = SqlResultKind::kEnd;
+      send_home(request.stmt_id);
       return;
     }
   }
   s.next_pending = false;
   if (s.next_failed) {
-    // Not the end of the results: the statement's error (review C66).
+    // Not the end of the results: the error the server gave for the next.
     s.next_failed = false;
-    statement_error(s, result);
-    if (!s.prepared) close(request.stmt_id);
-    return;
+    return statement_error(s, result);
   }
   reply(request.stmt_id, s,
         request.max_rows != 0 ? request.max_rows : sql_chunk_rows(), 0,
@@ -689,27 +869,34 @@ void SqlRunner::next_result(const mle::SqlMsg &request, SqlResultMsg *result) {
 void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
                       uint64_t exec_us, SqlResultMsg *result) {
   *result = SqlResultMsg();
-  result->exec_us = exec_us;
   uint32_t fields = 0;
   (void)mysql_service_mysql_stmt_resultset_metadata->field_count(s.h, &fields);
   if (s.to_client || fields == 0) {
-    // No rows for the worker: an OK (the client got any rows).
+    // A row count; or the server has sent every result of the execution to
+    // the consumer of the statement that invoked the routine: one OK, and
+    // the id goes home (§10.5).
     result->kind = SqlResultKind::kOk;
+    result->exec_us = exec_us;
     (void)mysql_service_mysql_stmt_diagnostics->affected_rows(
         s.h, &result->affected_rows);
     (void)mysql_service_mysql_stmt_diagnostics->insert_id(s.h,
                                                           &result->insert_id);
-    read_warnings(s.h, result);
+    read_warnings(s.h, &result->warnings);
     if (!s.to_client) s.advance();
-    result->more_results = s.next_pending;
-    if (!s.prepared && !s.next_pending) close(id);
+    if (!s.to_client && s.next_pending) {
+      result->more_results = true;
+      s.state = Statement::State::kNext;
+    } else {
+      send_home(id);  // may close s
+    }
     return;
   }
 
-  // A result set: its columns, then the first rows.
+  // A result set: its columns, then the first batch.
+  s.returns_rows = true;
   s.columns.clear();
   s.readers.clear();
-  s.lookahead.clear();
+  bool timestamps = false;
   for (uint32_t i = 0; i < fields; i++) {
     my_h_field f = nullptr;
     (void)mysql_service_mysql_stmt_resultset_metadata->fetch_field(s.h, i, &f);
@@ -725,9 +912,10 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
     const uint64_t type = number_info<uint64_t>(f, "type");
     const bool is_unsigned = number_info<bool>(f, "is_unsigned");
     const bool binary = c.charset == "binary";
+    const auto length =
+        static_cast<uint32_t>(number_info<unsigned long>(f, "length"));
+    const uint32_t decimals = number_info<uint>(f, "decimals");
     c.type.is_unsigned = is_unsigned;
-    c.type.length = static_cast<uint32_t>(number_info<unsigned long>(f, "length"));
-    c.type.scale = number_info<uint>(f, "decimals");
     c.type.type_name = sql_type_name(type);
     // As for a routine's parameters: text and bytes differ by the charset.
     if (binary) {
@@ -738,6 +926,11 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
     }
     Reader r;
     switch (type) {
+      case MYSQL_SP_ARG_TYPE_NULL:
+        r = Reader::kNull;
+        c.type.tag = Tag::kNull;
+        c.type.is_unsigned = false;
+        break;
       case MYSQL_SP_ARG_TYPE_TINY:
       case MYSQL_SP_ARG_TYPE_SHORT:
       case MYSQL_SP_ARG_TYPE_INT24:
@@ -754,9 +947,10 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
       case MYSQL_SP_ARG_TYPE_BIT:
         r = Reader::kBit;
         c.type.tag = Tag::kU64;
+        c.type.length = length;
         break;
       case MYSQL_SP_ARG_TYPE_FLOAT:
-        r = Reader::kDouble;
+        r = Reader::kFloat;
         c.type.tag = Tag::kF32;
         break;
       case MYSQL_SP_ARG_TYPE_DOUBLE:
@@ -767,6 +961,8 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
       case MYSQL_SP_ARG_TYPE_NEWDECIMAL:
         r = Reader::kDecimal;
         c.type.tag = Tag::kDecimal;
+        c.type.scale = decimals;
+        c.type.precision = decimal_precision(length, decimals, is_unsigned);
         break;
       case MYSQL_SP_ARG_TYPE_DATE:
       case MYSQL_SP_ARG_TYPE_NEWDATE:
@@ -777,16 +973,20 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
       case MYSQL_SP_ARG_TYPE_TIME2:
         r = Reader::kTime;
         c.type.tag = Tag::kTime;
+        c.type.scale = decimals <= 6 ? decimals : 0;
         break;
       case MYSQL_SP_ARG_TYPE_DATETIME:
       case MYSQL_SP_ARG_TYPE_DATETIME2:
         r = Reader::kDatetime;
         c.type.tag = Tag::kDatetime;
+        c.type.scale = decimals <= 6 ? decimals : 0;
         break;
       case MYSQL_SP_ARG_TYPE_TIMESTAMP:
       case MYSQL_SP_ARG_TYPE_TIMESTAMP2:
         r = Reader::kTimestamp;
         c.type.tag = Tag::kTimestamp;
+        c.type.scale = decimals <= 6 ? decimals : 0;
+        timestamps = true;
         break;
       case MYSQL_SP_ARG_TYPE_JSON:
         r = Reader::kJson;
@@ -795,24 +995,40 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
       case MYSQL_SP_ARG_TYPE_VECTOR:
         r = Reader::kVector;
         c.type.tag = Tag::kVector;
-        c.type.length /= 4;
+        c.type.length = length / 4;
         break;
-      default:  // strings, BLOBs, ENUM, SET, GEOMETRY
-        r = binary ? Reader::kBytes : Reader::kText;
-        c.type.tag = binary ? Tag::kBytes : Tag::kString;
+      default: {  // strings, BLOBs, ENUM, SET, GEOMETRY
+        // ENUM and SET are text whatever their character set.
+        const bool bytes = binary && type != MYSQL_SP_ARG_TYPE_ENUM &&
+                           type != MYSQL_SP_ARG_TYPE_SET;
+        r = bytes ? Reader::kBytes : Reader::kText;
+        c.type.tag = bytes ? Tag::kBytes : Tag::kString;
+        c.type.length = length;
+        if (c.type.type_name.empty())
+          c.type.type_name = bytes ? "VARBINARY" : "VARCHAR";
         break;
+      }
     }
     s.columns.push_back(std::move(c));
     s.readers.push_back(r);
   }
-  s.rows_open = true;
+  s.state = Statement::State::kRows;
+  s.columns_sent = false;
   s.pending = nullptr;
   s.all.clear();
   s.next = 0;
-  s.total = 0;
+  s.total = mle::wire::kUnknownTotalRows;
+  // The server gives a TIMESTAMP as local time in the session's zone.
+  if (timestamps) {
+    const std::string zone = session_time_zone(m_thd);
+    if (!s.zone.set(zone))
+      return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
+                       "cannot convert TIMESTAMP values: the session's time "
+                       "zone '" + zone + "' is not known to MLE");
+  }
   if (s.buffered) {
     // The server has all rows already: their handles give the count, which
-    // lets the worker allocate the routine's array once (exp note 44).
+    // lets a worker allocate the routine's array once.
     my_h_row row = nullptr;
     while (true) {
       if (mysql_service_mysql_stmt_result->fetch(s.h, &row))
@@ -822,52 +1038,60 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
     }
     s.total = s.all.size();
   }
-  result->kind = SqlResultKind::kRows;
-  result->columns = s.columns;
-  result->total_rows = s.total;
-  // rows() may close (destroy) s: nothing touches it afterwards (C6).
-  rows(id, s, max_rows, /*first=*/true, result);
+  // batch() may close (destroy) s: nothing touches it afterwards.
+  batch(id, s, max_rows, exec_us, result);
 }
 
-
-
-void SqlRunner::rows(uint64_t id, Statement &s, uint32_t max_rows, bool first,
-                     SqlResultMsg *result) {
-  if (m_direct != nullptr) {
-    switch (write_rows(id, s, max_rows, first, result)) {
-      case Direct::kWritten:
-        return;
-      case Direct::kError:
-        return statement_error(s, result);
-      case Direct::kNotHere:
-        break;
-    }
-  }
-  if (read_rows(s, max_rows, result)) return statement_error(s, result);
-  if (!s.rows_open)
-    finish_result_set(id, s, result);
-  else if (s.buffered && first)
-    read_warnings(s.h, result);
-}
-
-void SqlRunner::finish_result_set(uint64_t id, Statement &s,
-                                  SqlResultMsg *result) {
-  read_warnings(s.h, result);
+bool SqlRunner::finish_result_set(uint64_t id, Statement &s) {
   s.advance();
-  result->more_results = s.next_pending;
-  if (!s.prepared && !s.next_pending) close(id);
+  if (s.next_pending) {
+    s.state = Statement::State::kNext;
+    return true;
+  }
+  send_home(id);  // may close s
+  return false;
 }
 
 namespace {
 
-/** One row's values by the column readers; false on a getter failure. */
-bool read_row(my_h_row row, const std::vector<Reader> &readers,
-              std::vector<Value> *out, size_t *bytes) {
-  for (uint32_t i = 0; i < readers.size(); i++) {
+/** What reading a row needs. */
+struct RowSource {
+  const std::vector<Reader> &readers;
+  const TimeZone &zone;
+  /** Set when a TIMESTAMP has no instant. */
+  bool bad_timestamp = false;
+};
+
+mle::Temporal temporal_of(const mle_time &t) {
+  mle::Temporal tm;
+  tm.year = static_cast<uint16_t>(t.year);
+  tm.month = static_cast<uint8_t>(t.month);
+  tm.day = static_cast<uint8_t>(t.day);
+  tm.hour = t.hour;
+  tm.minute = static_cast<uint8_t>(t.minute);
+  tm.second = static_cast<uint8_t>(t.second);
+  tm.microsecond = static_cast<uint32_t>(t.second_part);
+  tm.negative = t.neg;
+  return tm;
+}
+
+uint64_t bit_value(std::string_view bytes) {
+  uint64_t x = 0;  // big-endian bytes
+  for (unsigned char c : bytes) x = (x << 8) | c;
+  return x;
+}
+
+/** One row's values, each NULL or with exactly its column's tag; false on a
+    getter failure or a TIMESTAMP without an instant. */
+bool read_row(my_h_row row, RowSource &from, std::vector<Value> *out) {
+  for (uint32_t i = 0; i < from.readers.size(); i++) {
     bool is_null = false;
     bool failed = false;
     Value v;
-    switch (readers[i]) {
+    switch (from.readers[i]) {
+      case Reader::kNull:
+        is_null = true;
+        break;
       case Reader::kSigned: {
         int64_t x = 0;
         failed = mysql_service_mysql_stmt_get_integer->get(row, i, &x, &is_null);
@@ -879,14 +1103,18 @@ bool read_row(my_h_row row, const std::vector<Reader> &readers,
         uint64_t x = 0;
         failed = mysql_service_mysql_stmt_get_unsigned_integer->get(row, i, &x,
                                                                     &is_null);
-        v = readers[i] == Reader::kUnsigned ? Value::u64(x)
-                                            : Value::i64(static_cast<int64_t>(x));
+        v = from.readers[i] == Reader::kUnsigned
+                ? Value::u64(x)
+                : Value::i64(static_cast<int64_t>(x));
         break;
       }
+      case Reader::kFloat:
       case Reader::kDouble: {
         double x = 0;
         failed = mysql_service_mysql_stmt_get_double->get(row, i, &x, &is_null);
-        v = Value::f64(x);
+        v = from.readers[i] == Reader::kFloat
+                ? Value::f32(static_cast<float>(x))
+                : Value::f64(x);
         break;
       }
       case Reader::kDate:
@@ -895,35 +1123,35 @@ bool read_row(my_h_row row, const std::vector<Reader> &readers,
       case Reader::kTimestamp: {
         mle_time t{};
         failed = mysql_service_mysql_stmt_get_time->get(row, i, &t, &is_null);
-        mle::Temporal tm;
-        tm.year = static_cast<uint16_t>(t.year);
-        tm.month = static_cast<uint8_t>(t.month);
-        tm.day = static_cast<uint8_t>(t.day);
-        tm.hour = t.hour;
-        tm.minute = static_cast<uint8_t>(t.minute);
-        tm.second = static_cast<uint8_t>(t.second);
-        tm.microsecond = static_cast<uint32_t>(t.second_part);
-        tm.negative = t.neg;
-        const Tag tag = readers[i] == Reader::kDate   ? Tag::kDate
-                        : readers[i] == Reader::kTime ? Tag::kTime
-                        : readers[i] == Reader::kDatetime ? Tag::kDatetime
-                                                          : Tag::kTimestamp;
-        v = Value::temporal(tag, tm);
+        if (failed || is_null) break;
+        const mle::Temporal tm = temporal_of(t);
+        if (from.readers[i] == Reader::kTimestamp) {
+          int64_t at = 0;
+          if (!from.zone.instant(tm, &at)) {
+            from.bad_timestamp = true;
+            return false;
+          }
+          v = Value::timestamp(at);
+        } else {
+          v = Value::temporal(from.readers[i] == Reader::kDate   ? Tag::kDate
+                              : from.readers[i] == Reader::kTime ? Tag::kTime
+                                                                 : Tag::kDatetime,
+                              tm);
+        }
         break;
       }
       default: {
         mysql_cstring_with_length s{nullptr, 0};
         failed = mysql_service_mysql_stmt_get_string->get(row, i, &s, &is_null);
         if (failed || is_null) break;
-        *bytes += s.length;
-        if (readers[i] == Reader::kVector) {
+        if (from.readers[i] == Reader::kVector) {
           std::vector<float> f(s.length / sizeof(float));
           memcpy(f.data(), s.str, f.size() * sizeof(float));
           v = Value::vector(std::move(f));
           break;
         }
         std::string text(s.str, s.length);
-        switch (readers[i]) {
+        switch (from.readers[i]) {
           case Reader::kDecimal:
             v = Value::decimal(std::move(text));
             break;
@@ -933,12 +1161,9 @@ bool read_row(my_h_row row, const std::vector<Reader> &readers,
           case Reader::kBytes:
             v = Value::bytes(std::move(text));
             break;
-          case Reader::kBit: {
-            uint64_t x = 0;  // big-endian bytes
-            for (unsigned char c : text) x = (x << 8) | c;
-            v = Value::u64(x);
+          case Reader::kBit:
+            v = Value::u64(bit_value(text));
             break;
-          }
           default:
             v = Value::string(std::move(text));
         }
@@ -950,15 +1175,16 @@ bool read_row(my_h_row row, const std::vector<Reader> &readers,
   return true;
 }
 
-/** One row by the column readers, written as read_row's Values would be
-    encoded (Writer::value), without them; false on a getter failure. The
-    caller checks w->overflow(). */
-bool write_row(my_h_row row, const std::vector<Reader> &readers,
-               mle::Writer *w) {
-  for (uint32_t i = 0; i < readers.size(); i++) {
+/** One row, written as read_row's Values would be encoded (Writer::value),
+    without them; false as read_row. The caller checks w->overflow(). */
+bool write_row(my_h_row row, RowSource &from, mle::Writer *w) {
+  for (uint32_t i = 0; i < from.readers.size(); i++) {
     bool is_null = false;
     bool failed = false;
-    switch (readers[i]) {
+    switch (from.readers[i]) {
+      case Reader::kNull:
+        is_null = true;
+        break;
       case Reader::kSigned: {
         int64_t x = 0;
         failed = mysql_service_mysql_stmt_get_integer->get(row, i, &x, &is_null);
@@ -971,16 +1197,21 @@ bool write_row(my_h_row row, const std::vector<Reader> &readers,
         failed = mysql_service_mysql_stmt_get_unsigned_integer->get(row, i, &x,
                                                                     &is_null);
         if (failed || is_null) break;
-        if (readers[i] == Reader::kUnsigned)
+        if (from.readers[i] == Reader::kUnsigned)
           w->u64_value(x);
         else
           w->i64_value(static_cast<int64_t>(x));
         break;
       }
+      case Reader::kFloat:
       case Reader::kDouble: {
         double x = 0;
         failed = mysql_service_mysql_stmt_get_double->get(row, i, &x, &is_null);
-        if (!failed && !is_null) w->f64_value(x);
+        if (failed || is_null) break;
+        if (from.readers[i] == Reader::kFloat)
+          w->f32_value(static_cast<float>(x));
+        else
+          w->f64_value(x);
         break;
       }
       case Reader::kDate:
@@ -990,20 +1221,20 @@ bool write_row(my_h_row row, const std::vector<Reader> &readers,
         mle_time t{};
         failed = mysql_service_mysql_stmt_get_time->get(row, i, &t, &is_null);
         if (failed || is_null) break;
-        mle::Temporal tm;
-        tm.year = static_cast<uint16_t>(t.year);
-        tm.month = static_cast<uint8_t>(t.month);
-        tm.day = static_cast<uint8_t>(t.day);
-        tm.hour = t.hour;
-        tm.minute = static_cast<uint8_t>(t.minute);
-        tm.second = static_cast<uint8_t>(t.second);
-        tm.microsecond = static_cast<uint32_t>(t.second_part);
-        tm.negative = t.neg;
-        w->temporal_value(readers[i] == Reader::kDate   ? Tag::kDate
-                          : readers[i] == Reader::kTime ? Tag::kTime
-                          : readers[i] == Reader::kDatetime ? Tag::kDatetime
-                                                            : Tag::kTimestamp,
-                          tm);
+        const mle::Temporal tm = temporal_of(t);
+        if (from.readers[i] == Reader::kTimestamp) {
+          int64_t at = 0;
+          if (!from.zone.instant(tm, &at)) {
+            from.bad_timestamp = true;
+            return false;
+          }
+          w->timestamp_value(at);
+        } else {
+          w->temporal_value(from.readers[i] == Reader::kDate   ? Tag::kDate
+                            : from.readers[i] == Reader::kTime ? Tag::kTime
+                                                               : Tag::kDatetime,
+                            tm);
+        }
         break;
       }
       default: {
@@ -1011,7 +1242,7 @@ bool write_row(my_h_row row, const std::vector<Reader> &readers,
         failed = mysql_service_mysql_stmt_get_string->get(row, i, &s, &is_null);
         if (failed || is_null) break;
         const std::string_view text(s.str, s.length);
-        switch (readers[i]) {
+        switch (from.readers[i]) {
           case Reader::kVector:
             // The server's bytes, once, into the arena.
             w->vector_value(s.str,
@@ -1026,12 +1257,9 @@ bool write_row(my_h_row row, const std::vector<Reader> &readers,
           case Reader::kBytes:
             w->text_value(Tag::kBytes, text);
             break;
-          case Reader::kBit: {
-            uint64_t x = 0;  // big-endian bytes
-            for (unsigned char c : text) x = (x << 8) | c;
-            w->u64_value(x);
+          case Reader::kBit:
+            w->u64_value(bit_value(text));
             break;
-          }
           default:
             w->text_value(Tag::kString, text);
         }
@@ -1045,51 +1273,111 @@ bool write_row(my_h_row row, const std::vector<Reader> &readers,
 
 }  // namespace
 
-SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s,
-                                        uint32_t max_rows, bool first,
-                                        SqlResultMsg *result) {
-  // The statement has run (no cursor: exp note 44), so its warnings are
-  // final: room for them at the end of the chunk is kept from the start.
-  SqlResultMsg diag;
-  read_warnings(s.h, &diag);
+void SqlRunner::batch(uint64_t id, Statement &s, uint32_t max_rows,
+                      uint64_t exec_us, SqlResultMsg *result) {
+  Batch b;
+  b.max_rows = std::max<uint32_t>(max_rows, 1);
+  b.exec_us = exec_us;
+  b.first = !s.columns_sent;
+  // The statement has run (no cursor), so its warnings are final: they go
+  // with the set's first batch, so that a worker has them before it reads
+  // all rows, and with its last, which carries the complete list.
+  read_warnings(s.h, &b.warnings);
+  const auto row_error = [&] {
+    if (b.bad_timestamp)
+      return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
+                       "a TIMESTAMP value of the result cannot be converted "
+                       "from the session's time zone");
+    statement_error(s, result);
+  };
+  if (m_direct != nullptr) {
+    switch (write_rows(id, s, b)) {
+      case Direct::kWritten:
+        // An ERROR instead (nothing was written): the room kept was short.
+        if (m_direct->length == 0)
+          sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
+                    "an SQL result did not fit the room kept for it");
+        return;
+      case Direct::kError:
+        return row_error();
+      case Direct::kNotHere:
+        break;
+    }
+  }
+  // One row, as Values: a batch of one row may be larger than the arena
+  // (the message then goes in several chunks).
+  *result = SqlResultMsg();
+  result->kind = SqlResultKind::kRows;
+  result->exec_us = exec_us;
+  if (b.first)
+    result->columns = s.columns;
+  else
+    result->ncolumns = static_cast<uint32_t>(s.columns.size());
+  result->total_rows = s.total;
+  my_h_row row = s.pending;
+  s.pending = nullptr;
+  if (row == nullptr && s.next_row(&row)) return statement_error(s, result);
+  bool more = false;
+  if (row != nullptr) {
+    RowSource from{s.readers, s.zone};
+    if (!read_row(row, from, &result->rows)) {
+      b.bad_timestamp = from.bad_timestamp;
+      return row_error();
+    }
+    // Whether another row follows; the server keeps this one until then.
+    my_h_row next = nullptr;
+    if (s.next_row(&next)) return statement_error(s, result);
+    s.pending = next;
+    more = next != nullptr;
+  }
+  s.columns_sent = true;
+  if (more) {
+    result->more = true;
+    if (s.buffered && b.first) result->warnings = std::move(b.warnings);
+    return;
+  }
+  result->warnings = std::move(b.warnings);
+  result->more_results = finish_result_set(id, s);
+}
+
+SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s, Batch &b) {
+  // Room for the warnings at the end of the batch is kept from the start.
   size_t tail = 1 + 1 + 4 + 8;
-  for (const mle::Warning &x : diag.warnings)
+  for (const mle::Warning &x : b.warnings)
     tail += 4 + 4 + 4 + x.message.size();
   if (tail >= m_direct->capacity) return Direct::kNotHere;
 
   m_direct->posts_at_start = *m_direct->posts;
   mle::Writer w(m_direct->data, m_direct->capacity - tail);
-  const size_t count_at = mle::put_rows_head(w, s.columns, s.total);
+  static const std::vector<mle::Column> kNoColumns;
+  const size_t count_at =
+      mle::put_rows_head(w, b.first ? s.columns : kNoColumns, s.total);
   if (w.overflow()) return Direct::kNotHere;
   uint32_t rows = 0;
   bool more = false;
-  if (!s.lookahead.empty()) {  // read ahead by the Value path
-    for (const Value &v : s.lookahead) w.value(v);
-    if (w.overflow()) return Direct::kNotHere;
-    s.lookahead.clear();
-    rows++;
-  }
+  RowSource from{s.readers, s.zone};
   while (true) {
     my_h_row row = s.pending;
     s.pending = nullptr;
     if (row == nullptr) {
       if (s.next_row(&row)) return Direct::kError;
-      if (row == nullptr) {
-        s.rows_open = false;
-        break;
-      }
+      if (row == nullptr) break;
     }
-    if (rows >= max_rows) {
+    if (rows >= b.max_rows) {
       s.pending = row;
       more = true;
       break;
     }
     const size_t at = w.position();
-    if (!write_row(row, s.readers, &w)) return Direct::kError;
+    if (!write_row(row, from, &w)) {
+      b.bad_timestamp = from.bad_timestamp;
+      return Direct::kError;
+    }
     if (w.overflow()) {
       w.set_position(at);
       s.pending = row;
-      // One row larger than the arena: the Value path sends it.
+      // The first row does not fit the arena with the head and the tail:
+      // it goes alone, as Values.
       if (rows == 0) return Direct::kNotHere;
       more = true;
       break;
@@ -1097,140 +1385,89 @@ SqlRunner::Direct SqlRunner::write_rows(uint64_t id, Statement &s,
     rows++;
   }
   w.patch_u32(count_at, rows);
-  bool more_results = false;
-  if (!s.rows_open) {
-    s.advance();
-    more_results = s.next_pending;
-  }
+  const bool with_warnings = !more || (s.buffered && b.first);
+  s.columns_sent = true;
+  // The set is complete: whether another result follows. This may close
+  // (destroy) s.
+  const bool more_results = !more && finish_result_set(id, s);
   w.set_capacity(m_direct->capacity);  // the tail's room
   static const std::vector<mle::Warning> kNone;
-  const bool warnings = !s.rows_open || (s.buffered && first);
-  mle::put_rows_tail(w, more, more_results, warnings ? diag.warnings : kNone,
-                     result->exec_us);
-  if (w.overflow()) {  // cannot happen: the room was kept
-    sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-              "an SQL result did not fit the room kept for it");
-    return Direct::kWritten;
-  }
+  mle::put_rows_tail(w, more, more_results, with_warnings ? b.warnings : kNone,
+                     b.exec_us);
+  if (w.overflow()) return Direct::kWritten;  // nothing written: the caller's error
   m_direct->length = w.position();
   m_direct->rows = rows;
-  if (!s.rows_open && !s.prepared && !s.next_pending) close(id);
   return Direct::kWritten;
-}
-
-bool SqlRunner::read_rows(Statement &s, uint32_t max_rows,
-                          SqlResultMsg *result) {
-  // A chunk ends after max_rows rows or about one mailbox arena of data:
-  // larger messages are split and reassembled, and rows of VECTORs or BLOBs
-  // would otherwise be held several times in fresh memory (Phase 7 bench).
-  constexpr size_t kChunkBytes = mle::wire::kDefaultArenaSize * 3 / 4;
-  size_t bytes = 0;
-  uint32_t rows = 0;
-  if (!s.lookahead.empty()) {
-    for (Value &v : s.lookahead) result->rows.push_back(std::move(v));
-    s.lookahead.clear();
-    rows++;
-  }
-  if (s.pending != nullptr) {
-    const my_h_row row = s.pending;
-    s.pending = nullptr;
-    if (!read_row(row, s.readers, &result->rows, &bytes)) return true;
-    rows++;
-  }
-  while (rows < max_rows && bytes < kChunkBytes) {
-    my_h_row row = nullptr;
-    if (s.next_row(&row)) return true;
-    if (row == nullptr) {
-      s.rows_open = false;
-      return false;
-    }
-    if (!read_row(row, s.readers, &result->rows, &bytes)) return true;
-    rows++;
-  }
-  // The chunk is full: is there one more row?
-  my_h_row row = nullptr;
-  if (s.next_row(&row)) return true;
-  if (row == nullptr) {
-    s.rows_open = false;
-    return false;
-  }
-  if (!read_row(row, s.readers, &s.lookahead, &bytes)) return true;
-  result->more = true;
-  return false;
 }
 
 // ------------------------------------------------------------- errors
 
 void SqlRunner::call_succeeded() { clear_pending_error(); }
 
-bool SqlRunner::propagates(const mle::Error &e) {
-  // The same error, text included: an error the routine made itself with
-  // the number of the one it caught is raised with its own text.
-  if (m_pending && e.sql_errno == m_pending_errno &&
-      e.sqlstate == m_pending_sqlstate && e.message == m_pending_message)
+bool SqlRunner::propagates(const mle::HeldError &held) {
+  // The host's own copies are compared: the error it sent under that id and
+  // the one the server left in the diagnostics area.
+  if (m_pending && held.sql_errno == m_pending_errno &&
+      held.sqlstate == m_pending_sqlstate && held.message == m_pending_message)
     return true;
   clear_pending_error();
   return false;
 }
 
-bool SqlRunner::raise(const mle::Error &e) {
-  clear_pending_error();
-  // SIGNAL's rules: a 5-character SQLSTATE not of class '00', an error
-  // number 1..65535.
-  const std::string &state = e.sqlstate;
-  bool valid = state.size() == 5 && state.compare(0, 2, "00") != 0 &&
-               e.sql_errno >= 1 && e.sql_errno <= 65535;
-  for (char c : state)
-    valid = valid && ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z'));
-  if (!valid) return false;
+bool signal_error(MYSQL_THD thd, uint32_t sql_errno, const std::string &state,
+                  const std::string &text) {
+  // SIGNAL's rules: a 5-character SQLSTATE, an error number 1..65535. Class
+  // 00 is no condition and class 01 a warning: neither fails a statement.
+  if (state.size() != 5 || !mle::is_valid_sqlstate(state) ||
+      state.compare(0, 2, "00") == 0 || state.compare(0, 2, "01") == 0 ||
+      sql_errno < 1 || sql_errno > mle::wire::kMaxSqlErrno)
+    return false;
   // The message as a hex literal: no quoting or escaping rules apply (also
   // under NO_BACKSLASH_ESCAPES), any bytes are safe in the statement text.
   // MESSAGE_TEXT takes 128 characters: a longer text is cut (whole UTF-8
   // characters) rather than losing the error's number to a failed SIGNAL.
   size_t length = 0;
-  for (size_t chars = 0; length < e.message.size(); chars++) {
+  for (size_t chars = 0; length < text.size(); chars++) {
     if (chars == 128) break;
     length++;
-    while (length < e.message.size() &&
-           (static_cast<unsigned char>(e.message[length]) & 0xC0) == 0x80)
+    while (length < text.size() &&
+           (static_cast<unsigned char>(text[length]) & 0xC0) == 0x80)
       length++;
   }
   static const char kHex[] = "0123456789ABCDEF";
   std::string message;
-  for (unsigned char c : std::string_view(e.message).substr(0, length)) {
+  for (unsigned char c : std::string_view(text).substr(0, length)) {
     message.push_back(kHex[c >> 4]);
     message.push_back(kHex[c & 15]);
   }
-  const std::string text =
+  const std::string statement =
       "SIGNAL SQLSTATE '" + state + "' SET MESSAGE_TEXT = " +
       (message.empty() ? std::string("''") : "_utf8mb4 X'" + message + "'") +
-      ", MYSQL_ERRNO = " + std::to_string(e.sql_errno);
-  bool raised;
+      ", MYSQL_ERRNO = " + std::to_string(sql_errno);
+  bool raised = false;
   {
-    Statement s;
-    s.h = new_statement(false, 500);
-    if (s.h == nullptr) return false;
-    if (!mysql_service_mysql_stmt_execute_direct->execute(
-            {text.data(), text.size()}, s.h))
-      return false;  // SIGNAL did not fail: should not happen
-    uint64_t err_no = 0;
-    mysql_cstring_with_length msg{"", 0};
-    (void)mysql_service_mysql_stmt_diagnostics->error_number(s.h, &err_no);
-    (void)mysql_service_mysql_stmt_diagnostics->error(s.h, &msg);
-    // The refusal of SQL in a function has the same number as the error
-    // the routine got for its own statement: the message tells them apart.
-    raised = err_no == static_cast<uint64_t>(e.sql_errno) &&
-             (err_no != ER_STMT_EXECUTION_NOT_ALLOWED_WITHIN_SP_OR_TRG_OR_UDF ||
-              std::string(msg.str, msg.length) == e.message);
-  }  // closed while its error is in the diagnostics area
-  if (!raised) {
-    // In a function SQL is not allowed, so SIGNAL is not either; or the
-    // SIGNAL itself failed (e.g. a message that is not UTF-8 or too long):
-    // the caller reports the error as a routine error instead.
-    m_pending = true;
-    clear_pending_error();
+    my_h_statement h = new_statement(false, 500);
+    if (h == nullptr) return false;
+    if (mysql_service_mysql_stmt_execute_direct->execute(
+            {statement.data(), statement.size()}, h)) {
+      uint64_t err_no = 0;
+      mysql_cstring_with_length msg{"", 0};
+      (void)mysql_service_mysql_stmt_diagnostics->error_number(h, &err_no);
+      (void)mysql_service_mysql_stmt_diagnostics->error(h, &msg);
+      // The refusal of SQL in a function has the same number as the error
+      // a routine got for its own statement: the message tells them apart.
+      raised = err_no == sql_errno &&
+               (err_no != ER_STMT_EXECUTION_NOT_ALLOWED_WITHIN_SP_OR_TRG_OR_UDF ||
+                std::string_view(msg.str, msg.length) ==
+                    std::string_view(text).substr(0, length));
+    }
+    // Closed while its error is in the diagnostics area.
+    (void)mysql_service_mysql_stmt_factory->close(h);
   }
-  return raised;  // if raised, the SIGNAL error is in the diagnostics area
+  // In a function SQL is not allowed, so SIGNAL is not either; or the
+  // SIGNAL itself failed: the caller reports the error another way.
+  if (!raised) clear_diagnostics(thd);
+  return raised;  // if raised, the SIGNAL's error is in the diagnostics area
 }
 
 }  // namespace mle_component

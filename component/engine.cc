@@ -71,6 +71,8 @@ std::map<const mle::Worker *, uint64_t> g_live;  // guarded by g_mutex
     forgotten keeps none of that account's workers: a new account of that
     name must not get them. An entry goes once no session is older. */
 uint64_t g_forgets = 0;                          // guarded by g_mutex
+/** g_forgets for readers without the mutex. */
+std::atomic<uint64_t> g_forgets_now{0};
 std::map<std::string, uint64_t> g_forgotten_at;  // guarded by g_mutex
 std::multiset<uint64_t> g_marks;                 // guarded by g_mutex
 
@@ -577,7 +579,8 @@ namespace {
 constexpr int kReadyTimeoutMs = 120000;
 }  // namespace
 
-std::unique_ptr<mle::Worker> engine_new_worker(WorkerKind kind, uint32_t max_workers, int spin_us,
+std::unique_ptr<mle::Worker> engine_new_worker(WorkerKind kind, const std::string &language,
+                                               uint32_t max_workers, int spin_us,
                                                int interrupt_grace_ms,
                                                mle::CallHooks *hooks,
                                                AcquireError *why,
@@ -631,10 +634,12 @@ std::unique_ptr<mle::Worker> engine_new_worker(WorkerKind kind, uint32_t max_wor
   options.interrupt_grace_ms = interrupt_grace_ms;
   auto worker = std::make_unique<mle::Worker>(std::move(process), options);
   mle::ReadyMsg ready;
-  if (worker->wait_ready(kReadyTimeoutMs, &ready, error, hooks) !=
-      mle::Status::kOk) {
+  if (const mle::Outcome outcome =
+          worker->wait_ready(kReadyTimeoutMs, &ready, error, hooks, language);
+      outcome != mle::Outcome::kOk) {
     worker.reset();
-    *why = AcquireError::kFailed;
+    *why = outcome == mle::Outcome::kIncompatible ? AcquireError::kIncompatible
+                                                  : AcquireError::kFailed;
     return nullptr;
   }
   *why = AcquireError::kNone;
@@ -700,7 +705,7 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker, WorkerKind kind,
     {
       std::string error;
       // RESET also tells whether a routine left a thread running (tainted).
-      if (worker->reset(&error) == mle::Status::kOk && worker->usable() &&
+      if (worker->reset(&error) == mle::Outcome::kOk && worker->usable() &&
           !worker->stats().tainted) {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_launcher && generation == g_generation && !forgotten()) {
@@ -721,6 +726,7 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker, WorkerKind kind,
 }
 
 std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal, WorkerKind kind,
+                                                 const std::string &language,
                                                  uint32_t max_workers) {
   std::unique_ptr<mle::Worker> worker;
   uint64_t generation = 0;
@@ -731,6 +737,11 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal, W
       for (auto it = g_cache.end(); it != g_cache.begin();) {
         --it;
         if (it->principal != principal || it->kind != kind) continue;
+        // A worker of the kind that lacks the language (a JVM worker without
+        // Python) stays kept for a request it can serve.
+        const auto &languages = it->worker->languages();
+        if (std::find(languages.begin(), languages.end(), language) == languages.end())
+          continue;
         worker = std::move(it->worker);
         generation = it->generation;
         g_cache.erase(it);
@@ -765,6 +776,7 @@ void engine_forget_account(const std::string &principal) {
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_forgotten_at[principal] = ++g_forgets;
+    g_forgets_now.store(g_forgets);
     prune_forgotten_locked();
     for (auto it = g_cache.begin(); it != g_cache.end();) {
       if (principal_has_account(it->principal, principal)) {
@@ -776,6 +788,15 @@ void engine_forget_account(const std::string &principal) {
     }
   }
   gone.clear();  // kills them, without the mutex
+}
+
+uint64_t engine_forgets() { return g_forgets_now.load(); }
+
+bool engine_account_forgotten(const std::string &principal, uint64_t since) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  for (const auto &[account, at] : g_forgotten_at)
+    if (at > since && principal_has_account(principal, account)) return true;
+  return false;
 }
 
 long engine_memory_used_percent() {

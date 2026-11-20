@@ -118,14 +118,19 @@ long engine_workers_in_use();
 */
 bool engine_refresh(std::string *error);
 
-/** Why engine_new_worker failed. */
-enum class AcquireError { kNone, kInactive, kLimit, kFailed };
+/** Why engine_new_worker failed. kIncompatible: the worker speaks another
+    major version of the protocol or does not run the language (protocol
+    §9.1); it is not at fault, the installation is. */
+enum class AcquireError { kNone, kInactive, kLimit, kFailed, kIncompatible };
 
 /**
-  A started worker (READY) for a session, counted in engine_workers_in_use()
-  until engine_release_worker(). At most max_workers at a time.
+  A started worker (READY) of a kind that runs language (the worker's
+  identifier: "js", "python", "java") for a session, counted in
+  engine_workers_in_use() until engine_release_worker(). At most max_workers
+  at a time.
 */
-std::unique_ptr<mle::Worker> engine_new_worker(WorkerKind kind, uint32_t max_workers, int spin_us,
+std::unique_ptr<mle::Worker> engine_new_worker(WorkerKind kind, const std::string &language,
+                                               uint32_t max_workers, int spin_us,
                                                int interrupt_grace_ms,
                                                mle::CallHooks *hooks,
                                                AcquireError *why,
@@ -147,15 +152,24 @@ uint64_t engine_session_begin();
 void engine_session_end(uint64_t mark);
 
 /**
-  A kept worker of this principal and kind (READY, reset), counted like
-  engine_new_worker()'s; nullptr if none (or at max_workers).
+  A kept worker of this principal and kind that runs language (READY, reset:
+  it has no options in force), counted like engine_new_worker()'s; nullptr if
+  none (or at max_workers).
 */
 std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal, WorkerKind kind,
+                                                 const std::string &language,
                                                  uint32_t max_workers);
 
 /** DROP USER / RENAME USER: kept workers of that account are destroyed (a
-    new account of the same name must not get them). */
+    new account of the same name must not get them), and the workers that
+    sessions hold for it are retired at their next use (protocol §1). */
 void engine_forget_account(const std::string &principal);
+
+/** How many accounts were forgotten so far; it only grows. Lock-free. */
+uint64_t engine_forgets();
+/** Whether an account of the principal was dropped or renamed after the
+    count of engine_forgets() was since. */
+bool engine_account_forgotten(const std::string &principal, uint64_t since);
 
 /** Heap in use over all session workers that report one (JVM: the Java
     heap, V8: its heap), % of their summed limits (mle_memory_used). */

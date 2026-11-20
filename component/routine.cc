@@ -22,12 +22,16 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <set>
+#include <stdexcept>
 
 #include <mysql/components/component_implementation.h>
 #include <mysql/components/services/mysql_runtime_error_service.h>
 #include <mysql/components/services/mysql_stored_program.h>
 #include <mysql/components/services/mysql_string.h>
+#include <mysql/components/services/mysql_thd_attributes.h>
+#include <mysql/mysql_lex_string.h>
 #include <mysqld_error.h>
 
 #include "mle_component.h"
@@ -45,6 +49,13 @@ extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_string
 extern REQUIRES_SERVICE_PLACEHOLDER(
     mysql_stored_program_runtime_argument_string_charset);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_null);
+extern REQUIRES_SERVICE_PLACEHOLDER(
+    mysql_stored_program_runtime_argument_timestamp);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_timestamp);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_string_factory);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_string_copy_converter);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_string_get_data_in_charset);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_int);
 extern REQUIRES_SERVICE_PLACEHOLDER(
     mysql_stored_program_return_value_unsigned_int);
@@ -74,6 +85,196 @@ const char *worker_language(unsigned bit) {
     default:
       return "";
   }
+}
+
+// ------------------------------------------------------------- text
+
+void repair_utf8(std::string *text) {
+  if (mle::is_valid_utf8(*text)) return;
+  constexpr std::string_view kReplacement = "\xEF\xBF\xBD";  // U+FFFD
+  std::string out;
+  out.reserve(text->size() + 8);
+  const auto *p = reinterpret_cast<const unsigned char *>(text->data());
+  const auto *const end = p + text->size();
+  while (p < end) {
+    const unsigned char c = *p;
+    if (c < 0x80) {
+      out += static_cast<char>(c);
+      p++;
+      continue;
+    }
+    // The bytes that may follow this lead byte: the first one has a
+    // narrower range where a wider one would give an overlong form, a
+    // surrogate or a code point above U+10FFFF.
+    size_t need = 0;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) {
+      need = 1;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+      need = 2;
+      if (c == 0xE0) lo = 0xA0;
+      if (c == 0xED) hi = 0x9F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+      need = 3;
+      if (c == 0xF0) lo = 0x90;
+      if (c == 0xF4) hi = 0x8F;
+    }
+    size_t got = 0;
+    while (got < need && p + 1 + got < end && p[1 + got] >= lo &&
+           p[1 + got] <= hi) {
+      lo = 0x80;
+      hi = 0xBF;
+      got++;
+    }
+    if (need != 0 && got == need)
+      out.append(reinterpret_cast<const char *>(p), need + 1);
+    else
+      out += kReplacement;  // one for the maximal subpart
+    p += 1 + got;
+  }
+  *text = std::move(out);
+}
+
+// ------------------------------------------------------------- time zones
+
+std::string session_time_zone(MYSQL_THD thd) {
+  MYSQL_LEX_CSTRING name{nullptr, 0};
+  if (mysql_service_mysql_thd_attributes->get(thd, "time_zone_name", &name) ||
+      name.str == nullptr)
+    return "";
+  return std::string(name.str, name.length);
+}
+
+namespace {
+
+/** "+05:30", "-3:00" -> seconds east of UTC. */
+bool parse_offset(std::string_view text, int32_t *seconds) {
+  if (text.size() < 5 || text.size() > 6 || (text[0] != '+' && text[0] != '-'))
+    return false;
+  const size_t colon = text.find(':');
+  if (colon != text.size() - 3) return false;
+  int hours = 0, minutes = 0;
+  for (size_t i = 1; i < text.size(); i++) {
+    if (i == colon) continue;
+    if (text[i] < '0' || text[i] > '9') return false;
+    (i < colon ? hours : minutes) = (i < colon ? hours : minutes) * 10 + (text[i] - '0');
+  }
+  if (minutes > 59) return false;
+  const int32_t total = hours * 3600 + minutes * 60;
+  // MySQL's and the protocol's range: -13:59 to +14:00.
+  if (text[0] == '-' ? total > 13 * 3600 + 59 * 60 : total > 14 * 3600)
+    return false;
+  *seconds = text[0] == '-' ? -total : total;
+  return true;
+}
+
+std::string offset_name(int32_t seconds) {
+  char b[16];
+  const int32_t a = seconds < 0 ? -seconds : seconds;
+  snprintf(b, sizeof b, "%c%02d:%02d", seconds < 0 ? '-' : '+', a / 3600,
+           a % 3600 / 60);
+  return b;
+}
+
+}  // namespace
+
+bool TimeZone::set(std::string_view name) {
+  m_zone = nullptr;
+  if (name == "SYSTEM") {
+    m_kind = Kind::kSystem;
+    return true;
+  }
+  if (parse_offset(name, &m_offset)) {
+    m_kind = Kind::kOffset;
+    return true;
+  }
+  m_kind = Kind::kNamed;
+  try {
+    m_zone = std::chrono::locate_zone(name);
+  } catch (const std::runtime_error &) {
+    return false;  // no such zone, or no zone data on this host
+  }
+  return true;
+}
+
+bool TimeZone::instant(const mle::Temporal &t, int64_t *microseconds) const {
+  if (t.year == 0 && t.month == 0 && t.day == 0 && t.hour == 0 &&
+      t.minute == 0 && t.second == 0 && t.microsecond == 0) {
+    *microseconds = mle::wire::kZeroTimestamp;
+    return true;
+  }
+  namespace ch = std::chrono;
+  const ch::year_month_day date{ch::year{t.year}, ch::month{t.month}, ch::day{t.day}};
+  if (!date.ok() || t.hour > 23 || t.minute > 59 || t.second > 59 ||
+      t.microsecond > 999999)
+    return false;
+  const ch::local_seconds local = ch::local_days{date} + ch::hours{t.hour} +
+                                  ch::minutes{t.minute} + ch::seconds{t.second};
+  int64_t seconds = 0;
+  switch (m_kind) {
+    case Kind::kOffset:
+      seconds = local.time_since_epoch().count() - m_offset;
+      break;
+    case Kind::kNamed:
+      if (m_zone == nullptr) return false;
+      // A local time in the hour the zone repeats names two instants: the
+      // first one is taken.
+      seconds = m_zone->to_sys(local, ch::choose::earliest).time_since_epoch().count();
+      break;
+    case Kind::kSystem: {
+      // mysqld's own zone, by the C library's rules, as the server converts.
+      struct tm tm {};
+      tm.tm_year = t.year - 1900;
+      tm.tm_mon = t.month - 1;
+      tm.tm_mday = t.day;
+      tm.tm_hour = static_cast<int>(t.hour);
+      tm.tm_min = t.minute;
+      tm.tm_sec = t.second;
+      tm.tm_isdst = -1;
+      seconds = mktime(&tm);
+      break;
+    }
+  }
+  *microseconds = seconds * 1000000 + t.microsecond;
+  return mle::is_valid_timestamp(*microseconds) &&
+         *microseconds != mle::wire::kZeroTimestamp;
+}
+
+std::string options_time_zone(std::string_view zone) {
+  if (zone == "SYSTEM") return system_time_zone();
+  if (int32_t offset = 0; parse_offset(zone, &offset)) return offset_name(offset);
+  // Zones that count leap seconds have no instants the protocol can carry.
+  if (zone.empty() || zone.size() > mle::wire::kMaxTimeZone ||
+      zone.rfind("leap/", 0) == 0 || zone.rfind("right/", 0) == 0 ||
+      !mle::is_valid_utf8(zone))
+    return "";
+  return std::string(zone);
+}
+
+mle::Temporal utc_fields(int64_t microseconds) {
+  namespace ch = std::chrono;
+  const ch::sys_time<ch::microseconds> at{ch::microseconds{microseconds}};
+  const auto day = ch::floor<ch::days>(at);
+  const ch::year_month_day date{day};
+  const ch::hh_mm_ss<ch::microseconds> time{at - day};
+  mle::Temporal t;
+  t.year = static_cast<uint16_t>(static_cast<int>(date.year()));
+  t.month = static_cast<uint8_t>(static_cast<unsigned>(date.month()));
+  t.day = static_cast<uint8_t>(static_cast<unsigned>(date.day()));
+  t.hour = static_cast<uint32_t>(time.hours().count());
+  t.minute = static_cast<uint8_t>(time.minutes().count());
+  t.second = static_cast<uint8_t>(time.seconds().count());
+  t.microsecond = static_cast<uint32_t>(time.subseconds().count());
+  return t;
+}
+
+uint32_t decimal_precision(uint64_t display_length, uint32_t scale, bool is_unsigned) {
+  // The display length counts the digits, the point if there is a scale and
+  // the sign if the type is signed.
+  uint64_t n = display_length;
+  if (scale > 0 && n > 0) n--;
+  if (!is_unsigned && n > 0) n--;
+  return static_cast<uint32_t>(n);
 }
 
 namespace {
@@ -202,7 +403,10 @@ const char *sql_type_name(uint64_t t) {
     case MYSQL_SP_ARG_TYPE_JSON:
       return "JSON";
     case MYSQL_SP_ARG_TYPE_VARCHAR:
+    case MYSQL_SP_ARG_TYPE_VAR_STRING:
       return "VARCHAR";
+    case MYSQL_SP_ARG_TYPE_NULL:
+      return "NULL";
     case MYSQL_SP_ARG_TYPE_STRING:
       return "CHAR";
     case MYSQL_SP_ARG_TYPE_TINY_BLOB:
@@ -224,6 +428,13 @@ const char *sql_type_name(uint64_t t) {
 }
 
 namespace {
+
+/** The fractional-second digits of a TIME, DATETIME or TIMESTAMP. */
+uint32_t fraction_digits(const TypeQuery &q) {
+  uint32_t decimals = 0;
+  (void)q.get("decimals", &decimals);
+  return decimals <= 6 ? decimals : 0;
+}
 
 /** Fills info from the metadata; false after reporting an unsupported
     type. what: "parameter 'a'" or "return value". */
@@ -280,9 +491,12 @@ bool describe(const TypeQuery &q, const std::string &what, ParamInfo *info) {
       info->kind = Kind::kDouble;
       return true;
     case MYSQL_SP_ARG_TYPE_NEWDECIMAL: {
-      uint64_t decimals = 0;
+      uint32_t decimals = 0;
+      size_t display = 0;
       (void)q.get("decimals", &decimals);
-      p.scale = static_cast<uint32_t>(decimals);
+      (void)q.get("max_display_length", &display);
+      p.scale = decimals;
+      p.precision = decimal_precision(display, decimals, !is_signed);
       p.tag = Tag::kDecimal;
       info->kind = Kind::kDecimal;
       return true;
@@ -293,22 +507,29 @@ bool describe(const TypeQuery &q, const std::string &what, ParamInfo *info) {
       return true;
     case MYSQL_SP_ARG_TYPE_TIME2:
       p.tag = Tag::kTime;
+      p.scale = fraction_digits(q);
       info->kind = Kind::kTime;
       return true;
     case MYSQL_SP_ARG_TYPE_DATETIME2:
       p.tag = Tag::kDatetime;
+      p.scale = fraction_digits(q);
       info->kind = Kind::kDatetime;
       return true;
     case MYSQL_SP_ARG_TYPE_TIMESTAMP2:
       p.tag = Tag::kTimestamp;
+      p.scale = fraction_digits(q);
       info->kind = Kind::kTimestamp;
+      return true;
+    case MYSQL_SP_ARG_TYPE_GEOMETRY:
+      p.tag = Tag::kBytes;
+      info->kind = Kind::kBytes;
       return true;
     case MYSQL_SP_ARG_TYPE_JSON:
       p.tag = Tag::kJson;
       info->kind = Kind::kJson;
       return true;
     case MYSQL_SP_ARG_TYPE_VECTOR: {
-      uint64_t bytes = 0;
+      size_t bytes = 0;
       (void)q.get("max_byte_length", &bytes);
       p.tag = Tag::kVector;
       p.length = static_cast<uint32_t>(bytes / 4);
@@ -326,15 +547,9 @@ bool describe(const TypeQuery &q, const std::string &what, ParamInfo *info) {
       const char *charset = nullptr;
       (void)q.get("charset", &charset);
       const std::string cs = charset == nullptr ? "" : charset;
-      uint64_t chars = 0;
+      size_t chars = 0;
       (void)q.get("max_display_length", &chars);
       p.length = static_cast<uint32_t>(chars);
-      if (cs == "utf8mb4") {
-        p.tag = Tag::kString;
-        info->kind = Kind::kString;
-        if (p.type_name == "BLOB") p.type_name = "TEXT";
-        return true;
-      }
       if (cs == "binary" && t != MYSQL_SP_ARG_TYPE_ENUM &&
           t != MYSQL_SP_ARG_TYPE_SET) {
         p.tag = Tag::kBytes;
@@ -343,8 +558,20 @@ bool describe(const TypeQuery &q, const std::string &what, ParamInfo *info) {
         if (p.type_name == "CHAR") p.type_name = "BINARY";
         return true;
       }
-      return unsupported("The character set " + cs +
-                         " is not supported; use utf8mb4 or binary");
+      p.tag = Tag::kString;
+      info->kind = Kind::kString;
+      if (p.type_name == "BLOB") p.type_name = "TEXT";
+      // The wire knows only UTF-8: text in another character set is
+      // converted when it is read (the server converts what is stored).
+      // utf8mb3 and ascii text is UTF-8 as it is; binary ENUM and SET
+      // members go as they are.
+      if (cs != "utf8mb4" && cs != "utf8mb3" && cs != "utf8" && cs != "ascii" &&
+          cs != "binary") {
+        info->charset = mysql_service_mysql_charset->get(cs.c_str());
+        if (info->charset == nullptr)
+          return unsupported("The character set " + cs + " is not known");
+      }
+      return true;
     }
     default:
       return unsupported(std::string("The type ") +
@@ -386,6 +613,19 @@ bool parse_temporal(Kind kind, const char *s, size_t n, mle::Temporal *t) {
   return true;
 }
 
+/** An instant as text with its offset, which the server reads in any
+    session time zone: "2024-01-02 03:04:05.000000+00:00". */
+std::string format_instant(int64_t microseconds) {
+  if (microseconds == mle::wire::kZeroTimestamp)
+    return "0000-00-00 00:00:00.000000";
+  const mle::Temporal t = utc_fields(microseconds);
+  char b[64];
+  snprintf(b, sizeof b, "%04u-%02u-%02u %02u:%02u:%02u.%06u+00:00", t.year,
+           t.month, t.day, t.hour, t.minute, t.second, t.microsecond);
+  return b;
+}
+
+/** A DATE, TIME or DATETIME as the server's text. */
 std::string format_temporal(Tag tag, const mle::Temporal &t) {
   char b[64];
   if (tag == Tag::kTime)
@@ -402,6 +642,28 @@ std::string format_temporal(Tag tag, const mle::Temporal &t) {
 CHARSET_INFO_h binary_charset() {
   static CHARSET_INFO_h cs = mysql_service_mysql_charset->get("binary");
   return cs;
+}
+
+/** Text of character set from as utf8mb4; false if the server cannot. */
+bool to_utf8mb4(const char *text, size_t length, CHARSET_INFO_h from,
+                std::string *out) {
+  my_h_string converted = nullptr;
+  if (mysql_service_mysql_string_factory->create(&converted) ||
+      converted == nullptr)
+    return false;
+  uint errors = 0;
+  const char *data = nullptr;
+  size_t size = 0;
+  CHARSET_INFO_h charset = nullptr;
+  const bool failed =
+      mysql_service_mysql_string_copy_converter->copy_convert(
+          converted, text, length, from,
+          mysql_service_mysql_charset->get_utf8mb4(), &errors) ||
+      mysql_service_mysql_string_get_data_in_charset->get_data(
+          converted, &data, &size, &charset);
+  if (!failed) out->assign(data == nullptr ? "" : data, size);
+  mysql_service_mysql_string_factory->destroy(converted);
+  return !failed;
 }
 
 // ------------------------------------------------------------- storing
@@ -447,6 +709,20 @@ struct Target {
                      ->set(nullptr, static_cast<uint16_t>(index), s.data(),
                            s.size());
   }
+  /** An instant (not the zero timestamp): the server converts it to the
+      session's zone, or to what the target's type needs. */
+  bool instant(int64_t microseconds) const {
+    const mle::Temporal t = utc_fields(microseconds);
+    constexpr uint32_t kDigits = 6;
+    return index < 0
+               ? mysql_service_mysql_stored_program_return_value_timestamp->set(
+                     nullptr, t.year, t.month, t.day, t.hour, t.minute,
+                     t.second, t.microsecond, false, kDigits, 0, true)
+               : mysql_service_mysql_stored_program_runtime_argument_timestamp
+                     ->set(nullptr, static_cast<uint16_t>(index), t.year,
+                           t.month, t.day, t.hour, t.minute, t.second,
+                           t.microsecond, false, kDigits, 0, true);
+  }
   bool binary(const char *data, size_t n) const {
     return index < 0
                ? mysql_service_mysql_stored_program_return_value_string_charset
@@ -478,8 +754,12 @@ bool store(const Target &to, const Value &v) {
     case Tag::kDate:
     case Tag::kTime:
     case Tag::kDatetime:
-    case Tag::kTimestamp:
       return to.text(format_temporal(v.tag(), v.as_temporal()));
+    case Tag::kTimestamp:
+      // The zero timestamp is no instant: as the server writes it.
+      if (v.as_timestamp() == mle::wire::kZeroTimestamp)
+        return to.text(format_instant(v.as_timestamp()));
+      return to.instant(v.as_timestamp());
     case Tag::kVector: {
       const auto &f = v.as_vector();
       return to.binary(reinterpret_cast<const char *>(f.data()),
@@ -583,6 +863,23 @@ Routine *Routine::create(stored_program_handle sp) {
   m.name = r->name;
   m.schema = r->schema;
   m.source = get_string("sp_body");
+  // Source code crosses as it is or not at all: text that is not UTF-8
+  // would become other code if it were repaired (protocol §7.1). Names are
+  // for messages: repaired.
+  if (!mle::is_valid_utf8(m.source)) {
+    my_error(ER_LANGUAGE_COMPONENT, MYF(0),
+             ("MLE> The code of " + r->qualified_name +
+              " is not valid UTF-8 text; create the routine over a connection "
+              "whose character set is utf8mb4")
+                 .c_str());
+    return nullptr;
+  }
+  repair_utf8(&m.name);
+  if (m.schema.empty() || !mle::is_valid_utf8(m.schema)) {
+    my_error(ER_LANGUAGE_COMPONENT, MYF(0),
+             "MLE> The routine has no schema name MLE can use.");
+    return nullptr;
+  }
   // USING (Phase 6): the libraries the routine imports.
   uint32_t imports = 0;
   (void)mysql_service_mysql_stored_program_metadata_query->get(sp, "import_count", &imports);
@@ -601,13 +898,25 @@ Routine *Routine::create(stored_program_handle sp) {
     // code (JavaScript: the wrapper's text): an identifier like a
     // parameter's, and not a parameter's or another library's.
     const std::string &binding = imp.alias.empty() ? imp.name : imp.alias;
-    bool taken = false;
+    // Java code names a library by its own means: there only the names of
+    // two libraries must differ, as PREPARE requires of every language.
+    bool taken = false, twice = false;
     for (const ParamInfo &p : r->params) taken = taken || p.name == binding;
     for (const mle::Import &other : m.imports)
-      taken = taken || (other.alias.empty() ? other.name : other.alias) == binding;
-    if (family(bit) != kJava && (taken || !valid_name(binding, bit))) {
+      twice = twice || (other.alias.empty() ? other.name : other.alias) == binding;
+    if (twice || (family(bit) != kJava && (taken || !valid_name(binding, bit)))) {
       my_error(ER_LANGUAGE_COMPONENT_KEYWORD, MYF(0), r->display_language(),
                binding.c_str());
+      return nullptr;
+    }
+    // A library's schema and name cross as they are (never repaired).
+    if (!mle::is_valid_library_name(imp.schema) ||
+        !mle::is_valid_library_name(imp.name) || !mle::is_valid_utf8(imp.schema) ||
+        !mle::is_valid_utf8(imp.name) || !mle::is_valid_utf8(imp.alias)) {
+      my_error(ER_LANGUAGE_COMPONENT, MYF(0),
+               ("MLE> The routine imports a library whose name MLE cannot use: " +
+                imp.schema + "." + imp.name)
+                   .c_str());
       return nullptr;
     }
     m.imports.push_back(std::move(imp));
@@ -621,6 +930,8 @@ Routine *Routine::create(stored_program_handle sp) {
 bool Routine::read_args(std::vector<Value> *args) const {
   args->clear();
   args->reserve(params.size());
+  // The session's zone, looked up at the first TIMESTAMP argument.
+  std::optional<TimeZone> zone;
   for (uint16_t i = 0; i < params.size(); i++) {
     const ParamInfo &p = params[i];
     if (p.mode == ParamMode::kOut) {
@@ -673,9 +984,15 @@ bool Routine::read_args(std::vector<Value> *args) const {
           case Kind::kDecimal:
             args->push_back(Value::decimal(std::string(s, n)));
             break;
-          case Kind::kString:
-            args->push_back(Value::string(std::string(s, n)));
+          case Kind::kString: {
+            std::string text;
+            if (p.charset == nullptr)
+              text.assign(s, n);
+            else if (!to_utf8mb4(s, n, p.charset, &text))
+              return report_read_failure(p), false;
+            args->push_back(Value::string(std::move(text)));
             break;
+          }
           case Kind::kBytes:
             args->push_back(Value::bytes(std::string(s, n)));
             break;
@@ -686,6 +1003,28 @@ bool Routine::read_args(std::vector<Value> *args) const {
             std::vector<float> f(n / sizeof(float));
             memcpy(f.data(), s, f.size() * sizeof(float));
             args->push_back(Value::vector(std::move(f)));
+            break;
+          }
+          case Kind::kTimestamp: {
+            // The server gives the local time in the session's zone.
+            mle::Temporal local;
+            if (!parse_temporal(p.kind, s, n, &local))
+              return report_read_failure(p), false;
+            if (!zone) {
+              zone.emplace();
+              const std::string name = session_time_zone();
+              if (!zone->set(name)) {
+                my_error(ER_LANGUAGE_COMPONENT, MYF(0),
+                         ("MLE-Type> Cannot convert the TIMESTAMP parameter '" +
+                          p.name + "': the session's time zone '" + name +
+                          "' is not known to MLE")
+                             .c_str());
+                return false;
+              }
+            }
+            int64_t at = 0;
+            if (!zone->instant(local, &at)) return report_read_failure(p), false;
+            args->push_back(Value::timestamp(at));
             break;
           }
           default: {
@@ -744,8 +1083,10 @@ std::string Routine::call_text(const std::vector<Value> &args) const {
       case Tag::kDate:
       case Tag::kTime:
       case Tag::kDatetime:
-      case Tag::kTimestamp:
         s += "'" + format_temporal(v.tag(), v.as_temporal()) + "'";
+        break;
+      case Tag::kTimestamp:
+        s += "'" + format_instant(v.as_timestamp()) + "'";
         break;
       default:
         s += "...";

@@ -21,12 +21,15 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
-#include <mutex>
 #include <climits>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
+#include <mutex>
+#include <string_view>
+#include <unordered_set>
 
 #include <mysql/components/component_implementation.h>
 #include <mysql/components/services/bits/mysql_thd_attributes_bits.h>
@@ -59,9 +62,94 @@ extern REQUIRES_SERVICE_PLACEHOLDER(global_grants_check);
 
 namespace mle_component {
 
+using mle::Outcome;
 using mle::ResultMsg;
-using mle::Status;
 using mle::Value;
+
+// ------------------------------------------------------------- libraries
+
+namespace {
+
+std::atomic<uint64_t> g_library_epoch{1};
+
+/** The commands that change no library, no routine and no right to use
+    one, by the names the server's query events carry. */
+bool leaves_libraries(std::string_view command) {
+  static const std::unordered_set<std::string_view> kHarmless = {
+      "select", "update", "update_multi", "insert", "insert_select", "delete",
+      "delete_multi", "replace", "replace_select", "truncate", "load", "do",
+      "call", "set_option", "change_db", "begin", "commit", "rollback",
+      "rollback_to_savepoint", "savepoint", "release_savepoint", "prepare",
+      "execute", "deallocate_prepare", "empty_query", "lock_tables",
+      "unlock_tables", "ha_open", "ha_close", "ha_read", "signal", "resignal",
+      "get_diagnostics", "help", "kill", "analyze", "check", "checksum",
+      "optimize", "repair", "explain_other", "create_table", "create_index",
+      "alter_table", "drop_table", "drop_index", "rename_table", "create_view",
+      "drop_view", "create_trigger", "drop_trigger"};
+  return command.starts_with("show_") || command.starts_with("xa_") ||
+         kHarmless.contains(command);
+}
+
+/**
+  The version tokens of library bodies (protocol §9.10): a number that two
+  different (language, body) pairs under one schema and name never share
+  while this component is loaded, also across DROP and CREATE of the
+  library. The last body given for each schema and name is kept to compare
+  with; numbers come from one counter and are never reused, so forgetting a
+  body (the table is bounded) only costs sending it once more.
+*/
+class LibraryVersions {
+ public:
+  uint64_t of(const std::string &schema, const std::string &name,
+              std::string_view language, std::string_view body) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    Entry &e = m_entries[{schema, name}];
+    if (e.version == 0 || e.language != language || e.body != body) {
+      m_bytes += body.size();
+      m_bytes -= e.body.size();
+      e.language.assign(language);
+      e.body.assign(body);
+      e.version = ++m_last;
+    }
+    e.used = ++m_clock;
+    while (m_entries.size() > 1 &&
+           (m_bytes > kMaxBytes || m_entries.size() > kMaxEntries)) {
+      auto oldest = m_entries.begin();
+      for (auto it = m_entries.begin(); it != m_entries.end(); ++it)
+        if (it->second.used < oldest->second.used) oldest = it;
+      m_bytes -= oldest->second.body.size();
+      m_entries.erase(oldest);
+    }
+    return m_entries.find({schema, name})->second.version;
+  }
+
+ private:
+  struct Entry {
+    std::string language;
+    std::string body;
+    uint64_t version = 0;
+    uint64_t used = 0;
+  };
+  static constexpr size_t kMaxBytes = 64ULL << 20;
+  static constexpr size_t kMaxEntries = 4096;
+  std::mutex m_mutex;
+  std::map<std::pair<std::string, std::string>, Entry> m_entries;
+  size_t m_bytes = 0;
+  uint64_t m_last = 0;
+  uint64_t m_clock = 0;
+};
+
+LibraryVersions g_library_versions;
+
+}  // namespace
+
+uint64_t library_epoch() { return g_library_epoch.load(); }
+
+void library_epoch_changed() { ++g_library_epoch; }
+
+void statement_ended(std::string_view sql_command) {
+  if (!leaves_libraries(sql_command)) library_epoch_changed();
+}
 
 namespace {
 
@@ -70,119 +158,148 @@ std::atomic<mysql_thd_store_slot> g_slot{nullptr};
 
 constexpr size_t kConsoleKeep = 64 * 1024;
 
-/** The SQL layer's side of a call: SQL from routines (Phase 5) and KILL. */
+constexpr char kNoSqlWhileLoading[] = "SQL cannot run while a routine is loaded";
+
 /** Forgets an error the server put in the diagnostics area meanwhile. */
 void clear_server_error(MYSQL_THD thd) {
   uint16_t empty = STATUS_DA_EMPTY;
   (void)mysql_service_mysql_thd_attributes->set(thd, "da_status", &empty);
 }
 
+/** KILL QUERY / KILL CONNECTION / max_execution_time reached the session. */
+bool session_killed(MYSQL_THD thd) {
+  uint16_t status = STATUS_SESSION_OK;
+  mysql_service_mysql_thd_attributes->get(thd, "thd_status", &status);
+  return status != STATUS_SESSION_OK;
+}
+
+/** The SQL layer's side of one request: the routine's SQL, the libraries it
+    imports, the session's bounds, KILL. */
 class Hooks : public mle::CallHooks {
  public:
-  explicit Hooks(MYSQL_THD thd, SqlRunner *sql = nullptr,
-                 const Routine *routine = nullptr,
-                 const char *no_sql = "SQL is only possible while a routine runs")
-      : m_thd(thd), m_sql(sql), m_routine(routine), m_no_sql(no_sql) {}
+  /** sql: the request's statements (a CALL of a routine), or nullptr for a
+      request that runs no SQL: every action but CLOSE then gets no_sql. */
+  explicit Hooks(MYSQL_THD thd, SqlBudget *budget = nullptr,
+                 SqlRunner *sql = nullptr, const Routine *routine = nullptr,
+                 const char *no_sql = kNoSqlWhileLoading)
+      : m_thd(thd),
+        m_budget(budget),
+        m_sql(sql),
+        m_routine(routine),
+        m_no_sql(no_sql) {}
 
   /**
-    A database library the routine imports (Phase 6, 14 §2). Importable:
-    the routine's schema, its USING libraries and their schemas (the server
-    checked EXECUTE on the USING libraries at CREATE; components cannot check
-    routine privileges at run time).
+    A database library the routine of this request imports (§9.10),
+    answered from the catalog as it is now. A routine may have the
+    libraries of its USING clause and the libraries those import. The host
+    does not read source code, so it cannot tell which libraries a library
+    imports: a routine with a USING clause may have every library that the
+    account whose rights it runs with may use (the server checks EXECUTE on
+    the library in the security context in force, which is that account's),
+    a routine without one has none. Every refusal says the same, whether the
+    library exists or not.
   */
   void library(const mle::LibraryMsg &m, mle::LibraryResultMsg *r) override {
-    r->status = mle::wire::LibraryStatus::kRefused;
+    *r = mle::LibraryResultMsg();
     const std::string what = m.schema + "." + m.name;
-    if (m_routine == nullptr) {
-      r->message = "library " + what + ": no routine to import it";
-      return;
-    }
-    bool allowed = m.schema == m_routine->schema;
-    for (const mle::Import &i : m_routine->prepare.imports)
-      allowed = allowed || i.schema == m.schema;
-    if (!allowed) {
-      r->message = "library " + what + " is not importable from " +
-                   m_routine->qualified_name +
-                   " (import it with USING, or use a library of the routine's schema)";
-      return;
-    }
+    const auto refuse = [&] {
+      *r = mle::LibraryResultMsg();
+      r->message = "library " + what + " is not available to " +
+                   (m_routine != nullptr ? m_routine->qualified_name
+                                         : std::string("this code"));
+      repair_utf8(&r->message);
+    };
+    if (m_routine == nullptr || m_routine->prepare.imports.empty())
+      return refuse();
     // A failed lookup may leave the server's error (a missing library, an
-    // MDL timeout, KILL) in the DA: it is not the routine's, the routine
-    // gets r->message. An inner statement's error kept there goes with it,
-    // and the SqlRunner must know (or a rethrown SQL error would be taken as
-    // still raised).
-    const auto lookup_failed = [&](std::string message) {
-      r->message = std::move(message);
+    // MDL timeout, KILL) in the diagnostics area: it is not the routine's,
+    // the routine gets r->message. A statement's error kept there goes with
+    // it, and the SqlRunner must know.
+    const auto lookup_failed = [&] {
+      refuse();
       clear_server_error(m_thd);
       if (m_sql != nullptr) m_sql->clear();
     };
     my_h_library h = nullptr;
     if (mysql_service_mysql_library->init(
-            m_thd, {m.schema.data(), m.schema.size()}, {m.name.data(), m.name.size()},
-            {"", 0}, &h) ||
-        h == nullptr) {
-      lookup_failed("library " + what + " does not exist");
-      return;
-    }
+            m_thd, {m.schema.data(), m.schema.size()},
+            {m.name.data(), m.name.size()}, {"", 0}, &h) ||
+        h == nullptr)
+      return lookup_failed();
     mysql_cstring_with_length body{nullptr, 0}, language{nullptr, 0};
+    // The server's init() succeeds for a library that does not exist or
+    // that the account may not use; reading its body is what fails.
     if (mysql_service_mysql_library->get_body(h, &body) ||
         mysql_service_mysql_library->get_language(h, &language)) {
       (void)mysql_service_mysql_library->deinit(h);
-      // The server's init() succeeds for a library that does not exist;
-      // reading its body is what fails.
-      lookup_failed("library " + what + " does not exist or cannot be read");
-      return;
+      return lookup_failed();
     }
     const std::string_view text(body.str == nullptr ? "" : body.str, body.length);
-    r->hash = mle::library_hash(text);
-    const unsigned bit = language_bit({language.str, language.length});
-    r->language = worker_language(bit);
-    if (r->language.empty()) {
-      r->message = "library " + what + " is in a language MLE does not run";
-    } else if (r->hash == m.known_hash) {
-      r->status = mle::wire::LibraryStatus::kUnchanged;
+    const std::string_view id =
+        worker_language(language_bit({language.str, language.length}));
+    // A body that is not UTF-8 text is not sent (§7.1), nor one in a
+    // language MLE does not run.
+    if (id.empty() || !mle::is_valid_utf8(text)) {
+      refuse();
     } else {
-      r->status = mle::wire::LibraryStatus::kBody;
-      r->body.assign(text);
+      r->language = id;
+      r->version = g_library_versions.of(m.schema, m.name, id, text);
+      if (m.known_version == r->version) {
+        r->status = mle::wire::LibraryStatus::kUnchanged;
+      } else {
+        r->status = mle::wire::LibraryStatus::kBody;
+        r->body.assign(text);
+      }
     }
     (void)mysql_service_mysql_library->deinit(h);
   }
 
-  /** SQL from the routine (Phase 5): the call's statements (sql.cc). */
   void sql(const mle::SqlMsg &m, mle::SqlResultMsg *r) override {
     sql_into(m, r, nullptr);
   }
-  /** The same; rows may go straight into the mailbox arena (exp note 44). */
+  /** SQL from the routine (sql.cc); rows may go straight into the mailbox
+      arena. */
   void sql_into(const mle::SqlMsg &m, mle::SqlResultMsg *r,
                 mle::DirectReply *direct) override {
     if (m_sql != nullptr) return m_sql->handle(m, r, direct);
+    // No statement ids exist here: CLOSE closes nothing, every other action
+    // is an ERROR and its id stays CLOSED.
+    *r = mle::SqlResultMsg();
+    if (m.action == mle::wire::SqlAction::kClose) return;
     sql_error(r, ER_LANGUAGE_COMPONENT_INTERNAL, m_no_sql);
+    if (m.action == mle::wire::SqlAction::kExecuteMany) r->failed_row = 0;
   }
 
-  /** KILL QUERY / KILL CONNECTION / max_execution_time. */
-  bool killed() override {
-    uint16_t status = STATUS_SESSION_OK;
-    mysql_service_mysql_thd_attributes->get(m_thd, "thd_status", &status);
-    return status != STATUS_SESSION_OK;
+  void sql_refused(mle::SqlRefusal why, mle::wire::SqlAction action,
+                   uint64_t stmt_id, mle::SqlResultMsg *error) override {
+    if (m_sql != nullptr) return m_sql->refused(why, action, stmt_id, error);
+    if (action != mle::wire::SqlAction::kClose)
+      refusal_error(why, m_no_sql, error);
   }
+
+  /** The bytes of SQL messages whose statements are in progress, over all
+      requests of the session (§10.7). */
+  bool sql_bytes_reserve(uint64_t bytes) override {
+    if (m_budget == nullptr) return true;
+    if (bytes > kSqlRequestBytesMax ||
+        m_budget->request_bytes > kSqlRequestBytesMax - bytes)
+      return false;
+    m_budget->request_bytes += bytes;
+    return true;
+  }
+  void sql_bytes_release(uint64_t bytes) override {
+    if (m_budget != nullptr) m_budget->request_bytes -= bytes;
+  }
+
+  bool killed() override { return session_killed(m_thd); }
 
  private:
   MYSQL_THD m_thd;
+  SqlBudget *m_budget;
   SqlRunner *m_sql;
   const Routine *m_routine;
   const char *m_no_sql;
 };
-
-std::string session_time_zone(MYSQL_THD thd) {
-  char buffer[256];
-  void *value = buffer;
-  size_t length = sizeof buffer - 1;
-  if (mysql_service_mysql_system_variable_reader->get(
-          thd, "SESSION", "mysql_server", "time_zone", &value, &length))
-    return "+00:00";
-  std::string zone(static_cast<const char *>(value), length);
-  return zone == "SYSTEM" ? system_time_zone() : zone;
-}
 
 /** Text from a worker or routine for the error log: one line, bounded (a
     routine must not forge log lines or fill the log). */
@@ -276,48 +393,62 @@ void engine_error(std::string why) {
 }
 }  // namespace
 
-/** KILL QUERY / KILL CONNECTION / max_execution_time interrupt the worker
-    at once (the worker's killed() polling is the backstop). */
+class Session::Request {
+ public:
+  explicit Request(Session *s) : m_session(s) { ++s->m_calls; }
+  ~Request() {
+    if (--m_session->m_calls == 0) {
+      // The outermost request ended: no request runs in a retired worker.
+      for (auto &w : m_session->m_retired) engine_release_worker(std::move(w));
+      m_session->m_retired.clear();
+    }
+  }
+  Request(const Request &) = delete;
+  Request &operator=(const Request &) = delete;
+
+ private:
+  Session *m_session;
+};
+
+/** KILL QUERY / KILL CONNECTION / max_execution_time interrupt the workers
+    at once (each Worker's polling of killed() is the backstop). A worker is
+    listed while a top-level request of the session is in progress in it;
+    its nested requests are covered by that entry. */
 class Session::KillGuard {
  public:
   KillGuard(Session *s, mle::Worker *worker) : m_session(s) {
-    ++s->m_calls;
+    if (worker->depth() != 0) return;  // nested: its worker is listed
     const size_t n = s->m_running_n.load();
-    m_pushed = n < kMaxNesting;
+    m_pushed = n < kMaxRunning;
     if (m_pushed) {
       s->m_running[n].store(worker);
       s->m_running_n.store(n + 1);
     }
-    if (n == 0) {
+    if (!s->m_kill_installed) {
       // Fails if another component's handler is installed (e.g. a V8
       // routine called us): the workers' KILL polling still works.
       s->m_kill_installed = !mysql_service_mysql_thd_kill_handler->set(
           s->m_thd,
           [](MYSQL_THD, uint16_t, void *data) {
             auto *session = static_cast<Session *>(data);
-            session->m_kills.fetch_add(1);
             const size_t count = session->m_running_n.load();
-            for (size_t i = 0; i < count && i < kMaxNesting; i++)
+            for (size_t i = 0; i < count && i < kMaxRunning; i++)
               if (mle::Worker *w = session->m_running[i].load()) w->interrupt();
           },
           s);
+      m_installed = s->m_kill_installed;
     }
   }
   ~KillGuard() {
-    if (m_pushed) {
-      const size_t n = m_session->m_running_n.load() - 1;
-      m_session->m_running[n].store(nullptr);
-      m_session->m_running_n.store(n);
-    }
-    if (m_session->m_running_n.load() == 0 && m_session->m_kill_installed) {
+    if (m_installed) {
       (void)mysql_service_mysql_thd_kill_handler->set(m_session->m_thd,
                                                       nullptr, nullptr);
       m_session->m_kill_installed = false;
     }
-    if (--m_session->m_calls == 0) {
-      // The outermost request ended: no request runs in a retired worker.
-      for (auto &w : m_session->m_retired) engine_release_worker(std::move(w));
-      m_session->m_retired.clear();
+    if (m_pushed) {
+      const size_t n = m_session->m_running_n.load() - 1;
+      m_session->m_running[n].store(nullptr);
+      m_session->m_running_n.store(n);
     }
   }
   KillGuard(const KillGuard &) = delete;
@@ -326,6 +457,8 @@ class Session::KillGuard {
  private:
   Session *m_session;
   bool m_pushed = false;
+  /** This guard installed the handler: it is the outermost one. */
+  bool m_installed = false;
 };
 
 // ------------------------------------------------------------- lifetime
@@ -464,159 +597,278 @@ void Session::drop_worker(const std::string &key) {
   m_workers.erase(it);
 }
 
-Session::Slot *Session::worker_for(const std::string &key,
-                                   const Routine &routine) {
-  auto it = m_workers.find(key);
-  if (it != m_workers.end()) {
-    if (it->second.worker && it->second.worker->usable()) return &it->second;
-    drop_worker(key);  // died or retired: a fresh one below
-  }
-  const std::string principal = key.substr(0, key.find('\0'));
-  const WorkerKind kind = kind_of(routine.language);
-
-  if (!m_options_bound) {
-    // Oracle: the session's time zone is bound at its first use (until
-    // mle_session_reset()).
-    m_options.time_zone = session_time_zone(m_thd);
-    m_options_bound = true;
-  }
-  const std::string &zone = m_options.time_zone;
-  if (zone.rfind("leap/", 0) == 0 || zone.rfind("right/", 0) == 0) {
-    my_error(ER_LANGUAGE_COMPONENT_TIMEZONE, MYF(0), routine.display_language(),
-             zone.c_str());
-    return nullptr;
-  }
-
-  AcquireError why = AcquireError::kNone;
-  std::string error;
-  // A worker kept from an earlier session of this principal (warm), else a
-  // new one from the pool. A kept worker that died meanwhile fails its
-  // OPTIONS: then a new one.
-  std::unique_ptr<mle::Worker> worker =
-      engine_reuse_worker(principal, kind, max_workers());
-  if (worker && worker->options(m_options, &error) != Status::kOk) {
-    engine_release_worker(std::move(worker), kind);
-    error.clear();
-  }
-  const bool reused = worker != nullptr;
-  Hooks hooks(m_thd);
-  if (!worker)
-    worker = engine_new_worker(kind, max_workers(), spin_us(), interrupt_grace_ms(),
-                               &hooks, &why, &error);
-  if (why == AcquireError::kFailed && hooks.killed())
-    return nullptr;  // KILL while waiting for the worker: the server reports it
-  switch (why) {
-    case AcquireError::kNone:
-      break;
-    case AcquireError::kLimit:
-      my_error(ER_LANGUAGE_COMPONENT_CONCURRENCY_LIMIT, MYF(0),
-               ("mle.max_workers = " + std::to_string(max_workers())).c_str());
-      return nullptr;
-    case AcquireError::kInactive:
-      engine_error("The MLE engine is not running: " + error);
-      return nullptr;
-    case AcquireError::kFailed:
-      log_error("No worker for " + display_key(key) + ": " + log_safe(error));
-      my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
-      return nullptr;
-  }
-
-  if (!reused && worker->options(m_options, &error) != Status::kOk) {
-    engine_release_worker(std::move(worker), kind);
-    if (error.find("unknown time zone") != std::string::npos) {
-      my_error(ER_LANGUAGE_COMPONENT_TIMEZONE, MYF(0),
-               routine.display_language(), zone.c_str());
-    } else {
-      log_error("A new worker for " + display_key(key) + " failed: " + log_safe(error));
-      my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
-    }
-    return nullptr;
-  }
-  Slot &slot = m_workers[key];
-  slot.worker = std::move(worker);
-  slot.principal = principal;
-  slot.kind = kind;
-  return &slot;
+void Session::settle(const std::string &key, mle::Worker *worker) {
+  if (worker->usable()) return;
+  const auto it = m_workers.find(key);
+  if (it != m_workers.end() && it->second.worker.get() == worker)
+    drop_worker(key);
 }
 
-bool Session::prepare_in(const std::string &principal, Slot &slot,
+Session::Slot *Session::worker_for(const std::string &key,
+                                   const Routine &routine) {
+  const std::string principal = key.substr(0, key.find('\0'));
+  const WorkerKind kind = kind_of(routine.language);
+  const std::string language = worker_language(routine.language);
+
+  auto it = m_workers.find(key);
+  if (it != m_workers.end()) {
+    Slot &slot = it->second;
+    bool keep = slot.worker && slot.worker->usable();
+    // A worker runs its kind's languages, but an installation may lack one
+    // of them (a JVM worker without Python): the host sends no other.
+    if (keep) {
+      const auto &languages = slot.worker->languages();
+      if (std::find(languages.begin(), languages.end(), language) ==
+          languages.end()) {
+        engine_error("incompatible MLE worker: it does not run the language '" +
+                     language + "'");
+        return nullptr;
+      }
+    }
+    // A worker whose principal names an account that was dropped or renamed
+    // is retired: an account of that name is another one now (§1).
+    if (keep && slot.worker->depth() == 0) {
+      const uint64_t forgets = engine_forgets();
+      if (forgets != slot.forgets) {
+        if (engine_account_forgotten(slot.principal, slot.forgets)) {
+          log_info("The worker of " + display_key(key) +
+                   " was retired: an account of its principal was dropped or "
+                   "renamed.");
+          keep = false;
+        } else {
+          slot.forgets = forgets;
+        }
+      }
+    }
+    if (!keep) {
+      drop_worker(key);
+      it = m_workers.end();
+    }
+  }
+  // A nested request: the worker serves a top-level request of this session
+  // and has its options.
+  if (it != m_workers.end() && it->second.worker->depth() != 0)
+    return &it->second;
+
+  // A top-level request follows. Nothing is sent for a session that is
+  // killed or whose statement is out of time (§11.1): the server reports it.
+  if (session_killed(m_thd)) return nullptr;
+
+  if (it == m_workers.end()) {
+    const uint64_t forgets = engine_forgets();
+    AcquireError why = AcquireError::kNone;
+    std::string error;
+    // A worker kept from an earlier session of this principal (warm, RESET
+    // when it was given back), else a new one from the pool.
+    std::unique_ptr<mle::Worker> worker =
+        engine_reuse_worker(principal, kind, language, max_workers());
+    Hooks hooks(m_thd);
+    if (!worker)
+      worker = engine_new_worker(kind, language, max_workers(), spin_us(),
+                                 interrupt_grace_ms(), &hooks, &why, &error);
+    if (why == AcquireError::kFailed && hooks.killed())
+      return nullptr;  // KILL while waiting for the worker: the server reports it
+    switch (why) {
+      case AcquireError::kNone:
+        break;
+      case AcquireError::kLimit:
+        my_error(ER_LANGUAGE_COMPONENT_CONCURRENCY_LIMIT, MYF(0),
+                 ("mle.max_workers = " + std::to_string(max_workers())).c_str());
+        return nullptr;
+      case AcquireError::kInactive:
+        engine_error("The MLE engine is not running: " + error);
+        return nullptr;
+      case AcquireError::kIncompatible:
+        // Not the worker's fault and not the routine's: the installed
+        // worker and this component do not fit together.
+        log_error("The " + std::string(kind_name(kind)) + " worker cannot serve " +
+                  routine.display_language() + " for " + display_key(key) + ": " +
+                  log_safe(error) +
+                  ". The MLE packages installed in mle.dir do not match component_mle.");
+        engine_error(error + " (the installed MLE worker does not match the server's MLE component)");
+        return nullptr;
+      case AcquireError::kFailed:
+        log_error("No worker for " + display_key(key) + ": " + log_safe(error));
+        my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+        return nullptr;
+    }
+    Slot &slot = m_workers[key];
+    slot.worker = std::move(worker);
+    slot.principal = principal;
+    slot.kind = kind;
+    slot.forgets = forgets;
+    it = m_workers.find(key);
+  }
+
+  Slot &slot = it->second;
+  slot.worker->set_timing(spin_us(), interrupt_grace_ms());
+  // Routines that went away while their DROP could not be sent.
+  while (!slot.undropped.empty()) {
+    std::string error;
+    const Outcome o = slot.worker->drop(slot.undropped.back(), &error);
+    if (o == Outcome::kRefused) break;
+    slot.undropped.pop_back();
+    if (!slot.worker->usable()) break;
+  }
+  if (slot.worker->usable() && options_in(key, slot, routine)) return &slot;
+  // The worker was lost on the way (or retired for an INTERNAL answer).
+  mle::Worker *const worker = slot.worker.get();
+  if (!worker->usable()) {
+    ++g_counters.worker_failures;
+    log_warning("The worker of " + display_key(key) + " was lost: " +
+                log_safe(worker->failure()));
+    drop_worker(key);
+  }
+  return nullptr;
+}
+
+bool Session::options_in(const std::string &key, Slot &slot,
                          const Routine &routine) {
-  if (slot.prepared.count(routine.id) != 0) return true;
-  Hooks hooks(m_thd, nullptr, &routine);
+  mle::Worker &worker = *slot.worker;
+  const std::string zone = session_time_zone(m_thd);
+  if (worker.options_in_force() && zone == slot.zone &&
+      m_settings_version == slot.settings_version)
+    return true;
+  mle::OptionsMsg options;
+  options.time_zone = options_time_zone(zone);
+  if (options.time_zone.empty()) {
+    // A zone the protocol cannot express: nothing is sent.
+    my_error(ER_LANGUAGE_COMPONENT_TIMEZONE, MYF(0), routine.display_language(),
+             zone.c_str());
+    return false;
+  }
+  // The complete set: a setting that is not listed has its default.
+  for (const auto &[name, value] : m_settings)
+    options.settings.push_back({name, value});
+  if (worker.options_in_force() && options == slot.options) {
+    slot.zone = zone;
+    slot.settings_version = m_settings_version;
+    return true;
+  }
+  mle::Error refused;
+  std::string error;
+  switch (worker.options(options, &refused, &error)) {
+    case Outcome::kOk:
+      slot.options = std::move(options);
+      slot.zone = zone;
+      slot.settings_version = m_settings_version;
+      return true;
+    case Outcome::kGuestError:
+      // The options in force are unchanged (possibly none) and the worker
+      // lives on; the statement fails. Which setting it was is told by the
+      // Error's language, never by its text.
+      if (refused.language == mle::wire::kLanguageTimeZone) {
+        my_error(ER_LANGUAGE_COMPONENT_TIMEZONE, MYF(0),
+                 routine.display_language(), zone.c_str());
+      } else {
+        repair_utf8(&refused.message);
+        my_error(ER_LANGUAGE_COMPONENT, MYF(0),
+                 ("MLE-Option> " + refused.message).c_str());
+      }
+      return false;
+    case Outcome::kRefused:
+      log_error("Options for the worker of " + display_key(key) +
+                " were not sent: " + log_safe(error));
+      my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+      return false;
+    default:
+      break;
+  }
+  // INTERNAL (the worker is retired for it), or the worker is lost.
+  if (worker.usable()) {
+    log_error("The worker of " + display_key(key) +
+              " failed to take its options: " + log_safe(error));
+  }
+  if (!worker.usable()) {
+    engine_error(worker.failure());
+  } else {
+    my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+  }
+  return false;
+}
+
+bool Session::interrupted(Outcome outcome, const mle::Worker &worker) const {
+  switch (outcome) {
+    case Outcome::kInterrupted:
+    case Outcome::kKilled:
+      return true;
+    case Outcome::kRefused:
+    case Outcome::kIncompatible:
+      return false;  // nothing was sent
+    default:
+      // Whatever the RESULT says, and also when the worker had to be ended.
+      return worker.interrupted() || session_killed(m_thd);
+  }
+}
+
+bool Session::prepare_in(const std::string &key, Slot &slot, Routine &routine) {
+  mle::Worker *const worker = slot.worker.get();
+  if (worker->is_prepared(routine.id)) return true;
+  Hooks hooks(m_thd, &m_budget, nullptr, &routine);
   ResultMsg result;
   std::string error;
-  Status s;
-  mle::Worker *worker = slot.worker.get();
+  Outcome outcome;
+  // The epoch as it is when the request is sent.
+  routine.prepare.library_epoch = library_epoch();
   {
     const KillGuard kill(this, worker);
-    s = worker->prepare(routine.prepare, hooks, &result, &error);
+    outcome = worker->prepare(routine.prepare, hooks, &result, &error);
   }
   keep_console(result);
-  if (s != Status::kOk) {
-    m_console_now = console_warnings(m_thd);  // this failure's, not the last call's
-    report(principal, s, result, error, routine, nullptr);
-    return false;
+  findings_to_warnings(routine, result);
+  const bool stopped = interrupted(outcome, *worker);
+  if (outcome == Outcome::kOk && !stopped) {
+    settle(key, worker);
+    m_programs[routine.id] = routine.sp_type;
+    return true;
   }
-  // Loading runs routine code, which may run SQL and nested calls; one of
-  // them may have retired this worker (and its slot) meanwhile.
-  const auto it = m_workers.find(principal);
-  if (it == m_workers.end() || it->second.worker.get() != worker) {
-    my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
-    return false;
+  m_console_now = console_warnings(m_thd);  // this failure's, not the last call's
+  report(key, worker, outcome, stopped, result, error, routine, nullptr);
+  return false;
+}
+
+mle::Worker *Session::prepared_worker(const std::string &key,
+                                      Routine &routine) {
+  for (int attempt = 0; attempt < 2; attempt++) {
+    Slot *slot = worker_for(key, routine);
+    if (slot == nullptr) return nullptr;
+    mle::Worker *const worker = slot->worker.get();
+    if (!prepare_in(key, *slot, routine)) return nullptr;
+    // A worker can ask to be retired with the RESULT of the PREPARE: then
+    // once more, in a new one.
+    if (worker->usable()) return worker;
   }
-  it->second.prepared.insert(routine.id);
-  m_programs[routine.id] = routine.sp_type;
-  return true;
+  engine_error("the worker was retired while the routine was loaded");
+  return nullptr;
 }
 
 // ------------------------------------------------------------- requests
 
 bool Session::parse(Routine &routine) {
   if (!check_create_privilege(m_thd, routine)) return false;
-  const std::string who = slot_key(principal(&routine), routine.language);
-  Slot *slot = worker_for(who, routine);
+  const Request request(this);
+  const std::string key = slot_key(principal(&routine), routine.language);
+  Slot *slot = worker_for(key, routine);
   if (slot == nullptr) return false;
-  // CREATE: the worker also checks the code (exp note 39); its findings
-  // become the statement's warnings.
+  // CREATE: the worker also checks the code; what it finds becomes the
+  // statement's warnings.
   enum_sql_command command = SQLCOM_END;
   (void)mysql_service_mysql_thd_attributes->get(m_thd, "sql_command_id", &command);
   routine.prepare.check =
       command == SQLCOM_CREATE_PROCEDURE || command == SQLCOM_CREATE_SPFUNCTION;
-  const bool ok = prepare_in(who, *slot, routine);
-  const bool checked = routine.prepare.check;
+  const bool ok = prepare_in(key, *slot, routine);
   routine.prepare.check = false;
-  if (ok && checked) check_findings_to_warnings(routine);
   return ok;
 }
 
-void Session::check_findings_to_warnings(const Routine &routine) {
-  // "\x1f" CHECK_MARK "message" lines of the PREPARE's stderr: warnings, and
-  // not the session's output.
-  constexpr std::string_view kMark = "\x1fmle-check:";
-  auto take = [&](std::string *text, bool emit) {
-    std::string kept;
-    size_t start = 0;
-    while (start < text->size()) {
-      size_t end = text->find('\n', start);
-      if (end == std::string::npos) end = text->size() - 1;
-      const std::string_view line(text->data() + start, end - start + 1);
-      if (line.substr(0, kMark.size()) == kMark) {
-        if (emit) {
-          std::string message = std::string(routine.display_language()) + "> " + routine.name +
-                                ", " + std::string(line.substr(kMark.size()));
-          while (!message.empty() && message.back() == '\n') message.pop_back();
-          mysql_service_mysql_runtime_warning->emit(m_thd, ER_LANGUAGE_COMPONENT,
-                                                    message.c_str());
-        }
-      } else {
-        kept.append(line);
-      }
-      start = end + 1;
-    }
-    *text = std::move(kept);
-  };
-  take(&m_last_err, true);
-  take(&m_err, false);
+void Session::findings_to_warnings(const Routine &routine,
+                                   const ResultMsg &result) {
+  for (const std::string &finding : result.findings) {
+    const std::string message = std::string(routine.display_language()) + "> " +
+                                routine.name + ", " + finding;
+    mysql_service_mysql_runtime_warning->emit(m_thd, ER_LANGUAGE_COMPONENT,
+                                              message.c_str());
+  }
 }
 
 bool Session::execute(Routine &routine) {
@@ -624,9 +876,13 @@ bool Session::execute(Routine &routine) {
   m_trace.reset();
   std::vector<Value> args = std::move(m_args);  // reused; a nested call allocates
   if (!routine.read_args(&args)) return false;
-  const std::string who = slot_key(principal(&routine), routine.language);  // a copy: nested calls change it
-  Slot *slot = worker_for(who, routine);
-  if (slot == nullptr || !prepare_in(who, *slot, routine)) return false;
+  const Request request(this);
+  const std::string key =
+      slot_key(principal(&routine), routine.language);  // a copy: nested calls change it
+  // Its slot may go while the call runs (a nested request can lose the
+  // worker); the worker itself lives until this request ends.
+  mle::Worker *const worker = prepared_worker(key, routine);
+  if (worker == nullptr) return false;
 
   // Whose code runs, for what it evaluates with mle_eval(): restored when
   // the call returns (a nested call has its own).
@@ -638,36 +894,37 @@ bool Session::execute(Routine &routine) {
   m_running_routine = &routine;
 
   // The call's statements; closed when it returns.
-  SqlRunner sql(m_thd, &m_results_held);
-  Hooks hooks(m_thd, &sql, &routine);
+  SqlRunner sql(m_thd, &m_budget);
+  Hooks hooks(m_thd, &m_budget, &sql, &routine);
   ResultMsg result;
   std::string error;
-  Status s;
-  const uint64_t kills = m_kills.load();
-  slot->worker->set_timing(spin_us(), interrupt_grace_ms());
+  Outcome outcome;
   {
     // mle_threads: counted while the call runs, released if it throws too.
-    struct Running {
-      Running() { raise_max(g_counters.threads_max, ++g_counters.threads); }
-      ~Running() { --g_counters.threads; }
-    } running;
-    const KillGuard kill(this, slot->worker.get());
-    s = slot->worker->call(routine.id, 0, args, hooks, &result, &error);
+    struct Counted {
+      Counted() { raise_max(g_counters.threads_max, ++g_counters.threads); }
+      ~Counted() { --g_counters.threads; }
+    } counted;
+    const KillGuard kill(this, worker);
+    outcome = worker->call(routine.id, library_epoch(), args, hooks, &result, &error);
   }
   keep_console(result);
+  // An interrupted call is reported as interrupted even if the routine
+  // ended normally (an inner SLEEP returned early and the worker finished
+  // before the interrupt reached it).
+  const bool stopped = interrupted(outcome, *worker);
+  const bool ok = outcome == Outcome::kOk && !stopped;
   // mle.console = WARNINGS: read only when there is something to show.
-  m_console_now = (s != Status::kOk || !result.console_out.empty() ||
+  m_console_now = (!ok || !result.console_out.empty() ||
                    !result.console_err.empty()) &&
                   console_warnings(m_thd);
   if (m_console_now) console_to_warnings(routine, result);
-  // A call killed meanwhile reports the KILL even if the routine then ended
-  // normally (e.g. an inner SLEEP returned early and the worker finished
-  // before the interrupt reached it).
-  if (s == Status::kOk && (hooks.killed() || m_kills.load() != kills))
-    s = Status::kInterrupted;
-  const bool ok = s == Status::kOk;
-  if (ok) sql.call_succeeded();
-  else report(who, s, result, error, routine, &args, &sql);
+  if (ok) {
+    sql.call_succeeded();
+    settle(key, worker);
+  } else {
+    report(key, worker, outcome, stopped, result, error, routine, &args, &sql);
+  }
   args.clear();
   m_args = std::move(args);
   return ok && routine.store_results(result);
@@ -675,11 +932,22 @@ bool Session::execute(Routine &routine) {
 
 void Session::forget(const Routine &routine) {
   m_programs.erase(routine.id);
-  for (auto &[principal, slot] : m_workers) {
-    if (slot.prepared.erase(routine.id) == 0) continue;
+  std::vector<std::string> lost;
+  for (auto &[key, slot] : m_workers) {
+    if (!slot.worker || !slot.worker->usable() ||
+        !slot.worker->is_prepared(routine.id))
+      continue;
     std::string error;
-    if (slot.worker && slot.worker->usable())
-      (void)slot.worker->drop(routine.id, &error);
+    // A DROP that cannot be sent now (the worker is busy where no nested
+    // request fits) goes before the worker's next top-level request.
+    if (slot.worker->drop(routine.id, &error) == Outcome::kRefused)
+      slot.undropped.push_back(routine.id);
+    if (!slot.worker->usable()) lost.push_back(key);
+  }
+  for (const std::string &key : lost) {
+    log_warning("The worker of " + display_key(key) + " was lost: " +
+                log_safe(m_workers[key].worker->failure()));
+    drop_worker(key);
   }
 }
 
@@ -731,34 +999,81 @@ void Session::keep_console(const ResultMsg &result) {
 }
 
 
-void Session::report(const std::string &principal, Status status,
-                     const ResultMsg &result, const std::string &error,
-                     const Routine &routine, const std::vector<Value> *args,
-                     SqlRunner *sql) {
+
+void Session::report(const std::string &key, mle::Worker *worker,
+                     Outcome outcome, bool stopped, const ResultMsg &result,
+                     const std::string &error, const Routine &routine,
+                     const std::vector<Value> *args, SqlRunner *sql) {
   const mle::Error *e = result.error ? &*result.error : nullptr;
-  // A MySQL error from the routine (S-3, S-11): an inner statement's error
-  // still in the diagnostics area reaches the client unchanged; an
-  // SqlError the routine threw is raised like SIGNAL.
-  if (status == Status::kGuestError && e != nullptr && e->sql_errno != 0 &&
-      sql != nullptr) {
-    if (sql->propagates(*e) || sql->raise(*e)) return;
+  const bool lost = outcome == Outcome::kDied || outcome == Outcome::kKilled ||
+                    outcome == Outcome::kViolation ||
+                    outcome == Outcome::kTimedOut;
+  const std::string why =
+      !error.empty() ? error : e != nullptr ? e->message : "no details";
+  // The worker's part first: one that is lost or was retired leaves its
+  // slot, whatever the client is told.
+  if (lost) {
+    ++g_counters.worker_failures;
+    if (why.find("out-of-memory") != std::string::npos) ++g_counters.oom_errors;
+    if (outcome == Outcome::kViolation)
+      log_error("The worker of " + display_key(key) +
+                " broke the protocol during " + log_safe(routine.qualified_name) +
+                " and was ended: " + log_safe(why));
+    else
+      log_warning("The worker of " + display_key(key) + " was lost during " +
+                  log_safe(routine.qualified_name) + ": " + log_safe(why));
+  } else if (!worker->usable()) {
+    // Retired after the request: it reported that it must not be used
+    // again (out of heap or stack, damaged state).
+    log_warning("The worker of " + display_key(key) + " was retired after " +
+                log_safe(routine.qualified_name) + ": " +
+                log_safe(worker->failure()));
+  }
+  settle(key, worker);
+
+  // To the client an interrupted request is interrupted in every case:
+  // whatever the RESULT says, and also when the worker had to be ended
+  // (§11.1 step 4).
+  if (stopped) {
+    if (sql != nullptr) sql->clear();
+    // A KILL or max_execution_time: the SQL layer reports it.
+    if (session_killed(m_thd)) return;
+    my_error(ER_QUERY_INTERRUPTED, MYF(0));
+    return;
+  }
+
+  // The error a routine ends with (§10.8); only GUEST_ERROR looks at the
+  // Error's SQL fields.
+  if (outcome == Outcome::kGuestError && e != nullptr) {
+    // 1. An ERROR the host sent during this top-level request, handed back
+    //    by its id: the client gets that error. It is unchanged if it is
+    //    still the one in the diagnostics area; an older one is raised
+    //    again with its number and SQLSTATE.
+    const mle::HeldError *held =
+        e->sql_error_id != 0 ? worker->held_error(e->sql_error_id) : nullptr;
+    if (held != nullptr) {
+      if (sql != nullptr && sql->propagates(*held)) return;
+      if (signal_error(m_thd, held->sql_errno, held->sqlstate, held->message))
+        return;
+    } else {
+      // 2. The routine raises its own SQL error.
+      if (sql != nullptr) sql->clear();
+      if (signal_error(m_thd, e->sql_errno, e->sqlstate, e->message)) return;
+    }
+    // 3. A routine error (also where the server lets no error be raised by
+    //    number: in a stored function or trigger).
   }
   if (sql != nullptr) sql->clear();
-  switch (status) {
-    case Status::kGuestError:
-    case Status::kExhausted: {
-      if (status == Status::kExhausted) ++g_counters.oom_errors;
-      if (e == nullptr) {
-        // A guest error without its details is the worker's fault, not the
-        // routine's, and not a reason to give the worker up.
-        log_error("Internal error in the worker of " + principal + " during " +
-                  log_safe(routine.qualified_name) +
-                  ": an error result without an error");
-        my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
-        return;
-      }
-      if (e->language == "MLE-Type") {
-        std::string message = "MLE-Type> " + e->message;
+
+  switch (outcome) {
+    case Outcome::kGuestError:
+    case Outcome::kExhausted: {
+      if (outcome == Outcome::kExhausted) ++g_counters.oom_errors;
+      if (e == nullptr) break;  // cannot be: the Worker checks every RESULT
+      std::string text = e->message;
+      repair_utf8(&text);
+      if (e->language == mle::wire::kLanguageType) {
+        std::string message = "MLE-Type> " + text;
         if (args != nullptr)
           message += " in '" + routine.call_text(*args) + "'";
         my_error(ER_LANGUAGE_COMPONENT, MYF(0), message.c_str());
@@ -768,9 +1083,9 @@ void Session::report(const std::string &principal, Status status,
                                  ? routine.display_language()
                                  : display_language(e->language);
       keep_stack_trace(*e, routine);
-      // Where it happened, at the innermost frame of the routine's code
-      // (exp note 39); the frames: mle_session_state('traceback'/'stack_trace').
-      const std::string message = e->message + error_location(*e);
+      // Where it happened, at the innermost frame of the routine's code;
+      // the frames: mle_session_state('traceback' / 'stack_trace').
+      const std::string message = text + error_location(*e);
       my_error(ER_LANGUAGE_COMPONENT_RUNTIME, MYF(0), language, message.c_str());
       if (m_console_now) {
         // The warnings go to the session's client, whoever's rights the
@@ -781,51 +1096,30 @@ void Session::report(const std::string &principal, Status status,
           client = nullptr;  // a server that does not tell: no source lines
         lines_to_warnings(traceback_for(client), routine.name + " traceback");
       }
-      const auto it = m_workers.find(principal);
-      if (it != m_workers.end() &&
-          (!it->second.worker || !it->second.worker->usable())) {
-        // Retired after running out of heap or stack.
-        log_warning("The worker of " + display_key(principal) +
-                    " was retired: " + log_safe(e->message));
-        drop_worker(principal);
-      }
       return;
     }
-    case Status::kInterrupted:
-      // A KILL or max_execution_time: the SQL layer reports it.
-      if (Hooks(m_thd).killed()) return;
-      my_error(ER_QUERY_INTERRUPTED, MYF(0));
+    case Outcome::kRefused:
+      // The host did not send the request: nesting too deep, a routine
+      // larger than a message may be.
+      engine_error(why);
+      return;
+    case Outcome::kViolation:
+      // The reason is a host-side diagnostic: the log has it.
+      my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
+      return;
+    case Outcome::kDied:
+    case Outcome::kKilled:
+    case Outcome::kTimedOut:
+      // The caller learns why (the worker died: signal ...); the next call
+      // of the session gets a new worker.
+      engine_error(why);
       return;
     default:
       break;
   }
-  // The worker is lost (died, killed, misbehaved) or failed internally.
-  const std::string why =
-      !error.empty() ? error : e != nullptr ? e->message : "no details";
-  if (status == Status::kProtocolError) {
-    // Lost, but the reason is a host-side diagnostic: the log has it, the
-    // caller gets an internal error.
-    ++g_counters.worker_failures;
-    log_error("The worker of " + display_key(principal) + " broke the protocol during " +
-              log_safe(routine.qualified_name) + " and was killed: " +
-              log_safe(why));
-    drop_worker(principal);
-    my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
-    return;
-  }
-  if (status != Status::kInternal) {
-    ++g_counters.worker_failures;
-    if (why.find("out-of-memory") != std::string::npos) ++g_counters.oom_errors;
-    log_warning("The worker of " + display_key(principal) + " was lost during " +
-                log_safe(routine.qualified_name) + ": " + log_safe(why));
-    drop_worker(principal);
-    if (status == Status::kKilled && Hooks(m_thd).killed()) return;
-    // The caller learns why (the worker died: signal ..., did not stop after
-    // KILL ...); the next call of the session gets a new worker.
-    engine_error(why);
-    return;
-  }
-  log_error("Internal error in the worker of " + principal + " during " +
+  // INTERNAL from PREPARE, CALL or PARSE_LIBRARY: the request fails with an
+  // internal error; the worker stays in use unless it asked to be retired.
+  log_error("Internal error in the worker of " + display_key(key) + " during " +
             log_safe(routine.qualified_name) + ": " + log_safe(why));
   my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
 }
@@ -929,15 +1223,15 @@ void Session::clear_state(bool reuse) {
                           m_mark);
   m_workers.clear();
   m_programs.clear();
-  // Everything a later account could read with mle_session_state() (C1).
+  // Everything a later account could read with mle_session_state().
   m_stack.clear();
   m_trace.reset();
   m_out.clear();
   m_err.clear();
   m_last_out.clear();
   m_last_err.clear();
-  m_options = mle::OptionsMsg();
-  m_options_bound = false;
+  m_settings.clear();
+  ++m_settings_version;
 }
 
 bool Session::reset() {
@@ -958,17 +1252,17 @@ void Session::account_changed() {
   m_mark = engine_session_begin();
 }
 
-bool Session::set_options(mle::wire::IntegerType integer_type,
-                          mle::wire::DecimalType decimal_type) {
+bool Session::set_settings(
+    const std::vector<std::pair<std::string, std::string>> &settings) {
   if (has_programs()) return false;
-  m_options.integer_type = integer_type;
-  m_options.decimal_type = decimal_type;
-  for (auto &[principal, slot] : m_workers) {
-    std::string error;
-    if (slot.worker && slot.worker->usable() &&
-        slot.worker->options(m_options, &error) != Status::kOk)
-      log_warning("Options for the worker of " + display_key(principal) + ": " + error);
+  for (const auto &[name, value] : settings) {
+    if (value.empty())
+      m_settings.erase(name);
+    else
+      m_settings[name] = value;
   }
+  // The workers get them with OPTIONS before their next top-level request.
+  ++m_settings_version;
   return true;
 }
 
@@ -1060,44 +1354,58 @@ bool Session::parse_library(unsigned language, const std::string &name,
   routine.name = name;
   routine.qualified_name = name;
   // From a routine's SQL the worker is the one waiting for that statement:
-  // it takes calls there, not a library to check.
+  // it takes nested calls there, not a library to check.
   if (m_calls > 0) {
     my_error(ER_LANGUAGE_COMPONENT, MYF(0),
              "MLE> CREATE LIBRARY cannot run from the SQL of an MLE routine");
     return false;
   }
-  // A library is code for the language's routines: the same privilege
-  // (D-3) as CREATE FUNCTION / PROCEDURE in that language.
+  // A library is code for the language's routines: the same privilege as
+  // CREATE FUNCTION / PROCEDURE in that language.
   if (!has_global_privilege(m_thd, privilege_of(routine))) {
     my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), privilege_of(routine));
     return false;
   }
-  const std::string who = slot_key(principal(), routine.language);
-  Slot *slot = worker_for(who, routine);
-  if (slot == nullptr) return false;
   mle::ParseLibraryMsg m;
   m.language = worker_language(language);
   m.name = name;
   m.body = body;
+  // Source code crosses as it is or not at all (protocol §7.1).
+  if (!mle::is_valid_utf8(m.body)) {
+    my_error(ER_LANGUAGE_COMPONENT, MYF(0),
+             "MLE> The library's code is not valid UTF-8 text; create it over "
+             "a connection whose character set is utf8mb4");
+    return false;
+  }
+  repair_utf8(&m.name);
+  const Request request(this);
+  const std::string key = slot_key(principal(), routine.language);
+  Slot *slot = worker_for(key, routine);
+  if (slot == nullptr) return false;
+  mle::Worker *const worker = slot->worker.get();
   Hooks hooks(m_thd);
   ResultMsg result;
   std::string error;
-  Status s;
+  Outcome outcome;
   {
-    const KillGuard kill(this, slot->worker.get());
-    s = slot->worker->parse_library(m, hooks, &result, &error);
+    const KillGuard kill(this, worker);
+    outcome = worker->parse_library(m, hooks, &result, &error);
   }
-  if (s == Status::kOk) return true;
+  const bool stopped = interrupted(outcome, *worker);
+  if (outcome == Outcome::kOk && !stopped) {
+    settle(key, worker);
+    return true;
+  }
   m_console_now = console_warnings(m_thd);  // this failure's, not the last call's
-  report(who, s, result, error, routine, nullptr);
+  report(key, worker, outcome, stopped, result, error, routine, nullptr);
   return false;
 }
 
 std::optional<std::string> Session::eval(unsigned language,
                                          const std::string &code) {
   // A snippet in the session's worker for this account, like a routine
-  // without CREATE (exp note 39): the language's CREATE privilege, since the
-  // same code could be put in a routine.
+  // without CREATE: the language's CREATE privilege, since the same code
+  // could be put in a routine.
   Routine routine;
   routine.id = next_routine_id();
   routine.language = language;
@@ -1108,48 +1416,70 @@ std::optional<std::string> Session::eval(unsigned language,
     my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), privilege_of(routine));
     return std::nullopt;
   }
+  if (!mle::is_valid_utf8(code)) {
+    my_error(ER_LANGUAGE_COMPONENT, MYF(0),
+             "MLE> The code is not valid UTF-8 text");
+    return std::nullopt;
+  }
   mle::PrepareMsg &m = routine.prepare;
   m.routine_id = routine.id;
   m.language = worker_language(language);
   m.name = routine.name;
   m.entry = "<eval>";  // the worker evaluates the code and returns its value as text
   m.source = code;
+  // The current schema while it runs; a session without one names a schema
+  // that holds no libraries.
+  mysql_cstring_with_length schema{nullptr, 0};
+  if (!mysql_service_mysql_thd_attributes->get(m_thd, "schema", &schema) &&
+      schema.str != nullptr && schema.length > 0)
+    m.schema.assign(schema.str, schema.length);
+  if (m.schema.empty() || !mle::is_valid_utf8(m.schema))
+    m.schema = "information_schema";
+  routine.schema = m.schema;
   mle::ParamType text;
   text.tag = mle::Tag::kString;
   text.type_name = "LONGTEXT";
   m.returns = text;
 
-  // Called by a routine's SQL: the code is that routine's author's, and runs
-  // where that author's code runs (not in the worker of the account's own
-  // code, when the author is another account).
-  const std::string who = slot_key(principal(m_running_routine), routine.language);
-  Slot *slot = worker_for(who, routine);
-  if (slot == nullptr || !prepare_in(who, *slot, routine)) {
-    forget(routine);
-    return std::nullopt;
-  }
+  // Directly from the session both accounts of the principal are the
+  // session's. Called by a routine's SQL, the code is what that routine
+  // made: it runs where that routine's owner's code runs with these rights
+  // (not in the worker of the account's own code, when the owner is
+  // another account).
+  const Request request(this);
+  const std::string key =
+      slot_key(principal(m_running_routine), routine.language);
+  // Dropped however it ends: the id is used once.
+  struct Dropped {
+    Session *session;
+    const Routine &routine;
+    ~Dropped() { session->forget(routine); }
+  } dropped{this, routine};
+  mle::Worker *const worker = prepared_worker(key, routine);
+  if (worker == nullptr) return std::nullopt;
   // A function in a SELECT: no statements (they need a stored program's
   // context).
-  Hooks hooks(m_thd, nullptr, &routine,
+  Hooks hooks(m_thd, &m_budget, nullptr, &routine,
               "mle_eval cannot run SQL: put the code in a procedure to run SQL");
   ResultMsg result;
   std::string error;
-  Status s;
+  Outcome outcome;
   {
-    const KillGuard kill(this, slot->worker.get());
-    s = slot->worker->call(routine.id, 0, {}, hooks, &result, &error);
+    const KillGuard kill(this, worker);
+    outcome = worker->call(routine.id, library_epoch(), {}, hooks, &result, &error);
   }
   keep_console(result);
-  m_console_now = (s != Status::kOk || !result.console_out.empty() ||
+  const bool stopped = interrupted(outcome, *worker);
+  const bool ok = outcome == Outcome::kOk && !stopped;
+  m_console_now = (!ok || !result.console_out.empty() ||
                    !result.console_err.empty()) &&
                   console_warnings(m_thd);
   if (m_console_now) console_to_warnings(routine, result);
-  if (s != Status::kOk) {
-    report(who, s, result, error, routine, nullptr);
-    forget(routine);
+  if (!ok) {
+    report(key, worker, outcome, stopped, result, error, routine, nullptr);
     return std::nullopt;
   }
-  forget(routine);
+  settle(key, worker);
   // What it printed, then its value (as a REPL shows them); NULL for neither.
   std::string out = result.console_out + result.console_err;
   const bool value =

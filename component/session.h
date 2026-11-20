@@ -21,16 +21,32 @@
 /**
   @file component/session.h
 
-  The MLE state of a client session (thd_store slot): one worker per
-  principal (D-8: the definer for SQL SECURITY DEFINER routines, else the
-  current user, as priv_user@priv_host), the routines each worker has
-  prepared, the conversion options and time zone (bound at the session's
-  first use, as Oracle), and the console output. Created at the session's
-  first MLE use, freed with the session; its workers are killed then.
+  The MLE state of a client session (thd_store slot): its workers, what the
+  session's routines make mysqld hold through SQL, the session's language
+  settings, and the console output. Created at the session's first MLE use,
+  freed with the session.
 
-  Only the session's own thread uses it (deinit gets the THD explicitly).
-  UNINSTALL is refused while sessions exist: the server does not free
-  objects of an unregistered thd_store slot.
+  Workers and principals (docs/protocol.md §1). A worker has one security
+  principal for its whole life: the account that owns the code and the
+  account whose rights the code runs with, both as priv_user@priv_host. The
+  server tells a routine's definer but not its SQL SECURITY, so the pair is
+  (definer, account of the security context in force): for a routine that
+  runs with its definer's rights both are the definer; for one that runs
+  with the invoker's rights it is (definer, invoker); for mle_eval() and
+  CREATE LIBRARY both are the account of the context in force. A session
+  holds one worker per principal and worker kind. A worker whose principal
+  names an account that was dropped or renamed is retired before its next
+  top-level request.
+
+  Options (§9.8). Before every top-level PREPARE, CALL or PARSE_LIBRARY the
+  session's time zone and settings are compared with the options in force
+  in that worker, and OPTIONS is sent when they differ or none are in force
+  (a new worker, a kept one after its RESET).
+
+  Only the session's own thread uses it (deinit gets the THD explicitly; the
+  KILL handler touches only the list of running workers). UNINSTALL is
+  refused while sessions exist: the server does not free objects of an
+  unregistered thd_store slot.
 */
 
 #include <array>
@@ -39,7 +55,7 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <mysql/components/services/mysql_current_thread_reader.h>
@@ -67,14 +83,15 @@ class Session {
   static Session *of(MYSQL_THD thd);
 
   /** CREATE (and loading into the session's routine cache): the worker of
-      the current principal compiles the routine (syntax errors -> 6113). */
+      the current principal compiles the routine (syntax errors -> 6113).
+      At CREATE the worker also checks the code: its findings become the
+      statement's warnings. */
   bool parse(Routine &routine);
+  /** mle_eval(language, code): what the snippet printed and its value; nullopt
+      after reporting an error. */
+  std::optional<std::string> eval(unsigned language, const std::string &code);
   /** CREATE LIBRARY: syntax check in the account's worker; false after
       reporting the error (6113 "JavaScript> SyntaxError: ..."). */
-  /** mle_eval(language, code): what the snippet printed and its value; nullopt
-      after reporting an error (exp note 39). */
-  std::optional<std::string> eval(unsigned language, const std::string &code);
-
   bool parse_library(unsigned language, const std::string &name,
                      const std::string &body);
   /** Runs the routine for the current principal. False after reporting
@@ -91,8 +108,8 @@ class Session {
   /** mle_session_reset('stdout' | 'stderr' | 'output'). */
   void reset_output(bool out, bool err);
   /** mle_session_reset(): workers closed (the next call gets a new one),
-      programs, stack trace, options and time-zone binding forgotten. False
-      while a routine of this session runs (it would destroy its worker). */
+      programs, stack trace and settings forgotten. False while a routine
+      of this session runs (it would destroy its worker). */
   bool reset();
   /** COM_CHANGE_USER: the session's state belongs to the old account; its
       workers go back to the engine for that account's later sessions. */
@@ -108,20 +125,30 @@ class Session {
   bool has_programs() const { return !m_programs.empty(); }
   /** The pid of the current principal's worker, or -1 (debug UDF). */
   long worker_pid();
-  /** mle_set_session_state(): sent to the session's workers at once. */
-  bool set_options(mle::wire::IntegerType integer_type,
-                   mle::wire::DecimalType decimal_type);
-  /** The options in effect (mle_set_session_state() keeps those it is not given). */
-  const mle::OptionsMsg &options() const { return m_options; }
+  /** mle_set_session_state(): language settings by their OPTIONS names
+      (protocol Appendix B.2); an empty value is the setting's default. They
+      reach each worker with its next top-level request. False while the
+      session has programs (Oracle's rule). */
+  bool set_settings(
+      const std::vector<std::pair<std::string, std::string>> &settings);
 
  private:
-  /** A worker of the session: one per principal and worker kind (exp design
-      note 63: a session that uses JS and CPYTHON holds two). */
+  /** A worker of the session: one per principal and worker kind. */
   struct Slot {
     std::unique_ptr<mle::Worker> worker;
-    std::unordered_set<uint64_t> prepared;
     std::string principal;
     WorkerKind kind = WorkerKind::kJvm;
+    /** The options in force in the worker, and what they were made from:
+        the session's zone as the server names it and the version of the
+        session's settings. */
+    mle::OptionsMsg options;
+    std::string zone;
+    uint64_t settings_version = 0;
+    /** engine_forgets() when no account of the principal was known to be
+        dropped or renamed. */
+    uint64_t forgets = 0;
+    /** Routines that are gone but whose DROP could not be sent yet. */
+    std::vector<uint64_t> undropped;
   };
   /** The key of a slot in m_workers: the principal and the kind of the
       language's worker ('\0' between: not in account names). */
@@ -131,52 +158,64 @@ class Session {
 
   explicit Session(MYSQL_THD thd);
 
-  /** The account the current request runs as ('user'@'host', from the
-      security context's contents on every call). */
-  /** The worker's principal for the current security context; with a
-      routine whose code another account wrote (an INVOKER routine of
-      another definer), a principal of its own: code of different authors
+  /** The principal for the security context in force and, with a routine,
+      its definer: the account of the context when both are the same,
+      else "<account> running code of <definer>". Code of different owners
       never shares a worker, where it could change the language's shared
       objects (JSON.parse, builtins, statics) under the other's code. */
   std::string principal(const Routine *routine = nullptr) const;
   /** Releases the workers (kept for their principals if reuse) and forgets
-      programs, console, stack trace, options. */
+      programs, console, stack trace, settings. */
   void clear_state(bool reuse);
-  /** The principal's worker, started (and given the options) if needed;
-      nullptr after reporting the error. */
-  Slot *worker_for(const std::string &principal, const Routine &routine);
-  /** PREPAREs the routine in the slot's worker unless it has it. */
-  bool prepare_in(const std::string &principal, Slot &slot,
-                  const Routine &routine);
+  /** The principal's worker, started if needed and ready for a request: at
+      top level with the session's options in force. nullptr after reporting
+      the error (or for a session that is killed: the server reports it). */
+  Slot *worker_for(const std::string &key, const Routine &routine);
+  /** OPTIONS when the session's zone or settings differ from the options in
+      force in the slot's worker, or none are. False after reporting. */
+  bool options_in(const std::string &key, Slot &slot, const Routine &routine);
+  /** PREPAREs the routine in the slot's worker unless it is prepared there. */
+  bool prepare_in(const std::string &key, Slot &slot, Routine &routine);
+  /** The principal's worker with the routine prepared in it; nullptr after
+      reporting the error. */
+  mle::Worker *prepared_worker(const std::string &key, Routine &routine);
+  /** What a request's outcome is for the client when an interrupt may have
+      been requested (§11.1 step 4). */
+  bool interrupted(mle::Outcome outcome, const mle::Worker &worker) const;
   /** Reports a failed request; drops the worker if it is gone. */
-  void report(const std::string &principal, mle::Status status,
-              const mle::ResultMsg &result, const std::string &error,
-              const Routine &routine, const std::vector<mle::Value> *args,
-              SqlRunner *sql = nullptr);
+  void report(const std::string &key, mle::Worker *worker, mle::Outcome outcome,
+              bool interrupted, const mle::ResultMsg &result,
+              const std::string &error, const Routine &routine,
+              const std::vector<mle::Value> *args, SqlRunner *sql = nullptr);
+  /** After a request: a worker that was retired or ended leaves its slot. */
+  void settle(const std::string &key, mle::Worker *worker);
   void keep_console(const mle::ResultMsg &result);
   void keep_stack_trace(const mle::Error &error, const Routine &routine);
-  void drop_worker(const std::string &principal);
-  /** KILL handler on the session while requests run. The server keeps one
-      handler per session and refuses to replace it, so it is installed by
-      the outermost request and interrupts every worker on the stack
-      (nested calls: routine -> SQL -> routine). */
+  /** Takes the worker out of the session: ended, never kept. */
+  void drop_worker(const std::string &key);
+  /** A request of this session, from before its worker is chosen until its
+      outcome is reported: a worker dropped meanwhile (by a nested request)
+      lives until the outermost one ends, for outer requests still run in
+      it. */
+  class Request;
+  /** The KILL handler on the session while interruptible requests run. The
+      server keeps one handler per session and refuses to replace it, so it
+      is installed with the first request and interrupts every worker that
+      has a top-level request of this session in progress (a chain of calls
+      can pass through several workers). */
   class KillGuard;
-  static constexpr size_t kMaxNesting = 64;
-  std::array<std::atomic<mle::Worker *>, kMaxNesting> m_running{};
+  static constexpr size_t kMaxRunning = 64;
+  std::array<std::atomic<mle::Worker *>, kMaxRunning> m_running{};
   std::atomic<size_t> m_running_n{0};
-  /** KILLs seen by the kill handler (a call killed meanwhile is interrupted
-      even if the KILL was consumed by an inner statement). */
-  std::atomic<uint64_t> m_kills{0};
   bool m_kill_installed = false;
   /** Requests of this session in progress (nested: routine -> SQL ->
-      routine). A worker dropped by a nested request is kept here until the
-      outermost one ends: outer requests still run in it. */
+      routine). */
   size_t m_calls = 0;
   /** The routine of the innermost call in progress (nullptr: none). */
   const Routine *m_running_routine = nullptr;
-  /** The bytes of SQL results the calls in progress hold in the server
-      (SqlRunner; all nesting levels: one budget). */
-  size_t m_results_held = 0;
+  /** What the requests in progress hold through SQL: all nesting levels and
+      all workers, one budget (§10.7). */
+  SqlBudget m_budget;
   std::vector<std::unique_ptr<mle::Worker>> m_retired;
 
   MYSQL_THD m_thd;
@@ -185,15 +224,17 @@ class Session {
   std::map<std::string, Slot> m_workers;
   /** Argument buffer of the top-level call, reused. */
   std::vector<mle::Value> m_args;
-  mle::OptionsMsg m_options;
-  bool m_options_bound = false;
+  /** The session's language settings that are not at their default, by
+      name; and a number that changes with them. */
+  std::map<std::string, std::string> m_settings;
+  uint64_t m_settings_version = 1;
   std::string m_out;
   std::string m_err;
   /** Oracle's stack_trace: the frames of the last call's runtime error. */
   std::string m_stack;
-  /** The same error, kept to show as a traceback in its language's form
-      (exp note 39). Its source lines are for those who may see the code:
-      decided for each reader (traceback_for, independent review C18). */
+  /** The same error, kept to show as a traceback in its language's form.
+      Its source lines are for those who may see the code: decided for each
+      reader (traceback_for). */
   struct Trace {
     mle::Error error;
     std::string language;
@@ -214,13 +255,13 @@ class Session {
   /** mle.console: the lines a call printed, as warnings. */
   void console_to_warnings(const Routine &routine, const mle::ResultMsg &result);
   void lines_to_warnings(const std::string &text, const std::string &prefix);
-  /** CREATE: the worker's check findings (marked stderr lines) as warnings. */
-  void check_findings_to_warnings(const Routine &routine);
+  /** CREATE: what the worker's check found, as warnings. */
+  void findings_to_warnings(const Routine &routine, const mle::ResultMsg &result);
   /** Routine id -> its type (stored_functions / stored_procedures). */
   std::map<uint64_t, uint16_t> m_programs;
 };
 
-/** CREATE FUNCTION/PROCEDURE needs CREATE_<LANGUAGE>_ROUTINE too (D-3);
+/** CREATE FUNCTION/PROCEDURE needs CREATE_<LANGUAGE>_ROUTINE too;
     false after reporting the missing privilege. Other statements pass. */
 bool check_create_privilege(MYSQL_THD thd, const Routine &routine);
 

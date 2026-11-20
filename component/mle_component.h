@@ -135,9 +135,9 @@ bool console_warnings(MYSQL_THD thd);
 uint32_t max_workers();
 /** An account as 'user'@'host' (quotes doubled): the key of workers. */
 std::string account_key(std::string_view user, std::string_view host);
-/** In a worker's principal, between the account it runs for and the other
-    account whose code it runs (an SQL SECURITY INVOKER routine of another
-    definer: independent review C3). */
+/** In a worker's principal, between the account whose rights apply and the
+    other account that owns the code (a routine of another definer that runs
+    with the invoker's rights). */
 inline constexpr std::string_view kCodeOf = " running code of ";
 /** Whether the principal is the account's: runs for it or runs its code. */
 bool principal_has_account(std::string_view principal,
@@ -162,6 +162,17 @@ size_t sql_statements_max();
 /** mle.sql_call_results_max (0: four times mle.sql_result_max). */
 size_t sql_call_results_max();
 uint32_t sql_chunk_rows();
+
+/* session.cc: the library epoch (protocol §9.10). A number that only grows;
+   every PREPARE and CALL carries its value. It changes after a library, a
+   routine's USING clause or the right to use a library may have changed and
+   before the statement that made the change reports success. */
+uint64_t library_epoch();
+void library_epoch_changed();
+/** A statement of a command (the server's name: "create_library") ended:
+    changes the epoch unless that command can change neither libraries nor
+    routines nor rights. */
+void statement_ended(std::string_view sql_command);
 
 /* status.cc: the mle_* status variables. */
 bool register_status();

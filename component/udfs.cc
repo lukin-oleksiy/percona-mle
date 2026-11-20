@@ -25,9 +25,11 @@
                             last_output
     mle_session_reset([what])  'stdout', 'stderr', 'output', or no argument
                             for the whole session (workers, programs, stack
-                            trace, options, time-zone binding)
-    mle_set_session_state(json)  {"integer_type": ..., "decimal_type": ...};
-                            only while no programs are cached, else 1123
+                            trace, settings)
+    mle_set_session_state(json)  {"integer_type": ..., "decimal_type": ...}:
+                            the session's settings js.integer_type and
+                            js.decimal_type (protocol Appendix B.2); only
+                            while no programs are cached, else 1123
                             "... Cannot set options of an active session.
                             Please reset the session first."
   MLE's own:
@@ -271,32 +273,22 @@ class mle_set_session_state_impl {
     if (ctx.is_arg_null(0))
       throw std::invalid_argument("the argument must not be NULL");
     const std::string json(ctx.get_arg<STRING_RESULT>(0));
-    namespace w = mle::wire;
     Session *s = Session::current(true);
     if (s == nullptr) throw std::invalid_argument("no MLE session");
-    // An option that is not given keeps its value.
-    w::IntegerType integer_type = s->options().integer_type;
-    w::DecimalType decimal_type = s->options().decimal_type;
+    // An option that is not given keeps its value. The settings go to the
+    // workers by name and value; the default of each is sent as its absence.
+    std::vector<std::pair<std::string, std::string>> settings;
     for (const auto &[key, value] : json_options(json)) {
-      const char *v = value.c_str();
+      const std::string v = lower(value);
       if (key == "integer_type") {
-        if (strcasecmp(v, "UNSAFE_STRING") == 0)
-          integer_type = w::IntegerType::kUnsafeString;
-        else if (strcasecmp(v, "UNSAFE_BIGINT") == 0)
-          integer_type = w::IntegerType::kUnsafeBigint;
-        else if (strcasecmp(v, "STRING") == 0)
-          integer_type = w::IntegerType::kString;
-        else if (strcasecmp(v, "BIGINT") == 0)
-          integer_type = w::IntegerType::kBigint;
-        else
+        if (v != "unsafe_string" && v != "unsafe_bigint" && v != "string" &&
+            v != "bigint")
           throw std::invalid_argument("invalid integer_type '" + value + "'");
+        settings.emplace_back("js.integer_type", v == "unsafe_string" ? "" : v);
       } else if (key == "decimal_type") {
-        if (strcasecmp(v, "STRING") == 0)
-          decimal_type = w::DecimalType::kString;
-        else if (strcasecmp(v, "NUMBER") == 0)
-          decimal_type = w::DecimalType::kNumber;
-        else
+        if (v != "string" && v != "number")
           throw std::invalid_argument("invalid decimal_type '" + value + "'");
+        settings.emplace_back("js.decimal_type", v == "string" ? "" : v);
       } else {
         // An unknown key (e.g. integerType, the SQL API's spelling) would
         // otherwise be ignored without a word.
@@ -305,7 +297,7 @@ class mle_set_session_state_impl {
                                     "decimal_type");
       }
     }
-    if (!s->set_options(integer_type, decimal_type))
+    if (!s->set_settings(settings))
       throw std::invalid_argument(
           "Cannot set options of an active session. Please reset the "
           "session first.");
