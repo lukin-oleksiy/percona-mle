@@ -56,8 +56,10 @@ SELECT @r;
 @r
 js(python(java(two)))
 #
-# 3. Recursion: the server's max_sp_recursion_depth applies; the worker
-#    allows 32 nested calls; the session stays usable after both errors.
+# 3. Recursion: the server's max_sp_recursion_depth applies; a worker
+#    serves 32 nested calls, and the statement that needs a 33rd fails
+#    with the host's error, which every level hands back (protocol 8.2,
+#    10.8); the session stays usable after both errors.
 #
 CREATE PROCEDURE js_rec(IN n INT, OUT r INT) LANGUAGE JAVASCRIPT AS $$
 if (n == 0) { r = 0; return }
@@ -74,7 +76,7 @@ SELECT @r;
 5
 SET max_sp_recursion_depth = 255;
 CALL js_rec(40, @r);
-ERROR HY000: JavaScript> too many nested routine calls (the limit is 32)
+ERROR HY000: MLE> too many nested routine calls (the limit is 32)
 CALL js_rec(4, @r);
 SELECT @r;
 @r

@@ -17,8 +17,8 @@
 
 // Tests of the MLE JVM worker (mle_worker + mle-worker.jar) with Java
 // routines, started by the real launcher under the full lockdown (Landlock
-// and seccomp). The host side here is a minimal synchronous test host that
-// polls the mailbox; the real one (mle::Worker) comes with W4.
+// and seccomp). The host's side is mle::Worker (docs/protocol.md; section
+// numbers below refer to it).
 
 #include <gtest/gtest.h>
 
@@ -49,7 +49,6 @@ using namespace mle_test;
 using Clock = std::chrono::steady_clock;
 using wire::MessageHeader;
 using wire::Op;
-using wire::Status;
 
 // ---------------------------------------------------------------- fixture
 
@@ -60,7 +59,7 @@ class MleJavaWorker : public ::testing::Test {
     c.launcher_exe = MLE_LAUNCHER_EXE;
     c.arena_size = wire::kMinArenaSize;  // 64 KiB: chunking is easy to reach
     c.classes = {jvm_class("jvm", "java", "256m"),
-                 jvm_class("jvm-cold", "", "256m")};
+                 jvm_class("jvm_cold", "", "256m")};
     std::string err;
     s_launcher = Launcher::start(c, &err).release();
     ASSERT_NE(s_launcher, nullptr) << err;
@@ -103,10 +102,7 @@ class MleJavaWorker : public ::testing::Test {
   }
 
   static ParamType type(Tag tag, bool is_unsigned = false) {
-    ParamType t;
-    t.tag = tag;
-    t.is_unsigned = is_unsigned;
-    return t;
+    return type_of(tag, is_unsigned);
   }
 
   static Launcher *s_launcher;
@@ -120,15 +116,17 @@ TestHost *MleJavaWorker::s_host = nullptr;
 
 TEST_F(MleJavaWorker, Ready) {
   ReadyMsg ready;
-  TestHost *h = new_host("jvm-cold", &ready);
+  TestHost *h = new_host("jvm_cold", &ready);
   ASSERT_NE(h, nullptr);
-  EXPECT_EQ(ready.worker_class, "jvm-cold");
+  EXPECT_EQ(ready.worker_class, "jvm_cold");
   EXPECT_EQ(ready.languages,
             (std::vector<std::string>{"java", "js", "python"}));
   EXPECT_NE(ready.runtime.find("Java 25"), std::string::npos) << ready.runtime;
   std::cout << "[ INFO     ] " << ready.runtime << ", " << ready.info << "\n";
-  EXPECT_EQ(h->header().stats.state, uint32_t(wire::WorkerState::kIdle));
-  EXPECT_GT(h->header().stats.heap_max, 0u);
+  EXPECT_EQ(ready.version, wire::kVersion);
+  EXPECT_EQ(ready.features, 0u);
+  EXPECT_EQ(h->stats().state, uint32_t(wire::WorkerState::kIdle));
+  EXPECT_GT(h->stats().heap_max, 0u);
   delete h;
 }
 
@@ -163,14 +161,17 @@ TEST_F(MleJavaWorker, ValuesRoundTrip) {
       {type(Tag::kI64), Value::i64(std::numeric_limits<int64_t>::min())},
       {type(Tag::kU64, true), Value::u64(std::numeric_limits<uint64_t>::max())},
       {type(Tag::kF64), Value::f64(-0.0)},
-      {type(Tag::kF64), Value::f64(std::nan(""))},
       {type(Tag::kF32), Value::f32(3.25f)},
       {type(Tag::kDecimal), Value::decimal("-123456789012345678901234567.50")},
       {type(Tag::kString), Value::string("caf\xc3\xa9 \xf0\x9f\x98\x80")},
       {type(Tag::kBytes), Value::bytes(std::string("a\0b\xff", 4))},
       {type(Tag::kDate), Value::temporal(Tag::kDate, date)},
       {type(Tag::kDatetime), Value::temporal(Tag::kDatetime, dt)},
-      {type(Tag::kTimestamp), Value::temporal(Tag::kTimestamp, dt)},
+      // TIMESTAMP is an instant (§7.2): 2024-01-01 00:00:00.123456 UTC and
+      // the ends of the wire's range.
+      {type(Tag::kTimestamp), Value::timestamp(1704067200123456)},
+      {type(Tag::kTimestamp), Value::timestamp(0)},
+      {type(Tag::kTimestamp), Value::timestamp(wire::kMaxTimestamp)},
       {type(Tag::kTime), Value::temporal(Tag::kTime, time)},
       {type(Tag::kJson), Value::json(R"({"a": [1, 2]})")},
       {type(Tag::kVector), Value::vector(v768)},
@@ -186,6 +187,51 @@ TEST_F(MleJavaWorker, ValuesRoundTrip) {
     ASSERT_TRUE(res.ret.has_value());
     EXPECT_EQ(*res.ret, v);
   }
+  // MySQL's zero timestamp is on the wire (§7.2), but Java's instant type
+  // cannot express it: a guest error (§12), and the worker lives on.
+  ResultMsg res;
+  const ParamType ts = type(Tag::kTimestamp);
+  ASSERT_EQ(prepare(*s_host, ++id, "Echo.echo", src, {ts}, ts, &res), 0u)
+      << error_of(res);
+  EXPECT_EQ(s_host->call(id, {Value::timestamp(wire::kZeroTimestamp)}, &res),
+            u(Outcome::kGuestError));
+  EXPECT_EQ(error_of(res),
+            "argument 1 (p1): the zero TIMESTAMP has no Java equivalent");
+  EXPECT_TRUE(s_host->worker.usable());
+}
+
+// NaN and the infinities are not SQL values (§7.2): the host sends none, and
+// one that a routine returns fails the call as a conversion error (GUEST_ERROR
+// with the language MLE-Type, §9.4), whoever finds it; the worker lives on.
+TEST_F(MleJavaWorker, NonFiniteResults) {
+  ResultMsg res;
+  uint64_t id = 150;
+  for (const char *expr :
+       {"Double.NaN", "Double.POSITIVE_INFINITY", "Double.NEGATIVE_INFINITY"}) {
+    SCOPED_TRACE(expr);
+    ASSERT_EQ(prepare(*s_host, ++id, "N.f",
+                      std::string("public class N { public static double f() "
+                                  "{ return ") +
+                          expr + "; } }",
+                      {}, type(Tag::kF64), &res),
+              0u)
+        << error_of(res);
+    EXPECT_EQ(s_host->call(id, {}, &res), u(Outcome::kGuestError));
+    ASSERT_TRUE(res.error.has_value());
+    EXPECT_EQ(res.error->language, wire::kLanguageType);
+    EXPECT_FALSE(res.ret.has_value());
+    EXPECT_TRUE(s_host->worker.usable());
+  }
+  ASSERT_EQ(prepare(*s_host, ++id, "N.f",
+                    "public class N { public static float[] f() { return new "
+                    "float[] {1, Float.NaN}; } }",
+                    {}, type(Tag::kVector), &res),
+            0u)
+      << error_of(res);
+  EXPECT_EQ(s_host->call(id, {}, &res), u(Outcome::kGuestError));
+  ASSERT_TRUE(res.error.has_value());
+  EXPECT_EQ(res.error->language, wire::kLanguageType);
+  EXPECT_TRUE(s_host->worker.usable());
 }
 
 TEST_F(MleJavaWorker, ParameterConversions) {
@@ -213,7 +259,7 @@ TEST_F(MleJavaWorker, ParameterConversions) {
                          {Value::i64(1LL << 40), Value::f64(0),
                           Value::decimal("0"), Value::string("")},
                          &res),
-            uint32_t(Status::kGuestError));
+            u(Outcome::kGuestError));
   EXPECT_EQ(error_of(res),
             "argument 1 (p1): value 1099511627776 is out of "
             "range for int");
@@ -221,7 +267,7 @@ TEST_F(MleJavaWorker, ParameterConversions) {
                          {Value::i64(1), Value::null(), Value::decimal("0"),
                           Value::string("")},
                          &res),
-            uint32_t(Status::kGuestError));
+            u(Outcome::kGuestError));
   EXPECT_NE(error_of(res).find("SQL NULL cannot be passed to a double"),
             std::string::npos)
       << error_of(res);
@@ -231,7 +277,7 @@ TEST_F(MleJavaWorker, ParameterConversions) {
                     "public class R { public static long f() { return -1; } }",
                     {}, type(Tag::kU64, true), &res),
             0u);
-  EXPECT_EQ(s_host->call(201, {}, &res), uint32_t(Status::kGuestError));
+  EXPECT_EQ(s_host->call(201, {}, &res), u(Outcome::kGuestError));
   EXPECT_NE(error_of(res).find("out of range"), std::string::npos)
       << error_of(res);
 }
@@ -242,7 +288,7 @@ TEST_F(MleJavaWorker, CompileAndEntryErrors) {
                     "public class Bad {\n  public static int f() { return 1 "
                     "}\n}",
                     {}, type(Tag::kI64), &res),
-            uint32_t(Status::kGuestError));
+            u(Outcome::kGuestError));
   EXPECT_EQ(error_of(res), "Bad.java:2:35: ';' expected");
 
   const std::string src =
@@ -251,20 +297,20 @@ TEST_F(MleJavaWorker, CompileAndEntryErrors) {
       "public static int g(String a) { return 0; } }";
   EXPECT_EQ(prepare(*s_host, 301, "E.missing", src, {type(Tag::kI64)},
                     type(Tag::kI64), &res),
-            uint32_t(Status::kGuestError));
+            u(Outcome::kGuestError));
   EXPECT_EQ(error_of(res),
             "no public static method missing with 1 parameter in E");
   EXPECT_EQ(prepare(*s_host, 302, "E.g", src, {type(Tag::kI64)},
                     type(Tag::kI64), &res),
-            uint32_t(Status::kGuestError));
+            u(Outcome::kGuestError));
   EXPECT_NE(error_of(res).find("more than one"), std::string::npos);
   EXPECT_EQ(
       prepare(*s_host, 303, "f", src, {type(Tag::kI64)}, type(Tag::kI64), &res),
-      uint32_t(Status::kGuestError));
+      u(Outcome::kGuestError));
   EXPECT_EQ(prepare(*s_host, 304, "Hidden.f",
                     "class Hidden { public static int f() { return 1; } }", {},
                     type(Tag::kI64), &res),
-            uint32_t(Status::kGuestError));
+            u(Outcome::kGuestError));
   EXPECT_NE(error_of(res).find("must be public"), std::string::npos)
       << error_of(res);
   // Routines cannot see the worker's internals.
@@ -273,7 +319,7 @@ TEST_F(MleJavaWorker, CompileAndEntryErrors) {
                     "com.percona.mle.worker.Main.class.getName(); } }",
                     {}, type(Tag::kString), &res),
             0u);
-  EXPECT_EQ(s_host->call(305, {}, &res), uint32_t(Status::kGuestError));
+  EXPECT_EQ(s_host->call(305, {}, &res), u(Outcome::kGuestError));
   EXPECT_NE(error_of(res).find("NoClassDefFoundError"), std::string::npos)
       << error_of(res);
 }
@@ -296,7 +342,7 @@ TEST_F(MleJavaWorker, ExceptionsAndConsole) {
               {}, type(Tag::kI64), &res),
       0u)
       << error_of(res);
-  EXPECT_EQ(s_host->call(400, {}, &res), uint32_t(Status::kGuestError));
+  EXPECT_EQ(s_host->call(400, {}, &res), u(Outcome::kGuestError));
   ASSERT_TRUE(res.error.has_value());
   EXPECT_EQ(res.error->language, "java");
   EXPECT_EQ(res.error->message, "java.lang.IllegalStateException: boom");
@@ -332,15 +378,12 @@ TEST_F(MleJavaWorker, SqlCallback) {
     if (calls++ == 0) {
       EXPECT_EQ(m.statement, "SELECT name, v FROM t WHERE id = ?");
       EXPECT_EQ(m.params, std::vector<Value>{Value::i64(9)});
-      r.kind = SqlResultKind::kRows;
-      r.columns = {{"name", "t", type(Tag::kString)},
-                   {"v", "t", type(Tag::kVector)}};
-      r.rows = {Value::string("nine"), Value::vector({1, 2})};
+      sql_rows(&r,
+               {{"name", "t", type(Tag::kString)},
+                {"v", "t", type(Tag::kVector)}},
+               {Value::string("nine"), Value::vector({1, 2})});
     } else {
-      r.kind = SqlResultKind::kError;
-      r.sql_errno = 1062;
-      r.sqlstate = "23000";
-      r.message = "Duplicate entry '1' for key 't.PRIMARY'";
+      sql_error(&r, 1062, "23000", "Duplicate entry '1' for key 't.PRIMARY'");
     }
   };
   ASSERT_EQ(s_host->call(500, {Value::i64(9)}, &res, sql), 0u) << error_of(res);
@@ -355,16 +398,20 @@ TEST_F(MleJavaWorker, SqlCallback) {
               {}, type(Tag::kI64), &res),
       0u);
   auto fail = [](const SqlMsg &, SqlResultMsg *r) {
-    r->kind = SqlResultKind::kError;
-    r->sql_errno = 1051;
-    r->sqlstate = "42S02";
-    r->message = "Unknown table 'test.x'";
+    sql_error(r, 1051, "42S02", "Unknown table 'test.x'");
   };
-  EXPECT_EQ(s_host->call(501, {}, &res, fail), uint32_t(Status::kGuestError));
+  EXPECT_EQ(s_host->call(501, {}, &res, fail), u(Outcome::kGuestError));
   ASSERT_TRUE(res.error.has_value());
   EXPECT_EQ(res.error->sql_errno, 1051u);
   EXPECT_EQ(res.error->sqlstate, "42S02");
   EXPECT_EQ(res.error->message, "Unknown table 'test.x'");
+  // The error is handed back by its id (§10.8): the first ERROR of this
+  // top-level request, which the host still holds.
+  EXPECT_EQ(res.error->sql_error_id, 1u);
+  const HeldError *held = s_host->worker.held_error(res.error->sql_error_id);
+  ASSERT_NE(held, nullptr);
+  EXPECT_EQ(held->sql_errno, 1051u);
+  EXPECT_EQ(held->message, "Unknown table 'test.x'");
 }
 
 // routine -> SQL -> another routine of the same worker -> SQL.
@@ -384,16 +431,14 @@ TEST_F(MleJavaWorker, NestedCalls) {
                     {}, type(Tag::kString), &res),
             0u);
   auto sql = [&](const SqlMsg &m, SqlResultMsg *r) {
-    r->kind = SqlResultKind::kRows;
-    r->columns = {{"c", "", type(Tag::kString)}};
     if (m.statement == "SELECT inner()") {
       EXPECT_EQ(s_host->worker.depth(), 1u);
       ResultMsg inner;
       EXPECT_EQ(s_host->call(601, {}, &inner), 0u) << error_of(inner);
-      r->rows = {*inner.ret};
+      sql_rows(r, {{"c", "", type(Tag::kString)}}, {*inner.ret});
     } else {
       EXPECT_EQ(s_host->worker.depth(), 2u);  // inside the nested call
-      r->rows = {Value::string("1")};
+      sql_rows(r, {{"c", "", type(Tag::kString)}}, {Value::string("1")});
     }
   };
   ASSERT_EQ(s_host->call(600, {}, &res, sql), 0u) << error_of(res);
@@ -445,7 +490,7 @@ TEST_F(MleJavaWorker, VectorSegmentsAndVectorApi) {
 
   // The second call touches the segment kept from the first one.
   EXPECT_EQ(s_host->call(700, {Value::vector(a), Value::vector(b)}, &res),
-            uint32_t(Status::kGuestError));
+            u(Outcome::kGuestError));
   EXPECT_NE(error_of(res).find("IllegalStateException"), std::string::npos)
       << "a segment kept after the call must be unusable: " << error_of(res);
 }
@@ -472,8 +517,40 @@ TEST_F(MleJavaWorker, DropAndReset) {
             0u);
   ASSERT_EQ(s_host->call(900, {}, &res), 0u);
   std::string err;
-  ASSERT_EQ(s_host->worker.drop(900, &err), Status::kOk) << err;
-  EXPECT_EQ(s_host->call(900, {}, &res), uint32_t(Status::kInternal));
+  ASSERT_EQ(s_host->worker.drop(900, &err), Outcome::kOk) << err;
+  // The host sends CALL only for a prepared id (§8.3): nothing is sent.
+  EXPECT_FALSE(s_host->worker.is_prepared(900));
+  EXPECT_EQ(s_host->call(900, {}, &res), u(Outcome::kRefused));
+  // Dropping an id that is not prepared is not an error (§9.6).
+  EXPECT_EQ(s_host->worker.drop(900, &err), Outcome::kOk) << err;
+
+  // RESET (§9.7): no id is prepared any more and the options end; the host
+  // sends OPTIONS again before it uses the worker.
+  TestHost *h = new_host("jvm");
+  ASSERT_NE(h, nullptr);
+  ASSERT_EQ(prepare(*h, 1, "D.f",
+                    "public class D { public static long f() { return 1; } }",
+                    {}, type(Tag::kI64), &res),
+            0u);
+  ASSERT_EQ(h->worker.reset(&err), Outcome::kOk) << err;
+  EXPECT_FALSE(h->worker.is_prepared(1));
+  EXPECT_FALSE(h->worker.options_in_force());
+  EXPECT_EQ(h->call(1, {}, &res), u(Outcome::kRefused));
+  EXPECT_EQ(prepare(*h, 1, "D.f",
+                    "public class D { public static long f() { return 2; } }",
+                    {}, type(Tag::kI64), &res),
+            u(Outcome::kRefused))
+      << "PREPARE without options in force";
+  ASSERT_EQ(h->options(OptionsMsg(), &err), Outcome::kOk) << err;
+  ASSERT_EQ(prepare(*h, 1, "D.f",
+                    "public class D { public static long f() { return 2; } }",
+                    {}, type(Tag::kI64), &res),
+            0u)
+      << error_of(res);
+  ASSERT_EQ(h->call(1, {}, &res), 0u) << error_of(res);
+  EXPECT_EQ(*res.ret, Value::i64(2));
+  EXPECT_TRUE(h->worker.usable());
+  delete h;
 }
 
 TEST_F(MleJavaWorker, LockdownFromJava) {
@@ -564,7 +641,7 @@ TEST_F(MleJavaWorker, InterruptCooperativeLoop) {
     h->hooks.kill = true;  // the session was killed: Worker sends INTERRUPT
   });
   const auto t0 = Clock::now();
-  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kInterrupted));
+  EXPECT_EQ(h->call(1, {}, &res), u(Outcome::kInterrupted));
   killer.join();
   h->hooks.kill = false;  // the next statement of the session
   std::cout
@@ -587,15 +664,33 @@ TEST_F(MleJavaWorker, InterruptBeforeTheCallStarts) {
   ASSERT_NE(h, nullptr);
   ResultMsg res;
   ASSERT_EQ(prepare(*h, 1, "Z.f",
-                    "public class Z { public static long f() throws Exception "
-                    "{ Thread.sleep(60000); return 0; } }",
-                    {}, type(Tag::kI64), &res),
+                    "public class Z { public static long f(String s) throws "
+                    "Exception { Thread.sleep(60000); return 0; } }",
+                    {type(Tag::kString)}, type(Tag::kI64), &res),
             0u);
-  h->raw_interrupt(2);  // the next call's sequence number (PREPARE was 1)
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  // An INTERRUPT that reaches the worker before it has received its request
+  // completely is kept as pending and delivered when the request begins
+  // (§11.1, the worker's table). The host makes the record only once the
+  // first chunk is posted, so the request here is a CALL in several chunks
+  // (a 64 KiB arena) and the session is found killed between two of them:
+  // killed() is polled once before the request starts and then at every
+  // chunk.
+  h->hooks.kill_at_poll = 2;
   const auto t0 = Clock::now();
-  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kInterrupted));
+  EXPECT_EQ(h->call(1, {Value::string(std::string(5 * 64 * 1024, 'x'))}, &res),
+            u(Outcome::kInterrupted))
+      << error_of(res);
   EXPECT_LT(Clock::now() - t0, std::chrono::seconds(5));
+  EXPECT_TRUE(h->worker.interrupted());
+  EXPECT_TRUE(h->worker.usable());
+  h->hooks.kill_at_poll = 0;
+  // The interrupt does not reach the next request.
+  ASSERT_EQ(prepare(*h, 2, "Ok.f",
+                    "public class Ok { public static long f() { return 5; } }",
+                    {}, type(Tag::kI64), &res),
+            0u)
+      << error_of(res);
+  EXPECT_EQ(h->call(2, {}, &res), 0u) << error_of(res);
   delete h;
 }
 
@@ -609,10 +704,10 @@ TEST_F(MleJavaWorker, ExhaustedTaintsTheWorker) {
               "public static long f() { return r(0); } }",
               {}, type(Tag::kI64), &res),
       0u);
-  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kExhausted));
+  EXPECT_EQ(h->call(1, {}, &res), u(Outcome::kExhausted));
   EXPECT_NE(error_of(res).find("StackOverflowError"), std::string::npos);
-  EXPECT_EQ(h->header().stats.tainted, 1u);
-  // Retired: killed once the call was over.
+  EXPECT_TRUE(h->stats().tainted);
+  // Retired: ended once the call was over (§11.5).
   EXPECT_FALSE(h->worker.usable());
   EXPECT_TRUE(h->worker.process().wait_exit(2000));
   delete h;
@@ -624,7 +719,7 @@ TEST_F(MleJavaWorker, ExhaustedTaintsTheWorker) {
                     "while (true) l.add(new long[1 << 20]); } }",
                     {}, type(Tag::kI64), &res),
             0u);
-  EXPECT_EQ(h->call(2, {}, &res), uint32_t(Status::kExhausted));
+  EXPECT_EQ(h->call(2, {}, &res), u(Outcome::kExhausted));
   EXPECT_NE(error_of(res).find("OutOfMemoryError"), std::string::npos);
   delete h;
 }
@@ -645,7 +740,7 @@ TEST_F(MleJavaWorker, KillTightLoopIgnoringInterrupts) {
     h->hooks.kill = true;
   });
   const auto t0 = Clock::now();
-  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kKilled));
+  EXPECT_EQ(h->call(1, {}, &res), u(Outcome::kKilled));
   killer.join();
   const auto ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0)
@@ -673,7 +768,7 @@ TEST_F(MleJavaWorker, InterruptFromAnotherThread) {
     h->worker.interrupt();
   });
   const auto t0 = Clock::now();
-  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kInterrupted));
+  EXPECT_EQ(h->call(1, {}, &res), u(Outcome::kInterrupted));
   killer.join();
   EXPECT_LT(Clock::now() - t0, std::chrono::seconds(6));
   EXPECT_TRUE(h->worker.usable());
@@ -689,17 +784,16 @@ TEST_F(MleJavaWorker, WorkerExitsDuringACall) {
                     "Runtime.getRuntime().halt(7); return 0; } }",
                     {}, type(Tag::kI64), &res),
             0u);
-  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kDied));
+  EXPECT_EQ(h->call(1, {}, &res), u(Outcome::kDied));
   EXPECT_EQ(error_of(res), "the MLE worker died: exited with status 7");
   EXPECT_FALSE(h->worker.usable());
   delete h;
 }
 
-// routine -> SQL -> the same routine ...: the host stops at max_depth.
+// routine -> SQL -> the same routine ...: depth is at most 31, and the host
+// fails the statement that would need a request at depth 32 (§8.2).
 TEST_F(MleJavaWorker, NestingLimit) {
-  WorkerOptions o;
-  o.max_depth = 3;
-  TestHost *h = new_host("jvm", nullptr, o);
+  TestHost *h = new_host("jvm");
   ASSERT_NE(h, nullptr);
   ResultMsg res;
   ASSERT_EQ(prepare(*h, 1, "Rec.f",
@@ -710,24 +804,26 @@ TEST_F(MleJavaWorker, NestingLimit) {
                     "e.getMessage(); } } }",
                     {}, type(Tag::kString), &res),
             0u);
-  auto sql = [h](const SqlMsg &, SqlResultMsg *r) {
+  uint32_t deepest = 0;
+  auto sql = [&](const SqlMsg &, SqlResultMsg *r) {
+    deepest = std::max(deepest, h->worker.depth());
     ResultMsg inner;
     const uint32_t st = h->call(1, {}, &inner);
     if (st != 0) {
-      r->kind = SqlResultKind::kError;
-      r->sql_errno = 1;
-      r->sqlstate = "HY000";
-      r->message = error_of(inner);
+      EXPECT_EQ(st, u(Outcome::kRefused));
+      sql_error(r, 1456, "HY000", error_of(inner));
       return;
     }
-    r->kind = SqlResultKind::kRows;
-    r->columns = {{"c", "", type(Tag::kString)}};
-    r->rows = {*inner.ret};
+    sql_rows(r, {{"c", "", type(Tag::kString)}}, {*inner.ret});
   };
   ASSERT_EQ(h->call(1, {}, &res, sql), 0u) << error_of(res);
-  EXPECT_EQ(
-      *res.ret,
-      Value::string("((too many nested routine calls (the limit is 3)))"));
+  // Requests at depths 0 to 31 ran: 32 in progress when the 33rd is refused.
+  EXPECT_EQ(deepest, wire::kMaxDepth + 1);
+  EXPECT_EQ(*res.ret,
+            Value::string(std::string(wire::kMaxDepth, '(') +
+                          "too many nested routine calls (the limit is 32)" +
+                          std::string(wire::kMaxDepth, ')')));
+  EXPECT_TRUE(h->worker.usable());
   delete h;
 }
 

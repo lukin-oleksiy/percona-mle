@@ -315,6 +315,14 @@ void Worker::hold_error(SqlResultMsg *error) {
   e.message = error->message;
 }
 
+void Worker::forget_record() {
+  if (m_depth != 0) return;
+  // No record is made between top-level requests (m_running is 0), so this
+  // cannot lose one.
+  std::lock_guard<std::mutex> lock(m_interrupt_mutex);
+  m_recorded.store(false);
+}
+
 // ---------------------------------------------------------------- mailbox
 
 void Worker::post(Op op, uint32_t flags, const char *data, size_t len,
@@ -755,6 +763,7 @@ std::string Worker::check_result(const Request &q, uint32_t status,
 Outcome Worker::request(const Request &q, CallHooks &hooks, ResultMsg *result,
                         std::string *error) {
   *result = ResultMsg();
+  forget_record();
   if (!m_usable) return died(error);
   auto refuse = [&](std::string why) {
     *error = std::move(why);
@@ -1095,6 +1104,7 @@ Outcome Worker::prepare(const PrepareMsg &routine, CallHooks &hooks,
                         ResultMsg *result, std::string *error) {
   if (routine.params.size() > wire::kMaxParams ||
       routine.imports.size() > wire::kMaxImports) {
+    forget_record();
     *error = "the routine has more parameters or imports than MLE allows";
     return Outcome::kRefused;
   }
@@ -1122,6 +1132,7 @@ Outcome Worker::call(uint64_t routine_id, uint64_t library_epoch,
                      ResultMsg *result, std::string *error) {
   const auto it = m_routines.find(routine_id);
   if (it == m_routines.end() || it->second.params != args.size()) {
+    forget_record();
     *error = "routine " + std::to_string(routine_id) +
              " is not prepared with " + std::to_string(args.size()) +
              " parameters";
@@ -1161,6 +1172,7 @@ Outcome Worker::drop(uint64_t routine_id, std::string *error) {
 Outcome Worker::options(const OptionsMsg &options, Error *guest_error,
                         std::string *error) {
   if (std::string why; !is_valid(options, &why)) {
+    forget_record();
     *error = "bad options: " + why;
     return Outcome::kRefused;
   }

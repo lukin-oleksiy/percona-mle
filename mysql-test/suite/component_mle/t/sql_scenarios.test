@@ -58,8 +58,10 @@ CALL js_l1(2, @r);
 SELECT @r;
 
 --echo #
---echo # 3. Recursion: the server's max_sp_recursion_depth applies; the worker
---echo #    allows 32 nested calls; the session stays usable after both errors.
+--echo # 3. Recursion: the server's max_sp_recursion_depth applies; a worker
+--echo #    serves 32 nested calls, and the statement that needs a 33rd fails
+--echo #    with the host's error, which every level hands back (protocol 8.2,
+--echo #    10.8); the session stays usable after both errors.
 --echo #
 CREATE PROCEDURE js_rec(IN n INT, OUT r INT) LANGUAGE JAVASCRIPT AS $$
   if (n == 0) { r = 0; return }
@@ -73,7 +75,7 @@ SET max_sp_recursion_depth = 10;
 CALL js_rec(5, @r);
 SELECT @r;
 SET max_sp_recursion_depth = 255;
---error ER_LANGUAGE_COMPONENT_RUNTIME
+--error ER_LANGUAGE_COMPONENT
 CALL js_rec(40, @r);
 CALL js_rec(4, @r);
 SELECT @r;

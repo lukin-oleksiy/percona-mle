@@ -624,6 +624,9 @@ TEST_F(MleWorkerProtocol, SpecVectorsOnTheWire) {
   ASSERT_GE(res.console_out.size(), 9u);
   EXPECT_EQ(res.console_out.substr(res.console_out.size() - 9),
             std::string("\x01\x05\0\0\0\0\0\0\0", 9));
+  // The record is the request's: one that is not sent has none.
+  EXPECT_EQ(w->call(99, 1, {}, hooks, &res, &err), Outcome::kRefused);
+  EXPECT_FALSE(w->interrupted());
   EXPECT_TRUE(w->usable());
 }
 
@@ -1275,6 +1278,7 @@ TEST_F(MleWorkerProtocol, LegalResults) {
                 fail_with(Status::kGuestError, wire::kLanguageType),
                 Outcome::kGuestError);
   EXPECT_EQ(r.result.error->language, "MLE-Type");
+
   // OUT parameters, console output with any bytes, findings with check.
   ResultMsg m = good_result();
   m.out_params = {{1, Value::string("out")}, {2, Value::null()}};

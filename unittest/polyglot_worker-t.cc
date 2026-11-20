@@ -72,10 +72,7 @@ class MlePolyglotWorker : public ::testing::Test {
   }
 
   static ParamType type(Tag tag, bool is_unsigned = false) {
-    ParamType t;
-    t.tag = tag;
-    t.is_unsigned = is_unsigned;
-    return t;
+    return type_of(tag, is_unsigned);
   }
 
   static uint32_t prepare(TestHost &h, uint64_t id, const std::string &lang,
@@ -166,18 +163,14 @@ void round_trip(TestHost &h, const std::string &lang, uint64_t first_id) {
   time_us.microsecond = 456789;
   std::vector<float> v768(768);
   for (size_t i = 0; i < v768.size(); i++) v768[i] = float(i) * 0.25f - 3.0f;
-  auto t = [](Tag tag, bool u = false) {
-    ParamType p;
-    p.tag = tag;
-    p.is_unsigned = u;
-    return p;
+  auto t = [](Tag tag, bool is_unsigned = false) {
+    return type_of(tag, is_unsigned);
   };
   const std::vector<std::pair<ParamType, Value>> cases = {
       {t(Tag::kI64), Value::i64(-42)},
       {t(Tag::kI64), Value::i64(std::numeric_limits<int64_t>::min())},
       {t(Tag::kU64, true), Value::u64(std::numeric_limits<uint64_t>::max())},
       {t(Tag::kF64), Value::f64(-0.0)},
-      {t(Tag::kF64), Value::f64(std::nan(""))},
       {t(Tag::kF64), Value::f64(1e300)},
       {t(Tag::kF32), Value::f32(3.25f)},
       {t(Tag::kDecimal), Value::decimal("-123456789012345678901234567.50")},
@@ -185,7 +178,11 @@ void round_trip(TestHost &h, const std::string &lang, uint64_t first_id) {
       {t(Tag::kBytes), Value::bytes(std::string("a\0b\xff", 4))},
       {t(Tag::kDate), Value::temporal(Tag::kDate, date)},
       {t(Tag::kDatetime), Value::temporal(Tag::kDatetime, dt)},
-      {t(Tag::kTimestamp), Value::temporal(Tag::kTimestamp, dt)},
+      // TIMESTAMP is an instant (§7.2): 2026-11-10 23:59:58 UTC and a
+      // fraction (JS Dates have millisecond precision), and the epoch.
+      {t(Tag::kTimestamp),
+       Value::timestamp(1794355198000000 + (lang == "js" ? 123000 : 123456))},
+      {t(Tag::kTimestamp), Value::timestamp(0)},
       {t(Tag::kTime), Value::temporal(Tag::kTime, time)},
       {t(Tag::kTime), Value::temporal(Tag::kTime, time_us)},
       {t(Tag::kJson), Value::json(R"({"a":[1,2,{"b":null}],"c":"\u00e9"})")},
@@ -221,6 +218,29 @@ TEST_F(MlePolyglotWorker, ValuesRoundTripJs) { round_trip(*s_host, "js", 100); }
 
 TEST_F(MlePolyglotWorker, ValuesRoundTripPython) {
   round_trip(*s_host, "python", 200);
+}
+
+// NaN and the infinities are not SQL values (§7.2): a routine that returns
+// one fails as a conversion error (GUEST_ERROR / MLE-Type, §9.4) and the
+// worker lives on.
+TEST_F(MlePolyglotWorker, NonFiniteResults) {
+  ResultMsg res;
+  const std::vector<std::pair<std::string, std::string>> sources = {
+      {"js", "function f() { return NaN; }"},
+      {"js", "function f() { return -Infinity; }"},
+      {"python", "def f():\n    return float('nan')\n"},
+      {"python", "def f():\n    return float('inf')\n"}};
+  uint64_t id = 250;
+  for (const auto &[lang, src] : sources) {
+    SCOPED_TRACE(src);
+    ASSERT_EQ(prepare(*s_host, ++id, lang, "f", src, {}, type(Tag::kF64), &res),
+              0u)
+        << error_of(res);
+    EXPECT_EQ(s_host->call(id, {}, &res), u(Outcome::kGuestError));
+    ASSERT_TRUE(res.error.has_value());
+    EXPECT_EQ(res.error->language, wire::kLanguageType) << error_of(res);
+    EXPECT_TRUE(s_host->worker.usable());
+  }
 }
 
 // What each language sees: the default mapping of SQL types.
@@ -276,22 +296,22 @@ TEST_F(MlePolyglotWorker, SyntaxErrors) {
   ResultMsg res;
   EXPECT_EQ(prepare(*s_host, 400, "js", "f", "function f() {\n  return 1 +;\n}",
                     {}, type(Tag::kI64), &res),
-            uint32_t(Status::kGuestError));
+            u(Outcome::kGuestError));
   EXPECT_EQ(error_of(res).rfind("routine_400.js:2:", 0), 0u) << error_of(res);
   EXPECT_EQ(prepare(*s_host, 401, "python", "f", "def f():\n    return 1 +\n",
                     {}, type(Tag::kI64), &res),
-            uint32_t(Status::kGuestError));
+            u(Outcome::kGuestError));
   EXPECT_NE(error_of(res).find("SyntaxError"), std::string::npos)
       << error_of(res);
   EXPECT_NE(error_of(res).find("line 2"), std::string::npos) << error_of(res);
   EXPECT_EQ(prepare(*s_host, 402, "js", "nothere", "function f() {}", {},
                     type(Tag::kI64), &res),
-            uint32_t(Status::kGuestError));
+            u(Outcome::kGuestError));
   EXPECT_NE(error_of(res).find("does not define a function nothere"),
             std::string::npos)
       << error_of(res);
-  EXPECT_EQ(prepare(*s_host, 403, "ruby", "f", "", {}, type(Tag::kI64), &res),
-            uint32_t(Status::kGuestError));
+  // (A language outside READY's list is the host's to refuse: it sends no
+  // other, §9.2.)
 }
 
 TEST_F(MlePolyglotWorker, RuntimeErrorsWithFrames) {
@@ -301,7 +321,7 @@ TEST_F(MlePolyglotWorker, RuntimeErrorsWithFrames) {
                     "function f() {\n  return inner({});\n}",
                     {}, type(Tag::kI64), &res),
             0u);
-  EXPECT_EQ(s_host->call(410, {}, &res), uint32_t(Status::kGuestError));
+  EXPECT_EQ(s_host->call(410, {}, &res), u(Outcome::kGuestError));
   ASSERT_TRUE(res.error.has_value());
   EXPECT_EQ(res.error->language, "js");
   EXPECT_NE(res.error->message.find("TypeError"), std::string::npos)
@@ -318,7 +338,7 @@ TEST_F(MlePolyglotWorker, RuntimeErrorsWithFrames) {
                     "    return inner(0)\n",
                     {}, type(Tag::kI64), &res),
             0u);
-  EXPECT_EQ(s_host->call(411, {}, &res), uint32_t(Status::kGuestError));
+  EXPECT_EQ(s_host->call(411, {}, &res), u(Outcome::kGuestError));
   ASSERT_TRUE(res.error.has_value());
   EXPECT_EQ(res.error->language, "python");
   EXPECT_NE(res.error->message.find("ZeroDivisionError"), std::string::npos)
@@ -332,7 +352,7 @@ TEST_F(MlePolyglotWorker, RuntimeErrorsWithFrames) {
   ASSERT_EQ(prepare(*s_host, 412, "js", "f", "function f() { return 'abc'; }",
                     {}, type(Tag::kI64), &res),
             0u);
-  EXPECT_EQ(s_host->call(412, {}, &res), uint32_t(Status::kGuestError));
+  EXPECT_EQ(s_host->call(412, {}, &res), u(Outcome::kGuestError));
   EXPECT_NE(error_of(res).find("cannot convert 'abc' to BIGINT"),
             std::string::npos)
       << error_of(res);
@@ -381,16 +401,11 @@ TEST_F(MlePolyglotWorker, SqlFromJsAndPython) {
       << error_of(res);
   auto sql = [&](const SqlMsg &m, SqlResultMsg *r) {
     if (m.statement == "BAD") {
-      r->kind = SqlResultKind::kError;
-      r->sql_errno = 1064;
-      r->sqlstate = "42000";
-      r->message = "You have an error in your SQL syntax";
+      sql_error(r, 1064, "42000", "You have an error in your SQL syntax");
       return;
     }
     EXPECT_EQ(m.params, std::vector<Value>{Value::i64(9)});
-    r->kind = SqlResultKind::kRows;
-    r->columns = {{"name", "t", type(Tag::kString)}};
-    r->rows = {Value::string("nine")};
+    sql_rows(r, {{"name", "t", type(Tag::kString)}}, {Value::string("nine")});
   };
   for (uint64_t id : {500, 501}) {
     ASSERT_EQ(s_host->call(id, {Value::i64(9)}, &res, sql), 0u)
@@ -402,10 +417,13 @@ TEST_F(MlePolyglotWorker, SqlFromJsAndPython) {
       prepare(*s_host, 502, "python", "f", "def f():\n    session.run_sql('BAD')\n", {},
               type(Tag::kI64), &res),
       0u);
-  EXPECT_EQ(s_host->call(502, {}, &res), uint32_t(Status::kGuestError));
+  EXPECT_EQ(s_host->call(502, {}, &res), u(Outcome::kGuestError));
   ASSERT_TRUE(res.error.has_value());
   EXPECT_EQ(res.error->sql_errno, 1064u);
   EXPECT_EQ(res.error->sqlstate, "42000");
+  // Handed back by its id (§10.8).
+  EXPECT_EQ(res.error->sql_error_id, 1u);
+  EXPECT_NE(s_host->worker.held_error(res.error->sql_error_id), nullptr);
 }
 
 // ---------------------------------------------------------------- polyglot
@@ -448,7 +466,7 @@ TEST_F(MlePolyglotWorker, CrossLanguage) {
                     "Java.type('com.percona.mle.worker.Main').toString(); }",
                     {}, type(Tag::kString), &res),
             0u);
-  EXPECT_EQ(s_host->call(603, {}, &res), uint32_t(Status::kGuestError));
+  EXPECT_EQ(s_host->call(603, {}, &res), u(Outcome::kGuestError));
 }
 
 TEST_F(MlePolyglotWorker, NumpyInPythonAndFromJava) {
@@ -517,7 +535,7 @@ TEST_F(MlePolyglotWorker, KillGuestLoops) {
       h->hooks.kill = true;
     });
     const auto t0 = Clock::now();
-    EXPECT_EQ(h->call(id, {}, &res), uint32_t(Status::kInterrupted))
+    EXPECT_EQ(h->call(id, {}, &res), u(Outcome::kInterrupted))
         << error_of(res);
     killer.join();
     h->hooks.kill = false;
@@ -563,7 +581,7 @@ TEST_F(MlePolyglotWorker, LockdownFromPython) {
                     "import os\ndef f():\n    return os.system('true')\n", {},
                     type(Tag::kI64), &res),
             0u);
-  EXPECT_EQ(s_host->call(801, {}, &res), uint32_t(Status::kGuestError));
+  EXPECT_EQ(s_host->call(801, {}, &res), u(Outcome::kGuestError));
   EXPECT_NE(error_of(res).find("Process creation is not allowed"),
             std::string::npos)
       << error_of(res);

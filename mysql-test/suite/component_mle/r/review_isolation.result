@@ -196,7 +196,7 @@ again_js	again_py
 2	2
 DROP LIBRARY s1.inner_lib;
 SELECT s1.f() AS dropped;
-ERROR HY000: JavaScript> Error: Error reading module '/s1/inner_lib' imported from /.mle-libraries/s1/outer_lib.9cb1b3b45a54b4a7.mjs: library s1.inner_lib does not exist or cannot be read
+ERROR HY000: JavaScript> Error: Error reading module '/s1/inner_lib' imported from /.mle-libraries/s1/outer_lib.VERSION.mjs: library s1.inner_lib is not available to s1.f
 CREATE LIBRARY s1.inner_lib LANGUAGE JAVASCRIPT AS $$ export const x = 3 $$;
 SELECT s1.f() AS created_again;
 created_again
@@ -206,8 +206,10 @@ CREATE LIBRARY s1.inner_lib LANGUAGE JAVASCRIPT AS $$ export const x = 4 $$;
 SELECT s1.f() AS changed_between_sessions;
 changed_between_sessions
 4
-# s2.r1 may import s2.secret (its schema's) through s1.bridge; s3.r2
-# may not, also after s2.r1 evaluated the bridge in the same worker.
+# A routine with a USING clause may import what the account whose
+# rights apply may use (the host cannot see which libraries a library
+# imports; protocol Appendix A): s2.r1 and s3.r2 both reach s2.secret
+# through s1.bridge, each with an answer of its own (protocol 9.10).
 CREATE LIBRARY s2.secret LANGUAGE JAVASCRIPT AS $$ export const value = 'of s2' $$;
 CREATE LIBRARY s1.bridge LANGUAGE JAVASCRIPT AS $$
 import { value } from '/s2/secret'
@@ -219,12 +221,14 @@ SELECT s2.r1();
 s2.r1()
 of s2
 SELECT s3.r2();
-ERROR HY000: JavaScript> Error: Error reading module '/s2/secret' imported from /.mle-libraries/s1/bridge.67e6c0db925ba38b.mjs: library s2.secret is not importable from s3.r2 (import it with USING, or use a library of the routine's schema)
+s3.r2()
+of s2
 SELECT s2.r1() AS still_works;
 still_works
 of s2
 SELECT s3.r2();
-ERROR HY000: JavaScript> Error: Error reading module '/s2/secret' imported from /.mle-libraries/s1/bridge.f800ae31916193ff.mjs: library s2.secret is not importable from s3.r2 (import it with USING, or use a library of the routine's schema)
+s3.r2()
+of s2
 # C3: DROP USER of the author ends the kept workers that ran its code.
 DROP USER author@localhost;
 Warnings:

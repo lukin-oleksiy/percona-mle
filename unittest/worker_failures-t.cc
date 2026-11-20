@@ -106,7 +106,7 @@ TEST(MleWorkerMemoryLimit, NumpyBeyondTheCgroupLimit) {
             0u)
       << error_of(res);
   const auto t0 = Clock::now();
-  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kDied));
+  EXPECT_EQ(h->call(1, {}, &res), u(Outcome::kDied));
   EXPECT_EQ(error_of(res),
             "the MLE worker died: killed by the out-of-memory killer (cgroup "
             "memory limit)");
@@ -169,7 +169,7 @@ TEST_F(MleWorkerFailures, WorkersThatCannotStart) {
     ASSERT_NE(p, nullptr) << err;
     Worker w(std::move(p));
     ReadyMsg ready;
-    EXPECT_EQ(w.wait_ready(30000, &ready, &err), Status::kDied);
+    EXPECT_EQ(w.wait_ready(30000, &ready, &err), Outcome::kDied);
     EXPECT_EQ(err, "the MLE worker died: " + why);
     EXPECT_FALSE(w.usable());
   }
@@ -204,7 +204,7 @@ TEST_F(MleWorkerFailures, KillDuringPrepare) {
     const auto t0 = Clock::now();
     EXPECT_EQ(
         prepare_routine(*h, id++, lang, "f", src, {}, type_of(Tag::kI64), &res),
-        uint32_t(Status::kInterrupted))
+        u(Outcome::kInterrupted))
         << error_of(res);
     killer.join();
     h->hooks.kill = false;
@@ -246,8 +246,20 @@ TEST_F(MleWorkerFailures, KillDuringSql) {
       if (++statements == 5) h->hooks.kill = true;
       r->kind = SqlResultKind::kOk;
     };
-    EXPECT_EQ(h->call(id, {}, &res, sql), uint32_t(Status::kInterrupted))
-        << error_of(res);
+    // From the moment of notice the host answers all SQL with ERROR (§11.1
+    // step 2). The routine ends INTERRUPTED if the INTERRUPT was delivered
+    // before that error ended it, and otherwise with the error it got ("the
+    // RESULT is what it would have been"): either way the request counts as
+    // interrupted (step 4), which Worker::interrupted() tells.
+    const uint32_t st = h->call(id, {}, &res, sql);
+    if (st == u(Outcome::kGuestError)) {
+      ASSERT_TRUE(res.error.has_value());
+      EXPECT_EQ(res.error->sql_errno, 1317u) << error_of(res);
+      EXPECT_NE(res.error->sql_error_id, 0u);
+    } else {
+      EXPECT_EQ(st, u(Outcome::kInterrupted)) << error_of(res);
+    }
+    EXPECT_TRUE(h->worker.interrupted());
     EXPECT_LT(statements, 1000) << "the routine ran on after KILL";
     h->hooks.kill = false;
     EXPECT_TRUE(h->worker.usable());
@@ -280,8 +292,8 @@ TEST_F(MleWorkerFailures, KillLongNumpyComputation) {
   const double ms = ms_since(t0) - 300;
   std::cout << "[ INFO     ] numpy SVD after KILL: status " << st << " ("
             << error_of(res) << ") after " << ms << " ms\n";
-  EXPECT_TRUE(st == uint32_t(Status::kInterrupted) ||
-              st == uint32_t(Status::kKilled))
+  EXPECT_TRUE(st == u(Outcome::kInterrupted) ||
+              st == u(Outcome::kKilled))
       << st;
   EXPECT_LT(ms, 3 * (500 + 1000));  // generous: slow builds
 }
@@ -301,7 +313,7 @@ TEST_F(MleWorkerFailures, GuestStackOverflowIsAGuestError) {
     ASSERT_EQ(prepare_routine(*s_host, ++id, lang, "f", src, {},
                               type_of(Tag::kI64), &res),
               0u);
-    EXPECT_EQ(s_host->call(id, {}, &res), uint32_t(Status::kGuestError));
+    EXPECT_EQ(s_host->call(id, {}, &res), u(Outcome::kGuestError));
     EXPECT_NE(error_of(res).find(error), std::string::npos) << error_of(res);
     // Recoverable in the guest: the worker stays.
     EXPECT_TRUE(s_host->worker.usable());
@@ -325,7 +337,7 @@ TEST_F(MleWorkerFailures, GuestHeapExhaustionRetiresTheWorker) {
         prepare_routine(*h, 1, lang, "f", src, {}, type_of(Tag::kI64), &res),
         0u);
     const auto t0 = Clock::now();
-    EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kExhausted))
+    EXPECT_EQ(h->call(1, {}, &res), u(Outcome::kExhausted))
         << error_of(res);
     std::cout << "[ INFO     ] " << lang << " heap exhausted after "
               << ms_since(t0) << " ms: " << error_of(res) << "\n";
@@ -349,7 +361,7 @@ TEST_F(MleWorkerFailures, NativeCrashEndsOnlyTheWorker) {
                             {}, type_of(Tag::kI64), &res),
             0u)
       << error_of(res);
-  EXPECT_EQ(h->call(1, {}, &res), uint32_t(Status::kDied));
+  EXPECT_EQ(h->call(1, {}, &res), u(Outcome::kDied));
   std::cout << "[ INFO     ] " << error_of(res) << "\n";
   EXPECT_FALSE(h->worker.usable());
   // The host and the launcher are fine; the next worker works.

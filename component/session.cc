@@ -209,7 +209,16 @@ class Hooks : public mle::CallHooks {
                                          : std::string("this code"));
       repair_utf8(&r->message);
     };
-    if (m_routine == nullptr || m_routine->prepare.imports.empty())
+    if (m_routine == nullptr) return refuse();
+    // SPEC QUESTION (integration, 20 Nov): Appendix A allows a routine its
+    // USING libraries and what those import, so one without USING could
+    // import nothing; Oracle's JavaScript imports libraries dynamically in
+    // routines without USING (the suite's libraries tests have such
+    // examples, for libraries of the routine's own schema). Until the
+    // specification settles it, a routine without USING may import the
+    // libraries of its own schema that the account whose rights apply may
+    // use, and nothing else.
+    if (m_routine->prepare.imports.empty() && m.schema != m_routine->schema)
       return refuse();
     // A failed lookup may leave the server's error (a missing library, an
     // MDL timeout, KILL) in the diagnostics area: it is not the routine's,

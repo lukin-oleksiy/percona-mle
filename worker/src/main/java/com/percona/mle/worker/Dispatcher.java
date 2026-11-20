@@ -712,7 +712,10 @@ final class Dispatcher {
       // and nothing runs in it again; the host retires this worker after the top-level request.
       if (e.isCancelled()) tainted = true;
       if (stopped) result(q, Wire.INTERRUPTED, new ErrorInfo(language, "interrupted", frames, 0, "", 0));
-      else if (e.isCancelled()) result(q, Wire.INTERNAL, internal("the worker's context was closed"));
+      // What the runtime calls cancelled because guest code provoked it is an error of guest
+      // code (§10.6), like its own "interrupted" below; tainted retires the worker.
+      else if (e.isCancelled())
+        result(q, Wire.GUEST_ERROR, new ErrorInfo(language, "the worker's context was closed by a routine", frames, 0, "", 0));
       else result(q, Wire.GUEST_ERROR, new ErrorInfo(language, "interrupted by the routine's own code", frames, 0, "", 0));
       return;
     }

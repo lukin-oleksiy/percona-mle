@@ -16,7 +16,8 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 // Helpers shared by the JVM worker tests (java_worker-t.cc,
-// polyglot_worker-t.cc).
+// polyglot_worker-t.cc, worker_failures-t.cc, body_forms-t.cc): the host's
+// side is mle::Worker, as docs/protocol.md defines it.
 
 #ifndef MLE_JVM_TEST_UTIL_H
 #define MLE_JVM_TEST_UTIL_H
@@ -85,8 +86,78 @@ inline ClassConfig jvm_class(const std::string &name,
 
 // ---------------------------------------------------------------- test host
 
-/** The host's Worker with test hooks; host-side errors are put into the
-    result's error so that tests can print them uniformly. */
+inline uint32_t u(Outcome o) { return static_cast<uint32_t>(o); }
+
+/** The SQL type name of a tag, as the host gives it in a Type (§7.4: never
+    empty). */
+inline const char *sql_type_name(Tag tag, bool is_unsigned = false) {
+  switch (tag) {
+    case Tag::kNull:
+      return "NULL";
+    case Tag::kI64:
+      return "BIGINT";
+    case Tag::kU64:
+      return is_unsigned ? "BIGINT" : "BIT";
+    case Tag::kF64:
+      return "DOUBLE";
+    case Tag::kF32:
+      return "FLOAT";
+    case Tag::kDecimal:
+      return "DECIMAL";
+    case Tag::kString:
+      return "VARCHAR";
+    case Tag::kBytes:
+      return "VARBINARY";
+    case Tag::kDate:
+      return "DATE";
+    case Tag::kTime:
+      return "TIME";
+    case Tag::kDatetime:
+      return "DATETIME";
+    case Tag::kTimestamp:
+      return "TIMESTAMP";
+    case Tag::kJson:
+      return "JSON";
+    case Tag::kVector:
+      return "VECTOR";
+  }
+  return "?";
+}
+
+inline ParamType type_of(Tag tag, bool is_unsigned = false) {
+  ParamType t;
+  t.tag = tag;
+  t.is_unsigned = is_unsigned;
+  t.type_name = sql_type_name(tag, is_unsigned);
+  return t;
+}
+
+/** An SQL_RESULT ERROR as the server gives one (§10.4); the Worker sets
+    error_id. */
+inline void sql_error(SqlResultMsg *r, uint32_t sql_errno,
+                      const std::string &sqlstate, const std::string &message) {
+  *r = SqlResultMsg();
+  r->kind = SqlResultKind::kError;
+  r->sql_errno = sql_errno;
+  r->sqlstate = sqlstate;
+  r->message = message;
+}
+
+/** An SQL_RESULT ROWS with one complete result set of one batch. */
+inline void sql_rows(SqlResultMsg *r, std::vector<Column> columns,
+                     std::vector<Value> values) {
+  *r = SqlResultMsg();
+  r->kind = SqlResultKind::kRows;
+  r->columns = std::move(columns);
+  r->total_rows = r->columns.empty() ? 0 : values.size() / r->columns.size();
+  r->rows = std::move(values);
+}
+
+/** The host's Worker with test hooks. A request's outcome is returned as a
+    number (the first five are the RESULT's status, §9.4); what the host
+    library says about a request that failed without an Error of the worker
+    is put into the result's error with the language "host", so that tests
+    can print both uniformly. */
 class TestHost {
  public:
   using SqlHandler = std::function<void(const SqlMsg &, SqlResultMsg *)>;
@@ -94,16 +165,27 @@ class TestHost {
   explicit TestHost(std::unique_ptr<WorkerProcess> w, WorkerOptions o = {})
       : worker(std::move(w), o) {}
 
+  /** Waits for READY, then puts options in force (§9.8): no PREPARE, CALL
+      or PARSE_LIBRARY goes to a worker without them. */
   bool wait_ready(ReadyMsg *m, std::string *err, int timeout_ms = 60000) {
-    return worker.wait_ready(timeout_ms, m, err) == Status::kOk;
+    if (worker.wait_ready(timeout_ms, m, err) != Outcome::kOk) return false;
+    return options(OptionsMsg(), err) == Outcome::kOk;
   }
-  const wire::RegionHeader &header() { return *worker.process().header(); }
+  Outcome options(const OptionsMsg &o, std::string *err,
+                  Error *guest_error = nullptr) {
+    return worker.options(o, guest_error, err);
+  }
+  WorkerStats stats() { return worker.stats(); }
 
-  uint32_t prepare(const PrepareMsg &p, ResultMsg *res) {
+  uint32_t prepare(PrepareMsg p, ResultMsg *res) {
+    // The host's guarantees of §9.2.
+    if (p.schema.empty()) p.schema = "test";
+    p.library_epoch = epoch;
     std::string err;
-    const Status s = worker.prepare(p, hooks, res, &err);
-    if (!err.empty() && !res->error) res->error = Error{"host", err, {}, 0, ""};
-    return uint32_t(s);
+    const Outcome o = worker.prepare(p, hooks, res, &err);
+    if (!err.empty() && !res->error)
+      res->error = Error{"host", err, {}, 0, "", 0};
+    return u(o);
   }
 
   /** sql serves the routine's SQL (kept for nested calls). */
@@ -111,44 +193,45 @@ class TestHost {
                 ResultMsg *res, SqlHandler sql = nullptr) {
     if (sql && worker.depth() == 0) hooks.handler = std::move(sql);
     std::string err;
-    const Status s = worker.call(routine, 0, args, hooks, res, &err);
-    if (!err.empty() && !res->error) res->error = Error{"host", err, {}, 0, ""};
-    return uint32_t(s);
-  }
-
-  /** INTERRUPT for a given call sequence, sent directly (to test the
-      worker's handling of an interrupt that precedes its call). */
-  void raw_interrupt(uint64_t call_seq) {
-    unsigned char b[9];
-    b[0] = uint8_t(wire::Control::kInterrupt);
-    memcpy(b + 1, &call_seq, 8);
-    EXPECT_EQ(send(worker.process().control_fd(), b, sizeof b, MSG_NOSIGNAL),
-              9);
+    const Outcome o = worker.call(routine, epoch, args, hooks, res, &err);
+    if (!err.empty() && !res->error)
+      res->error = Error{"host", err, {}, 0, "", 0};
+    return u(o);
   }
 
   struct Hooks : CallHooks {
     SqlHandler handler;
+    std::function<void(const LibraryMsg &, LibraryResultMsg *)> on_library;
     std::atomic<bool> kill{false};
+    /** If not 0: killed() is true from its kill_at_poll-th call on (counted
+        from the moment this was set). */
+    std::atomic<int> kill_at_poll{0};
+    std::atomic<int> polls{0};
     void sql(const SqlMsg &m, SqlResultMsg *r) override {
       if (handler)
         handler(m, r);
       else
         NoSql().sql(m, r);
     }
-    bool killed() override { return kill.load(); }
+    void library(const LibraryMsg &q, LibraryResultMsg *r) override {
+      if (on_library)
+        on_library(q, r);
+      else
+        CallHooks::library(q, r);
+    }
+    bool killed() override {
+      const int at = kill_at_poll.load();
+      if (at != 0 && ++polls >= at) return true;
+      return kill.load();
+    }
   } hooks;
+  /** The library epoch of the requests (§9.10). */
+  uint64_t epoch = 1;
   Worker worker;
 };
 
 inline std::string error_of(const ResultMsg &r) {
   return r.error ? r.error->message : "";
-}
-
-inline ParamType type_of(Tag tag, bool is_unsigned = false) {
-  ParamType t;
-  t.tag = tag;
-  t.is_unsigned = is_unsigned;
-  return t;
 }
 
 /** PREPAREs a routine with IN parameters of the given types. */

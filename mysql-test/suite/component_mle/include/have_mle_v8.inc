@@ -4,12 +4,11 @@
 # headers are found: libnode-dev, nodejs-devel) and installed in <plugin_dir>/mle/v8.
 #
 --let $mle_plugin_dir = `SELECT @@plugin_dir`
---let MLE_V8_EXE = $mle_plugin_dir/mle/v8/mle_v8_worker
---perl
-open(my $f, '>', "$ENV{MYSQLTEST_VARDIR}/tmp/have_mle_v8.inc") or die "have_mle_v8: $!";
-print $f (-e $ENV{MLE_V8_EXE} ? "" : "--skip The V8 worker is not installed (build percona-mle with -DMLE_V8=ON)\n");
-close $f;
-EOF
---source $MYSQLTEST_VARDIR/tmp/have_mle_v8.inc
---remove_file $MYSQLTEST_VARDIR/tmp/have_mle_v8.inc
+# Without a file of the test's own: a skip would leave it behind, and MTR's
+# check of the test case would fail.
+--error 0,1
+--file_exists $mle_plugin_dir/mle/v8/mle_v8_worker
+if ($__error) {
+  --skip The V8 worker is not installed (build percona-mle with -DMLE_V8=ON)
+}
 --enable_query_log

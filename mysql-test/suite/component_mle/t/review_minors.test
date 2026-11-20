@@ -5,6 +5,8 @@
 --source ../include/have_mle_component.inc
 --source include/count_sessions.inc
 
+# C60: a worker whose context a routine closed is retired.
+call mtr.add_suppression("Component mle reported: 'The worker of .* was retired");
 INSTALL COMPONENT "file://component_mle";
 GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
 --connect (con1, localhost, root,,test)
@@ -178,8 +180,9 @@ SELECT js_liar();
 SELECT js_context();
 CALL java_close();
 --echo # A Java routine may close it: the next script call finds it closed, and
---echo # the worker is replaced (it used to stay, failing every call).
---error ER_QUERY_INTERRUPTED
+--echo # the worker is replaced (it used to stay, failing every call). It is an
+--echo # error of guest code, not an interrupt: none was requested (protocol 10.6).
+--error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT js_one();
 SELECT js_one() AS works_after;
 SET @pid = mle_debug_worker_pid();

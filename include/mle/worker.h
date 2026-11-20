@@ -259,7 +259,9 @@ class Worker {
   void interrupt();
   /** True if an interrupt was requested for the top-level request in
       progress or, between requests, for the last one: the client is then
-      told "interrupted" whatever the outcome (§11.1 step 4). */
+      told "interrupted" whatever the outcome (§11.1 step 4). A request that
+      was not sent (kRefused, a worker that is gone, a session killed before
+      it started) has no record: false after it. */
   bool interrupted() const { return m_recorded.load(); }
 
   /** The ERROR with this error_id, if it was sent during the top-level
@@ -383,6 +385,9 @@ class Worker {
   Outcome died(std::string *error);
   Outcome lost(Wait w, wire::Op op, const std::string &why, std::string *error);
   void hold_error(SqlResultMsg *error);
+  /** A request is asked for: at top level, the record of the last
+      top-level request is not this one's. */
+  void forget_record();
 
   std::unique_ptr<WorkerProcess> m_process;
   WorkerOptions m_options;

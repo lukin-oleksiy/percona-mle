@@ -59,7 +59,7 @@ CREATE FUNCTION java_other(using_it INT) RETURNS INT LANGUAGE JAVA AS $$
 return Mle.importLibrary("other_lib.tiny").getMember("v").asInt();
 $$;
 SELECT java_other(0);
-ERROR HY000: Java> java.lang.IllegalArgumentException: /other_lib/tiny: library other_lib.tiny is not importable from test.java_other (import it with USING, or use a library of the routine's schema) (java_other, line 2)
+ERROR HY000: Java> java.lang.IllegalArgumentException: /other_lib/tiny: library other_lib.tiny is not available to test.java_other (java_other, line 2)
 CREATE FUNCTION java_other_using() RETURNS INT LANGUAGE JAVA USING (other_lib.tiny) AS $$
 return Mle.importLibrary("other_lib.tiny").getMember("v").asInt();
 $$;

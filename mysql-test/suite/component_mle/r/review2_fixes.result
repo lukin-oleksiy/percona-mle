@@ -44,7 +44,7 @@ None
 # 5: a result or SQL request larger than the host accepts is a clean
 # error; the worker goes on (no failure counted).
 SELECT LENGTH(py_big());
-ERROR HY000: MLE-Type> the routine's result with its output is larger than MLE allows (64 MiB) in 'py_big()'
+ERROR HY000: MLE-Type> the routine's result is larger than MLE allows (64 MiB) in 'py_big()'
 CALL js_big_sql(@r);
 SELECT @r AS sql_request;
 sql_request
@@ -58,7 +58,7 @@ workers lost: 0
 CALL js_import(@r);
 SELECT @r AS missing_library;
 missing_library
-Error: Error reading module '/test/no_such_library' imported from js_import: library test.no_such_library does not exist or cannot be read
+Error: Error reading module '/test/no_such_library' imported from js_import: library test.no_such_library is not available to test.js_import
 CALL js_rethrow();
 ERROR 42S02: Table 'test.no_such_table' doesn't exist
 # 8: a thread a Java routine leaves (named like the runtime's, a

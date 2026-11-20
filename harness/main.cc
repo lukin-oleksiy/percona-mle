@@ -126,7 +126,10 @@ std::unique_ptr<Worker> ready_worker(Launcher &l, const std::string &cls,
   if (!p) die(err);
   auto w = std::make_unique<Worker>(std::move(p));
   ReadyMsg ready;
-  if (w->wait_ready(120000, &ready, &err) != Status::kOk) die(err);
+  if (w->wait_ready(120000, &ready, &err) != Outcome::kOk) die(err);
+  // No PREPARE or CALL without options in force (docs/protocol.md 9.8).
+  if (w->options(OptionsMsg(), nullptr, &err) != Outcome::kOk)
+    die("OPTIONS: " + err);
   if (ms) *ms = ms_since(t0);
   return w;
 }
@@ -161,10 +164,11 @@ void prepare(Worker &w, uint64_t id, const std::string &lang,
     p.params.push_back(
         {"p" + std::to_string(i + 1), wire::ParamMode::kIn, params[i]});
   p.returns = ret;
+  p.schema = "test";
   Hooks hooks;
   ResultMsg res;
   std::string err;
-  if (w.prepare(p, hooks, &res, &err) != Status::kOk)
+  if (w.prepare(p, hooks, &res, &err) != Outcome::kOk)
     die("PREPARE " + lang + ": " + (res.error ? res.error->message : err));
 }
 
@@ -177,7 +181,7 @@ Percentiles time_calls(Worker &w, uint64_t id, const std::vector<Value> &args,
   ResultMsg res;
   std::string err;
   for (int i = 0; i < warmup; i++)
-    if (w.call(id, 0, args, hooks, &res, &err) != Status::kOk)
+    if (w.call(id, 0, args, hooks, &res, &err) != Outcome::kOk)
       die("CALL: " + (res.error ? res.error->message : err));
   std::vector<double> us;
   us.reserve(n);

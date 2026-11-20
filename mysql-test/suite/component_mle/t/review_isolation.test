@@ -191,6 +191,9 @@ $$;
 SELECT s1.f() AS changed_js, s1.pf() AS changed_py;
 SELECT s1.f() AS again_js, s1.pf() AS again_py;
 DROP LIBRARY s1.inner_lib;
+# The module's path carries the host's version token of the library, which
+# is a number of this mysqld (protocol 9.10), not a property of the body.
+--replace_regex /outer_lib\.[0-9a-f]+\.mjs/outer_lib.VERSION.mjs/
 --error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT s1.f() AS dropped;
 CREATE LIBRARY s1.inner_lib LANGUAGE JAVASCRIPT AS $$ export const x = 3 $$;
@@ -204,8 +207,10 @@ CREATE LIBRARY s1.inner_lib LANGUAGE JAVASCRIPT AS $$ export const x = 4 $$;
 --connect (con1, localhost, root,,test)
 SELECT s1.f() AS changed_between_sessions;
 
---echo # s2.r1 may import s2.secret (its schema's) through s1.bridge; s3.r2
---echo # may not, also after s2.r1 evaluated the bridge in the same worker.
+--echo # A routine with a USING clause may import what the account whose
+--echo # rights apply may use (the host cannot see which libraries a library
+--echo # imports; protocol Appendix A): s2.r1 and s3.r2 both reach s2.secret
+--echo # through s1.bridge, each with an answer of its own (protocol 9.10).
 CREATE LIBRARY s2.secret LANGUAGE JAVASCRIPT AS $$ export const value = 'of s2' $$;
 CREATE LIBRARY s1.bridge LANGUAGE JAVASCRIPT AS $$
   import { value } from '/s2/secret'
@@ -214,10 +219,8 @@ $$;
 CREATE FUNCTION s2.r1() RETURNS VARCHAR(20) LANGUAGE JAVASCRIPT USING (s1.bridge AS b) AS $$ return b.get() $$;
 CREATE FUNCTION s3.r2() RETURNS VARCHAR(20) LANGUAGE JAVASCRIPT USING (s1.bridge AS b) AS $$ return b.get() $$;
 SELECT s2.r1();
---error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT s3.r2();
 SELECT s2.r1() AS still_works;
---error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT s3.r2();
 --disconnect con1
 --connection setup

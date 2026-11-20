@@ -18,7 +18,7 @@ CREATE TABLE rw_my (id INT PRIMARY KEY, a VARCHAR(20), x DOUBLE) ENGINE=MyISAM;
 CALL js_batch(@r);
 SELECT @r;
 @r
-affected 3 | error 1062 23000 row 1 true | ids 1,2,3,10 | width 1210 row 0 | empty 0 | select: executeMany runs statements that return no rows; this one returned a result set (its first row was executed), row 0 | not rows: executeMany takes a list of rows, each a list of values | update 2 | plain error row null
+affected 3 | error 1062 23000 row 1 true | ids 1,2,3,10 | width 1210 row 0 | empty 0 | select: executeMany runs statements that return no rows; this one returned a result set (the row was executed), row 0 | not rows: executeMany takes a list of rows, each a list of values | update 2 | plain error row null
 SELECT id, name, x, VECTOR_TO_STRING(v) AS v, d FROM b ORDER BY id;
 id	name	x	v	d
 1	a	2.5	[1.00000e+00,2.00000e+00,3.00000e+00]	2024-01-02

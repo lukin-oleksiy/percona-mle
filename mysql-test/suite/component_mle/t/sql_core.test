@@ -291,12 +291,13 @@ CALL many(@r);
 SET GLOBAL mle.sql_statements_max = DEFAULT;
 --echo # statements do not outlive their call
 CREATE PROCEDURE keep(INOUT id BIGINT) LANGUAGE JAVA AS $$
-if (id[0] == null) { id[0] = 1000000L; MleSql.prepare(id[0], "SELECT 1", false); }
+if (id[0] == null) { id[0] = MleSql.newStatementId(); MleSql.prepare(id[0], "SELECT 1", false); }
 else MleSql.executePrepared(id[0], null, 0);
 $$;
 SET @id = NULL;
 CALL keep(@id);
---error ER_LANGUAGE_COMPONENT_INTERNAL
+--echo # The worker fails the use of another call's statement itself (protocol 10.1).
+--error ER_UNKNOWN_STMT_HANDLER
 CALL keep(@id);
 
 --echo #

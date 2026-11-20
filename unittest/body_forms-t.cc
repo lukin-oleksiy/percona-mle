@@ -127,7 +127,14 @@ class MleBodyForms : public ::testing::Test {
 
   static void set_options(const OptionsMsg &o) {
     std::string err;
-    ASSERT_EQ(s_host->worker.options(o, &err), Status::kOk) << err;
+    ASSERT_EQ(s_host->options(o, &err), Outcome::kOk) << err;
+  }
+
+  /** OPTIONS with one setting (Appendix B.2) and the default zone. */
+  static OptionsMsg setting(const std::string &name, const std::string &value) {
+    OptionsMsg o;
+    o.settings = {{name, value}};
+    return o;
   }
 
   /** A one-expression JS function returning type t: return (expr). */
@@ -196,7 +203,7 @@ TEST_F(MleBodyForms, JsStrictMode) {
   ASSERT_NE(id, 0u);
   uint32_t s;
   ResultMsg r = call(id, {}, &s);
-  EXPECT_EQ(s, uint32_t(Status::kGuestError));
+  EXPECT_EQ(s, u(Outcome::kGuestError));
   EXPECT_NE(error_of(r).find("ReferenceError"), std::string::npos) << error_of(r);
 }
 
@@ -222,7 +229,7 @@ TEST_F(MleBodyForms, JsAwait) {
                                {}, kInt);
   ASSERT_NE(bad, 0u);
   r = call(bad, {}, &s);
-  EXPECT_EQ(s, uint32_t(Status::kGuestError));
+  EXPECT_EQ(s, u(Outcome::kGuestError));
   EXPECT_EQ(error_of(r), "Error: boom");
 }
 
@@ -235,16 +242,12 @@ TEST_F(MleBodyForms, JsIntegerTypeOption) {
   // Oracle's default UNSAFE_STRING: Number when safe, else String.
   EXPECT_EQ(ret(id, {small}), Value::string("number:5"));
   EXPECT_EQ(ret(id, {big}), Value::string("string:1152921504606846976"));
-  OptionsMsg o;
-  o.integer_type = wire::IntegerType::kUnsafeBigint;
-  set_options(o);
+  set_options(setting("js.integer_type", "unsafe_bigint"));
   EXPECT_EQ(ret(id, {small}), Value::string("number:5"));
   EXPECT_EQ(ret(id, {big}), Value::string("bigint:1152921504606846976"));
-  o.integer_type = wire::IntegerType::kBigint;
-  set_options(o);
+  set_options(setting("js.integer_type", "bigint"));
   EXPECT_EQ(ret(id, {small}), Value::string("bigint:5"));
-  o.integer_type = wire::IntegerType::kString;
-  set_options(o);
+  set_options(setting("js.integer_type", "string"));
   EXPECT_EQ(ret(id, {small}), Value::string("string:5"));
   // BIGINT UNSIGNED beyond 2^63.
   const uint64_t u = prepare("js", "iu", "return typeof a + ':' + String(a);",
@@ -261,9 +264,7 @@ TEST_F(MleBodyForms, JsDecimalTypeOption) {
                               kVarchar);
   ASSERT_NE(id, 0u);
   EXPECT_EQ(ret(id, {Value::decimal("1.50")}), Value::string("string:1.50"));
-  OptionsMsg o;
-  o.decimal_type = wire::DecimalType::kNumber;
-  set_options(o);
+  set_options(setting("js.decimal_type", "number"));
   EXPECT_EQ(ret(id, {Value::decimal("1.50")}), Value::string("number:1.5"));
 }
 
@@ -307,10 +308,23 @@ TEST_F(MleBodyForms, JsDatesInTheSessionTimeZone) {
             dt(Tag::kDate, 2024, 1, 3, 0, 0, 0));
   o.time_zone = "Europe/Kyiv";
   set_options(o);
+  // A zone the worker does not know: GUEST_ERROR with the marker
+  // MLE-TimeZone, and the options in force are unchanged (§9.8).
   o.time_zone = "Mars/Olympus";
   std::string err;
-  EXPECT_EQ(s_host->worker.options(o, &err), Status::kGuestError);
+  Error guest;
+  EXPECT_EQ(s_host->options(o, &err, &guest), Outcome::kGuestError);
+  EXPECT_EQ(guest.language, wire::kLanguageTimeZone);
   EXPECT_NE(err.find("unknown time zone"), std::string::npos) << err;
+  EXPECT_TRUE(s_host->worker.options_in_force());
+  EXPECT_EQ(ret(id, {dt(Tag::kDatetime, 2024, 1, 2, 3, 4, 5)}),
+            Value::string("2024-01-02T01:04:05.000Z"));  // Kyiv: +02:00
+  // A value the worker does not accept for a setting it knows: MLE-Option;
+  // a name it does not know is ignored.
+  EXPECT_EQ(s_host->options(setting("js.integer_type", "roman"), &err, &guest),
+            Outcome::kGuestError);
+  EXPECT_EQ(guest.language, wire::kLanguageOption);
+  set_options(setting("zz.unknown_setting", "1"));
 }
 
 TEST_F(MleBodyForms, JsIntegerResults) {
@@ -333,7 +347,7 @@ TEST_F(MleBodyForms, JsIntegerResults) {
        {"NaN", "Infinity", "2147483648", "'abc'", "({})", "[1]"}) {
     uint32_t s;
     ResultMsg r = call(js_expr(bad, kInt), {}, &s);
-    EXPECT_EQ(s, uint32_t(Status::kGuestError)) << bad;
+    EXPECT_EQ(s, u(Outcome::kGuestError)) << bad;
     ASSERT_TRUE(r.error) << bad;
     EXPECT_EQ(r.error->language, "MLE-Type") << bad;
   }
@@ -344,7 +358,7 @@ TEST_F(MleBodyForms, JsIntegerResults) {
   for (const char *bad : {"256", "-1"}) {
     uint32_t s;
     call(js_expr(bad, tiny), {}, &s);
-    EXPECT_EQ(s, uint32_t(Status::kGuestError)) << bad;
+    EXPECT_EQ(s, u(Outcome::kGuestError)) << bad;
   }
 }
 
@@ -383,7 +397,7 @@ TEST_F(MleBodyForms, JsOtherResults) {
            {"'now'", ty(Tag::kDate, "DATE")}}) {
     uint32_t s;
     ResultMsg r = call(js_expr(expr, t), {}, &s);
-    EXPECT_EQ(s, uint32_t(Status::kGuestError)) << expr;
+    EXPECT_EQ(s, u(Outcome::kGuestError)) << expr;
     EXPECT_TRUE(r.error && r.error->language == "MLE-Type") << expr << ": " << error_of(r);
   }
 }
@@ -459,7 +473,7 @@ TEST_F(MleBodyForms, JsFrameLimit) {
   EXPECT_EQ(ret(id, {Value::i64(998)}), Value::i64(998 * 999 / 2));  // 1000 frames
   uint32_t s;
   ResultMsg r = call(id, {Value::i64(999)}, &s);
-  EXPECT_EQ(s, uint32_t(Status::kGuestError));
+  EXPECT_EQ(s, u(Outcome::kGuestError));
   EXPECT_EQ(error_of(r), "Maximum frame limit of 1000 exceeded. Frames on stack: 1001.");
   ASSERT_TRUE(r.error);
   EXPECT_EQ(r.error->language, "js");
