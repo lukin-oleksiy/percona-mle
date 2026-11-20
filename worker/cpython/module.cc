@@ -19,8 +19,10 @@
 
 #include <array>
 #include <cmath>
-#include <exception>
+#include <memory>
+#include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "codec.hpp"
 #include "mailbox.hpp"
@@ -29,73 +31,221 @@ namespace mle::cpython {
 
 namespace w = mle::wire;
 
+Config &config() {
+  static Config c;
+  return c;
+}
+
 namespace {
 
-/** open(spin) -> arena size */
-Ref py_open(PyObject *args) {
-  int spin = 2000;
-  if (!PyArg_ParseTuple(args, "|i", &spin)) throw PyErrorSet{};
-  try {
-    return Ref::steal(PyLong_FromUnsignedLong(open_mailbox(spin)));
-  } catch (const std::exception &e) {
-    PyErr_SetString(PyExc_OSError, e.what());
-    throw PyErrorSet{};
+/** SQL flags bit 1, KEEP (§10.2): only with PREPARE while serving a CALL; the statement is a kept
+    statement (§10.1). Belongs beside wire::kPassResultToClient in include/mle/protocol.h. */
+constexpr uint8_t kKeep = 1U << 1;
+
+// ------------------------------------------------------------------------------ requests
+
+/** An SQL statement id that is not CLOSED (§10.1). */
+struct Statement {
+  enum class State : uint8_t { kIdle, kRows, kNext };
+  State state = State::kIdle;
+  /** Opened by PREPARE: its home is IDLE. Else by EXECUTE: its home is CLOSED. */
+  bool prepared = false;
+  /** PASS_RESULT_TO_CLIENT, given when the id was opened. */
+  bool to_client = false;
+  uint32_t param_count = 0;
+  /** The columns of the current result set; of a prepared statement, the ones last received,
+      which a later set's first batch may leave out (§10.3): (block, labels, tags). */
+  Ref columns;
+  uint32_t ncols = 0;
+  /** A kept statement: the request (its scope) that uses it now, or 0; when it was used last;
+      and what it was prepared from (the flag and the text), by which a later PREPARE finds it. */
+  uint64_t lease = 0;
+  uint64_t used = 0;
+  std::string key;
+};
+
+using Statements = std::unordered_map<uint64_t, Statement>;
+
+/** A request being served, at its depth. */
+struct Request {
+  uint32_t op = 0;
+  uint32_t depth = 0;
+  /** A number of its own: statement handles and per-call options carry it. */
+  uint64_t scope = 0;
+  /** Guest code of this request may run: only then SQL and LIBRARY are sent (§10.1, §10.6). */
+  bool guest = false;
+  /** PREPARE, CALL, DROP: the routine. */
+  uint64_t routine_id = 0;
+  uint64_t library_epoch = 0;
+  /** The statements of this request that are not kept. */
+  Statements statements;
+  Request *outer = nullptr;
+};
+
+/** The innermost request being served; nullptr between requests. */
+Request *g_request = nullptr;
+/** call_seq of the top-level request being served or served last. */
+uint64_t g_seq = 0;
+uint64_t g_scopes = 0;
+/** Statement ids are never used twice in a worker: unique among every request's and every
+    routine's (§10.1). */
+uint64_t g_statement_ids = 0;
+/** The kept statements of each routine id. */
+std::unordered_map<uint64_t, Statements> g_kept;
+uint64_t g_kept_tick = 0;
+
+/** The request loop's Python side (serve()). */
+struct Loop {
+  PyObject *handle = nullptr;      // handle(op, body or None, head, ctx): a request; returns its outcome
+  PyObject *finish = nullptr;      // finish(op, ctx, outcome, exception, delivered) -> (status, body)
+  PyObject *convert = nullptr;     // convert(routine, value) -> the RESULT's values, for a fast call
+  PyObject *failed = nullptr;      // failed(routine, exception) -> what a fast call failed with, described
+  PyObject *vector_arg = nullptr;  // vector_arg(index, dims, body, pos)
+};
+Loop g_loop;
+
+/** Python did something during the call that its own tail must see (SQL, a library). */
+bool g_marked = false;
+/** Guest code printed something no RESULT has carried yet. */
+bool g_console = false;
+
+std::byte *allocate(Ref &assembled, size_t total) {
+  if ((config().message_max != 0 && total > config().message_max) || total > size_t{PY_SSIZE_T_MAX}) return nullptr;
+  PyObject *bytes = PyBytes_FromStringAndSize(nullptr, Py_ssize_t(total));
+  if (bytes == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  assembled = Ref::steal(bytes);
+  return reinterpret_cast<std::byte *>(PyBytes_AS_STRING(bytes));
+}
+
+Message receive(Ref &assembled) {
+  return Mailbox::receive([&assembled](size_t total) { return allocate(assembled, total); });
+}
+
+/** The body as a Python object (a memoryview of the arena, or of the reassembled bytes). */
+Ref body_object(const Message &m, Ref &assembled) {
+  if (!m.in_arena) return Ref::steal(PyMemoryView_FromObject(assembled.get()));
+  return Ref::steal(PyMemoryView_FromMemory(reinterpret_cast<char *>(const_cast<std::byte *>(m.body.data())),
+                                           Py_ssize_t(m.body.size()), PyBUF_READ));
+}
+
+/** Text of the host as a str; ill-formed UTF-8 is repaired (§7.1). */
+Ref str_of(std::string_view s) {
+  return Ref::steal(PyUnicode_DecodeUTF8(s.data(), Py_ssize_t(s.size()), "replace"));
+}
+
+/** The guest code of the request served waits for the host: no interrupt is raised meanwhile.
+    One that was delivered is raised by the caller when the guest code goes on. */
+struct HostCall {
+  HostCall() { guest_leave(); }
+  ~HostCall() { guest_resume(); }
+  HostCall(const HostCall &) = delete;
+  HostCall &operator=(const HostCall &) = delete;
+};
+
+/** Why guest code may not send to the host now (sets the Python error), or false if it may: SQL
+    and LIBRARY come only from the guest code of the innermost request, on the serving thread. */
+bool host_unavailable(const char *what) {
+  if (g_request != nullptr && g_request->guest && on_serving_thread()) return false;
+  PyErr_Format(PyExc_RuntimeError, "%s only while a routine runs, in its own thread", what);
+  return true;
+}
+
+// ------------------------------------------------------------------------------ RESULT
+
+/** A RESULT of the worker itself, when its Python code could not make one: status INTERNAL with
+    TAINTED, since the worker's state may be damaged (§9.4). text is ASCII. */
+void post_internal(const Request &q, std::string_view text) {
+  Mailbox::taint();
+  Writer wr(Mailbox::arena());
+  // No return value, OUT parameters, console output or findings; an Error without language,
+  // frames or SQL error.
+  (void)(wr.put<uint8_t>(0) && wr.put<uint32_t>(0) && wr.put<uint32_t>(0) && wr.put<uint32_t>(0) && wr.put<uint8_t>(0) &&
+         wr.put<uint32_t>(0) && wr.put<uint8_t>(1) && wr.str("") && wr.str(text.substr(0, 1024)) && wr.put<uint32_t>(0) &&
+         wr.put<uint32_t>(0) && wr.str("") && wr.put<uint64_t>(0));
+  Mailbox::post(uint32_t(w::Op::kResult), uint32_t(w::Status::kInternal), q.depth, g_seq, uint32_t(wr.size()));
+}
+
+/** The Python error that is set, as ASCII text; the error is cleared. */
+std::string python_error() {
+  PyObject *e = PyErr_GetRaisedException();
+  std::string text = "the worker's Python code failed";
+  if (e != nullptr) {
+    if (PyObject *shown = PyObject_ASCII(e); shown != nullptr) {
+      if (const char *s = PyUnicode_AsUTF8(shown); s != nullptr) text = text + ": " + s;
+      Py_DECREF(shown);
+    }
+    PyErr_Clear();
+    Py_DECREF(e);
+  }
+  return text;
+}
+
+/** The request ends: the host closes the statements it left open; the kept statements it used
+    are IDLE again and free for a later request of the routine (§10.1). */
+void release_statements(Request &q) {
+  if (q.op != uint32_t(w::Op::kCall)) return;
+  const auto kept = g_kept.find(q.routine_id);
+  if (kept == g_kept.end()) return;
+  for (auto &[id, st] : kept->second) {
+    if (st.lease != q.scope) continue;
+    st.lease = 0;
+    st.state = Statement::State::kIdle;
   }
 }
 
-/** receive() -> (op, status, depth, call_seq, body): body is a read-only memoryview of the arena
-    (one chunk: valid until the worker posts) or of a new bytes object (a reassembled message). */
-Ref py_receive(PyObject *) {
-  Ref assembled;
-  const Message m = Mailbox::receive([&assembled](size_t total) {
-    assembled = Ref::steal(PyBytes_FromStringAndSize(nullptr, Py_ssize_t(total)));
-    return reinterpret_cast<std::byte *>(PyBytes_AS_STRING(assembled.get()));
-  });
-  Ref body = Ref::steal(
-      m.in_arena ? PyMemoryView_FromMemory(reinterpret_cast<char *>(const_cast<std::byte *>(m.body.data())),
-                                           Py_ssize_t(m.body.size()), PyBUF_READ)
-                 : PyMemoryView_FromObject(assembled.get()));
-  return Ref::steal(Py_BuildValue("(IIIKN)", m.op, m.status, m.depth, static_cast<unsigned long long>(m.call_seq),
-                                  body.release()));
+/** Posts the RESULT of q, which Python makes from what the request ended with. From here on no
+    guest code of the request runs and the status is fixed (§11.1). */
+void finish_request(Request &q, PyObject *ctx, PyObject *outcome, PyObject *failure, bool delivered) {
+  const bool guest_op = q.op == uint32_t(w::Op::kPrepare) || q.op == uint32_t(w::Op::kCall);
+  if (guest_op) g_console = false;  // this RESULT carries the console output
+  PyObject *r = PyObject_CallFunction(g_loop.finish, "IOOOO", q.op, ctx, outcome != nullptr ? outcome : Py_None,
+                                      failure != nullptr ? failure : Py_None, delivered ? Py_True : Py_False);
+  release_statements(q);
+  // The statistics change when the worker becomes idle after a RESET, not on every request (§3.1).
+  if (q.op == uint32_t(w::Op::kReset)) Mailbox::stats(uint32_t(w::WorkerState::kIdle));
+  unsigned status = 0;
+  PyObject *body = nullptr;
+  Py_buffer view;
+  if (r != nullptr && PyArg_ParseTuple(r, "IO", &status, &body) && PyObject_GetBuffer(body, &view, PyBUF_SIMPLE) == 0) {
+    Mailbox::send(uint32_t(w::Op::kResult), status, q.depth, g_seq,
+                  {static_cast<const std::byte *>(view.buf), static_cast<size_t>(view.len)});
+    PyBuffer_Release(&view);
+  } else {
+    post_internal(q, python_error());
+  }
+  Py_XDECREF(r);
 }
 
-/** send(op, status, depth, call_seq, buffer) */
-Ref py_send(PyObject *args) {
-  unsigned op, status, depth;
-  unsigned long long seq;
-  PyObject *body;
-  if (!PyArg_ParseTuple(args, "IIIKO", &op, &status, &depth, &seq, &body)) throw PyErrorSet{};
-  const Buffer b(body, PyBUF_SIMPLE);
-  Mailbox::send(op, status, depth, seq, b.bytes());
-  return Ref::borrow(Py_None);
-}
+// ------------------------------------------------------------------------------ the fast call path
+//
+// Top-level CALLs of simple routines (no OUT parameters, no USING) run here without Python's
+// dispatcher: arguments decoded, the function made with fresh globals and called, a scalar result
+// written into the arena. Every call whose routine printed, ran SQL or loaded a library, failed or
+// returned a value this writer does not take ends in Python (convert, finish).
 
-Ref py_pending(PyObject *) { return Ref::borrow(Mailbox::pending() ? Py_True : Py_False); }
+struct FastRoutine {
+  Ref routine;  // the dispatcher's Routine, for convert() and finish()
+  Ref fn;       // the function (entry form, <eval>), or
+  Ref code;     // the body's code object, called with a copy of
+  Ref base;     // the globals it was prepared with (fresh globals per call)
+  uint32_t nparams = 0;
+  int ret_tag = -1;  // -1: no return value
+  bool ret_unsigned = false;
+  bool vectors = false;  // VECTOR parameters: reused numpy arrays (the dispatcher's vector_arg)
+};
 
-/** stats(state, tainted[, heap_used]) */
-Ref py_stats(PyObject *args) {
-  unsigned state;
-  int tainted;
-  unsigned long long used = 0;
-  if (!PyArg_ParseTuple(args, "Ip|K", &state, &tainted, &used)) throw PyErrorSet{};
-  Mailbox::stats(state, tainted != 0, used);
-  return Ref::borrow(Py_None);
-}
+/** Shared with a running activation, which keeps its code when a nested PREPARE or DROP takes the
+    routine away (§8.3). */
+std::unordered_map<uint64_t, std::shared_ptr<const FastRoutine>> g_fast;
 
-/** begin(call_seq): a top-level request starts. */
-Ref py_begin(PyObject *args) {
-  unsigned long long seq;
-  if (!PyArg_ParseTuple(args, "K", &seq)) throw PyErrorSet{};
-  Interrupts::begin(seq);
-  return Ref::borrow(Py_None);
-}
-
-/** end() -> whether the request was interrupted */
-Ref py_end(PyObject *) { return Ref::borrow(Interrupts::end() ? Py_True : Py_False); }
+constexpr uint32_t kFastParams = 64;
 
 /** The routine's value as the declared type, for the common cases only (exact int, float, str or
     None as an integer, floating-point or string type); false: Python's writer handles it, with its
-    conversions and error messages. */
+    conversions and error messages. No guest code runs here. */
 bool put_value(Writer &wr, PyObject *v, w::Tag tag, bool is_unsigned) {
   if (v == Py_None) return wr.put(static_cast<uint8_t>(w::Tag::kNull));
   switch (tag) {
@@ -132,16 +282,17 @@ bool put_value(Writer &wr, PyObject *v, w::Tag tag, bool is_unsigned) {
       } else {
         return false;
       }
+      if (!std::isfinite(d)) return false;  // not an SQL value: Python's error (§7.2)
       if (tag == w::Tag::kF64) return wr.put(static_cast<uint8_t>(w::Tag::kF64)) && wr.put(d);
       const auto f = static_cast<float>(d);
-      if (std::isfinite(d) && !std::isfinite(f)) return false;  // out of range: Python's error
+      if (!std::isfinite(f)) return false;  // out of range: Python's error
       return wr.put(static_cast<uint8_t>(w::Tag::kF32)) && wr.put(f);
     }
     case w::Tag::kString: {
       if (!PyUnicode_CheckExact(v)) return false;
       Py_ssize_t n;
       const char *s = PyUnicode_AsUTF8AndSize(v, &n);
-      if (s == nullptr) {  // lone surrogates: Python's writer replaces them
+      if (s == nullptr) {  // lone surrogates: Python's writer repairs them
         PyErr_Clear();
         return false;
       }
@@ -152,93 +303,219 @@ bool put_value(Writer &wr, PyObject *v, w::Tag tag, bool is_unsigned) {
   }
 }
 
-/** result_fast(state, tainted, depth, seq, value, tag, unsigned, stdout, stderr) -> bool: an OK
-    RESULT without OUT parameters written straight into the arena and posted (tag < 0: no return
-    value); False if Python must write it (then nothing was sent). */
-Ref py_result_fast(PyObject *args) {
-  unsigned state, depth;
-  int tainted, tag, is_unsigned;
-  unsigned long long seq;
-  PyObject *value, *out_obj, *err_obj;
-  if (!PyArg_ParseTuple(args, "IpIKOipOO", &state, &tainted, &depth, &seq, &value, &tag, &is_unsigned, &out_obj,
-                        &err_obj))
-    throw PyErrorSet{};
-  const Buffer out(out_obj, PyBUF_SIMPLE), err(err_obj, PyBUF_SIMPLE);
+/** An OK RESULT of a CALL without OUT parameters, console output or findings, into the arena;
+    its size, or 0 if this writer does not take the value or the arena is too small. */
+uint32_t write_fast_result(const FastRoutine &f, PyObject *value) {
   Writer wr(Mailbox::arena());
-  const auto raw = [&wr](std::span<const std::byte> b) {
-    return wr.put(static_cast<uint32_t>(b.size())) && wr.bytes(b);
-  };
-  const bool ok = (tag < 0 ? wr.put(uint8_t{0})
-                           : wr.put(uint8_t{1}) && put_value(wr, value, static_cast<w::Tag>(tag), is_unsigned != 0)) &&
-                  wr.put(uint32_t{0}) &&                 // no OUT parameters
-                  raw(out.bytes()) && raw(err.bytes()) &&  // console output
-                  wr.put(uint8_t{0}) &&                  // console not cleared
-                  wr.put(uint8_t{0});                    // no error
-  if (!ok) return Ref::borrow(Py_False);
-  Mailbox::stats(state, tainted != 0);
-  Mailbox::post(uint32_t(w::Op::kResult), uint32_t(w::Status::kOk), depth, seq, uint32_t(wr.size()));
-  return Ref::borrow(Py_True);
+  const bool ok = (f.ret_tag < 0 ? wr.put(uint8_t{0})
+                                 : wr.put(uint8_t{1}) && put_value(wr, value, static_cast<w::Tag>(f.ret_tag), f.ret_unsigned)) &&
+                  wr.put(uint32_t{0}) &&                         // no OUT parameters
+                  wr.put(uint32_t{0}) && wr.put(uint32_t{0}) &&  // stdout, stderr
+                  wr.put(uint8_t{0}) &&                          // console not cleared
+                  wr.put(uint32_t{0}) &&                         // no findings
+                  wr.put(uint8_t{0});                            // no error
+  return ok ? uint32_t(wr.size()) : 0;
 }
 
-// ------------------------------------------------------------------------------ the call loop
-//
-// Top-level CALLs of simple routines (no OUT parameters, no USING) run here without Python's
-// dispatcher (exp note 62 §8): arguments decoded, the function made with fresh globals and
-// called, a scalar result written into the arena. Everything else, and every call whose routine
-// printed, ran SQL or loaded a library (Python marks it), failed, was killed or returned a value
-// the writer does not take, goes to Python as before.
+/** Runs the top-level CALL m of q as a fast call if its routine is registered; false: Python
+    handles it (nothing was done). */
+bool fast_call(Request &q, const Message &m, Ref &assembled) {
+  const auto it = g_fast.find(q.routine_id);
+  if (it == g_fast.end()) return false;
+  const std::shared_ptr<const FastRoutine> keep = it->second;
+  const FastRoutine &f = *keep;
+  Reader r(m.body, 16);
+  // Another argument count than the routine's Params is Python's to find (a protocol failure).
+  if (r.get<uint32_t>() != f.nparams) return false;
+  const uint32_t n = f.nparams;
 
-struct FastRoutine {
-  Ref fn;    // the function (entry form, mle_eval), or
-  Ref code;  // the body's code object, called with a copy of
-  Ref base;  // the globals it was prepared with (fresh globals per call)
-  uint32_t nparams = 0;
-  int ret_tag = -1;  // -1: no return value
-  bool ret_unsigned = false;
-  bool vectors = false;  // VECTOR parameters: reused numpy arrays (the dispatcher's vector_arg)
-};
+  // Arguments; anything Python reports (a zero date) is left to Python's path.
+  std::array<Ref, kFastParams> argv;
+  Ref body;
+  for (uint32_t i = 0; i < n; i++) {
+    const Reader at = r;
+    const auto tag = static_cast<w::Tag>(r.get<uint8_t>());
+    try {
+      if (tag == w::Tag::kVector) {
+        if (!f.vectors) return false;
+        const auto dims = r.get<uint32_t>();
+        r.align();
+        const size_t pos = r.pos();
+        r.take(size_t{dims} * 4);
+        if (!body) body = body_object(m, assembled);
+        argv[i] = Ref::steal(PyObject_CallFunction(g_loop.vector_arg, "IIOn", i, dims, body.get(), Py_ssize_t(pos)));
+      } else {
+        r = at;
+        argv[i] = decode_value(r, nullptr, nullptr);
+      }
+    } catch (const PyErrorSet &) {
+      PyErr_Clear();
+      return false;
+    }
+  }
 
-std::unordered_map<uint64_t, FastRoutine> g_fast;
-/** Python did something during the call that its own tail must see (output, SQL, a library). */
-bool g_marked = false;
-bool g_tainted = false;
+  g_marked = false;
+  // The function with fresh globals (its errors, MemoryError, are the call's, as Python's own).
+  PyObject *ret = nullptr;
+  q.guest = true;
+  guest_enter();
+  PyObject *globals = f.fn ? nullptr : PyDict_Copy(f.base.get());
+  PyObject *made = f.fn || globals == nullptr ? nullptr : PyFunction_New(f.code.get(), globals);
+  Py_XDECREF(globals);
+  if (f.fn || made != nullptr) {
+    std::array<PyObject *, kFastParams> raw;
+    for (uint32_t i = 0; i < n; i++) raw[i] = argv[i].get();
+    ret = PyObject_Vectorcall(f.fn ? f.fn.get() : made, raw.data(), n, nullptr);
+  }
+  Py_XDECREF(made);
+  // The RESULT straight into the arena, or its values by Python's writer, whose conversions can
+  // run guest code: the request is not over for interrupts before they are done (§4.1).
+  uint32_t size = 0;
+  PyObject *values = nullptr;
+  if (ret != nullptr) {
+    if (!g_marked && !g_console) size = write_fast_result(f, ret);
+    if (size == 0) values = PyObject_CallFunctionObjArgs(g_loop.convert, f.routine.get(), ret, nullptr);
+    Py_DECREF(ret);
+  } else {
+    // What it failed with is described while the request can still be interrupted: an
+    // exception's text is guest code.
+    PyObject *raised = PyErr_GetRaisedException();
+    values = PyObject_CallFunctionObjArgs(g_loop.failed, f.routine.get(), raised, nullptr);
+    Py_XDECREF(raised);
+  }
+  guest_leave();
+  q.guest = false;
+  PyObject *failure = size == 0 && values == nullptr ? PyErr_GetRaisedException() : nullptr;
+  const bool delivered = Interrupts::end();
+  if (size != 0) {
+    // The code completed before an interrupt could stop it: its result stands (§11.1).
+    Mailbox::post(uint32_t(w::Op::kResult), uint32_t(w::Status::kOk), 0, g_seq, size);
+    return true;
+  }
+  PyObject *ctx = PyList_New(1);
+  if (ctx == nullptr) {
+    post_internal(q, python_error());
+  } else {
+    PyList_SET_ITEM(ctx, 0, Py_NewRef(f.routine.get()));
+    finish_request(q, ctx, values, failure, delivered);
+    Py_DECREF(ctx);
+  }
+  Py_XDECREF(values);
+  Py_XDECREF(failure);
+  return true;
+}
 
-/** register(id, fn, code, base, nparams, ret_tag, unsigned, vectors) */
+/** The routine id is not prepared any more, or is prepared anew (§8.3): later CALLs do not find
+    its fast routine, and the host has closed its kept statements (§10.1). */
+void forget_routine(uint64_t id) {
+  g_fast.erase(id);
+  g_kept.erase(id);
+}
+
+/** Serves the request m: from its complete receipt to the post of its RESULT. Nested requests
+    come here from the wait for an SQL_RESULT (§10.6). */
+void dispatch(const Message &m, Ref &assembled) {
+  const auto op = static_cast<w::Op>(m.op);
+  const bool top = m.depth == 0;
+  const bool guest_op = op == w::Op::kPrepare || op == w::Op::kCall;
+  const bool interruptible = guest_op || op == w::Op::kParseLibrary;
+  Request q;
+  q.op = m.op;
+  q.depth = m.depth;
+  q.scope = ++g_scopes;
+  q.outer = g_request;
+  if (guest_op || op == w::Op::kDrop) q.routine_id = m.discarded ? m.head : Reader(m.body).get<uint64_t>();
+  if (op == w::Op::kCall && !m.discarded) q.library_epoch = Reader(m.body, 8).get<uint64_t>();
+  if (op == w::Op::kPrepare || op == w::Op::kDrop) forget_routine(q.routine_id);
+  if (op == w::Op::kReset) {
+    g_fast.clear();
+    g_kept.clear();
+  }
+  if (top) {
+    // The worker begins to serve the request: it has received it completely (§11.1).
+    g_seq = m.call_seq;
+    Interrupts::begin(g_seq, interruptible);
+  }
+  g_request = &q;
+  if (!(op == w::Op::kCall && top && !m.discarded && fast_call(q, m, assembled))) {
+    PyObject *ctx = PyList_New(0);
+    PyObject *body = ctx == nullptr ? nullptr : m.discarded ? Py_NewRef(Py_None) : body_object(m, assembled).release();
+    PyObject *outcome = nullptr;
+    if (body != nullptr) {
+      q.guest = guest_op && !m.discarded;
+      if (q.guest) guest_enter();
+      outcome = PyObject_CallFunction(g_loop.handle, "IOKO", m.op, body, static_cast<unsigned long long>(m.head), ctx);
+      if (q.guest) guest_leave();
+      q.guest = false;
+    }
+    PyObject *failure = outcome == nullptr ? PyErr_GetRaisedException() : nullptr;
+    // The status is fixed from here on. An interrupt of the top-level request that was delivered
+    // and not raised is cancelled; inside a nested request it stays for the outer code.
+    const bool delivered = interruptible && (top ? Interrupts::end() : Interrupts::interrupted());
+    if (ctx == nullptr || body == nullptr) {
+      PyErr_SetRaisedException(Py_XNewRef(failure));
+      post_internal(q, python_error());
+    } else {
+      finish_request(q, ctx, outcome, failure, delivered);
+    }
+    Py_XDECREF(outcome);
+    Py_XDECREF(failure);
+    Py_XDECREF(body);
+    Py_XDECREF(ctx);
+  }
+  g_request = q.outer;
+}
+
+/** serve(handle, finish, convert, failed, vector_arg): the worker's request loop; never returns. */
+Ref py_serve(PyObject *args) {
+  if (!PyArg_ParseTuple(args, "OOOOO", &g_loop.handle, &g_loop.finish, &g_loop.convert, &g_loop.failed,
+                        &g_loop.vector_arg))
+    throw PyErrorSet{};
+  serving_thread();
+  while (true) {
+    Ref assembled;
+    const Message m = receive(assembled);
+    dispatch(m, assembled);
+  }
+}
+
+/** register(id, routine, fn, code, base, nparams, ret_tag, unsigned, vectors) */
 Ref py_register(PyObject *args) {
   unsigned long long id;
-  PyObject *fn, *code, *base;
+  PyObject *routine, *fn, *code, *base;
   unsigned nparams;
   int ret_tag, is_unsigned, vectors;
-  if (!PyArg_ParseTuple(args, "KOOOIipp", &id, &fn, &code, &base, &nparams, &ret_tag, &is_unsigned, &vectors))
+  if (!PyArg_ParseTuple(args, "KOOOOIipp", &id, &routine, &fn, &code, &base, &nparams, &ret_tag, &is_unsigned, &vectors))
     throw PyErrorSet{};
-  FastRoutine f;
+  auto f = std::make_shared<FastRoutine>();
   if (code != Py_None) {
     if (!PyCode_Check(code) || !PyDict_Check(base)) {
       PyErr_SetString(PyExc_TypeError, "register: code and a dict of globals, or a function");
       throw PyErrorSet{};
     }
-    f.code = Ref::borrow(code);
-    f.base = Ref::borrow(base);
+    f->code = Ref::borrow(code);
+    f->base = Ref::borrow(base);
   } else {
-    f.fn = Ref::borrow(fn);
+    f->fn = Ref::borrow(fn);
   }
-  f.nparams = nparams;
-  f.ret_tag = ret_tag;
-  f.ret_unsigned = is_unsigned != 0;
-  f.vectors = vectors != 0;
+  if (nparams > kFastParams) {
+    PyErr_SetString(PyExc_ValueError, "register: too many parameters");
+    throw PyErrorSet{};
+  }
+  f->routine = Ref::borrow(routine);
+  f->nparams = nparams;
+  f->ret_tag = ret_tag;
+  f->ret_unsigned = is_unsigned != 0;
+  f->vectors = vectors != 0;
   g_fast.insert_or_assign(id, std::move(f));
   return Ref::borrow(Py_None);
 }
 
-/** unregister(id) or unregister(): every routine */
+/** unregister(id): the routine is not one of the fast call path any more. */
 Ref py_unregister(PyObject *args) {
-  unsigned long long id = 0;
-  if (PyTuple_GET_SIZE(args) == 0) {
-    g_fast.clear();
-  } else {
-    if (!PyArg_ParseTuple(args, "K", &id)) throw PyErrorSet{};
-    g_fast.erase(id);
-  }
+  unsigned long long id;
+  if (!PyArg_ParseTuple(args, "K", &id)) throw PyErrorSet{};
+  g_fast.erase(id);
   return Ref::borrow(Py_None);
 }
 
@@ -247,350 +524,559 @@ Ref py_mark(PyObject *) {
   return Ref::borrow(Py_None);
 }
 
-Ref py_taint(PyObject *args) {
-  int t;
-  if (!PyArg_ParseTuple(args, "p", &t)) throw PyErrorSet{};
-  g_tainted = t != 0;
+Ref py_printed(PyObject *) {
+  g_console = true;
   return Ref::borrow(Py_None);
 }
 
-/** What the loop needs of the dispatcher. */
-struct Loop {
-  PyObject *handle;      // handle(op, depth, seq, body): every other request
-  PyObject *finish;      // finish(id, result, exception, interrupted): the Python tail of a call
-  PyObject *vector_arg;  // vector_arg(index, dims, body, pos)
-  PyObject *state;       // the dispatcher's __dict__: seq, scope, scopes, routine
-  PyObject *open;        // the libraries' loadsets being collected (cleared per top-level request)
-  Ref k_seq, k_scope, k_scopes, k_routine;
-};
-
-void set(PyObject *dict, PyObject *key, Ref value) {
-  if (PyDict_SetItem(dict, key, value.get()) != 0) throw PyErrorSet{};
+Ref py_taint(PyObject *) {
+  Mailbox::taint();
+  return Ref::borrow(Py_None);
 }
 
-/** The body as a Python object (a memoryview of the arena, or the reassembled bytes). */
-Ref body_object(const Message &m, Ref &assembled) {
-  if (!m.in_arena) return Ref::steal(PyMemoryView_FromObject(assembled.get()));
-  return Ref::steal(PyMemoryView_FromMemory(reinterpret_cast<char *>(const_cast<std::byte *>(m.body.data())),
-                                           Py_ssize_t(m.body.size()), PyBUF_READ));
+/** request() -> (depth, scope, routine id, library epoch, call_seq, whether a CALL) of the
+    innermost request being served, or None between requests. */
+Ref py_request(PyObject *) {
+  const Request *q = g_request;
+  if (q == nullptr) return Ref::borrow(Py_None);
+  return Ref::steal(Py_BuildValue("(IKKKKO)", q->depth, static_cast<unsigned long long>(q->scope),
+                                  static_cast<unsigned long long>(q->routine_id),
+                                  static_cast<unsigned long long>(q->library_epoch),
+                                  static_cast<unsigned long long>(g_seq),
+                                  q->op == uint32_t(w::Op::kCall) ? Py_True : Py_False));
 }
 
-/** Runs m as a fast call if its routine is registered; false: Python handles it (nothing done). */
-bool fast_call(Loop &l, const Message &m, Ref &assembled) {
-  Reader r(m.body, 0);
-  const uint64_t id = r.get<uint64_t>();
-  r.get<uint32_t>();  // events
-  const uint32_t n = r.get<uint32_t>();
-  const auto it = g_fast.find(id);
-  if (it == g_fast.end() || it->second.nparams != n || n > 64) return false;
-  const FastRoutine &f = it->second;
-
-  // Arguments; anything Python reports (a zero date) is left to Python's path.
-  std::array<Ref, 64> argv;
-  Ref body;
-  for (uint32_t i = 0; i < n; i++) {
-    const Reader at = r;
-    const auto tag = static_cast<w::Tag>(r.get<uint8_t>());
-    if (tag == w::Tag::kVector) {
-      if (!f.vectors) return false;
-      const auto dims = r.get<uint32_t>();
-      r.align();
-      const size_t pos = r.pos();
-      r.take(size_t{dims} * 4);
-      if (!body) body = body_object(m, assembled);
-      PyObject *v = PyObject_CallFunction(l.vector_arg, "IIOn", i, dims, body.get(), Py_ssize_t(pos));
-      if (v == nullptr) {
-        PyErr_Clear();
-        return false;
-      }
-      argv[i] = Ref::steal(v);
-      continue;
-    }
-    r = at;
-    try {
-      argv[i] = decode_value(r, nullptr, nullptr);
-    } catch (const PyErrorSet &) {
-      PyErr_Clear();
-      return false;
-    }
-  }
-
-  // The request's state, as the dispatcher's handle() sets it (the SQL API reads it).
-  const Ref seq = Ref::steal(PyLong_FromUnsignedLongLong(m.call_seq));
-  PyObject *scopes = PyDict_GetItemWithError(l.state, l.k_scopes.get());
-  if (scopes == nullptr) {
-    if (!PyErr_Occurred()) PyErr_SetString(PyExc_RuntimeError, "the dispatcher has no scopes");
-    throw PyErrorSet{};
-  }
-  const long long next = PyLong_AsLongLong(scopes) + 1;
-  if (next == 0 && PyErr_Occurred()) throw PyErrorSet{};
-  const Ref scope = Ref::steal(PyLong_FromLongLong(next));
-  set(l.state, l.k_seq.get(), Ref::borrow(seq.get()));
-  set(l.state, l.k_scopes.get(), Ref::borrow(scope.get()));
-  set(l.state, l.k_scope.get(), Ref::borrow(scope.get()));
-  const Ref rid = Ref::steal(PyLong_FromUnsignedLongLong(id));
-  set(l.state, l.k_routine.get(), Ref::borrow(rid.get()));
-  if (PyList_GET_SIZE(l.open) > 0 && PyList_SetSlice(l.open, 0, PY_SSIZE_T_MAX, nullptr) != 0) throw PyErrorSet{};
-
-  Interrupts::begin(m.call_seq);
-  Mailbox::stats(uint32_t(w::WorkerState::kRunning), g_tainted);
-  g_marked = false;
-  // The function with fresh globals (its errors, MemoryError, are the call's, as Python's own).
-  PyObject *ret = nullptr;
-  PyObject *globals = f.fn ? nullptr : PyDict_Copy(f.base.get());
-  PyObject *made = f.fn || globals == nullptr ? nullptr : PyFunction_New(f.code.get(), globals);
-  Py_XDECREF(globals);
-  if (f.fn || made != nullptr) {
-    std::array<PyObject *, 64> raw;
-    for (uint32_t i = 0; i < n; i++) raw[i] = argv[i].get();
-    ret = PyObject_Vectorcall(f.fn ? f.fn.get() : made, raw.data(), n, nullptr);
-  }
-  Py_XDECREF(made);
-  Ref result = ret == nullptr ? Ref() : Ref::steal(ret);
-  Ref failure = ret == nullptr ? Ref::steal(PyErr_GetRaisedException()) : Ref();
-  set(l.state, l.k_routine.get(), Ref::steal(PyLong_FromLong(0)));
-  const bool interrupted = Interrupts::end();
-
-  if (result && !interrupted && !g_marked) {
-    Writer wr(Mailbox::arena());
-    const bool ok = (f.ret_tag < 0 ? wr.put(uint8_t{0})
-                                   : wr.put(uint8_t{1}) && put_value(wr, result.get(), static_cast<w::Tag>(f.ret_tag),
-                                                                     f.ret_unsigned)) &&
-                    wr.put(uint32_t{0}) && wr.put(uint32_t{0}) && wr.put(uint32_t{0}) &&  // no OUTs, no output
-                    wr.put(uint8_t{0}) && wr.put(uint8_t{0});
-    if (ok) {
-      Mailbox::stats(uint32_t(w::WorkerState::kIdle), g_tainted);
-      Mailbox::post(uint32_t(w::Op::kResult), uint32_t(w::Status::kOk), 0, m.call_seq, uint32_t(wr.size()));
-      return true;
-    }
-  }
-  // Python's tail: the SQL API's end of call, the console, errors, other result types.
-  PyObject *done = PyObject_CallFunction(l.finish, "OOOO", rid.get(), result ? result.get() : Py_None,
-                                         failure ? failure.get() : Py_None, interrupted ? Py_True : Py_False);
-  if (done != nullptr) {
-    Py_DECREF(done);
-  } else if (PyErr_ExceptionMatches(PyExc_KeyboardInterrupt)) {
-    PyErr_Clear();  // a KILL after the call had ended
-  } else {
-    throw PyErrorSet{};
-  }
-  return true;
+/** epoch(library_epoch): of the PREPARE being served (the field ends its body). */
+Ref py_epoch(PyObject *args) {
+  unsigned long long epoch;
+  if (!PyArg_ParseTuple(args, "K", &epoch)) throw PyErrorSet{};
+  if (g_request != nullptr) g_request->library_epoch = epoch;
+  return Ref::borrow(Py_None);
 }
 
-/** serve(handle, finish, vector_arg, state, open): the worker's request loop; returns only on error. */
-Ref py_serve(PyObject *args) {
-  Loop l{};
-  if (!PyArg_ParseTuple(args, "OOOO!O!", &l.handle, &l.finish, &l.vector_arg, &PyDict_Type, &l.state, &PyList_Type,
-                        &l.open))
-    throw PyErrorSet{};
-  l.k_seq = Ref::steal(PyUnicode_InternFromString("seq"));
-  l.k_scope = Ref::steal(PyUnicode_InternFromString("scope"));
-  l.k_scopes = Ref::steal(PyUnicode_InternFromString("scopes"));
-  l.k_routine = Ref::steal(PyUnicode_InternFromString("routine"));
-  while (true) {
-    Ref assembled;
-    const Message m = Mailbox::receive([&assembled](size_t total) {
-      assembled = Ref::steal(PyBytes_FromStringAndSize(nullptr, Py_ssize_t(total)));
-      return reinterpret_cast<std::byte *>(PyBytes_AS_STRING(assembled.get()));
-    });
-    // A KILL that came after its call had ended: taken here, not in the next call.
-    if (PyErr_CheckSignals() != 0) PyErr_Clear();
-    if (m.depth != 0) {
-      PyErr_Format(PyExc_RuntimeError, "top-level message at depth %u", m.depth);
-      throw PyErrorSet{};
-    }
-    if (m.op == uint32_t(w::Op::kCall) && fast_call(l, m, assembled)) continue;
-    const Ref body = body_object(m, assembled);
-    PyObject *r = PyObject_CallFunction(l.handle, "IIKO", m.op, m.depth, static_cast<unsigned long long>(m.call_seq),
-                                        body.get());
-    if (r != nullptr) {
-      Py_DECREF(r);
-    } else if (PyErr_ExceptionMatches(PyExc_KeyboardInterrupt)) {
-      PyErr_Clear();  // a KILL after its call had ended
-    } else {
-      throw PyErrorSet{};
-    }
-  }
+Ref py_arena_size(PyObject *) { return Ref::steal(PyLong_FromUnsignedLong(config().arena_size)); }
+
+/** ready(info, runtime): READY with status OK (§9.1), and the statistics of an idle worker. */
+Ref py_ready(PyObject *args) {
+  const char *info, *runtime;
+  if (!PyArg_ParseTuple(args, "ss", &info, &runtime)) throw PyErrorSet{};
+  const std::string_view languages[] = {"python"};
+  Mailbox::stats(uint32_t(w::WorkerState::kIdle));
+  Mailbox::ready(info, "cpython", languages, runtime);
+  return Ref::borrow(Py_None);
+}
+
+/** protocol_failure(text): a message of the host breaks the protocol; the process ends (§1). */
+Ref py_protocol_failure(PyObject *args) {
+  const char *text;
+  if (!PyArg_ParseTuple(args, "s", &text)) throw PyErrorSet{};
+  protocol_failure(text);
 }
 
 // ------------------------------------------------------------------------------ SQL round trips
 //
-// The SQL API's mechanics in C++ (exp note 62 §9), as the JVM worker's Java core under its thin
-// language adapters: a statement message is finished and sent, the host's nested requests are
-// served while the worker waits, and the reply is parsed into a tuple. The API (sql.py) stays
-// Python.
+// The SQL API's mechanics (§10): a statement message is checked, finished and sent, the host's
+// nested requests are served while the worker waits, and the reply is checked against the
+// statement's state (§10.1), which it moves, and parsed into a tuple. Everything of a message
+// that guest code could get wrong is decided here (§10.6). The API (sql.py) is Python.
 
-/** The str fields of a column, after its name and table: ParamType's name, original name,
-    schema, original table, charset, collation. */
-void skip_column_rest(Reader &r) {
-  r.take(14);  // ParamType: tag, unsigned, length, precision, scale
-  for (int i = 0; i < 6; i++) r.str();
-  r.get<uint32_t>();  // flags
+/** The reply to the SQL message just sent, nested requests served before it. */
+Message sql_reply(Ref &assembled) {
+  while (true) {
+    assembled = Ref();
+    const Message m = receive(assembled);
+    if (m.op == uint32_t(w::Op::kSqlResult)) return m;
+    // A nested PREPARE, CALL or DROP (the mailbox has checked that it is one), served on this
+    // thread from inside the wait (§10.6).
+    dispatch(m, assembled);
+  }
 }
 
-Ref str_of(std::string_view s) {
-  return Ref::steal(PyUnicode_DecodeUTF8(s.data(), Py_ssize_t(s.size()), "replace"));
-}
-
-/** u32 n + n x (u32 level, u32 code, str message): None if none, else a list of tuples. */
+/** A list of Warning: None if empty, else a list of (level, code, message). */
 Ref warnings(Reader &r) {
-  const uint32_t n = r.get<uint32_t>();
+  const uint32_t n = r.count(w::kMaxWarnings, 12);
   if (n == 0) return Ref::borrow(Py_None);
   Ref list = Ref::steal(PyList_New(n));
   for (uint32_t i = 0; i < n; i++) {
     const uint32_t level = r.get<uint32_t>(), code = r.get<uint32_t>();
     Ref msg = str_of(r.str());
-    PyList_SET_ITEM(list.get(), i, Py_BuildValue("(IIN)", level, code, msg.release()));
+    PyList_SET_ITEM(list.get(), i, Ref::steal(Py_BuildValue("(IIN)", level, code, msg.release())).release());
   }
   return list;
 }
 
-/** A SQL_RESULT as a tuple:
-      (0, errno, sqlstate, message, failed row or None)
-      (1, affected, insert id, warnings, more results, parameter count, exec us)
-      (2, column block (bytes), labels, tags, total, body, rows position, rows, more, more results,
-       warnings, exec us)
-    The rows stay in body (decoded when needed); the column block is the columns' metadata as on the
-    wire, made into Column objects only when a routine asks for them. */
-Ref parse_sql_result(const Message &m, Ref &assembled) {
-  Reader r(m.body, 0);
-  switch (static_cast<w::SqlResultKind>(r.get<uint8_t>())) {
+/** A list of Column of count entries as (block, labels, tags): the columns' bytes as on the wire
+    (made into Column objects only when a routine asks for them), their labels and type tags. */
+Ref columns(Reader &r, uint32_t count) {
+  const size_t block_at = r.pos();
+  Ref labels = Ref::steal(PyTuple_New(count));
+  Ref tags = Ref::steal(PyTuple_New(count));
+  for (uint32_t i = 0; i < count; i++) {
+    PyTuple_SET_ITEM(labels.get(), i, str_of(r.str()).release());
+    r.str();  // table
+    const auto tag = r.get<uint8_t>();
+    if (tag > w::kMaxTag) protocol_failure("an unknown tag in a Column's Type");
+    PyTuple_SET_ITEM(tags.get(), i, Ref::steal(PyLong_FromLong(tag)).release());
+    r.take(13);                            // Type: unsigned, length, precision, scale
+    for (int k = 0; k < 6; k++) r.str();   // type_name, org_name, schema, org_table, charset, collation
+    r.get<uint32_t>();                     // flags
+  }
+  const auto block = r.all().subspan(block_at, r.pos() - block_at);
+  return Ref::steal(Py_BuildValue("(y#OO)", reinterpret_cast<const char *>(block.data()), Py_ssize_t(block.size()),
+                                  labels.get(), tags.get()));
+}
+
+/** Where the statement id is, if it is one the request q may use: its own, or a kept statement
+    of its routine that it uses now. */
+struct Found {
+  Statement *st = nullptr;
+  Statements *in = nullptr;
+};
+Found find_statement(Request &q, uint64_t id) {
+  if (const auto own = q.statements.find(id); own != q.statements.end()) return {&own->second, &q.statements};
+  if (q.op == uint32_t(w::Op::kCall)) {
+    if (const auto kept = g_kept.find(q.routine_id); kept != g_kept.end())
+      if (const auto st = kept->second.find(id); st != kept->second.end() && st->second.lease == q.scope)
+        return {&st->second, &kept->second};
+  }
+  return {};
+}
+
+/** What an SQL message of the worker was, for the check of its reply. */
+struct Sent {
+  w::SqlAction action = w::SqlAction::kExecute;
+  uint64_t id = 0;
+  bool to_client = false;
+  /** PREPARE with KEEP, and what the kept statement is found by. */
+  bool keep = false;
+  std::string key;
+  /** EXECUTE_MANY: the rows sent. */
+  uint32_t rows = 0;
+};
+
+Ref ok_tuple(const Request &q, uint64_t affected, uint64_t insert_id, Ref warns, bool more_results, uint32_t params,
+             uint64_t exec_us, uint64_t id) {
+  return Ref::steal(Py_BuildValue("(iKKNOIKKK)", 1, static_cast<unsigned long long>(affected),
+                                  static_cast<unsigned long long>(insert_id), warns.release(),
+                                  more_results ? Py_True : Py_False, params, static_cast<unsigned long long>(exec_us),
+                                  static_cast<unsigned long long>(id), static_cast<unsigned long long>(q.scope)));
+}
+
+/** An ERROR the worker answers itself, without a message: it has no error id. */
+Ref error_tuple(uint32_t code, std::string_view state, std::string_view message) {
+  return Ref::steal(
+      Py_BuildValue("(iINNOKK)", 0, code, str_of(state).release(), str_of(message).release(), Py_None, 0ULL, 0ULL));
+}
+
+/** Checks the SQL_RESULT m that answers the message `sent` of q (§1: the reply kind for the
+    action, counts against the bytes, the numbers the worker finds its state by), moves the id to
+    its next state (§10.1), and returns the reply:
+      (0, errno, sqlstate, message, failed row or None, error id, call_seq)
+      (1, affected, insert id, warnings, more results, parameter count, exec us, id, scope)
+      (2, columns or None, total rows or None, body, rows position, rows, more, more results,
+       warnings, exec us, id, scope)
+      (3,)
+    id and scope are the statement's handle for later actions.
+    columns: (block, labels, tags) with the first batch of a result set. The rows stay in body
+    and are decoded when a routine reads them. */
+Ref sql_result(Request &q, const Sent &sent, const Message &m, Ref &assembled) {
+  using State = Statement::State;
+  const w::SqlAction action = sent.action;
+  Reader r(m.body);
+  const auto kind = r.get<uint8_t>();
+  if (kind > w::kMaxSqlResultKind) protocol_failure("an unknown SQL_RESULT kind");
+  // Looked up now: a nested PREPARE or DROP may have taken the routine's kept statements.
+  Found found = find_statement(q, sent.id);
+  Statement *st = found.st;  // nullptr: CLOSED
+  const bool to_client = st != nullptr ? st->to_client : sent.to_client;
+  const bool nothing_next = action == w::SqlAction::kNextResult && (st == nullptr || st->state == State::kIdle);
+  bool legal = false;
+  switch (static_cast<w::SqlResultKind>(kind)) {
+    case w::SqlResultKind::kError:
+      legal = action != w::SqlAction::kClose;
+      break;
+    case w::SqlResultKind::kOk:
+      legal = action != w::SqlAction::kFetch && !nothing_next;
+      break;
+    case w::SqlResultKind::kRows:
+      legal = !to_client && !nothing_next && action != w::SqlAction::kPrepare &&
+              action != w::SqlAction::kExecuteMany && action != w::SqlAction::kClose;
+      break;
+    case w::SqlResultKind::kEnd:
+      legal = action == w::SqlAction::kNextResult;
+      break;
+  }
+  if (!legal) protocol_failure("an SQL_RESULT of a kind that cannot answer the action in the statement's state");
+  // The id's home: IDLE for a prepared statement, CLOSED for a direct one.
+  const auto home = [&]() {
+    if (st == nullptr) return;
+    if (st->prepared)
+      st->state = State::kIdle;
+    else
+      found.in->erase(sent.id);
+    st = nullptr;
+  };
+  // The id has a result to read: a direct statement gets its entry now.
+  const auto open = [&]() -> Statement & {
+    if (st == nullptr) {
+      found.in = &q.statements;
+      st = &q.statements[sent.id];
+      st->to_client = to_client;
+    }
+    return *st;
+  };
+  switch (static_cast<w::SqlResultKind>(kind)) {
     case w::SqlResultKind::kError: {
-      const uint32_t err = r.get<uint32_t>();
-      Ref state = str_of(r.str()), msg = str_of(r.str());
+      const uint32_t code = r.get<uint32_t>();
+      Ref state = str_of(r.str()), message = str_of(r.str());
       const uint32_t row = r.get<uint32_t>();
-      Ref failed = row == w::kNoRow ? Ref::borrow(Py_None) : Ref::steal(PyLong_FromUnsignedLong(row));
-      return Ref::steal(Py_BuildValue("(iINNN)", 0, err, state.release(), msg.release(), failed.release()));
+      const uint64_t error_id = r.get<uint64_t>();
+      Ref failed = Ref::borrow(Py_None);
+      if (action == w::SqlAction::kExecuteMany) {
+        if (row > sent.rows) protocol_failure("a failed_row beyond the rows sent");
+        failed = Ref::steal(PyLong_FromUnsignedLong(row));
+      }
+      // The actions sent are allowed in the id's state (the others fail without a message), so
+      // rule 3 applies: the id goes home.
+      home();
+      return Ref::steal(Py_BuildValue("(iINNNKK)", 0, code, state.release(), message.release(), failed.release(),
+                                      static_cast<unsigned long long>(error_id), static_cast<unsigned long long>(g_seq)));
     }
     case w::SqlResultKind::kOk: {
       const uint64_t affected = r.get<uint64_t>(), insert_id = r.get<uint64_t>();
       Ref warns = warnings(r);
-      const bool more_results = r.get<uint8_t>() != 0;
+      const bool more_results = r.boolean();
       const uint32_t params = r.get<uint32_t>();
       const uint64_t exec_us = r.get<uint64_t>();
-      return Ref::steal(Py_BuildValue("(iKKNOIK)", 1, static_cast<unsigned long long>(affected),
-                                      static_cast<unsigned long long>(insert_id), warns.release(),
-                                      more_results ? Py_True : Py_False, params,
-                                      static_cast<unsigned long long>(exec_us)));
+      if (action == w::SqlAction::kClose) {
+        if (st != nullptr) found.in->erase(sent.id);
+      } else if (action == w::SqlAction::kPrepare) {
+        Statement &s = sent.keep ? g_kept[q.routine_id][sent.id] : q.statements[sent.id];
+        s.prepared = true;
+        s.to_client = sent.to_client;
+        s.param_count = params;
+        if (sent.keep) {
+          s.lease = q.scope;
+          s.used = ++g_kept_tick;
+          s.key = sent.key;
+        }
+      } else if (more_results) {
+        open().state = State::kNext;
+      } else {
+        home();
+      }
+      return ok_tuple(q, affected, insert_id, std::move(warns), more_results, params, exec_us, sent.id);
     }
     case w::SqlResultKind::kRows: {
-      const uint32_t ncols = r.get<uint32_t>();
-      if (ncols > 4096) throw Malformed{"too many columns"};
-      const size_t block_at = r.pos();
-      Ref labels = Ref::steal(PyTuple_New(ncols));
-      Ref tags = Ref::steal(PyTuple_New(ncols));
-      for (uint32_t i = 0; i < ncols; i++) {
-        PyTuple_SET_ITEM(labels.get(), i, str_of(r.str()).release());
-        r.str();  // table
-        Reader peek = r;  // ParamType's tag
-        PyTuple_SET_ITEM(tags.get(), i, PyLong_FromLong(peek.get<uint8_t>()));
-        skip_column_rest(r);
+      // The first batch of a result set carries its columns; of a prepared statement it may leave
+      // them out when they are the ones it sent last. A later batch has none (§10.3).
+      const bool first = action != w::SqlAction::kFetch;
+      const uint32_t ncols = r.count(w::kMaxColumns, 50);
+      Ref cols;
+      if (ncols != 0) {
+        cols = columns(r, ncols);
+      } else if (st == nullptr || !st->columns || (first && !st->prepared)) {
+        protocol_failure("a batch of rows without columns for a statement that has none");
       }
-      const auto block = m.body.subspan(block_at, r.pos() - block_at);
-      Ref block_bytes = Ref::steal(
-          PyBytes_FromStringAndSize(reinterpret_cast<const char *>(block.data()), Py_ssize_t(block.size())));
+      const uint32_t set_cols = ncols != 0 ? ncols : st->ncols;
       const uint64_t total = r.get<uint64_t>();
       const uint32_t nrows = r.get<uint32_t>();
+      // Every value has at least its tag.
+      if (uint64_t{nrows} * set_cols > r.left()) protocol_failure("more row values than the message holds");
       const size_t rows_at = r.pos();
-      for (uint64_t i = 0; i < uint64_t{nrows} * ncols; i++) skip_value(r);
-      const bool more = r.get<uint8_t>() != 0, more_results = r.get<uint8_t>() != 0;
+      for (uint64_t i = 0; i < uint64_t{nrows} * set_cols; i++) skip_value(r);
+      const bool more = r.boolean(), more_results = r.boolean();
       Ref warns = warnings(r);
       const uint64_t exec_us = r.get<uint64_t>();
+      // The reply tells the columns with a set's first batch.
+      Ref shown = Ref::borrow(Py_None);
+      if (more || more_results || (st != nullptr && st->prepared)) {
+        Statement &s = open();
+        if (ncols != 0) {
+          s.columns = std::move(cols);
+          s.ncols = ncols;
+        }
+        if (first) shown = Ref::borrow(s.columns.get());
+        s.state = more ? State::kRows : more_results ? State::kNext : State::kIdle;
+      } else {
+        // A direct statement's set is complete and no result follows: CLOSED.
+        if (first) shown = std::move(cols);
+        home();
+      }
       Ref body = nrows == 0 ? Ref::borrow(Py_None) : body_object(m, assembled);
-      return Ref::steal(Py_BuildValue("(iNNNKNnIOONK)", 2, block_bytes.release(), labels.release(), tags.release(),
-                                      static_cast<unsigned long long>(total), body.release(), Py_ssize_t(rows_at),
-                                      nrows, more ? Py_True : Py_False, more_results ? Py_True : Py_False,
-                                      warns.release(), static_cast<unsigned long long>(exec_us)));
+      Ref total_rows =
+          total == w::kUnknownTotalRows ? Ref::borrow(Py_None) : Ref::steal(PyLong_FromUnsignedLongLong(total));
+      return Ref::steal(Py_BuildValue("(iONNnIOONKKK)", 2, shown.get(), total_rows.release(), body.release(),
+                                      Py_ssize_t(rows_at), nrows, more ? Py_True : Py_False,
+                                      more_results ? Py_True : Py_False, warns.release(),
+                                      static_cast<unsigned long long>(exec_us), static_cast<unsigned long long>(sent.id),
+                                      static_cast<unsigned long long>(q.scope)));
     }
+    case w::SqlResultKind::kEnd:
+      home();
+      return Ref::steal(Py_BuildValue("(i)", 3));
   }
-  throw Malformed{"bad SQL result kind"};
+  protocol_failure("an unknown SQL_RESULT kind");
 }
 
-/** sql(message, action, statement id, count position, count, flags, row width, depth, call seq,
-    handle) -> the reply tuple, or None if the message is larger than the host accepts (nothing
-    sent). message: a bytearray of the SQL message without its trailer (u8 action and u64 statement
-    id at 0 and the u32 value count at count position are filled in here). handle(op, depth, seq,
-    body) serves the host's nested requests (CALL, PREPARE, DROP at depth + 1) while it waits. */
+/** Sends CLOSE for id and takes its OK (§10.1 rule 1): the id is CLOSED. */
+void sql_close(Request &q, uint64_t id) {
+  std::array<std::byte, w::kSqlCloseSize> close{};
+  Writer wr(close);
+  (void)(wr.put(uint8_t(w::SqlAction::kClose)) && wr.put(id));  // no text, no params, flags and the rest 0
+  Mailbox::send(uint32_t(w::Op::kSql), 0, q.depth, g_seq, close);
+  Ref assembled;
+  const Message m = sql_reply(assembled);
+  if (m.discarded || m.body.empty() || m.body[0] != std::byte{uint8_t(w::SqlResultKind::kOk)})
+    protocol_failure("a reply to CLOSE that is not OK");
+  if (const Found f = find_statement(q, id); f.st != nullptr) f.in->erase(id);
+}
+
+/** A free kept statement of q's routine that was prepared from key, or nullptr. */
+std::pair<uint64_t, Statement *> free_kept(Request &q, const std::string &key) {
+  const auto kept = g_kept.find(q.routine_id);
+  if (kept != g_kept.end())
+    for (auto &[id, st] : kept->second)
+      if (st.lease == 0 && st.key == key) return {id, &st};
+  return {0, nullptr};
+}
+
+/** Room for one more kept statement of q's routine: true if there is, after closing the free one
+    used longest ago if the routine has as many as it may. */
+bool kept_room(Request &q) {
+  const auto kept = g_kept.find(q.routine_id);
+  if (kept == g_kept.end() || kept->second.size() < config().kept_statements) return true;
+  uint64_t oldest = 0, tick = UINT64_MAX;
+  for (const auto &[id, st] : kept->second)
+    if (st.lease == 0 && st.used < tick) {
+      oldest = id;
+      tick = st.used;
+    }
+  if (oldest == 0) return false;  // every one is in use (a recursion): this statement is not kept
+  kept->second.erase(oldest);
+  sql_close(q, oldest);
+  return true;
+}
+
+/** sql(action, scope, id, message, count, flags, width) -> the reply tuple (sql_result), or None
+    if the message would be larger than a worker's may be (nothing is sent).
+
+    message: for EXECUTE, PREPARE, EXECUTE_PREPARED and EXECUTE_MANY a bytearray of the SQL message
+    up to its values (9 bytes for the action and the id, the text, 4 bytes for the value count,
+    the values), which this function completes; else None. scope and id: the statement's handle
+    as an earlier reply gave it (the reply's id, the scope of the request that got it); not used
+    by EXECUTE and PREPARE, which open a new id. flags: PASS_RESULT_TO_CLIENT, with EXECUTE and
+    PREPARE. A PREPARE while serving a CALL is a kept statement of the routine (§10.1): the same
+    text prepared again, by this or a later call, gets a free one without a message.
+
+    What does not need the host is answered here: an id that is CLOSED (CLOSE: OK; NEXT_RESULT:
+    END; others: an ERROR), FETCH without rows to fetch. The handle of another request fails. */
 Ref py_sql(PyObject *args) {
-  PyObject *message, *handle;
-  unsigned action, flags, width, depth;
-  unsigned long long sid, seq;
-  Py_ssize_t count_at;
-  unsigned count;
-  if (!PyArg_ParseTuple(args, "O!IKnIIIIKO", &PyByteArray_Type, &message, &action, &sid, &count_at, &count, &flags,
-                        &width, &depth, &seq, &handle))
+  using State = Statement::State;
+  unsigned action_code, count, flags, width;
+  unsigned long long scope, handle;
+  PyObject *message;
+  if (!PyArg_ParseTuple(args, "IKKOIII", &action_code, &scope, &handle, &message, &count, &flags, &width))
     throw PyErrorSet{};
-  const Buffer b(message, PyBUF_SIMPLE);
-  const auto in = b.bytes();
-  if (count_at < 9 || size_t(count_at) + 4 > in.size()) throw Malformed{"bad SQL message"};
-  if (in.size() + 9 > w::kMaxWorkerMessage) return Ref::borrow(Py_None);  // + flags, max rows, row width
-  std::vector<std::byte> msg(in.begin(), in.end());
-  const auto put = [&msg](size_t at, auto v) {
-    const auto bytes = std::bit_cast<std::array<std::byte, sizeof(v)>>(v);
-    std::copy(bytes.begin(), bytes.end(), msg.begin() + static_cast<std::ptrdiff_t>(at));
-  };
-  const auto add = [&msg](auto v) {
-    const auto bytes = std::bit_cast<std::array<std::byte, sizeof(v)>>(v);
-    msg.insert(msg.end(), bytes.begin(), bytes.end());
-  };
-  put(0, static_cast<uint8_t>(action));
-  put(1, static_cast<uint64_t>(sid));
-  put(size_t(count_at), static_cast<uint32_t>(count));
-  add(static_cast<uint8_t>(flags));
-  add(uint32_t{0});  // max rows per chunk: the host's default
-  add(static_cast<uint32_t>(width));
-  Mailbox::send(uint32_t(w::Op::kSql), uint32_t(w::Status::kOk), depth, seq, msg);
-  while (true) {
-    Ref assembled;
-    const Message m = Mailbox::receive([&assembled](size_t size) {
-      assembled = Ref::steal(PyBytes_FromStringAndSize(nullptr, Py_ssize_t(size)));
-      return reinterpret_cast<std::byte *>(PyBytes_AS_STRING(assembled.get()));
-    });
-    if (m.op == uint32_t(w::Op::kSqlResult) && m.depth == depth) {
-      // A KILL that stopped a nested routine (its KeyboardInterrupt ended there) stops this one
-      // too: its SqlError could be caught (except Exception) and the routine run on.
-      if (Interrupts::interrupted()) {
-        PyErr_SetNone(PyExc_KeyboardInterrupt);
-        throw PyErrorSet{};
-      }
-      return parse_sql_result(m, assembled);
-    }
-    const bool nested = m.op == uint32_t(w::Op::kCall) || m.op == uint32_t(w::Op::kPrepare) ||
-                        m.op == uint32_t(w::Op::kDrop);
-    if (nested && m.depth == depth + 1) {
-      const Ref body = body_object(m, assembled);
-      Ref r = Ref::steal(PyObject_CallFunction(handle, "IIKO", m.op, m.depth,
-                                               static_cast<unsigned long long>(m.call_seq), body.get()));
-      continue;
-    }
-    PyErr_Format(PyExc_RuntimeError, "unexpected message %u at depth %u during SQL", m.op, m.depth);
+  if (host_unavailable("SQL is available")) throw PyErrorSet{};
+  Request &q = *g_request;
+  if (action_code > w::kMaxSqlAction) {
+    PyErr_SetString(PyExc_ValueError, "sql: unknown action");
     throw PyErrorSet{};
   }
+  Sent sent;
+  sent.action = static_cast<w::SqlAction>(action_code);
+  const w::SqlAction action = sent.action;
+  const bool opens = action == w::SqlAction::kExecute || action == w::SqlAction::kPrepare;
+  const bool with_message = opens || action == w::SqlAction::kExecutePrepared || action == w::SqlAction::kExecuteMany;
+  // After an interrupt the host answers ERROR to everything but CLOSE; the worker does it itself,
+  // without a message, and the guest code does not run on (§11.1).
+  if (Interrupts::interrupted() && action != w::SqlAction::kClose) {
+    PyErr_SetNone(PyExc_KeyboardInterrupt);
+    throw PyErrorSet{};
+  }
+  if (with_message ? !PyByteArray_Check(message) : message != Py_None) {
+    PyErr_SetString(PyExc_TypeError, "sql: a bytearray for a statement with text or values, else None");
+    throw PyErrorSet{};
+  }
+  if (count > w::kMaxValues || width > w::kMaxValues || (flags & ~unsigned{w::kPassResultToClient}) != 0) {
+    PyErr_SetString(PyExc_ValueError, "sql: too many values, or unknown flags");
+    throw PyErrorSet{};
+  }
+
+  Statement *st = nullptr;
+  if (!opens) {
+    // A statement belongs to the request that opened it (a kept one: that uses it): the handle of
+    // another request, an earlier one or the caller's, fails here and nothing is sent.
+    if (scope != q.scope) {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "the SQL statement or result belongs to another routine call (one that ended, or the caller)");
+      throw PyErrorSet{};
+    }
+    sent.id = handle;
+    const Found found = find_statement(q, sent.id);
+    st = found.st;
+    if (action == w::SqlAction::kClose) {
+      if (st == nullptr) return ok_tuple(q, 0, 0, Ref::borrow(Py_None), false, 0, 0, sent.id);
+      if (st->lease != 0 && st->state == State::kIdle) {
+        st->lease = 0;  // a kept statement with nothing to read stays prepared for the routine
+        return ok_tuple(q, 0, 0, Ref::borrow(Py_None), false, 0, 0, sent.id);
+      }
+    } else if (action == w::SqlAction::kNextResult) {
+      if (st == nullptr || st->state == State::kIdle) return Ref::steal(Py_BuildValue("(i)", 3));
+    } else if (action == w::SqlAction::kFetch) {
+      if (st == nullptr || st->state != State::kRows) return error_tuple(1210, "HY000", "the result has no rows to fetch");
+    } else if (st == nullptr || !st->prepared) {
+      return error_tuple(1243, "HY000", "Unknown prepared statement handler given to EXECUTE");
+    }
+  }
+
+  // The message. Its fields are decided here; the values are the codec's (encode_values).
+  std::array<std::byte, w::kSqlCloseSize> bare{};
+  std::span<std::byte> out;
+  uint8_t wire_flags = 0;
+  if (with_message) {
+    const size_t size = size_t(PyByteArray_GET_SIZE(message));
+    const auto *head = reinterpret_cast<const std::byte *>(PyByteArray_AS_STRING(message));
+    uint32_t text_len = 0;
+    if (size >= 17) std::memcpy(&text_len, head + 9, 4);
+    const bool has_text = opens, has_values = action != w::SqlAction::kPrepare;
+    if (size < 17 || text_len > size - 17 || (!has_text && text_len != 0) ||
+        (!has_values && (count != 0 || size != size_t{text_len} + 17))) {
+      PyErr_SetString(PyExc_ValueError, "sql: a message that does not fit its action");
+      throw PyErrorSet{};
+    }
+    if (size + 9 > w::kMaxWorkerMessage) return Ref::borrow(Py_None);
+    if (opens) {
+      sent.to_client = (flags & w::kPassResultToClient) != 0;
+      wire_flags = sent.to_client ? uint8_t{w::kPassResultToClient} : uint8_t{0};
+    }
+    if (action == w::SqlAction::kPrepare && q.op == uint32_t(w::Op::kCall) && config().kept_statements != 0) {
+      sent.key.assign(1, sent.to_client ? '1' : '0');
+      sent.key.append(reinterpret_cast<const char *>(head) + 13, text_len);
+      if (const auto [id, free] = free_kept(q, sent.key); free != nullptr) {
+        free->lease = q.scope;
+        free->used = ++g_kept_tick;
+        return ok_tuple(q, 0, 0, Ref::borrow(Py_None), false, free->param_count, 0, id);
+      }
+    }
+  }
+  if (action == w::SqlAction::kExecuteMany) sent.rows = width != 0 ? count / width : 0;
+
+  const HostCall waiting;
+  if (!sent.key.empty()) {
+    sent.keep = kept_room(q);
+    if (sent.keep) wire_flags |= kKeep;
+  }
+  if (opens) sent.id = ++g_statement_ids;
+  if (with_message) {
+    const Py_ssize_t size = PyByteArray_GET_SIZE(message);
+    if (PyByteArray_Resize(message, size + 9) != 0) throw PyErrorSet{};
+    out = {reinterpret_cast<std::byte *>(PyByteArray_AS_STRING(message)), size_t(size) + 9};
+    uint32_t text_len;
+    std::memcpy(&text_len, out.data() + 9, 4);
+    const uint32_t values = count, max_rows = 0, row_width = action == w::SqlAction::kExecuteMany ? width : 0;
+    std::memcpy(out.data() + 13 + text_len, &values, 4);
+    out[size_t(size)] = std::byte{wire_flags};
+    std::memcpy(out.data() + size + 1, &max_rows, 4);
+    std::memcpy(out.data() + size + 5, &row_width, 4);
+  } else {
+    out = bare;
+  }
+  out[0] = std::byte{static_cast<uint8_t>(action)};
+  std::memcpy(out.data() + 1, &sent.id, 8);
+  Mailbox::send(uint32_t(w::Op::kSql), 0, q.depth, g_seq, out);
+  Ref assembled;
+  const Message m = sql_reply(assembled);
+  if (m.discarded) {
+    // §5.3: the worker cannot know the id's state: it closes the id and fails the statement.
+    sql_close(q, sent.id);
+    PyErr_SetString(PyExc_RuntimeError, "the result of the SQL statement is larger than this MLE worker can hold");
+    throw PyErrorSet{};
+  }
+  Ref reply = sql_result(q, sent, m, assembled);
+  // An interrupt that stopped a nested routine stops this one too: it could catch the error of
+  // its statement and run on (§11.1). A CLOSE, which code that unwinds may send, is just done.
+  if (Interrupts::interrupted() && action != w::SqlAction::kClose) {
+    PyErr_SetNone(PyExc_KeyboardInterrupt);
+    throw PyErrorSet{};
+  }
+  return reply;
+}
+
+/** library(schema, name, known_version) -> (status, language, body, version, message), or None
+    if the worker cannot hold the answer (§5.3): one LIBRARY message and its LIBRARY_RESULT
+    (§9.10). schema and name are names: they are checked, never repaired (§7.1). */
+Ref py_library(PyObject *args) {
+  PyObject *schema, *name;
+  unsigned long long known;
+  if (!PyArg_ParseTuple(args, "UUK", &schema, &name, &known)) throw PyErrorSet{};
+  if (host_unavailable("libraries can be imported")) throw PyErrorSet{};
+  Request &q = *g_request;
+  // After an interrupt an import fails, here without a message (§11.1).
+  if (Interrupts::interrupted()) {
+    PyErr_SetNone(PyExc_KeyboardInterrupt);
+    throw PyErrorSet{};
+  }
+  std::array<std::byte, 16 + 2 * w::kMaxLibraryName> msg;
+  Writer wr(msg);
+  for (PyObject *part : {schema, name}) {
+    Py_ssize_t n = 0;
+    const char *s = PyUnicode_AsUTF8AndSize(part, &n);
+    if (s == nullptr) PyErr_Clear();
+    if (s == nullptr || n < 1 || size_t(n) > w::kMaxLibraryName || std::memchr(s, 0, size_t(n)) != nullptr) {
+      PyErr_Format(PyExc_ValueError,
+                   "a library's schema and name must each be well-formed text of 1 to %zu bytes without U+0000",
+                   w::kMaxLibraryName);
+      throw PyErrorSet{};
+    }
+    (void)wr.str({s, size_t(n)});
+  }
+  (void)wr.put(static_cast<uint64_t>(known));
+  const HostCall waiting;
+  Mailbox::send(uint32_t(w::Op::kLibrary), 0, q.depth, g_seq, wr.written());
+  Ref assembled;
+  const Message m = receive(assembled);
+  // An interrupt that stopped a nested routine, or came while the worker waited, stops this code.
+  if (Interrupts::interrupted()) {
+    PyErr_SetNone(PyExc_KeyboardInterrupt);
+    throw PyErrorSet{};
+  }
+  if (m.discarded) return Ref::borrow(Py_None);
+  Reader r(m.body);
+  const auto status = r.get<uint8_t>();
+  if (status > w::kMaxLibraryStatus) protocol_failure("an unknown LIBRARY_RESULT status");
+  Ref language = str_of(r.str()), body = str_of(r.str());
+  const uint64_t version = r.get<uint64_t>();
+  Ref message = str_of(r.str());
+  return Ref::steal(Py_BuildValue("(BNNKN)", status, language.release(), body.release(),
+                                  static_cast<unsigned long long>(version), message.release()));
 }
 
 PyMethodDef kMethods[] = {
-    {"sql", boundary<py_sql>, METH_VARARGS, "sql(message, action, id, count_at, count, flags, width, depth, seq, handle)"},
-    {"encode_values", boundary<py_encode_values>, METH_VARARGS, "encode_values(buffer, values, fallback) -> count"},
-    {"serve", boundary<py_serve>, METH_VARARGS, "serve(handle, finish, vector_arg, state, open): the request loop"},
-    {"register", boundary<py_register>, METH_VARARGS, "register(id, fn, code, base, nparams, ret_tag, unsigned, vectors)"},
-    {"unregister", boundary<py_unregister>, METH_VARARGS, "unregister([id]): drop fast routines"},
+    {"serve", boundary<py_serve>, METH_VARARGS, "serve(handle, finish, convert, failed, vector_arg): the request loop"},
+    {"ready", boundary<py_ready>, METH_VARARGS, "ready(info, runtime): post READY"},
+    {"arena_size", boundary<py_arena_size>, METH_NOARGS, "the arena's size"},
+    {"protocol_failure", boundary<py_protocol_failure>, METH_VARARGS, "protocol_failure(text): end the process"},
+    {"register", boundary<py_register>, METH_VARARGS,
+     "register(id, routine, fn, code, base, nparams, ret_tag, unsigned, vectors): a routine of the fast call path"},
+    {"unregister", boundary<py_unregister>, METH_VARARGS, "unregister(id): drop a routine of the fast call path"},
     {"mark", boundary<py_mark>, METH_NOARGS, "the running call needs Python's tail"},
-    {"taint", boundary<py_taint>, METH_VARARGS, "taint(flag): the worker asks to be retired"},
-    {"open", boundary<py_open>, METH_VARARGS, "open(spin): map the mailbox; the arena's size"},
-    {"receive", boundary<py_receive>, METH_NOARGS, "the next message: (op, status, depth, call_seq, body)"},
-    {"send", boundary<py_send>, METH_VARARGS, "send(op, status, depth, call_seq, body)"},
-    {"pending", boundary<py_pending>, METH_NOARGS, "whether a message is waiting"},
-    {"stats", boundary<py_stats>, METH_VARARGS, "stats(state, tainted[, heap_used])"},
-    {"begin", boundary<py_begin>, METH_VARARGS, "begin(call_seq): a top-level request starts"},
-    {"end", boundary<py_end>, METH_NOARGS, "end(): whether the request was interrupted"},
-    {"result_fast", boundary<py_result_fast>, METH_VARARGS, "an OK RESULT of a scalar, if it can"},
-    {"setup", boundary<py_setup>, METH_VARARGS, "setup(decimal, json_loads, temporal, new_vector, demote)"},
+    {"printed", boundary<py_printed>, METH_NOARGS, "console output waits for a RESULT"},
+    {"taint", boundary<py_taint>, METH_NOARGS, "the worker asks to be retired"},
+    {"request", boundary<py_request>, METH_NOARGS, "the request being served, or None"},
+    {"epoch", boundary<py_epoch>, METH_VARARGS, "epoch(library_epoch): of the PREPARE being served"},
+    {"sql", boundary<py_sql>, METH_VARARGS, "sql(action, scope, id, message, count, flags, width) -> reply"},
+    {"library", boundary<py_library>, METH_VARARGS, "library(schema, name, known_version) -> answer"},
+    {"encode_values", boundary<py_encode_values>, METH_VARARGS, "encode_values(buffer, values, fallback) -> count"},
+    {"setup", boundary<py_setup>, METH_VARARGS,
+     "setup(decimal, json_loads, temporal, new_vector, demote, row_temporal, number, timestamp)"},
     {"decode", boundary<py_decode>, METH_VARARGS, "decode(body, pos, n[, vector]) -> (values, pos)"},
-    {"decode_rows", boundary<py_decode_rows>, METH_VARARGS, "decode_rows(body, pos, nrows, ncols, row_type)"},
-    {"decode_columns", boundary<py_decode_columns>, METH_VARARGS, "decode_columns(body, pos, nrows, collectors)"},
+    {"decode_rows", boundary<py_decode_rows>, METH_VARARGS, "decode_rows(body, pos, nrows, ncols, row_type[, rules])"},
+    {"decode_columns", boundary<py_decode_columns>, METH_VARARGS, "decode_columns(body, pos, nrows, collectors[, rules])"},
     {nullptr, nullptr, 0, nullptr}};
 
-PyModuleDef kModule = {PyModuleDef_HEAD_INIT, "_mlewire", "The MLE CPython worker's mailbox and codec.", -1,
+PyModuleDef kModule = {PyModuleDef_HEAD_INIT, "_mlewire", "The MLE CPython worker's mailbox, requests and codec.", -1,
                        kMethods, nullptr, nullptr, nullptr, nullptr};
 
 }  // namespace

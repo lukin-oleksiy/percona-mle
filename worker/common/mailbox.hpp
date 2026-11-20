@@ -20,8 +20,8 @@
 
   A native worker's side of the mailbox (docs/protocol.md; include/mle/protocol.h): the start-up
   checks of §2, turns and waiting (§4), chunked messages both ways with the size limits (§5, §12),
-  the dialogue's grammar (§8.1), READY (§9.1), WorkerStats (§3.1), the control socket (§6) and the
-  interrupt variables of §11.1. Shared by the CPython and V8 workers; what an engine does around a
+  the dialogue's grammar (§8.1), READY (§9.1), the TAINTED flag (§5.1), WorkerStats (§3.1), the
+  control socket (§6) and the interrupt bookkeeping of §11.1. Shared by the CPython and V8 workers; what an engine does around a
   sleep and on an interrupt are its hooks.
 
   Every protocol failure, here and in the workers, ends the process through
@@ -42,15 +42,19 @@
 
 namespace mle::common {
 
+/** MessageHeader::flags bit 1, TAINTED (§5.1, §11.5): only in a RESULT; the worker asks to be
+    retired. Belongs beside wire::kMore in include/mle/protocol.h. */
+constexpr uint32_t kTainted = 1U << 1;
+
 /** What an engine does at the mailbox's edges; every hook may be empty. */
 struct EngineHooks {
   /** Around the futex sleep while waiting for the host (CPython: release and take the GIL). */
   void (*before_sleep)() = nullptr;
   void (*after_sleep)() = nullptr;
   /** Delivers an interrupt of the running top-level request seq (§11.1): make its guest code stop
-      soon, at every depth. Called with the interrupt lock held, by the control thread or by
-      Interrupts::begin (no function of Interrupts may be called from it); at most once per
-      request. */
+      soon, at every depth. Called by the control thread or by Interrupts::begin, at most once
+      per request, and never after Interrupts::end of that request has returned. It must not call
+      Interrupts::begin or end. */
   void (*interrupt)(uint64_t seq) = nullptr;
   /** The request an interrupt was delivered to has ended: cancel the interrupt if the runtime has
       not acted on it. In the serving thread, from Interrupts::end. */
@@ -58,7 +62,7 @@ struct EngineHooks {
 };
 
 /** A received message. body is the arena (one chunk: valid until the worker's next write to the
-    arena) or the buffer the allocator gave (a message in chunks). */
+    arena) or the bytes received into the buffer the allocator gave (a message in chunks). */
 struct Message {
   uint32_t op;
   uint32_t depth;
@@ -88,17 +92,19 @@ class Mailbox {
       cannot serve (§2 step 5). info is cut to what READY may carry; bytes outside ASCII become '?'. */
   [[noreturn]] static void failed_ready(std::string_view info);
 
-  /** Waits for the next message of the host and checks its header on the first chunk: the op the
-      dialogue allows here, depth, call_seq, sizes (§5.2, §8.1, §12); anything else is a protocol
-      failure. A message in chunks goes into allocate(total_len), CONTINUE answered for each chunk;
-      if allocate returns nullptr the chunks are discarded (Message::discarded). The buffer needs
-      no alignment unless the caller reads VECTOR elements in place (§7.2). */
+  /** Waits for the next message of the host and checks what §1 and §5.2 ask of a worker: on the
+      first chunk the op the dialogue allows here, depth and call_seq; of every chunk its len.
+      Anything else is a protocol failure. A message in chunks goes into allocate(total_len),
+      CONTINUE answered for each chunk; if allocate returns nullptr the chunks are discarded
+      (Message::discarded). The buffer needs no alignment unless the caller reads VECTOR elements
+      in place (§7.2). */
   static Message receive(const std::function<std::byte *(size_t)> &allocate);
 
   /** Posts body as one message, in chunks if it is larger than the arena. The message must be one
       the dialogue allows here and within the limits of §12 (64 MiB; READY, LIBRARY and the RESULT
       of DROP, RESET and OPTIONS one chunk of 64 KiB): the caller turns what guest code makes larger
-      into an error first. No guest code may run between composing body and this call. */
+      into an error first. No guest code may run between composing body and this call. A RESULT
+      gets the TAINTED flag once taint() was called. */
   static void send(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, std::span<const std::byte> body);
 
   /** The arena, for a message of one chunk written in place; post() sends its first len bytes. */
@@ -108,9 +114,12 @@ class Mailbox {
   /** True if the host has posted a message receive() has not taken. */
   static bool pending();
 
-  /** Writes the statistics (§3.1). tainted must be set before the RESULT of the request (§11.5). */
-  static void stats(uint32_t state, bool tainted, uint64_t heap_used = 0, uint64_t heap_max = 0,
-                    uint64_t gc_count = 0);
+  /** The worker must not be reused (§9.4, §11.5): this and every later RESULT has TAINTED. */
+  static void taint();
+
+  /** Writes the statistics (§3.1): for reporting only, and not on every request. A worker calls
+      it when the figures changed enough to matter and when it becomes idle after a RESET. */
+  static void stats(uint32_t state, uint64_t heap_used = 0, uint64_t heap_max = 0, uint64_t gc_count = 0);
 };
 
 /** Interruption of top-level requests: the worker's side of §11.1. */

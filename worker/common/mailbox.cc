@@ -70,16 +70,29 @@ int g_depth = -1;
 /** The op of the request being served at each depth. */
 std::array<uint32_t, w::kMaxDepth + 1> g_requests{};
 
-// Interrupts (§11.1, the worker's side): the call_seq of the interruptible top-level request being
-// served (0: none), the highest call_seq begun, an INTERRUPT that came before its request (0:
-// none), and whether an interrupt was delivered to the running request. One lock for the control
-// thread's decision and begin()/end(): an INTERRUPT is then either for the running request or
-// pending for a later one, never delivered after its request ended.
-std::mutex g_interrupt_lock;
-uint64_t g_running = 0;
-uint64_t g_last = 0;
-uint64_t g_pending = 0;
-bool g_delivered = false;
+/** The worker asked to be retired (§11.5): every RESULT from now on has the TAINTED flag. */
+bool g_tainted = false;
+
+// Interrupts (§11.1, the worker's side), without a lock on the path of a request.
+//
+// g_run is the call_seq of the interruptible top-level request being served (0: none), with
+// kDelivered set once an interrupt was delivered to it. g_last is the highest call_seq begun,
+// g_pending an INTERRUPT that came before its request (0: none).
+//
+// The serving thread stores g_run at begin() and then loads g_pending; the control thread stores
+// g_pending and then loads g_run again. Both pairs are sequentially consistent, so at least one
+// side sees the other's store: an INTERRUPT that races with the begin of its request is delivered
+// by one of them, and the compare-exchange that sets kDelivered lets only one deliver. end()
+// exchanges g_run for 0, after which no compare-exchange for that request succeeds.
+//
+// g_deliver_lock is held from that compare-exchange to the return of the engine's hook, and
+// end() takes it once when it finds kDelivered: so the hook is never running, nor still to be
+// called, when the request's interrupt is cancelled and the next request begins.
+constexpr uint64_t kDelivered = uint64_t{1} << 63;
+std::atomic<uint64_t> g_run{0};
+std::atomic<uint64_t> g_last{0};
+std::atomic<uint64_t> g_pending{0};
+std::mutex g_deliver_lock;
 
 [[noreturn]] void die(std::string_view kind, std::string_view what, int status) {
   std::string line = std::string(g_name) + ": fatal: ";
@@ -150,6 +163,9 @@ w::MessageHeader header(uint32_t op, uint32_t status, uint32_t flags, uint32_t d
 
 bool is(uint32_t op, w::Op expected) { return op == static_cast<uint32_t>(expected); }
 
+/** The TAINTED flag for a message of this op: only a RESULT carries it (§5.1). */
+uint32_t result_flags(uint32_t op) { return g_tainted && is(op, w::Op::kResult) ? kTainted : 0U; }
+
 /** The first chunk of a message of the host: is it what the dialogue allows here (§8.1, §8.2)? */
 void check_received(const w::MessageHeader &m) {
   const bool nestable = is(m.op, w::Op::kPrepare) || is(m.op, w::Op::kCall) || is(m.op, w::Op::kDrop);
@@ -183,8 +199,6 @@ void check_received(const w::MessageHeader &m) {
       protocol_failure("a message of the host while the worker has the turn");
   }
   g_await = Await::kNothing;
-  const bool small = is(m.op, w::Op::kOptions) || is(m.op, w::Op::kDrop) || is(m.op, w::Op::kReset);
-  if (m.total_len > (small ? w::kMaxSmallMessage : w::kMaxHostMessage)) protocol_failure("a message over the size limit");
 }
 
 /** A message the worker is about to post: the dialogue's next state, and the limits of §12 (a
@@ -219,11 +233,12 @@ void check_sent(uint32_t op, uint32_t depth, uint64_t seq, uint64_t total) {
   if (total > limit) protocol_failure("worker error: a message over the size limit");
 }
 
-/** With g_interrupt_lock held. */
-void deliver() {
-  if (g_delivered) return;
-  g_delivered = true;
-  if (g_hooks.interrupt != nullptr) g_hooks.interrupt(g_running);
+/** Delivers an interrupt to request seq if it is running and has none yet. */
+void deliver(uint64_t seq) {
+  const std::lock_guard lock(g_deliver_lock);
+  uint64_t expected = seq;
+  if (g_run.compare_exchange_strong(expected, seq | kDelivered) && g_hooks.interrupt != nullptr)
+    g_hooks.interrupt(seq);
 }
 
 /** The control socket (§6): INTERRUPT datagrams; end of file ends the process. */
@@ -237,11 +252,14 @@ void *control_thread(void *) {
       continue;
     uint64_t seq;
     std::memcpy(&seq, buf.data() + 1, sizeof seq);
-    const std::lock_guard lock(g_interrupt_lock);
-    if (g_running != 0 && seq == g_running)
-      deliver();
-    else if (seq > g_last)
-      g_pending = seq;
+    if (seq == 0 || (seq & kDelivered) != 0) continue;  // no request has such a call_seq
+    if (g_run.load() == seq) {
+      deliver(seq);
+    } else if (seq > g_last.load()) {
+      // Not begun yet: pending. The request may have begun meanwhile (see above).
+      g_pending.store(seq);
+      if (g_run.load() == seq) deliver(seq);
+    }
   }
 }
 
@@ -314,17 +332,13 @@ Message Mailbox::receive(const std::function<std::byte *(size_t)> &allocate) {
   uint64_t len = first.len;
   bool more = (first.flags & w::kMore) != 0;
   const uint64_t total = first.total_len;
-  if (!w::is_assigned_op(first.op) || first.status != 0 || (first.flags & ~w::kKnownMessageFlags) != 0 ||
-      first.reserved != 0)
-    protocol_failure("a malformed message header");
-  // §5.2: one chunk exactly when the body fits the arena; every chunk but the last is a whole arena.
-  if (more ? len != g_arena_size || total <= g_arena_size : len != total || total > g_arena_size)
-    protocol_failure("a message header that breaks the chunk rules");
+  // §5.2: of each chunk its len, at most the arena and the bytes still due.
+  if (len > g_arena_size || len > total) protocol_failure("a chunk longer than the arena or the message");
   check_received(first);
   if (!more) return {first.op, first.depth, first.call_seq, {g_arena, static_cast<size_t>(len)}, true, false, 0};
   uint64_t head = 0;
-  std::memcpy(&head, g_arena, sizeof head);  // len is a whole arena here
-  std::byte *dst = allocate(static_cast<size_t>(total));
+  std::memcpy(&head, g_arena, std::min<uint64_t>(len, sizeof head));
+  std::byte *dst = total <= SIZE_MAX ? allocate(static_cast<size_t>(total)) : nullptr;
   uint64_t have = 0;
   while (true) {
     if (dst != nullptr) std::memcpy(dst + have, g_arena, len);
@@ -335,13 +349,11 @@ Message Mailbox::receive(const std::function<std::byte *(size_t)> &allocate) {
     const w::MessageHeader m = g_hdr->msg;
     more = (m.flags & w::kMore) != 0;
     len = m.len;
-    if (m.op != first.op || m.status != 0 || m.depth != first.depth || m.call_seq != first.call_seq ||
-        m.total_len != total || m.reserved != 0 || (m.flags & ~w::kKnownMessageFlags) != 0 ||
-        (more ? len != g_arena_size || have + len >= total : len == 0 || len > g_arena_size || have + len != total))
-      protocol_failure("a chunk that breaks the chunk rules");
+    if (len > g_arena_size || len > total - have) protocol_failure("a chunk longer than the arena or the bytes still due");
   }
   if (dst == nullptr) return {first.op, first.depth, first.call_seq, {}, false, true, head};
-  return {first.op, first.depth, first.call_seq, {dst, static_cast<size_t>(total)}, false, false, 0};
+  // The bytes received: a host that sent fewer than total_len fails the bounds of whoever reads.
+  return {first.op, first.depth, first.call_seq, {dst, static_cast<size_t>(have)}, false, false, 0};
 }
 
 void Mailbox::send(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, std::span<const std::byte> body) {
@@ -352,18 +364,17 @@ void Mailbox::send(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, s
     return;
   }
   check_sent(op, depth, seq, total);
+  const uint32_t tainted = result_flags(op);
   for (uint64_t sent = 0;;) {
     const uint64_t len = std::min<uint64_t>(g_arena_size, total - sent);
     std::memcpy(g_arena, body.data() + sent, len);
     const bool more = sent + len < total;
-    post_raw(header(op, status, more ? uint32_t{w::kMore} : 0U, depth, static_cast<uint32_t>(len), total, seq));
+    post_raw(header(op, status, (more ? uint32_t{w::kMore} : 0U) | tainted, depth, static_cast<uint32_t>(len), total, seq));
     sent += len;
     if (!more) break;
     wait_host();
-    const w::MessageHeader go = g_hdr->msg;
-    if (!is(go.op, w::Op::kContinue) || go.status != 0 || go.flags != 0 || go.len != 0 || go.reserved != 0 ||
-        go.total_len != 0 || go.depth != depth || go.call_seq != seq)
-      protocol_failure("a message that is not the CONTINUE of a transfer");
+    // §5.2: of a CONTINUE, its op.
+    if (!is(g_hdr->msg.op, w::Op::kContinue)) protocol_failure("a message that is not the CONTINUE of a transfer");
   }
 }
 
@@ -371,50 +382,43 @@ std::span<std::byte> Mailbox::arena() { return {g_arena, g_arena_size}; }
 
 void Mailbox::post(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, uint32_t len) {
   check_sent(op, depth, seq, len);
-  post_raw(header(op, status, 0, depth, len, len, seq));
+  post_raw(header(op, status, result_flags(op), depth, len, len, seq));
 }
 
 bool Mailbox::pending() { return g_hdr->to_w.load(std::memory_order_acquire) != g_seen; }
 
-void Mailbox::stats(uint32_t state, bool tainted, uint64_t heap_used, uint64_t heap_max, uint64_t gc_count) {
+void Mailbox::taint() { g_tainted = true; }
+
+void Mailbox::stats(uint32_t state, uint64_t heap_used, uint64_t heap_max, uint64_t gc_count) {
+  // The four fields of §3.1; the rest of the line is reserved and stays as the launcher left it.
   w::WorkerStats &s = g_hdr->stats;
   s.heap_used = heap_used;
   s.heap_max = heap_max;
   s.gc_count = gc_count;
   s.state = state;
-  s.tainted = tainted ? 1 : 0;
 }
 
 void Interrupts::begin(uint64_t seq, bool interruptible) {
-  const std::lock_guard lock(g_interrupt_lock);
-  g_last = seq;
-  g_delivered = false;
+  g_last.store(seq);
   if (interruptible) {
-    g_running = seq;
-    if (g_pending == seq) deliver();
+    g_run.store(seq);
+    if (g_pending.load() == seq) deliver(seq);
   }
-  g_pending = 0;
+  g_pending.store(0, std::memory_order_relaxed);
 }
 
 bool Interrupts::end() {
-  bool delivered;
-  {
-    const std::lock_guard lock(g_interrupt_lock);
-    g_running = 0;
-    delivered = std::exchange(g_delivered, false);
-  }
-  if (delivered && g_hooks.interrupted_end != nullptr) g_hooks.interrupted_end();
-  return delivered;
+  if ((g_run.exchange(0) & kDelivered) == 0) return false;
+  // A hook that is running returns before the interrupt is cancelled.
+  { const std::lock_guard lock(g_deliver_lock); }
+  if (g_hooks.interrupted_end != nullptr) g_hooks.interrupted_end();
+  return true;
 }
 
-bool Interrupts::interrupted() {
-  const std::lock_guard lock(g_interrupt_lock);
-  return g_delivered && g_running != 0;
-}
+bool Interrupts::interrupted() { return (g_run.load(std::memory_order_acquire) & kDelivered) != 0; }
 
 bool Interrupts::running(uint64_t seq) {
-  const std::lock_guard lock(g_interrupt_lock);
-  return g_running != 0 && g_running == seq;
+  return seq != 0 && (g_run.load(std::memory_order_acquire) & ~kDelivered) == seq;
 }
 
 }  // namespace mle::common

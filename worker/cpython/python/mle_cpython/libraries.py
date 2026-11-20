@@ -13,168 +13,163 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
-"""Database libraries (CREATE LIBRARY, 14-phase6-libraries.md) for Python routines: bodies come
-from mysqld (LIBRARY requests), Python libraries become modules evaluated once per version.
+"""Database libraries (CREATE LIBRARY; docs/protocol.md §9.10) for Python routines: bodies come
+from the host (LIBRARY), Python libraries become modules.
 
-The JVM worker's rules (LibraryFileSystem.java), ported as they are:
-
-* Epochs: library DDL makes mysqld prepare the routines again, and each PREPARE starts an epoch;
-  within one, a library confirmed for a routine is used without asking mysqld again ("routine:key"
-  in confirmed: mysqld decides per importing routine).
-* Loadsets and generations (independent review C17): an evaluated library keeps the modules it
-  imported then. So every library has a loadset: the libraries (with their hashes) fetched in the
-  top-level request that first evaluated it, and their loadsets. When a library is confirmed for a
-  routine, its loadset is confirmed too; if one of those changed or is refused, a new generation
-  starts and every library is evaluated again at its next use (a new stamp).
+* An *answer* of the host (BODY or UNCHANGED) belongs to one routine id and one library and
+  carries the library epoch of the request in which it was given. An import is resolved under an
+  answer that holds for the request being served (the same routine id and epoch); if none does,
+  the worker asks. A routine never uses an answer given to another.
+* The worker keeps the most recent body of each library, by schema and name, with the version
+  token the host gave, and the module it evaluated from it.
+* A module is *linked* with the versions of the libraries it imported while it was evaluated.
+  Before it is used for a request, those are resolved for that request too, to any depth; when
+  one of them has another version, or is refused, the module is evaluated anew. Code that is
+  running keeps the modules it has.
+* Libraries are not in sys.modules and the import statement does not find them: guest code
+  reaches a library only through USING and import_library(), which resolve it each time.
 """
 
 import types
 
+import _mlewire
+
 from . import wire
 
 LIBRARY_REFUSED, LIBRARY_UNCHANGED, LIBRARY_BODY = 0, 1, 2
-_STAMP_MIX = 0x9E3779B97F4A7C15
-_MASK = (1 << 64) - 1
 
 
 class LibraryError(ImportError):
     """A library that is not there or not importable from the running routine."""
 
 
-class Library:
-    __slots__ = ('language', 'body', 'hash', 'checked', 'generation', 'loadset')
+class Body:
+    """The most recent body of a library the worker has."""
+    __slots__ = ('language', 'text', 'version')
 
-    def __init__(self, language, body, hash_, checked, generation, loadset):
-        self.language, self.body, self.hash = language, body, hash_
-        self.checked, self.generation, self.loadset = checked, generation, loadset
+    def __init__(self, language, text, version):
+        self.language, self.text, self.version = language, text, version
 
-    def confirmed(self, epoch):
-        if self.checked == epoch:
-            return self
-        return Library(self.language, self.body, self.hash, epoch, self.generation, self.loadset)
 
-    def stamp(self):
-        """What the cache of evaluated modules goes by: the hash, and another value per generation."""
-        return self.hash if self.generation == 0 else self.hash ^ ((self.generation * _STAMP_MIX) & _MASK)
+class Module:
+    """A library's module, evaluated from the body of one version."""
+    __slots__ = ('version', 'module', 'imports', 'checked', 'scope')
+
+    def __init__(self, version, module, scope):
+        self.version = version
+        self.module = module
+        self.imports = {}     # (schema, name) -> version: the libraries it imported while evaluated
+        self.checked = None   # what its link was last found current for (Libraries._request)
+        self.scope = scope    # the request that evaluates it
 
 
 class Libraries:
-    def __init__(self, dispatcher):
-        self.d = dispatcher
-        self.libraries = {}      # "schema/name" -> Library (the newest body seen)
-        self.generation = 0
-        self.open = []           # loadsets still collecting (libraries first evaluated in this request)
-        self.epoch = 1
-        self.confirmed = set()   # "routine:schema/name" confirmed in this epoch
-        self.modules = {}        # "schema/name" -> (stamp, module): evaluated Python libraries
-        self.globals = {}        # what a library module starts with (the SQL API ...)
+    def __init__(self):
+        self.bodies = {}      # (schema, name) -> Body
+        self.answers = {}     # routine id -> {(schema, name): (epoch, version)}
+        self.modules = {}     # (schema, name) -> Module
+        self.evaluating = []  # the Modules being evaluated, innermost last
+        self.globals = {}     # what a library module starts with (the SQL API ...)
+        self.discards = 0     # counts forget() and reset()
 
-    # -- the JVM worker's LibraryFileSystem ---------------------------------------------------
+    def forget(self, routine_id):
+        """A PREPARE of the id begins, or its DROP: its answers are discarded."""
+        if self.answers.pop(routine_id, None) is not None:
+            self.discards += 1
 
-    def request_start(self):
-        """A top-level request starts: the libraries evaluated in the last one have their loadsets."""
-        self.open.clear()
+    def reset(self):
+        """RESET: no answer is held. Bodies and modules stay (Appendix B.6)."""
+        self.answers.clear()
+        self.discards += 1
 
-    def revalidate(self):
-        """A routine is (re)loaded: libraries are confirmed with mysqld again at their next use."""
-        self.epoch += 1
-        self.confirmed.clear()
-
-    def _touch(self, key, lib):
-        for s in self.open:
-            if s is lib.loadset:
-                continue
-            s[key] = lib.hash
-            s.update(lib.loadset)
-
-    def _renewed(self, key, lib):
-        n = Library(lib.language, lib.body, lib.hash, lib.checked, self.generation, {})
-        self.libraries[key] = n
-        self._touch(key, n)
-        self.open.append(n.loadset)
-        return n
-
-    def _confirm_loadset(self, lib):
-        for key, h in list(lib.loadset.items()):
-            schema, _, name = key.partition('/')
-            try:
-                if self.fetch(schema, name).hash == h:
-                    continue
-            except LibraryError:
-                return  # dropped, or not for this routine: fetch started a generation
-            self._new_generation()
-            return
-
-    def _new_generation(self):
-        self.generation += 1
-        self.confirmed.clear()
-
-    def evaluating(self, schema, name):
-        lib = self.libraries.get(schema + '/' + name)
-        if lib is None:
-            return
-        if any(s is lib.loadset for s in self.open):
-            return
-        self.open.append(lib.loadset)
-
-    def fetch(self, schema, name):
-        key = schema + '/' + name
-        known = self.libraries.get(key)
-        confirmation = '%d:%s' % (self.d.routine, key)
-        if known is not None and known.checked == self.epoch and confirmation in self.confirmed:
-            if known.generation != self.generation:
-                return self._renewed(key, known)
-            if self.open:
-                self._touch(key, known)
+    def resolve(self, key):
+        """The Body of library key under an answer that holds for the request being served; asks
+        the host if none does or the worker no longer has that body. LibraryError if the import
+        is refused."""
+        q = _mlewire.request()
+        if q is None:
+            raise LibraryError('libraries can be imported only while a routine runs')
+        rid, epoch = q[2], q[3]
+        answers = self.answers.get(rid)
+        if answers is None:
+            answers = self.answers[rid] = {}
+        held = answers.get(key)
+        known = self.bodies.get(key)
+        if held is not None and held[0] == epoch and known is not None and known.version == held[1]:
             return known
-        status, language, body, h, message = self.d.library_request(schema, name, 0 if known is None else known.hash)
-        if status == LIBRARY_UNCHANGED and known is not None:
-            lib = known.confirmed(self.epoch)
-            self.libraries[key] = lib
-            self.confirmed.add(confirmation)
-            if lib.generation == self.generation:
-                self._touch(key, lib)
-                self._confirm_loadset(lib)
-            return self._renewed(key, lib) if lib.generation != self.generation else lib
+        schema, name = key
+        try:
+            reply = _mlewire.library(schema, name, 0 if known is None else known.version)
+        except ValueError as e:
+            raise LibraryError(str(e)) from None
+        if reply is None:
+            raise LibraryError('the library %s.%s is larger than this MLE worker can hold' % key)
+        status, language, text, version, message = reply
+        if status == LIBRARY_REFUSED:
+            # No answer is held for it, and one that is held is not changed.
+            raise LibraryError(message or 'the library %s.%s is not available' % key)
         if status == LIBRARY_BODY:
-            lib = Library(language, body, h, self.epoch, self.generation, {})
-            self.libraries[key] = lib
-            if known is not None:
-                self.confirmed.clear()  # a changed body: routines confirmed for the old one confirm again
-            self.confirmed.add(confirmation)
-            self._touch(key, lib)
-            self.open.append(lib.loadset)  # a new body: evaluated from here on
-            return lib
-        self.libraries.pop(key, None)
-        if known is not None or self.open:
-            self._new_generation()
-        raise LibraryError(message or 'the library %s.%s is not available' % (schema, name))
+            known = self.bodies[key] = Body(language, text, version)
+        elif known is None or known.version != version:
+            _mlewire.protocol_failure('LIBRARY_RESULT UNCHANGED for a body the worker does not hold')
+        # The request may have ended the routine's answers meanwhile; this one is the newest.
+        self.answers.setdefault(rid, {})[key] = (epoch, version)
+        return known
 
-    # -- modules ----------------------------------------------------------------------------------
+    def _current(self, key, entry, request, seen):
+        """Whether entry's link holds for the request: every library it imported resolves to the
+        version it was linked with, and so on for those."""
+        if entry.checked == request or key in seen:
+            return True
+        seen.add(key)
+        for dep, version in entry.imports.items():
+            try:
+                if self.resolve(dep).version != version:
+                    return False
+            except LibraryError:
+                return False  # evaluated anew, its import fails where the library's code has it
+            below = self.modules.get(dep)
+            if below is None or below.version != version or not self._current(dep, below, request, seen):
+                return False
+        entry.checked = request
+        return True
 
     def module(self, schema, name):
-        """A Python library's module (evaluated once per version), for USING and import_library."""
-        lib = self.fetch(schema, name)
-        if lib.language != 'python':
-            raise LibraryError('the library %s.%s is a %s library: it needs the JVM build of MLE '
-                               '(this worker runs Python only)' % (schema, name, _language_name(lib.language)))
-        key = schema + '/' + name
-        stamp = lib.stamp()
-        hit = self.modules.get(key)
-        if hit is not None and hit[0] == stamp:
-            return hit[1]
-        self.evaluating(schema, name)
+        """A Python library's module for the request being served, for USING and import_library."""
+        key = (schema, name)
+        body = self.resolve(key)
+        q = _mlewire.request()
+        if self.evaluating and self.evaluating[-1].scope == q[1]:
+            self.evaluating[-1].imports[key] = body.version
+        if body.language != wire.LANGUAGE:
+            raise LibraryError('the library %s.%s is a %s library: this worker runs Python only'
+                               % (schema, name, _language_name(body.language)))
+        entry = self.modules.get(key)
+        # A link found current stays so while the routine's answers hold: for the same routine id
+        # and epoch, until answers are discarded.
+        if entry is not None and entry.version == body.version and (
+                entry in self.evaluating or self._current(key, entry, (q[2], q[3], self.discards), set())):
+            return entry.module
         dotted = schema + '.' + name
         m = types.ModuleType(dotted)
         m.__dict__.update(self.globals)
-        # Kept before it runs (as sys.modules): libraries that import each other get the partly
-        # initialised module instead of recursing.
-        self.modules[key] = (stamp, m)
+        entry = Module(body.version, m, q[1])
+        # Kept before it runs: libraries that import each other get the partly initialised module
+        # instead of recursing.
+        former = self.modules.get(key)
+        self.modules[key] = entry
+        self.evaluating.append(entry)
         try:
-            exec(compile(lib.body, dotted, 'exec'), m.__dict__)
+            exec(compile(body.text, dotted, 'exec'), m.__dict__)
         except BaseException:
-            del self.modules[key]
+            if self.modules.get(key) is entry:
+                if former is None:
+                    del self.modules[key]
+                else:
+                    self.modules[key] = former
             raise
+        finally:
+            self.evaluating.remove(entry)
         return m
 
     def import_library(self, path):
@@ -188,14 +183,3 @@ class Libraries:
 
 def _language_name(language):
     return {'js': 'JavaScript', 'java': 'Java'}.get(language, language)
-
-
-def read_reply(body):
-    """LIBRARY_RESULT: (status, language, body, hash, message)."""
-    r = wire.Reader(body)
-    status = r.u8()
-    language, text = r.str(), r.str()
-    h = r.u64()
-    message = r.str()
-    r.finish()
-    return status, language, text, h, message

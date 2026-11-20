@@ -13,17 +13,20 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
-"""The dispatcher of the CPython worker (Dispatcher.java's role): READY, then requests from the
-host on the main thread; SQL round trips serve nested requests meanwhile."""
+"""The dispatcher of the CPython worker (docs/protocol.md): what each request does and what its
+RESULT says. The request loop, the requests being served and the SQL statements' states are C++
+(_mlewire, module.cc); SQL round trips serve nested requests meanwhile, through handle() again."""
 
 import ast
 import gc
 import io
 import os
 import platform
+import re
 import struct
 import sys
 import textwrap
+import threading
 import time
 import traceback
 import types
@@ -34,32 +37,50 @@ from . import wire
 from .wire import Reader, Writer, ConversionError
 
 
-class Routine:
-    __slots__ = ('fn', 'params', 'ret', 'outs', 'nparams', 'name', 'lines', 'vector_params', 'imports', 'base')
+class Source:
+    """What a request's code is called and its lines, for the frames of an Error."""
+    __slots__ = ('file', 'lines')
 
-    def __init__(self, fn, params, ret, outs, name, lines, imports, base):
-        self.fn, self.params, self.ret, self.outs, self.name, self.lines = fn, params, ret, outs, name, lines
+    def __init__(self, file, lines):
+        self.file, self.lines = file, lines
+
+
+class Routine(Source):
+    """A prepared routine. A running activation holds it, and the function it started with, also
+    when a nested PREPARE or DROP takes the id away (§8.3)."""
+    __slots__ = ('fn', 'params', 'ret', 'outs', 'nparams', 'vector_params', 'imports', 'base', 'schema',
+                 'relink', 'linked', 'active')
+
+    def __init__(self, fn, params, ret, outs, file, lines, imports, base, schema, relink):
+        Source.__init__(self, file, lines)
+        self.fn, self.params, self.ret, self.outs = fn, params, ret, outs
         self.nparams = len(params)
         self.vector_params = any(p[2].tag == wire.T_VECTOR for p in params)
         self.imports = imports  # USING: (schema, name, binding)
         self.base = base        # the globals each call starts from (USING binds into them)
+        self.schema = schema
+        self.relink = relink    # entry form: makes the function anew with other bindings
+        self.linked = None      # the modules of the imports it is linked with
+        self.active = 0         # its activations that are running
 
 
 class _Output(io.StringIO):
-    """sys.stdout/stderr of routines: a write marks the call, so that the C++ call loop leaves its
-    RESULT (with the output) to Python."""
+    """sys.stdout/stderr of routines: a write tells the C++ call loop that output waits for a
+    RESULT, which Python then writes."""
 
     def write(self, s):
-        _mlewire.mark()
+        _mlewire.printed()
         return io.StringIO.write(self, s)
 
     def writelines(self, lines):
-        _mlewire.mark()
+        _mlewire.printed()
         return io.StringIO.writelines(self, lines)
 
 
 class Console:
-    """print() output of a call, returned in its RESULT."""
+    """What guest code printed and no RESULT has carried yet (§9.4)."""
+    # Kept per stream, at most: the end of longer output.
+    LIMIT = 1 << 20
 
     def __init__(self):
         self.out = _Output()
@@ -72,11 +93,20 @@ class Console:
         v = s.getvalue()
         s.seek(0)
         s.truncate()
-        return v.encode('utf-8', 'replace')
+        return keep_end(wire.utf8(v), Console.LIMIT)
+
+
+def keep_end(b, limit):
+    """The last limit bytes of UTF-8 text at most, from a character boundary."""
+    if len(b) <= limit:
+        return b
+    at = len(b) - limit
+    while at < len(b) and (b[at] & 0xC0) == 0x80:
+        at += 1
+    return b[at:]
 
 
 # ------------------------------------------------------------------------------------ loaders
-# The JVM kind's Python helpers (Polyglot.pythonHelpers), minus what is polyglot-only.
 
 def _no_threads(*args, **kwargs):
     raise RuntimeError('threads are not available in MLE routines')
@@ -114,7 +144,7 @@ def _fn(fname, args, body):
 
 
 def load_body(src, name, params, has_outs, globals_):
-    """The body as a function of the parameters; fresh globals per call (Phase 7)."""
+    """The body as a function of the parameters; fresh globals per call."""
     tree = _parse_body(src, name)
     body = tree.body
     if has_outs:
@@ -138,17 +168,17 @@ def load_body(src, name, params, has_outs, globals_):
     return fresh, base
 
 
-def load_entry(src, name, entry, globals_):
+def load_entry(src, name, file, entry, globals_):
     ns = {'__name__': name}
     ns.update(globals_)
-    exec(compile(src, name + '.py', 'exec'), ns)
+    exec(compile(src, file, 'exec'), ns)
     fn = ns[entry]
     return fn, getattr(fn, '__globals__', ns)
 
 
 def load_eval(src, globals_):
-    """mle_eval (exp note 39): the snippet's statements, then the value of its last expression as
-    text (repr, as a REPL shows it; a str as it is), or None. Fresh globals per call."""
+    """Entry <eval>: the snippet's statements, then the value of its last expression as text (repr,
+    as a REPL shows it; a str as it is), or None. Fresh globals per call."""
     tree = ast.parse(textwrap.dedent(src), filename='mle_eval')
     tail = None
     if tree.body and isinstance(tree.body[-1], ast.Expr):
@@ -168,7 +198,7 @@ def load_eval(src, globals_):
 
 
 def check_names(src, params, known, globals_):
-    """CREATE (exp note 39): names the code reads but never binds (a typo such as lenght), not
+    """The findings of a PREPARE with check: names the code reads but never binds (a typo such as lenght), not
     built-ins, parameters, MLE's globals or USING aliases. Scopes are not told apart, so it never
     reports a name bound anywhere; exec/eval/globals/vars and star imports turn it off. Line numbers
     are the body's."""
@@ -216,186 +246,196 @@ def check_names(src, params, known, globals_):
 
 # ------------------------------------------------------------------------------------ dispatcher
 
+class _TooLarge(Exception):
+    """The worker could not hold the request (§5.3)."""
+
+
+class _Refused(Exception):
+    """OPTIONS the worker does not accept: language is MLE-TimeZone or MLE-Option (§9.8)."""
+
+    def __init__(self, language, message):
+        Exception.__init__(self, message)
+        self.language = language
+
+
+class _Failed:
+    """What a request failed with: the RESULT's status and Error (language, message, frames,
+    sql_errno, sqlstate, sql_error_id), and whether the worker must be retired after it."""
+    __slots__ = ('status', 'error', 'taint')
+
+    def __init__(self, status, language, message, frames=(), errno=0, state='', error_id=0, taint=False):
+        self.status = status
+        self.error = (language, message, frames, errno, state, error_id)
+        self.taint = taint
+
+
+_SQLSTATE = re.compile('[0-9A-Z]{5}', re.ASCII)
+_NO_VALUES = bytes(5)  # has_return 0, no out_params
+_CALL_HEAD = struct.Struct('<QQI')  # routine_id, library_epoch, the argument count
+_decode = _mlewire.decode
+
+
 class Dispatcher:
-    def __init__(self, arena_size, cls):
+    def __init__(self, arena_size):
         self.arena_size = arena_size
-        self.cls = cls
         self.routines = {}
-        self.depth = 0
-        self.seq = 0
-        # The request being handled, unique in this worker (nested ones have their own): the SQL
-        # API's per-call options (Session.callOptions).
-        self.scope = 0
-        self.scopes = 0
-        self.schemas = {}  # each prepared routine's schema (execute_many's engine lookups)
-        self._tainted = False
         self.console = Console()
         self.vector_buffers = {}
-        self.routine = 0  # the routine whose PREPARE or call runs now (libraries are per routine)
+        self.info = ''
         from . import libraries, sql
+        self.libraries = libraries.Libraries()
         self.sql = sql.Api(self)
-        self.libraries = libraries.Libraries(self)
         self.globals = self.sql.globals()
         self.globals['import_library'] = self.libraries.import_library
         self.globals['import_js'] = _no_js
         self.libraries.globals = self.globals
 
-    # -- messages
+    def serve(self):
+        """READY, then the request loop (C++): top-level calls of simple routines run there, every
+        other request comes to handle(), and every request's end to finish()."""
+        _mlewire.ready(self.info, 'CPython %s' % platform.python_version())
+        _mlewire.serve(self.handle, self.finish, self.values, self.failed, self.vector_arg)
 
-    def ready(self, status, info):
-        w = Writer()
-        w.u32(wire.VERSION)
-        w.str(self.cls)
-        w.u32(1)
-        w.str('python')
-        w.str('CPython %s' % platform.python_version())
-        w.str(info)
-        _mlewire.stats(wire.STATE_IDLE, 0)
-        _mlewire.send(wire.READY, status, 0, 0, w.b)
+    # -- requests
 
-    @property
-    def tainted(self):
-        return self._tainted
+    def handle(self, op, body, head, ctx):
+        """Serves a request up to its outcome: the values of a CALL, the findings of a PREPARE, or
+        what it failed with (a _Failed). body is None if the worker could not hold the message;
+        head is then its first 8 bytes. ctx, a list, gets the request's Source for finish().
 
-    @tainted.setter
-    def tainted(self, value):
-        self._tainted = bool(value)
-        _mlewire.taint(self._tainted)
-
-    def loop(self):
-        """The request loop is C++ (_mlewire.serve): top-level calls of simple routines run there,
-        every other request comes to handle(), and the end of a fast call that needs Python (output,
-        SQL, an error, other result types) to fast_finish()."""
-        _mlewire.serve(self.handle, self.fast_finish, self.vector_arg, self.__dict__, self.libraries.open)
-
-    def fast_finish(self, rid, ret, failure, interrupted):
-        """The tail of call() for a call the C++ loop ran (its state is set: depth 0, seq, scope)."""
-        routine = self.routines[rid]
-        self.sql.call_ended(True)
-        if failure is None and interrupted:
-            self.result(wire.INTERRUPTED, error=self.guest('python', 'interrupted'))
-        elif failure is None:
-            self.result(wire.OK, ret, routine)
-        else:
-            self.failed(failure, interrupted, routine.name, routine.lines)
-
-    def handle(self, op, depth, seq, body):
-        saved = (self.depth, self.seq, self.scope)
-        self.scopes += 1
-        self.scope = self.scopes
-        self.depth = depth
-        if depth == 0:
-            self.seq = seq
-            self.libraries.request_start()
+        Guest code of a PREPARE or CALL runs only inside this function, and an interrupt raises
+        KeyboardInterrupt only here; what leaves it as an exception is that interrupt."""
         try:
+            if body is None:
+                if op == wire.PREPARE:
+                    self.drop(head)
+                raise _TooLarge()
             if op == wire.CALL:
-                self.call(body)
-            elif op == wire.PREPARE:
-                self.prepare(body)
-            elif op == wire.DROP:
-                r = Reader(body)
-                rid = r.u64()
-                self.routines.pop(rid, None)
-                self.schemas.pop(rid, None)
-                _mlewire.unregister(rid)
-                self.result(wire.OK)
+                return self.call(body, ctx)
+            if op == wire.PREPARE:
+                return self.prepare(body, ctx)
+            if op == wire.DROP:
+                self.drop(Reader(body).u64())
             elif op == wire.RESET:
-                self.routines.clear()
-                self.schemas.clear()
-                _mlewire.unregister()
-                self.vector_buffers.clear()
-                gc.collect()
-                self.result(wire.OK)
+                self.reset()
             elif op == wire.OPTIONS:
-                r = Reader(body)
-                integer_type, decimal_type, zone = r.u8(), r.u8(), r.str()
-                from .sql import zone_of
-                if zone_of(zone) is None:  # as Options.parseZone on the JVM
-                    self.result(wire.GUEST_ERROR,
-                                error=self.guest(wire.LANGUAGE_TIME_ZONE, "unknown time zone '%s'" % zone))
-                else:
-                    self.sql.integer_type, self.sql.decimal_type, self.sql.zone = integer_type, decimal_type, zone
-                    self.result(wire.OK)
+                self.options(body)
             elif op == wire.PARSE_LIBRARY:
                 r = Reader(body)
-                language, name, src = r.str(), r.str(), r.str()
-                try:
-                    compile(src, name, 'exec')
-                    self.result(wire.OK)
-                except SyntaxError as e:
-                    self.result(wire.GUEST_ERROR, error=self.guest(language, 'SyntaxError: %s' % e))
-            else:
-                self.result(wire.INTERNAL, error=('', 'unexpected message %d' % op, [], 0, ''))
-        finally:
-            self.depth, self.seq, self.scope = saved
+                r.str()  # the language: one of READY's
+                name, source = r.str(), r.str()
+                ctx.append(Source(name, source.split('\n')))
+                compile(source, name, 'exec')
+            return None
+        except BaseException as e:
+            return self.failed(ctx[0] if ctx else None, e)
+
+    def drop(self, rid):
+        """The id is not prepared (§8.3), and the answers of its libraries are discarded (§9.10)."""
+        if self.routines.pop(rid, None) is not None:
+            _mlewire.unregister(rid)
+        self.libraries.forget(rid)
+
+    def reset(self):
+        """RESET (§9.7): no routine, no options, no session state and no waiting console output;
+        imported modules and loaded libraries stay (Appendix B.6)."""
+        for rid in list(self.routines):
+            _mlewire.unregister(rid)
+        self.routines.clear()
+        self.libraries.reset()
+        self.vector_buffers.clear()
+        self.sql.reset()
+        Console.take(self.console.out)
+        Console.take(self.console.err)
+        gc.collect()
+        # Guest threads left running: the worker cannot be reused safely.
+        if threading.active_count() > 1:
+            _mlewire.taint()
+
+    def options(self, body):
+        """OPTIONS (§9.8, Appendix B.2): the zone and decimal_type; integer_type and names of other
+        languages are not this worker's. On a refusal the options in force stay."""
+        r = Reader(body)
+        zone = r.str()
+        decimal_type = 0
+        for _ in range(r.count(8)):
+            name, value = r.str(), r.str()
+            if name == 'decimal_type':
+                if value not in ('string', 'number'):
+                    raise _Refused(wire.LANGUAGE_OPTION, "'%s' is not a value of decimal_type" % value)
+                decimal_type = 1 if value == 'number' else 0
+        from .sql import zone_of
+        tz = zone_of(zone)
+        if tz is None:
+            raise _Refused(wire.LANGUAGE_TIME_ZONE, "unknown time zone '%s'" % zone)
+        self.sql.decimal_type = decimal_type
+        self.sql.zone = tz
 
     # -- PREPARE
 
-    def prepare(self, body):
+    def prepare(self, body, ctx):
+        # The whole message is taken out of the arena before guest code, which may post, runs.
         r = Reader(body)
         rid = r.u64()
-        language, name, entry, source = r.str(), r.str(), r.str(), r.str()
-        params = [(r.str(), r.u8(), r.param_type()) for _ in range(r.u32())]
-        ret = r.param_type() if r.u8() else None
-        imports = [(r.str(), r.str(), r.str()) for _ in range(r.u32())]
-        self.schemas[rid] = r.str()  # the routine's schema
+        r.str()  # the language: one of READY's
+        name, entry, source = r.str(), r.str(), r.str()
+        params = []
+        for _ in range(r.count(23)):
+            pname, mode = r.str(), r.u8()
+            if mode > 2:
+                _mlewire.protocol_failure('an unknown Param mode')
+            params.append((pname, mode, r.type()))
+        ret = r.type() if r.u8() else None
+        imports = [(r.str(), r.str(), r.str()) for _ in range(r.count(12))]
+        schema = r.str()
         check = r.u8() != 0
-        if language != 'python':
-            self.result(wire.GUEST_ERROR, error=self.guest(language, 'the language %s is not available in this '
-                                                                     'worker (CPython: Python only)' % language))
-            return
-        _mlewire.stats(wire.STATE_COMPILING, int(self.tainted))
-        # A routine is (re)loaded: library DDL may have happened.
-        self.libraries.revalidate()
-        top = self.depth == 0
-        if top:
-            _mlewire.begin(self.seq)
-        self.routines.pop(rid, None)
-        _mlewire.unregister(rid)
-        outer, self.routine = self.routine, rid
-        failure = None
+        _mlewire.epoch(r.u64())
+        # The id is not prepared from here until this PREPARE answers OK (§8.3).
+        self.drop(rid)
         lines = source.split('\n')
-        try:
-            names = [p[0] for p in params]
-            outs = [i for i, p in enumerate(params) if p[1] != 0]
-            if entry == '<eval>':
-                fn, base = load_eval(source, self.globals)
-                name, lines = 'mle_eval', source.split('\n')
-            elif entry == '':
-                fn, base = load_body(source, name, names, bool(outs), self.globals)
-            else:
-                fn, base = load_entry(source, name, entry, self.globals)
-            if check and entry != '<eval>':
-                known = [alias or lib for _, lib, alias in imports]
-                for finding in check_names(source, names if entry == '' else [], known, self.globals):
-                    self.console.err.write('\x1fmle-check:' + finding + '\n')
-            routine = Routine(fn, params, ret, outs, name, lines,
-                              [(schema, lib, alias or lib) for schema, lib, alias in imports], base)
-            self.routines[rid] = routine
-            if not routine.outs and not routine.imports and len(params) <= 64:
-                # The C++ call loop runs its top-level calls (exp note 62 §8).
-                code = getattr(fn, '__mle_code__', None)
-                _mlewire.register(rid, fn, code, base if code is not None else None, len(params),
-                                  -1 if ret is None else ret.tag, False if ret is None else ret.unsigned,
-                                  routine.vector_params)
-        except BaseException as e:
-            failure = e
-        finally:
-            self.routine = outer
-        interrupted = top and _mlewire.end()
-        if failure is not None:
-            self.failed(failure, interrupted, name, lines)
+        names = [p[0] for p in params]
+        outs = [i for i, p in enumerate(params) if p[1] != 0]
+        relink = None
+        if entry == '<eval>':
+            file = 'mle_eval'
+            ctx.append(Source(file, lines))
+            fn, base = load_eval(source, self.globals)
+        elif entry == '':
+            file = name
+            ctx.append(Source(file, lines))
+            fn, base = load_body(source, name, names, bool(outs), self.globals)
         else:
-            self.result(wire.OK)
+            file = name + '.py'
+            ctx.append(Source(file, lines))
+            fn, base = load_entry(source, name, file, entry, self.globals)
+
+            def relink(bindings):
+                g = dict(self.globals)
+                g.update(bindings)
+                return load_entry(source, name, file, entry, g)
+        findings = []
+        if check and entry != '<eval>':
+            known = [alias or lib for _, lib, alias in imports]
+            findings = check_names(source, names if entry == '' else [], known, self.globals)
+        routine = Routine(fn, params, ret, outs, file, lines,
+                          [(s, lib, alias or lib) for s, lib, alias in imports], base, schema, relink)
+        if not routine.outs and not routine.imports and len(params) <= 64:
+            # The C++ call loop runs its top-level calls.
+            code = getattr(fn, '__mle_code__', None)
+            _mlewire.register(rid, routine, fn, code, base if code is not None else None, len(params),
+                              -1 if ret is None else ret.tag, False if ret is None else ret.unsigned,
+                              routine.vector_params)
+        self.routines[rid] = routine
+        return findings
 
     # -- CALL
 
     def vector_arg(self, i, dims, b, p):
-        """A VECTOR argument as a reused read-only numpy array (Phase 7, S-14)."""
+        """A VECTOR argument as a reused read-only numpy array: a copy of the message's elements."""
         np = wire._numpy.get()
         if np is None:
             return wire.new_vector(b, p, dims)
-        key = (self.depth, i, dims)
+        key = (_mlewire.request()[0], i, dims)
         e = self.vector_buffers.get(key)
         if e is None:
             a = np.empty(dims, np.float32)
@@ -405,195 +445,244 @@ class Dispatcher:
         e[0][:] = np.frombuffer(b, np.float32, dims, p)
         return e[1]
 
-    def call(self, body):
-        rid, _, n = _CALL_HEAD(body)
+    def link(self, routine):
+        """Resolves the routine's USING libraries for this request (§9.10) and binds their modules.
+        When one is another module than the routine is linked with, the routine is linked anew;
+        an activation that is running keeps the link it started with."""
+        modules = [self.libraries.module(schema, lib) for schema, lib, _ in routine.imports]
+        if modules == routine.linked:
+            return
+        bindings = {i[2]: m for i, m in zip(routine.imports, modules)}
+        if routine.relink is not None and routine.active and routine.linked is not None:
+            # Entry form: its functions share the globals the running activation uses.
+            routine.fn, routine.base = routine.relink(bindings)
+        else:
+            # Body form: each call starts from a copy of base. Entry form: nothing of it runs.
+            routine.base.update(bindings)
+        routine.linked = modules
+
+    def call(self, body, ctx):
+        if len(body) < _CALL_HEAD.size:
+            _mlewire.protocol_failure('message too short')
+        rid, _, n = _CALL_HEAD.unpack_from(body)
         routine = self.routines.get(rid)
         if routine is None or routine.nparams != n:
-            self.result(wire.INTERNAL, error=('', 'routine %d is not prepared with %d parameters' % (rid, n), [], 0, ''))
-            return
-        try:
-            if routine.vector_params:
-                # VECTOR arguments into reused read-only numpy arrays, by parameter position.
-                at = [0]
+            _mlewire.protocol_failure('CALL of a routine that is not prepared, or with another argument count')
+        ctx.append(routine)
+        if routine.vector_params:
+            # VECTOR arguments into reused read-only numpy arrays, by parameter position.
+            at = [0]
 
-                def vector(dims, p, b=body):
-                    i = at[0]
-                    at[0] += 1
-                    return self.vector_arg(i, dims, b, p)
-                args, _ = _decode(body, 16, n, vector)
-            else:
-                args, _ = _decode(body, 16, n)
-        except ConversionError as e:
-            self.result(wire.GUEST_ERROR, error=(wire.LANGUAGE_TYPE, str(e), [], 0, ''))
-            return
-        top = self.depth == 0
-        if top:
-            _begin(self.seq)
-            _mlewire.stats(wire.STATE_RUNNING, int(self.tainted))
-        failure = None
-        ret = None
-        outer, self.routine = self.routine, rid
-        try:
-            # USING: the libraries' current modules, bound before each call.
-            for schema, lib, binding in routine.imports:
-                routine.base[binding] = self.libraries.module(schema, lib)
-            ret = routine.fn(*args)
-        except BaseException as e:
-            failure = e
-        finally:
-            self.routine = outer
-        self.sql.call_ended(top)
-        interrupted = top and _end()
-        if failure is None and interrupted:
-            self.result(wire.INTERRUPTED, error=self.guest('python', 'interrupted'))
-        elif failure is None:
-            self.sql.flush_raw()
-            rt = routine.ret
-            out, err = Console.take(self.console.out), Console.take(self.console.err)
-            if routine.outs or not _result_fast(
-                    wire.STATE_IDLE if top else wire.STATE_RUNNING, int(self.tainted), self.depth, self.seq, ret,
-                    -1 if rt is None else rt.tag, False if rt is None else rt.unsigned, out, err):
-                self.result(wire.OK, ret, routine, console=(out, err))
+            def vector(dims, p, b=body):
+                i = at[0]
+                at[0] += 1
+                return self.vector_arg(i, dims, b, p)
+            args, _ = _decode(body, _CALL_HEAD.size, n, vector)
         else:
-            self.failed(failure, interrupted, routine.name, routine.lines)
-
-    # -- RESULT
-
-    def result(self, status, ret=None, routine=None, error=None, console=None):
-        self.sql.flush_raw()  # rows still in the arena are read before it is written over
-        if console is None:
-            console = (Console.take(self.console.out), Console.take(self.console.err))
+            args, _ = _decode(body, _CALL_HEAD.size, n)
+        if routine.imports:
+            self.link(routine)
+        fn = routine.fn
+        routine.active += 1
         try:
-            w = self.write_result(ret, routine, error, console)
-            if len(w.b) > wire.MAX_WORKER_MESSAGE:
-                raise MessageTooLarge()
-        except MessageTooLarge:
-            status = wire.GUEST_ERROR
-            w = self.write_result(None, None, (wire.LANGUAGE_TYPE, "the routine's result with its output is "
-                                               "larger than MLE allows (64 MiB)", [], 0, ''), (b'', b''))
-        except Exception as e:
-            # A value that cannot be the declared type: the call's error, never the worker's end.
-            # ConversionError is MLE's (MLE-Type); what json or numpy raise converting it (a set as
-            # JSON, strings as a VECTOR) is Python's, as on the JVM worker (its helpers run them).
-            status = wire.GUEST_ERROR
-            error = (wire.LANGUAGE_TYPE, str(e), [], 0, '') if isinstance(e, ConversionError) else \
-                ('python', _describe(e), [], 0, '')
-            w = self.write_result(None, None, error, console)
-        _mlewire.stats(wire.STATE_IDLE if self.depth == 0 else wire.STATE_RUNNING, int(self.tainted))
-        _mlewire.send(wire.RESULT, status, self.depth, self.seq, w.b)
+            ret = fn(*args)
+        finally:
+            routine.active -= 1
+        return self.values(routine, ret)
 
-    def write_result(self, ret, routine, error, console):
+    def values(self, routine, ret):
+        """The start of an OK RESULT of a CALL: has_return, the return value, out_params (all OUT
+        and INOUT parameters, ascending). Converting can run guest code (__str__, __index__ ...):
+        it is done here, before the request is over for interrupts, and into memory of the
+        worker, not the arena (§4.1)."""
         w = Writer()
         outs = ()
-        if routine is not None and error is None:
-            if routine.outs:
-                tup = ret
-                ret = tup[0]
-                outs = [(i, tup[i + 1]) for i in routine.outs]
-            if routine.ret is not None:
-                w.u8(1)
-                w.write_as(ret, routine.ret)
-            else:
-                w.u8(0)
-            w.u32(len(outs))
-            for i, v in outs:
-                w.u32(i)
-                w.write_as(v, routine.params[i][2])
+        if routine.outs:
+            tup = ret
+            ret = tup[0]
+            outs = [(i, tup[i + 1]) for i in routine.outs]
+        if routine.ret is not None:
+            w.u8(1)
+            w.write_as(ret, routine.ret)
         else:
             w.u8(0)
-            w.u32(0)
-        w.raw(console[0])
-        w.raw(console[1])
-        w.u8(0)
-        if error is None:
-            w.u8(0)
-            return w
-        language, message, frames, errno, state = error
-        w.u8(1)
-        w.str(language)
-        w.str(message)
-        w.u32(len(frames))
-        for f in frames:
-            w.str(f[0])
-            w.str(f[1])
-            w.u32(f[2])
-            w.u32(0)
-            w.u32(0)
-            w.str(f[3])
-        w.u32(errno)
-        w.str(state)
-        return w
+        w.u32(len(outs))
+        for i, v in outs:
+            w.u32(i)
+            w.write_as(v, routine.params[i][2])
+        return w.b
 
     # -- errors
 
     @staticmethod
-    def guest(language, message):
-        return (language, message, [], 0, '')
-
-    @staticmethod
-    def frames(e, name, lines):
+    def frames(e, source):
         out = []
-        # Innermost first, as the JVM worker (and the host's message: its first frame).
+        if source is None:
+            return out
+        file, lines = source.file, source.lines
+        # Innermost first: the host's message shows the first frame.
         for fs in reversed(traceback.extract_tb(e.__traceback__)):
-            if fs.filename != name:
+            if fs.filename != file:
                 continue
             fn = fs.name
             if fn in ('__mle_routine', '__mle_body', '<module>'):
                 fn = ''
             line = fs.lineno or 0
-            text = lines[line - 1].strip()[:200] if 0 < line <= len(lines) else ''
-            out.append((fn, name, line, text))
-        return out[:1000]
+            text = lines[line - 1].strip() if 0 < line <= len(lines) else ''
+            out.append((fn, file, line, text))
+            if len(out) == wire.MAX_FRAMES:
+                break
+        return out
 
-    def failed(self, e, interrupted, name, lines):
-        frames = self.frames(e, name, lines)
-        if isinstance(e, KeyboardInterrupt) or (interrupted and not isinstance(e, MemoryError)):
-            self.result(wire.INTERRUPTED, error=('python', 'interrupted', frames, 0, ''))
-        elif isinstance(e, (MemoryError, RecursionError)):
-            self.tainted = isinstance(e, MemoryError) or self.tainted
-            self.result(wire.EXHAUSTED, error=('python', '%s: %s' % (type(e).__name__, e), frames, 0, ''))
-        elif isinstance(e, ConversionError):
-            self.result(wire.GUEST_ERROR, error=(wire.LANGUAGE_TYPE, str(e), frames, 0, ''))
-        elif getattr(e, '$mle$sql', False):
-            state = getattr(e, 'sql_state', '') or ''
-            if state and not (len(state) == 5 and state.isalnum() and state.upper() == state):
-                self.result(wire.GUEST_ERROR, error=('python', '%s (SqlError with the invalid SQLSTATE %r)'
-                                                     % (e.message, state), frames, 0, ''))
-            else:
-                self.result(wire.GUEST_ERROR, error=('python', e.message, frames, int(e.code), state))
-        elif isinstance(e, SyntaxError) and e.filename == name:
-            self.result(wire.GUEST_ERROR, error=('python', '%s: %s' % (type(e).__name__, e.msg),
-                                                 [('', name, e.lineno or 0, (e.text or '').strip()[:200])], 0, ''))
+    def failed(self, source, e):
+        """What the exception e means for the request (a _Failed). An exception's text is guest
+        code (__str__): it is made here, while the request can still be interrupted."""
+        if isinstance(e, _TooLarge):
+            return _Failed(wire.EXHAUSTED, '', 'the request is larger than this MLE worker can hold')
+        if isinstance(e, _Refused):
+            return _Failed(wire.GUEST_ERROR, e.language, str(e))
+        try:
+            return self.described(source, e)
+        except Exception:
+            # The exception's own text failed (its __str__ raised).
+            return _Failed(wire.GUEST_ERROR, wire.LANGUAGE, type(e).__name__)
+
+    def described(self, source, e):
+        frames = self.frames(e, source)
+        if isinstance(e, (MemoryError, RecursionError)):
+            # The heap or the stack is exhausted: the worker asks to be retired (§9.4).
+            return _Failed(wire.EXHAUSTED, wire.LANGUAGE, '%s: %s' % (type(e).__name__, e), frames, taint=True)
+        if isinstance(e, ConversionError):
+            return _Failed(wire.GUEST_ERROR, wire.LANGUAGE_TYPE, str(e), frames)
+        if getattr(e, '$mle$sql', False):
+            return self.sql_failed(e, frames)
+        if isinstance(e, SyntaxError) and source is not None and e.filename == source.file:
+            return _Failed(wire.GUEST_ERROR, wire.LANGUAGE, '%s: %s' % (type(e).__name__, e.msg),
+                           [('', source.file, e.lineno or 0, (e.text or '').strip())])
+        return _Failed(wire.GUEST_ERROR, wire.LANGUAGE, _describe(e), frames)
+
+    @staticmethod
+    def sql_failed(e, frames):
+        """A routine that ends with a SqlError (§10.8). One made from an ERROR of the host in this
+        top-level request hands that error back by its id, with its number, SQLSTATE and message
+        as the host sent them; any other raises its own SQL error, if its fields are legal."""
+        handed = e.__dict__.get('$mle$error')
+        q = _mlewire.request()
+        if type(handed) is tuple and len(handed) == 5 and q is not None and handed[0] == q[4]:
+            _, error_id, errno, state, message = handed
+            if not (type(errno) is int and 0 <= errno <= wire.MAX_SQL_ERRNO and type(error_id) is int
+                    and 0 < error_id < 2 ** 64 and type(state) is str and type(message) is str):
+                errno, error_id, state = 0, 0, ''
+            return _Failed(wire.GUEST_ERROR, wire.LANGUAGE, message, frames, errno,
+                           state if _SQLSTATE.fullmatch(state) else '', error_id)
+        message = str(getattr(e, 'message', ''))
+        state = getattr(e, 'sql_state', '') or ''
+        if not isinstance(state, str) or (state and not _SQLSTATE.fullmatch(state)):
+            return _Failed(wire.GUEST_ERROR, wire.LANGUAGE,
+                           '%s (SqlError with the invalid SQLSTATE %r)' % (message, state), frames)
+        try:
+            errno = int(e.code)
+        except (TypeError, ValueError, AttributeError):
+            errno = 0
+        return _Failed(wire.GUEST_ERROR, wire.LANGUAGE, message, frames,
+                       errno if 0 <= errno <= wire.MAX_SQL_ERRNO else 0, state)
+
+    # -- RESULT
+
+    def finish(self, op, ctx, outcome, raised, delivered):
+        """The RESULT of a request: (status, body). outcome: what handle() returned (for a CALL of
+        the C++ call loop: values() or failed()); raised: the exception that left it instead;
+        delivered: an interrupt was delivered to the top-level request. No guest code of the
+        request runs any more, and no interrupt raises."""
+        guest = op == wire.CALL or op == wire.PREPARE
+        failed = None
+        if raised is not None:
+            failed = self.failed(ctx[0] if ctx else None, raised)
+        elif type(outcome) is _Failed:
+            failed = outcome
+        if failed is not None and delivered and not (failed.status == wire.EXHAUSTED and failed.taint):
+            # INTERRUPTED only for a delivered interrupt (§11.1); a KeyboardInterrupt of the guest
+            # code's own is its error.
+            failed = _Failed(wire.INTERRUPTED, wire.LANGUAGE, 'interrupted', failed.error[2])
+        if failed is not None and op in (wire.DROP, wire.RESET, wire.OPTIONS) and \
+                failed.error[0] not in (wire.LANGUAGE_TIME_ZONE, wire.LANGUAGE_OPTION):
+            # These requests run no guest code: the worker itself failed (§9.4).
+            failed = _Failed(wire.INTERNAL, '', failed.error[1], taint=True)
+        status, error, values, findings = wire.OK, None, _NO_VALUES, ()
+        if failed is None:
+            if op == wire.CALL:
+                values = outcome
+            elif op == wire.PREPARE:
+                findings = outcome
         else:
-            self.result(wire.GUEST_ERROR, error=('python', _describe(e), frames, 0, ''))
+            status, error = failed.status, failed.error
+            if failed.taint:
+                _mlewire.taint()
+            if op == wire.PREPARE:
+                self.drop(_mlewire.request()[2])  # a PREPARE that does not answer OK (§8.3)
+        out = err = b''
+        if guest:
+            self.sql.flush_raw()  # rows still in the arena are read before it is written over
+            out, err = Console.take(self.console.out), Console.take(self.console.err)
+        body = self.result(values, out, err, findings, error)
+        if len(body) > wire.MAX_WORKER_MESSAGE:
+            # §9.4: console output is cut, the end of each stream kept; if the RESULT is too large
+            # without any, it is a conversion error.
+            room = wire.MAX_WORKER_MESSAGE - (len(body) - len(out) - len(err))
+            if room < 0:
+                status, values, findings = wire.GUEST_ERROR, _NO_VALUES, ()
+                error = (wire.LANGUAGE_TYPE, "the routine's result is larger than MLE allows (64 MiB)", (), 0, '', 0)
+                if op == wire.PREPARE:
+                    self.drop(_mlewire.request()[2])
+                room = wire.MAX_WORKER_MESSAGE - len(self.result(values, b'', b'', findings, error))
+            err = keep_end(err, max(room // 2, room - len(out)))
+            out = keep_end(out, room - len(err))
+            body = self.result(values, out, err, findings, error)
+        return status, body
 
-    # -- requests to the host while a routine runs
-
-    def library_request(self, schema, name, known_hash):
-        """A database library's body (Phase 6): LIBRARY, answered by LIBRARY_RESULT."""
-        _mlewire.mark()
-        self.sql.flush_raw()
+    @staticmethod
+    def result(values, out, err, findings, error):
+        """A RESULT's body (§9.4) with the caps of §7.4 and §9.4."""
         w = Writer()
-        w.str(schema)
-        w.str(name)
-        w.u64(known_hash)
-        _mlewire.send(wire.LIBRARY, wire.OK, self.depth, self.seq, w.b)
-        op, status, depth, seq, body = _mlewire.receive()
-        if op != wire.LIBRARY_RESULT or depth != self.depth:
-            raise RuntimeError('unexpected message %d while loading a library' % op)
-        from .libraries import read_reply
-        return read_reply(body)
-
-
-class MessageTooLarge(Exception):
-    pass
+        b = w.b
+        b += values
+        w.raw(out)
+        w.raw(err)
+        w.u8(0)  # console_cleared: Python has no call that clears the console
+        findings = findings[:wire.MAX_FINDINGS]
+        w.u32(len(findings))
+        for f in findings:
+            w.raw(wire.cut(wire.utf8(f), wire.MAX_FINDING))
+        if error is None:
+            w.u8(0)
+            return b
+        language, message, frames, errno, state, error_id = error
+        w.u8(1)
+        w.str(language)
+        w.raw(wire.cut(wire.utf8(message), wire.MAX_ERROR_MESSAGE))
+        frames = frames[:wire.MAX_FRAMES]
+        w.u32(len(frames))
+        for function, file, line, text in frames:
+            w.raw(wire.cut(wire.utf8(function), wire.MAX_FRAME_TEXT))
+            w.raw(wire.cut(wire.utf8(file), wire.MAX_FRAME_TEXT))
+            w.u32(line if 0 <= line < 2 ** 32 else 0)
+            w.u32(0)
+            w.u32(0)
+            w.raw(wire.cut(wire.utf8(text), wire.MAX_FRAME_TEXT))
+        w.u32(errno)
+        w.str(state)
+        w.u64(error_id)
+        return b
 
 
 def _describe(e):
-    """An exception as Python's last traceback line, named by its class's own name (as GraalPy names
-    it): a class defined in a routine is MyError, not r.__mle_routine.<locals>.MyError (that
-    wrapper is ours); module prefixes go the same way."""
-    text = ''.join(traceback.format_exception_only(type(e), e)).strip()
+    """An exception as Python's last traceback line, named by its class's own name: a class defined
+    in a routine is MyError, not r.__mle_routine.<locals>.MyError (that wrapper is ours); module
+    prefixes go the same way."""
+    try:
+        text = ''.join(traceback.format_exception_only(type(e), e)).strip()
+    except Exception:
+        return type(e).__name__
     prefix = text.split(':', 1)[0]
     name = type(e).__name__
     if prefix != name and prefix.endswith('.' + name):
@@ -602,37 +691,25 @@ def _describe(e):
 
 
 def _no_js(name):
-    raise ImportError('import_js(%r): JavaScript needs the JVM build of MLE (this worker runs Python only)' % (name,))
+    raise ImportError('import_js(%r): this worker runs Python only' % (name,))
 
 
-_CALL_HEAD = struct.Struct('<QII').unpack_from  # routine id, events, argument count
-_decode = _mlewire.decode
-_begin = _mlewire.begin
-_end = _mlewire.end
-_result_fast = _mlewire.result_fast
-
-
-def main():
+def start():
+    """The worker's Python side, before READY: the Dispatcher. What fails here is the reason of a
+    failed READY (main.cc)."""
     t0 = time.monotonic()
-    cls = os.environ.get('MLE_CLASS', 'cpython')
     import decimal
     import json
     from . import sql
     # The values of routine arguments, and of rows (zero dates as None; DECIMAL as float with NUMBER).
     _mlewire.setup(decimal.Decimal, json.loads, wire.temporal, wire.new_vector, wire.demote, sql._row_temporal,
-                   float)
-    arena = _mlewire.open(int(os.environ.get("MLE_SPIN", "2000")))
-    d = Dispatcher(arena, cls)
+                   float, wire.timestamp)
+    d = Dispatcher(_mlewire.arena_size())
     sys.stdout = d.console.out
     sys.stderr = d.console.err
-    status, info = wire.OK, ''
-    try:
-        _ban_threads()
-        if os.environ.get('MLE_PREWARM_NUMPY') == '1':
-            import numpy  # noqa: F401
-        gc.collect()
-        info = 'ready in %d ms' % ((time.monotonic() - t0) * 1000)
-    except BaseException as e:
-        status, info = wire.INTERNAL, 'start failed: %r' % e
-    d.ready(status, info)
-    d.loop()
+    _ban_threads()
+    if os.environ.get('MLE_PREWARM_NUMPY') == '1':
+        import numpy  # noqa: F401
+    gc.collect()
+    d.info = 'class %s, ready in %d ms' % (os.environ.get('MLE_CLASS', 'cpython'), (time.monotonic() - t0) * 1000)
+    return d

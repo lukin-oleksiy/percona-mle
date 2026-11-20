@@ -46,7 +46,9 @@ static_assert(std::endian::native == std::endian::little, "the wire is little-en
     exception, no unwinding, no guest code. The one path for every such failure (mailbox.cc). */
 [[noreturn]] void protocol_failure(std::string_view what);
 
-/** Reads a message body of the host. Anything malformed is a protocol failure. */
+/** Reads a message body of the host with the checks of §1: every length and count against the
+    bytes the message has. Reading beyond the message is a protocol failure; domains, reserved
+    fields and trailing bytes are the host's to get right and are not looked at. */
 class Reader {
  public:
   explicit Reader(std::span<const std::byte> b, size_t pos = 0) : m_b(b), m_p(pos) {
@@ -70,25 +72,17 @@ class Reader {
     auto s = take(n);
     return {reinterpret_cast<const char *>(s.data()), s.size()};
   }
-  /** A bool: 0 or 1. */
-  bool boolean() {
-    const auto v = get<uint8_t>();
-    if (v > 1) protocol_failure("a bool that is neither 0 nor 1");
-    return v != 0;
-  }
-  /** The count of a list of at most max elements of at least min_size bytes each, checked against
-      the bytes left before anything is allocated for it (§7.1). */
+  bool boolean() { return get<uint8_t>() != 0; }
+  /** The count of a list of at most max elements of at least min_size bytes each (1 or more),
+      checked against the bytes left before anything is allocated for it (§1 item 1, §7.1). */
   uint32_t count(uint32_t max, size_t min_size) {
     const auto n = get<uint32_t>();
     if (n > max || n > left() / min_size) protocol_failure("a list longer than the message or its limit");
     return n;
   }
-  /** Skips a VECTOR's padding: zero bytes up to kVectorAlignment, counted from the body's start. */
-  void align() {
-    for (const std::byte b : take((wire::kVectorAlignment - m_p % wire::kVectorAlignment) % wire::kVectorAlignment))
-      if (b != std::byte{0}) protocol_failure("VECTOR padding that is not zero");
-  }
-  /** The body is consumed exactly (§5.1). */
+  /** Skips a VECTOR's padding: up to kVectorAlignment, counted from the body's start. */
+  void align() { take((wire::kVectorAlignment - m_p % wire::kVectorAlignment) % wire::kVectorAlignment); }
+  /** For a caller that wants the body consumed exactly; a worker need not look (§5.1). */
   void finish() const {
     if (m_p != m_b.size()) protocol_failure("trailing bytes in a message");
   }

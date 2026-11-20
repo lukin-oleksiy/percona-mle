@@ -19,7 +19,8 @@
   @file worker/cpython/codec.cc
 
   Decoding of values, rows and columns for the CPython worker: values as Python objects, rows as
-  row tuples, and columns of fetch_columns straight into typed buffers.
+  row tuples, and columns of fetch_columns straight into typed buffers. A value is decoded by its
+  own tag (§1 item 2); lengths are checked against the message, domains are not (§1).
 */
 
 #include "codec.hpp"
@@ -47,10 +48,11 @@ ValueRules &value_rules() {
 
 namespace {
 
-constexpr size_t kTemporalSize = 15;  // u16 year, u8 month, u8 day, u32 hour, u8 minute, u8 second, u32 us, u8 neg
+constexpr size_t kCivilSize = 15;  // u16 year, u8 month, u8 day, u32 hour, u8 minute, u8 second, u32 us, bool neg
 
+/** Text of the host as a str; ill-formed UTF-8 is repaired with U+FFFD (§7.1). */
 Ref unicode(std::string_view s) {
-  return Ref::steal(PyUnicode_DecodeUTF8(s.data(), static_cast<Py_ssize_t>(s.size()), "strict"));
+  return Ref::steal(PyUnicode_DecodeUTF8(s.data(), static_cast<Py_ssize_t>(s.size()), "replace"));
 }
 
 Ref call(PyObject *f, PyObject *a) { return Ref::steal(PyObject_CallOneArg(f, a)); }
@@ -109,11 +111,13 @@ Ref decode_tagged(Tag tag, Reader &r, PyObject *body, PyObject *vector) {
     case Tag::kDate:
     case Tag::kTime:
     case Tag::kDatetime:
-    case Tag::kTimestamp:
       return temporal(tag, r);
+    case Tag::kTimestamp:
+      // An instant (§7.2): Python makes the datetime, in the zone of OPTIONS.
+      return Ref::steal(PyObject_CallFunction(helpers().timestamp.get(), "Li", static_cast<long long>(r.get<int64_t>()),
+                                              value_rules() == ValueRules::kArguments ? 0 : 1));
     case Tag::kVector: {
       const auto dims = r.get<uint32_t>();
-      if (dims > wire::kMaxVectorDimensions) throw Malformed{"VECTOR too large"};
       r.align();
       const size_t pos = r.pos();
       r.take(size_t{dims} * 4);
@@ -122,7 +126,7 @@ Ref decode_tagged(Tag tag, Reader &r, PyObject *body, PyObject *vector) {
                                                                   Py_ssize_t(pos), dims));
     }
   }
-  throw Malformed{"unknown value tag"};
+  protocol_failure("an unknown value tag");
 }
 
 }  // namespace
@@ -135,11 +139,6 @@ void skip_value(Reader &r) {
   switch (static_cast<Tag>(r.get<uint8_t>())) {
     case Tag::kNull:
       return;
-    case Tag::kI64:
-    case Tag::kU64:
-    case Tag::kF64:
-      r.take(8);
-      return;
     case Tag::kF32:
       r.take(4);
       return;
@@ -149,11 +148,16 @@ void skip_value(Reader &r) {
     case Tag::kJson:
       r.take(r.get<uint32_t>());
       return;
+    case Tag::kI64:
+    case Tag::kU64:
+    case Tag::kF64:
+    case Tag::kTimestamp:
+      r.take(8);
+      return;
     case Tag::kDate:
     case Tag::kTime:
     case Tag::kDatetime:
-    case Tag::kTimestamp:
-      r.take(kTemporalSize);
+      r.take(kCivilSize);
       return;
     case Tag::kVector: {
       const auto dims = r.get<uint32_t>();
@@ -162,21 +166,22 @@ void skip_value(Reader &r) {
       return;
     }
   }
-  throw Malformed{"unknown value tag"};
+  protocol_failure("an unknown value tag");
 }
 
 // ------------------------------------------------------------------------------ module functions
 
-/** setup(decimal, json_loads, temporal, new_vector, demote, row_temporal, number) */
+/** setup(decimal, json_loads, temporal, new_vector, demote, row_temporal, number, timestamp) */
 Ref py_setup(PyObject *args) {
-  PyObject *d, *j, *t, *v, *m, *rt, *num;
-  if (!PyArg_ParseTuple(args, "OOOOOOO", &d, &j, &t, &v, &m, &rt, &num)) throw PyErrorSet{};
+  PyObject *d, *j, *t, *v, *m, *rt, *num, *ts;
+  if (!PyArg_ParseTuple(args, "OOOOOOOO", &d, &j, &t, &v, &m, &rt, &num, &ts)) throw PyErrorSet{};
   if (PyDateTimeAPI == nullptr) {
     PyDateTime_IMPORT;
     if (PyDateTimeAPI == nullptr) throw PyErrorSet{};
   }
   Helpers &h = helpers();
   h.row_temporal = Ref::borrow(rt);
+  h.timestamp = Ref::borrow(ts);
   h.number = Ref::borrow(num);
   h.decimal = Ref::borrow(d);
   h.json_loads = Ref::borrow(j);
@@ -193,7 +198,8 @@ Ref py_decode(PyObject *args) {
   if (!PyArg_ParseTuple(args, "Onn|O", &body, &pos, &n, &vector)) throw PyErrorSet{};
   Buffer buf(body, PyBUF_SIMPLE);
   Reader r(buf.bytes(), size_t(pos));
-  if (n < 0 || size_t(n) > wire::kMaxValues) throw Malformed{"bad value count"};
+  // Every value has at least its tag (§1 item 1).
+  if (n < 0 || size_t(n) > r.left()) protocol_failure("more values than the message holds");
   Ref list = Ref::steal(PyList_New(n));
   for (Py_ssize_t i = 0; i < n; i++)
     PyList_SET_ITEM(list.get(), i, decode_value(r, body, vector == Py_None ? nullptr : vector).release());
@@ -213,9 +219,10 @@ Ref py_decode_rows(PyObject *args) {
     PyErr_SetString(PyExc_TypeError, "row_type must be a tuple subclass");
     throw PyErrorSet{};
   }
-  if (nrows < 0 || ncols < 0) throw Malformed{"bad row count"};
   Buffer buf(body, PyBUF_SIMPLE);
   Reader r(buf.bytes(), size_t(pos));
+  if (nrows < 0 || ncols < 0 || (ncols != 0 && size_t(nrows) > r.left() / size_t(ncols)) || (ncols == 0 && nrows != 0))
+    protocol_failure("more row values than the message holds");
   auto *type = reinterpret_cast<PyTypeObject *>(row_type);
   Ref list = Ref::steal(PyList_New(nrows));
   for (Py_ssize_t i = 0; i < nrows; i++) {
@@ -273,7 +280,10 @@ struct Column {
     store();
     Ref r = Ref::steal(PyObject_CallOneArg(helpers().demote.get(), obj));
     load();
-    if (mode != Mode::kList) throw Malformed{"demote() left a typed column"};
+    if (mode != Mode::kList) {
+      PyErr_SetString(PyExc_RuntimeError, "demote() left a typed column");
+      throw PyErrorSet{};
+    }
   }
 };
 
@@ -282,7 +292,7 @@ bool add_typed(Column &c, Tag tag, Reader &r) {
     case Mode::kVector: {
       if (tag != Tag::kVector) return false;
       const auto dims = r.get<uint32_t>();
-      if (dims == 0 || dims > wire::kMaxVectorDimensions || (c.dims != 0 && dims != c.dims)) return false;
+      if (dims == 0 || (c.dims != 0 && dims != c.dims)) return false;
       r.align();
       c.dims = dims;
       auto src = r.take(size_t{dims} * 4);
@@ -332,10 +342,11 @@ Ref py_decode_columns(PyObject *args) {
   if (!PyArg_ParseTuple(args, "OnnO!|i", &body, &pos, &nrows, &PyList_Type, &collectors, &rules))
     throw PyErrorSet{};
   const UseRules use(static_cast<ValueRules>(rules));
-  if (nrows < 0) throw Malformed{"bad row count"};
   Buffer buf(body, PyBUF_SIMPLE);
   Reader r(buf.bytes(), size_t(pos));
   const Py_ssize_t ncols = PyList_GET_SIZE(collectors);
+  if (nrows < 0 || (ncols != 0 && size_t(nrows) > r.left() / size_t(ncols)) || (ncols == 0 && nrows != 0))
+    protocol_failure("more row values than the message holds");
   std::vector<Column> cols(static_cast<size_t>(ncols));
   for (Py_ssize_t c = 0; c < ncols; c++) {
     cols[size_t(c)].obj = PyList_GET_ITEM(collectors, c);
@@ -424,7 +435,7 @@ bool encode_common(PyObject *buffer, PyObject *v) {
   if (PyUnicode_CheckExact(v)) {
     Py_ssize_t n;
     const char *s = PyUnicode_AsUTF8AndSize(v, &n);
-    if (s == nullptr) {  // lone surrogates: the Python encoder replaces them
+    if (s == nullptr) {  // lone surrogates: the Python encoder repairs them
       PyErr_Clear();
       return false;
     }

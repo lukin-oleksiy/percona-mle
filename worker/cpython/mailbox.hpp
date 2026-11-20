@@ -19,7 +19,8 @@
   @file worker/cpython/mailbox.hpp
 
   The CPython worker on the shared mailbox (worker/common/mailbox.hpp): the futex sleep without the
-  GIL, and KILL as KeyboardInterrupt raised in the thread that serves requests.
+  GIL, and an interrupt (§11.1) as KeyboardInterrupt raised in the thread that serves requests,
+  only while guest code of the interrupted request runs.
 */
 
 #ifndef MLE_CPYTHON_MAILBOX_HPP
@@ -35,8 +36,24 @@ using common::Interrupts;
 using common::Mailbox;
 using common::Message;
 
-/** Mailbox::open with the CPython hooks; in the thread that serves requests, with the GIL. */
+/** Mailbox::open with the CPython hooks (§2 steps 3 and 4), before Python starts. */
 uint32_t open_mailbox(int spin);
+
+/** Python runs: the calling thread is the one that serves requests. With the GIL. */
+void serving_thread();
+/** Whether the caller is the thread that serves requests. */
+bool on_serving_thread();
+
+/** Guest code of the request being served starts or goes on: an interrupt delivered to the
+    top-level request raises KeyboardInterrupt in it from here on. With the GIL. */
+void guest_enter();
+/** Guest code goes on after a wait for the host. An interrupt that was delivered meanwhile is
+    raised by the caller itself, or by the helper thread a moment later: what the guest code runs
+    while it unwinds gets that moment. With the GIL. */
+void guest_resume();
+/** Guest code stops (it returned, or it waits for the host): a KeyboardInterrupt that was set and
+    not raised yet is dropped, and none is set until guest_enter(). With the GIL. */
+void guest_leave();
 
 }  // namespace mle::cpython
 

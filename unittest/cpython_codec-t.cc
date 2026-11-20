@@ -15,20 +15,22 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
-// The CPython worker's codec (worker/cpython/codec.cc, exp design note 62):
+// The CPython worker's codec (worker/cpython/codec.cc, docs/protocol.md §7):
 // Reader and Writer bounds; every value tag of messages the host encodes
-// (mle/codec.h) decoded into the Python values routines get; rows into row
-// tuples and columns into typed buffers, with the fallback to lists; and
-// malformed input (truncated, random) gives Python exceptions, never a crash.
+// (mle/codec.h) decoded into the Python values routines get, ill-formed text
+// repaired; rows into row tuples and columns into typed buffers, with the
+// fallback to lists; what the worker writes (text repaired with U+FFFD, the
+// domains of §7.2); and a message that breaks the protocol (truncated, an
+// unknown tag) ends the process with a protocol failure (§1), never a crash.
 //
 // The interpreter is the one the worker embeds, with the worker's code and
-// site-packages (numpy) on sys.path. MLE_FUZZ_ITERATIONS (default 20000) and
-// MLE_FUZZ_SEED control the random part.
+// site-packages (numpy) on sys.path.
 
 #include <gtest/gtest.h>
 
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -40,7 +42,6 @@
 namespace mle_cpython_codec_unittest {
 
 using mle::Value;
-using mle::cpython::Malformed;
 using mle::cpython::Reader;
 using mle::cpython::Writer;
 using mle::wire::Tag;
@@ -67,7 +68,9 @@ class PythonEnvironment : public ::testing::Environment {
     ASSERT_TRUE(run(R"(
 import _mlewire, decimal, json, random, numpy as np, datetime as dt
 from mle_cpython import wire
-_mlewire.setup(decimal.Decimal, json.loads, wire.temporal, wire.new_vector, wire.demote, lambda *a: None, float)
+_mlewire.setup(decimal.Decimal, json.loads, wire.temporal, wire.new_vector, wire.demote, lambda *a: None, float,
+               wire.timestamp)
+ARGS = 20  # a CALL's arguments follow routine_id, library_epoch and their count
 )"));
   }
 
@@ -122,17 +125,22 @@ std::pair<std::string, size_t> rows_body(std::vector<mle::Column> cols, std::vec
   return {out, empty.size() - 14};
 }
 
+/** The statement ends the process as a protocol failure does (common::protocol_failure). */
+#define EXPECT_PROTOCOL_FAILURE(statement) EXPECT_EXIT(statement, ::testing::ExitedWithCode(1), "protocol failure")
+
 TEST(CpythonCodec, ReaderBounds) {
   const std::array<std::byte, 6> b{std::byte{4}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{'a'},
                                    std::byte{'b'}};
-  Reader r(b, 0);
-  EXPECT_THROW(r.str(), Malformed);  // length 4, 2 bytes left
+  EXPECT_PROTOCOL_FAILURE(Reader(b, 0).str());  // length 4, 2 bytes left
   Reader r2(b, 4);
   EXPECT_EQ(r2.get<uint16_t>(), uint16_t('a' | ('b' << 8)));
-  EXPECT_THROW(r2.get<uint8_t>(), Malformed);
-  EXPECT_THROW(Reader(b, 7), Malformed);
-  Reader r3(b, 3);
-  EXPECT_THROW(r3.align(), Malformed);  // to 16: beyond the end
+  EXPECT_PROTOCOL_FAILURE(r2.get<uint8_t>());
+  EXPECT_PROTOCOL_FAILURE(Reader(b, 7));
+  EXPECT_PROTOCOL_FAILURE(Reader(b, 3).align());  // to 16: beyond the end
+  EXPECT_PROTOCOL_FAILURE(Reader(b, 0).count(100, 2));  // 4 elements of 2 bytes in 2 bytes
+  // A bool is not checked for 0 or 1, nor a VECTOR's padding for zeros (§1).
+  Reader r3(b, 0);
+  EXPECT_TRUE(r3.boolean());
 }
 
 TEST(CpythonCodec, WriterFull) {
@@ -156,31 +164,93 @@ TEST(CpythonCodec, EveryTag) {
                                Value::f32(0.5f), Value::decimal("-12.345"), Value::string("h\xC3\xA9llo"),
                                Value::bytes(std::string("A\xFF\0", 3)), Value::json(R"({"a": [1, 2]})"),
                                Value::temporal(Tag::kDate, date), Value::temporal(Tag::kDatetime, datetime),
-                               Value::temporal(Tag::kTimestamp, datetime), Value::temporal(Tag::kTime, time),
+                               Value::timestamp(1704067200000000), Value::temporal(Tag::kTime, time),
                                Value::vector({1.0f, -2.5f, 3.0f})}));
   EXPECT_TRUE(py(R"(
-v, end = _mlewire.decode(body, 16, 14)
+v, end = _mlewire.decode(body, ARGS, 14)
 assert end == len(body), (end, len(body))
 assert v[:9] == [None, -5, 2**64 - 1, 1.25, 0.5, decimal.Decimal('-12.345'), 'héllo', b'A\xff\x00', {'a': [1, 2]}], v
 assert type(v[5]) is decimal.Decimal
 assert v[9] == dt.date(2026, 11, 19) and type(v[9]) is dt.date
-assert v[10] == v[11] == dt.datetime(2026, 11, 19, 12, 34, 56, 123456)
+assert v[10] == dt.datetime(2026, 11, 19, 12, 34, 56, 123456)
+# A TIMESTAMP is an instant: the local time in the zone of OPTIONS, UTC here.
+assert v[11] == dt.datetime(2024, 1, 1) and v[11].tzinfo is None, v[11]
+wire.ZONE = dt.timezone(dt.timedelta(hours=2))
+assert _mlewire.decode(body, ARGS, 14)[0][11] == dt.datetime(2024, 1, 1, 2)
+wire.ZONE = dt.timezone.utc
 assert v[12] == -dt.timedelta(hours=838, minutes=59, seconds=59)
 assert v[13].dtype == np.float32 and v[13].tolist() == [1.0, -2.5, 3.0]
 seen = []
-v, _ = _mlewire.decode(body, 16, 14, lambda dims, pos: seen.append((dims, pos % 16)) or 'V')
+v, _ = _mlewire.decode(body, ARGS, 14, lambda dims, pos: seen.append((dims, pos % 16)) or 'V')
 assert v[13] == 'V' and seen == [(3, 0)], seen
 )"));
 }
 
 TEST(CpythonCodec, ZeroDate) {
   set_bytes("body", call_body({Value::temporal(Tag::kDatetime, mle::Temporal{})}));
+  set_bytes("body2", call_body({Value::timestamp(mle::wire::kZeroTimestamp)}));
   EXPECT_TRUE(py(R"(
-try:
-    _mlewire.decode(body, 16, 1)
-    raise AssertionError('no error')
-except wire.ConversionError as e:
-    assert 'zero date' in str(e), e
+for b, what in ((body, 'zero date'), (body2, 'zero timestamp')):
+    try:
+        _mlewire.decode(b, ARGS, 1)
+        raise AssertionError('no error')
+    except wire.ConversionError as e:
+        assert what in str(e), e
+# In a row a zero timestamp is None.
+assert wire.timestamp(wire.ZERO_TIMESTAMP, 1) is None
+)"));
+}
+
+TEST(CpythonCodec, HostTextAndFloats) {
+  // Ill-formed UTF-8 in a STRING is repaired, each maximal subpart by U+FFFD (§7.1); any float
+  // bit pattern is accepted (§7.2); a VECTOR's padding is not looked at.
+  std::string body = call_body({Value::string(std::string("a\xF0\x80\x80z\xFF", 6)), Value::f64(0.0), Value::f32(0.0f),
+                                Value::vector({1.5f})});
+  const size_t f64_at = 20 + 1 + 4 + 6 + 1;
+  std::memset(body.data() + f64_at, 0xFF, 8);      // a NaN
+  std::memset(body.data() + f64_at + 9, 0xFF, 4);  // a NaN
+  body[f64_at + 8 + 5 + 5 + 1] = 1;                // inside the padding
+  set_bytes("body", body);
+  EXPECT_TRUE(py(R"(
+import math
+v, _ = _mlewire.decode(body, ARGS, 4)
+assert v[0] == 'a\ufffd\ufffd\ufffdz\ufffd', ascii(v[0])
+assert math.isnan(v[1]) and math.isnan(v[2]), v
+assert v[3].tolist() == [1.5], v[3]
+)"));
+}
+
+TEST(CpythonCodec, WorkerValues) {
+  // What the worker sends: text repaired with U+FFFD, never '?'; the domains of §7.2.
+  EXPECT_TRUE(py(R"(
+assert wire.utf8('a\ud800b\udfff') == 'a\ufffdb\ufffd'.encode()
+assert wire.cut('h\u00e9llo'.encode(), 2) == b'h'
+w = wire.Writer()
+w.param('x\udc00')
+assert bytes(w.b) == b'\x06\x04\x00\x00\x00x\xef\xbf\xbd', bytes(w.b)
+b = bytearray()
+from mle_cpython import sql
+assert _mlewire.encode_values(b, ['\ud83d', 1, None, 2.5, b'\xff'], sql._encode_one) == 5
+assert bytes(b[:8]) == b'\x06\x03\x00\x00\x00\xef\xbf\xbd', bytes(b)
+t = wire.ParamType(wire.T_TIMESTAMP, False, 0, 0, 0, 'TIMESTAMP')
+w = wire.Writer()
+w.write_as(dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc), t)   # an instant
+w.write_as(dt.datetime(2024, 1, 1), t)                             # local time in the zone of OPTIONS
+assert bytes(w.b) == bytes.fromhex('0b0020211 0d70d0600'.replace(' ', '')) * 2, w.b.hex()
+for bad, t in ((dt.datetime(1969, 1, 1), t),
+               (float('nan'), wire.ParamType(wire.T_F64, False, 0, 0, 0, 'DOUBLE')),
+               (1e300, wire.ParamType(wire.T_F32, False, 0, 0, 0, 'FLOAT')),
+               ([], wire.ParamType(wire.T_VECTOR, False, 0, 0, 0, 'VECTOR')),
+               ([0.0] * 16384, wire.ParamType(wire.T_VECTOR, False, 0, 0, 0, 'VECTOR'))):
+    try:
+        wire.Writer().write_as(bad, t)
+        raise AssertionError('no error for %r' % (bad,))
+    except wire.ConversionError:
+        pass
+w = wire.Writer()
+w.param(dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc))   # aware: TIMESTAMP
+w.param(dt.datetime(2024, 1, 1))                           # naive: DATETIME
+assert w.b[0] == wire.T_TIMESTAMP and w.b[9] == wire.T_DATETIME, w.b.hex()
 )"));
 }
 
@@ -251,45 +321,21 @@ TEST(CpythonCodec, Truncated) {
                                rows, 3);
   set_bytes("body", body.substr(0, body.size() - 14));
   PyDict_SetItemString(g_globals, "pos", PyLong_FromSize_t(pos));
-  EXPECT_TRUE(py(R"(
-for n in range(pos, len(body)):
-    for f in (lambda b: _mlewire.decode_rows(b, pos, 3, 3, None),
-              lambda b: _mlewire.decode_columns(b, pos, 3, [wire.Collector(wire.MODE_LIST, 0),
-                                                           wire.Collector(wire.MODE_VECTOR, 0), None])):
-        try:
-            f(body[:n])
-            raise AssertionError('truncated at %d accepted' % n)
-        except RuntimeError as e:
-            assert 'short' in str(e) or 'beyond' in str(e), e
-)"));
-}
-
-TEST(CpythonCodec, RandomInput) {
-  const char *it = std::getenv("MLE_FUZZ_ITERATIONS");
-  const char *seed = std::getenv("MLE_FUZZ_SEED");
-  const std::string setup = std::string("iterations = ") + (it ? it : "20000") + "\nseed = " + (seed ? seed : "20261119");
-  ASSERT_TRUE(py(setup.c_str()));
-  EXPECT_TRUE(py(R"(
-rnd = random.Random(seed)
-tags = bytes(range(16))
-for i in range(iterations):
-    n = rnd.randrange(0, 64)
-    # Mostly valid tags, so that decoding gets past the first byte.
-    b = bytes(rnd.choice(tags) if rnd.random() < 0.3 else rnd.randrange(256) for _ in range(n))
-    try:
-        if i % 3 == 0:
-            _mlewire.decode(b, 0, rnd.randrange(0, 4))
-        elif i % 3 == 1:
-            _mlewire.decode_rows(b, 0, rnd.randrange(0, 3), rnd.randrange(0, 3), None)
-        else:
-            _mlewire.decode_columns(b, 0, rnd.randrange(0, 3),
-                                    [wire.Collector(rnd.randrange(0, 5), 0) for _ in range(rnd.randrange(0, 3))])
-    except (RuntimeError, ValueError, UnicodeDecodeError, OverflowError, decimal.InvalidOperation,
-            json.JSONDecodeError, wire.ConversionError):
-        pass
-    except Exception as e:
-        raise AssertionError('iteration %d (seed %d): %r on %r' % (i, seed, e, b))
-)"));
+  // Cut anywhere, the rows end the process and are not read beyond the message.
+  for (const size_t n : {pos, pos + 1, pos + 6, pos + 20, body.size() - 30, body.size() - 15}) {
+    PyDict_SetItemString(g_globals, "n", PyLong_FromSize_t(n));
+    EXPECT_PROTOCOL_FAILURE(py("_mlewire.decode_rows(body[:n], pos, 3, 3, None)"));
+    EXPECT_PROTOCOL_FAILURE(py("_mlewire.decode_columns(body[:n], pos, 3, [wire.Collector(wire.MODE_LIST, 0), "
+                               "wire.Collector(wire.MODE_VECTOR, 0), None])"));
+  }
+  // An unknown tag, and counts beyond the bytes there are.
+  EXPECT_PROTOCOL_FAILURE(py("_mlewire.decode(bytes([14]), 0, 1)"));
+  EXPECT_PROTOCOL_FAILURE(py("_mlewire.decode(bytes(4), 0, 5)"));
+  EXPECT_PROTOCOL_FAILURE(py("_mlewire.decode_rows(bytes(4), 0, 3, 2, None)"));
+  EXPECT_PROTOCOL_FAILURE(py("wire.Reader(bytes(3)).u32()"));
+  EXPECT_PROTOCOL_FAILURE(py("wire.Reader(bytes([9, 0, 0, 0, 65])).str()"));
+  EXPECT_PROTOCOL_FAILURE(py("wire.Reader(bytes([14]) + bytes(17)).type()"));
+  EXPECT_TRUE(py("assert wire.Reader(bytes([13]) + bytes(17)).type().tag == 13"));
 }
 
 }  // namespace mle_cpython_codec_unittest

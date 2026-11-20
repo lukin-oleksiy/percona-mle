@@ -13,41 +13,55 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
-"""Protocol v3 (include/mle/protocol.h): constants, a reader and a writer of message bodies,
-and SQL values <-> Python values with the JVM kind's Python rules (Polyglot/PySql)."""
+"""The MLE worker protocol (docs/protocol.md) as the Python side of the CPython worker needs it:
+constants, a reader of host messages and a writer of message bodies, and SQL values <-> Python
+values (the reading of values is C++: codec.cc)."""
 
 import datetime as _dt
 import decimal as _decimal
 import json as _json
 import math as _math
+import re as _re
 import struct as _struct
 import array as _array
 
-VERSION = 3
+import _mlewire
 
-READY, PREPARE, CALL, RESULT, SQL, SQL_RESULT, FETCH, DROP, RESET, CONTINUE, OPTIONS, \
-    PARSE_LIBRARY, LIBRARY, LIBRARY_RESULT = range(1, 15)
+# Operations the dispatcher handles (§9).
+PREPARE, CALL, DROP, RESET, OPTIONS, PARSE_LIBRARY = 2, 3, 8, 9, 11, 12
 
+# RESULT status (§9.4).
 OK, GUEST_ERROR, INTERRUPTED, EXHAUSTED, INTERNAL = range(5)
-
-STATE_IDLE, STATE_RUNNING, STATE_COMPILING = 1, 2, 3
 
 (T_NULL, T_I64, T_U64, T_F64, T_F32, T_DECIMAL, T_STRING, T_BYTES, T_DATE, T_TIME, T_DATETIME,
  T_TIMESTAMP, T_JSON, T_VECTOR) = range(14)
 TAG_NAMES = ('NULL', 'BIGINT', 'BIGINT UNSIGNED', 'DOUBLE', 'FLOAT', 'DECIMAL', 'VARCHAR', 'VARBINARY',
              'DATE', 'TIME', 'DATETIME', 'TIMESTAMP', 'JSON', 'VECTOR')
 
-SQL_ERROR, SQL_OK, SQL_ROWS = 0, 1, 2
-NO_ROW = 0xFFFFFFFF
+# Limits (§12).
 MAX_WORKER_MESSAGE = 64 << 20
+MAX_VALUES = 65535
 MAX_VECTOR_DIMENSIONS = 16383
 MAX_TIME_HOUR = 838
+MAX_ERROR_MESSAGE = 16 << 10
+MAX_FRAME_TEXT = 1 << 10
+MAX_FRAMES = 1000
+MAX_FINDING = 4 << 10
+MAX_FINDINGS = 1000
+MAX_SQL_ERRNO = 65535
+# TIMESTAMP (§7.2): microseconds since 1970-01-01 00:00:00 UTC, or MySQL's zero timestamp.
+MAX_TIMESTAMP = 253402300799999999
+ZERO_TIMESTAMP = -2 ** 63
+
+# Error.language (§7.4): the worker's language, and the markers.
+LANGUAGE = 'python'
 LANGUAGE_TYPE = 'MLE-Type'
 LANGUAGE_TIME_ZONE = 'MLE-TimeZone'
+LANGUAGE_OPTION = 'MLE-Option'
 
 _U32 = _struct.Struct('<I').unpack_from
 _U64 = _struct.Struct('<Q').unpack_from
-_TEMPORAL = _struct.Struct('<HBBIBBIB')
+_CIVIL = _struct.Struct('<HBBIBBIB')
 
 P_U8 = _struct.Struct('<B').pack
 P_U32 = _struct.Struct('<I').pack
@@ -59,6 +73,26 @@ _P_TAG_I64 = _struct.Struct('<Bq').pack
 _P_TAG_U64 = _struct.Struct('<BQ').pack
 _P_TAG_F64 = _struct.Struct('<Bd').pack
 _P_TAG_F32 = _struct.Struct('<Bf').pack
+
+_SURROGATE = _re.compile('[\ud800-\udfff]')
+
+
+def utf8(s):
+    """Guest text as well-formed UTF-8 (§7.1): each unpaired surrogate becomes U+FFFD."""
+    try:
+        return s.encode('utf-8')
+    except UnicodeEncodeError:
+        return _SURROGATE.sub('\ufffd', s).encode('utf-8')
+
+
+def cut(b, limit):
+    """UTF-8 bytes cut to at most limit bytes at a character boundary."""
+    if len(b) <= limit:
+        return b
+    while limit > 0 and (b[limit] & 0xC0) == 0x80:
+        limit -= 1
+    return b[:limit]
+
 
 class _LazyNumpy:
     """numpy on first use (as the JVM kind: a worker that never needs it does not pay for it);
@@ -81,9 +115,44 @@ class _LazyNumpy:
 _numpy = _LazyNumpy()
 
 
-# The session's time zone (OPTIONS; sql.Api.zone sets it): aware datetimes bound as SQL parameters
-# are converted to it.
-PARAM_ZONE = _dt.timezone.utc
+# The time zone of OPTIONS (sql.Api.zone sets it): a TIMESTAMP, which is an instant on the wire, is
+# a naive datetime of the local time in this zone for routines, as a DATETIME is; and an aware
+# datetime that goes where there is no zone (DATETIME) is converted to it.
+ZONE = _dt.timezone.utc
+_EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+_MICROSECOND = _dt.timedelta(microseconds=1)
+
+
+def timestamp(us, rows):
+    """A TIMESTAMP of the host (helper of the C++ codec): the local time in the zone of OPTIONS.
+    The zero timestamp, and what Python's datetime cannot hold, is None in a row and a conversion
+    error as a routine argument (as zero dates are)."""
+    try:
+        if us != ZERO_TIMESTAMP:
+            return (_EPOCH + _dt.timedelta(microseconds=us)).astimezone(ZONE).replace(tzinfo=None)
+    except OverflowError:
+        pass
+    if rows:
+        return None
+    raise ConversionError('the TIMESTAMP value has no Python equivalent (zero timestamp?)')
+
+
+def instant(v):
+    """A datetime as a TIMESTAMP of the wire, or None if it is outside the wire's range: an aware
+    one is an instant; a naive one is local time in the zone of OPTIONS (a repeated hour: its
+    first occurrence)."""
+    if v.tzinfo is None or v.utcoffset() is None:
+        v = v.replace(tzinfo=ZONE)
+    us = (v - _EPOCH) // _MICROSECOND
+    return us if 0 <= us <= MAX_TIMESTAMP else None
+
+
+def local(v):
+    """A datetime as it goes where there is no zone: an aware one as local time in the zone of
+    OPTIONS."""
+    if v.tzinfo is not None and v.utcoffset() is not None:
+        return v.astimezone(ZONE).replace(tzinfo=None)
+    return v
 
 
 class ConversionError(Exception):
@@ -102,51 +171,51 @@ class ParamType:
 
 
 class Reader:
-    __slots__ = ('b', 'p')
+    """Reads a message of the host with the checks of §1: lengths against the bytes it has, and the
+    tags and modes it reads. A message that breaks them is a protocol failure: the process ends."""
+    __slots__ = ('b', 'p', 'n')
 
     def __init__(self, body, pos=0):
         self.b = body
         self.p = pos
+        self.n = len(body)
+
+    def _take(self, n):
+        p = self.p
+        if n > self.n - p:
+            _mlewire.protocol_failure('message too short')
+        self.p = p + n
+        return p
 
     def u8(self):
-        p = self.p
-        self.p = p + 1
-        return self.b[p]
+        return self.b[self._take(1)]
 
     def u32(self):
-        v, = _U32(self.b, self.p)
-        self.p += 4
-        return v
+        return _U32(self.b, self._take(4))[0]
 
     def u64(self):
-        v, = _U64(self.b, self.p)
-        self.p += 8
-        return v
+        return _U64(self.b, self._take(8))[0]
+
+    def count(self, min_size):
+        """The count of a list whose elements have at least min_size bytes each."""
+        n = self.u32()
+        if n > (self.n - self.p) // min_size:
+            _mlewire.protocol_failure('a list longer than the message')
+        return n
 
     def str(self):
-        n, = _U32(self.b, self.p)
-        p = self.p + 4
-        self.p = p + n
-        return str(self.b[p:p + n], 'utf-8')
+        n = self.u32()
+        p = self._take(n)
+        return str(self.b[p:p + n], 'utf-8', 'replace')
 
-    def raw(self):
-        n, = _U32(self.b, self.p)
-        p = self.p + 4
-        self.p = p + n
-        return bytes(self.b[p:p + n])
-
-    def param_type(self):
-        b, p = self.b, self.p
+    def type(self):
+        p = self._take(14)
+        b = self.b
         tag, uns = b[p], b[p + 1]
+        if tag > T_VECTOR:
+            _mlewire.protocol_failure('an unknown tag in a Type')
         length, precision, scale = _struct.unpack_from('<III', b, p + 2)
-        self.p = p + 14
         return ParamType(tag, uns != 0, length, precision, scale, self.str())
-
-    def finish(self):
-        if self.p != len(self.b):
-            raise RuntimeError('trailing bytes in a message')
-
-    # values -----------------------------------------------------------------------------------
 
 
 def new_vector(b, p, dims):
@@ -173,7 +242,8 @@ class Writer:
         self.b += P_U64(v)
 
     def str(self, s):
-        e = s.encode('utf-8', 'replace')
+        """Text of guest code: repaired if it is not well-formed (§7.1)."""
+        e = utf8(s)
         self.b += P_U32(len(e))
         self.b += e
 
@@ -212,8 +282,13 @@ class Writer:
             self.str(text)
         elif isinstance(v, _dt.datetime):
             if v.tzinfo is not None and v.utcoffset() is not None:
-                # An aware datetime keeps its instant: in the session's time zone (PySql.param).
-                v = v.astimezone(PARAM_ZONE).replace(tzinfo=None)
+                # An aware datetime is an instant: a TIMESTAMP (§7.2). Outside the wire's range of
+                # instants it is the local time in the session's zone.
+                us = instant(v)
+                if us is not None:
+                    b += _P_TAG_I64(T_TIMESTAMP, us)
+                    return
+                v = local(v)
             self.temporal(T_DATETIME, v.year, v.month, v.day, v.hour, v.minute, v.second, v.microsecond, 0)
         elif isinstance(v, _dt.date):
             self.temporal(T_DATE, v.year, v.month, v.day, 0, 0, 0, 0, 0)
@@ -251,7 +326,7 @@ class Writer:
         if not 0 <= year <= 9999:
             raise ConversionError('the year %d is out of range (0 to 9999)' % year)
         self.b.append(tag)
-        self.b += _TEMPORAL.pack(year, month, day, hour, minute, second, micro, neg)
+        self.b += _CIVIL.pack(year, month, day, hour, minute, second, micro, neg)
 
     def time(self, d):
         neg = d < _dt.timedelta(0)
@@ -276,8 +351,8 @@ class Writer:
             a = v if isinstance(v, _array.array) and v.typecode == 'f' else _array.array('f', v)
             dims = len(a)
             data = memoryview(a).cast('B')
-        if dims > MAX_VECTOR_DIMENSIONS:
-            raise ConversionError('VECTOR too large: %d' % dims)
+        if not 1 <= dims <= MAX_VECTOR_DIMENSIONS:
+            raise ConversionError('a VECTOR has 1 to %d elements, not %d' % (MAX_VECTOR_DIMENSIONS, dims))
         b = self.b
         b.append(T_VECTOR)
         b += P_U32(dims)
@@ -314,6 +389,9 @@ class Writer:
                 b += _P_TAG_F32(T_F32, f)
             except OverflowError:
                 raise _range(v, t) from None
+            if _math.isinf(_struct.unpack_from('<f', b, len(b) - 4)[0]):
+                del b[-5:]
+                raise _range(v, t)
         elif tag == T_STRING:
             if isinstance(v, (bytes, bytearray, memoryview, _array.array)) or type(v).__module__ == 'numpy' \
                     and getattr(v, 'ndim', 0) > 0:
@@ -337,13 +415,23 @@ class Writer:
             if isinstance(v, _dt.datetime) or not isinstance(v, _dt.date):
                 raise _cannot(v, t)
             self.temporal(T_DATE, v.year, v.month, v.day, 0, 0, 0, 0, 0)
-        elif tag == T_DATETIME or tag == T_TIMESTAMP:
+        elif tag == T_DATETIME:
             if isinstance(v, _dt.datetime):
+                v = local(v)
                 self.temporal(tag, v.year, v.month, v.day, v.hour, v.minute, v.second, v.microsecond, 0)
             elif isinstance(v, _dt.date):
                 self.temporal(tag, v.year, v.month, v.day, 0, 0, 0, 0, 0)
             else:
                 raise _cannot(v, t)
+        elif tag == T_TIMESTAMP:
+            if not isinstance(v, _dt.datetime):
+                if not isinstance(v, _dt.date):
+                    raise _cannot(v, t)
+                v = _dt.datetime(v.year, v.month, v.day)
+            us = instant(v)
+            if us is None:
+                raise _range(v, t)
+            b += _P_TAG_I64(T_TIMESTAMP, us)
         elif tag == T_TIME:
             if isinstance(v, _dt.timedelta):
                 self.time(v)
@@ -364,8 +452,8 @@ _DECIMAL_CONTEXT = _decimal.Context(prec=_DECIMAL_MAX_DIGITS + _DECIMAL_MAX_SCAL
 
 
 def param_decimal_text(d, target='SQL'):
-    """A finite Decimal as DECIMAL text mysqld accepts (Values.decimalText): digits and a point,
-    at most 100 characters (the host ends a worker that sends more, independent review C13).
+    """A finite Decimal as DECIMAL text mysqld accepts: digits and a point, within the 100 bytes
+    of the wire (§7.2).
     Digits after the 30th decimal place are rounded as MySQL rounds them; more than 65 digits
     before the point is an error. Nothing is expanded before it is checked (1e2000000000)."""
     _, digits, exponent = d.as_tuple()
@@ -419,13 +507,21 @@ def _integral(v, t):
 
 
 def _number(v, t):
+    """v as a float of the declared type; NaN and the infinities are not SQL values (§7.2)."""
     if type(v) is float:
-        return v
-    if isinstance(v, (int, float, _decimal.Decimal)):
-        return float(v)
-    if type(v).__module__ == 'numpy' and getattr(v, 'ndim', 1) == 0:
-        return float(v)
-    raise _cannot(v, t)
+        f = v
+    elif isinstance(v, (int, float, _decimal.Decimal)):
+        try:
+            f = float(v)
+        except OverflowError:
+            raise _range(v, t) from None
+    elif type(v).__module__ == 'numpy' and getattr(v, 'ndim', 1) == 0:
+        f = float(v)
+    else:
+        raise _cannot(v, t)
+    if not _math.isfinite(f):
+        raise _cannot(v, t)
+    return f
 
 
 def _decimal_text(v, t):
@@ -449,7 +545,7 @@ def _decimal_text(v, t):
     return param_decimal_text(d, t.sql_name())
 
 
-# ------------------------------------------------------------------ helpers of the C++ codec (S-21b)
+# ------------------------------------------------------------------ helpers of the C++ codec
 
 def temporal(tag, year, month, day, hour, minute, second, micro, neg):
     """A temporal value Python's types cannot hold: raise the conversion error (zero dates)."""

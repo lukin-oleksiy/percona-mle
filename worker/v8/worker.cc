@@ -225,7 +225,7 @@ void setup_icu(const std::vector<std::string> &dirs) {
 
 Worker::Worker(const Config &config) : m_config(config) {
   s_current = this;
-  Mailbox::stats(uint32_t(w::WorkerState::kStarting), false);
+  Mailbox::stats(uint32_t(w::WorkerState::kStarting));
   setup_icu(m_config.icu_data);
   // Few background threads: a worker serves one session (compilation and GC helpers).
   m_platform = v8::platform::NewDefaultPlatform(2);
@@ -336,14 +336,15 @@ std::byte *Worker::allocate(std::vector<std::byte> &buffer, size_t total) {
 }
 
 void Worker::stats(uint32_t state) {
+  if (m_tainted) Mailbox::taint();
   // The heap's figures now and then (they cost a walk over the spaces): at idle, and every 64th call.
   if (state == uint32_t(w::WorkerState::kIdle) && (m_calls++ % 64) == 0) {
     v8::HeapStatistics hs;
     m_isolate->GetHeapStatistics(&hs);
-    Mailbox::stats(state, m_tainted, std::min<uint64_t>(hs.used_heap_size(), m_config.heap_max), m_config.heap_max);
+    Mailbox::stats(state, std::min<uint64_t>(hs.used_heap_size(), m_config.heap_max), m_config.heap_max);
     return;
   }
-  Mailbox::stats(state, m_tainted);
+  Mailbox::stats(state);
 }
 
 // ------------------------------------------------------------ requests
@@ -1049,7 +1050,7 @@ void Worker::post_result(const Request &q, Reply &reply) {
     fits = fits && wr.put(e.sql_errno) && wr.str(e.sql_state) && wr.put(e.sql_error_id);
   }
   if (!fits) protocol_failure("worker error: a RESULT over the size limit");
-  // tainted is set before the RESULT (§11.5).
+  // TAINTED goes into the RESULT's header (§5.1, §11.5): stats() tells the mailbox.
   stats(q.depth == 0 ? uint32_t(w::WorkerState::kIdle) : uint32_t(w::WorkerState::kRunning));
   Mailbox::send(uint32_t(w::Op::kResult), uint32_t(reply.status), q.depth, m_seq, wr.written());
   if (console) {

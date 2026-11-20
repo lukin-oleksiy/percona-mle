@@ -18,11 +18,12 @@
 /**
   @file worker/cpython/codec.hpp
 
-  The CPython worker's value codec (exp design note 62).
+  The CPython worker's value codec (docs/protocol.md §7).
 
-  Ref owns a PyObject reference; Reader and Writer read and write message bodies (protocol.h) with
-  bounds checks. Errors are C++ exceptions inside the module and become Python exceptions at the
-  boundary (boundary<F>): PyErrorSet means a Python exception is already set.
+  Ref owns a PyObject reference; Reader and Writer read and write message bodies with bounds
+  checks. A message of the host that breaks the protocol ends the process (common::
+  protocol_failure, §1). Python errors are the C++ exception PyErrorSet inside the module (a
+  Python exception is set) and become Python exceptions at the boundary (boundary<F>).
 */
 
 #ifndef MLE_CPYTHON_CODEC_HPP
@@ -49,7 +50,7 @@ namespace mle::cpython {
 /** A Python exception is set; return nullptr to Python. */
 struct PyErrorSet {};
 
-using common::Malformed;
+using common::protocol_failure;
 using common::Reader;
 using common::Writer;
 
@@ -109,6 +110,7 @@ struct Helpers {
   Ref decimal;       // decimal.Decimal(str)
   Ref json_loads;    // json.loads(str)
   Ref temporal;      // temporal(tag, y, mo, d, h, mi, s, us, neg): errors (zero dates) as ConversionError
+  Ref timestamp;     // timestamp(microseconds, rows): a TIMESTAMP as a datetime in the session's zone
   Ref new_vector;    // new_vector(body, pos, dims): a numpy array (copy)
   Ref demote;        // demote(collector): a typed column collector becomes a list
   Ref row_temporal;  // as temporal, for rows of SQL results: None for a zero date (PySql.temporal)
@@ -150,9 +152,6 @@ PyObject *boundary(PyObject *, PyObject *args) {
   try {
     return F(args).release();
   } catch (const PyErrorSet &) {
-    return nullptr;
-  } catch (const Malformed &e) {
-    PyErr_SetString(PyExc_RuntimeError, e.what);
     return nullptr;
   } catch (const std::bad_alloc &) {
     return PyErr_NoMemory();

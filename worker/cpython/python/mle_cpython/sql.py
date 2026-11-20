@@ -13,10 +13,13 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
-"""The SQL API for routines: the JVM kind's Python API (PySql, GuestSql and com.percona.mle.sql's
-Session, SqlResult, PreparedStatement ...) with the same names (snake_case and camelCase), values,
-errors and messages. Rows stay in the reply until they are read (decode_rows / decode_columns in
-C++); the api reads raw chunks before the arena is written over (Api.flush_raw)."""
+"""The SQL API for routines (docs/protocol.md §10): the JVM kind's Python API (PySql, GuestSql and
+com.percona.mle.sql's Session, SqlResult, PreparedStatement ...) with the same names (snake_case
+and camelCase), values, errors and messages. The messages, the statements' states and the checks
+of §10.6 are C++ (_mlewire.sql, module.cc); a statement here is the handle a reply gave: its id
+and the scope of the request that got it. Rows stay in the reply until they are read (decode_rows
+/ decode_columns in C++); the api reads raw batches before the arena is written over
+(Api.flush_raw)."""
 
 import collections as _collections
 import datetime as _dt
@@ -43,7 +46,7 @@ _decode_columns = _mlewire.decode_columns
 
 EXECUTE, PREPARE, EXECUTE_PREPARED, FETCH, NEXT_RESULT, CLOSE, EXECUTE_MANY = range(7)
 TO_CLIENT = 1
-MAX_VALUES = 65535
+MAX_VALUES = wire.MAX_VALUES
 
 
 class SqlError(Exception):
@@ -77,6 +80,17 @@ def _sql_error(code, state, message, row=None):
     e = SqlError(state, message, code)
     if row is not None and row >= 0:
         e.row = row
+    return e
+
+
+def _host_error(t):
+    """The SqlError of an ERROR reply (module.cc, sql_result). It remembers the host's error_id
+    with the top-level request it belongs to and the error as the host sent it: a routine that
+    ends with this exception hands that error back (§10.8)."""
+    _, errno, state, message, row, error_id, seq = t
+    e = _sql_error(errno, state, message, row)
+    if error_id:
+        e.__dict__['$mle$error'] = (seq, error_id, errno, state, message)
     return e
 
 
@@ -324,16 +338,21 @@ def _param_error(values, e):
 
 
 class _Msg:
-    """An SQL message being built (protocol.h kSql): the header (action and statement id, filled in
-    when it is sent; the text; the value count), the values encoded in place (VECTOR data is
-    16-aligned relative to the message start) before anything is sent, so that a value that cannot
-    be bound fails first (as PySql.param), and the trailer when it is sent (Api._send)."""
+    """An SQL message being built (§9.5): room for the action and the statement id, the text, room
+    for the value count, and the values, encoded in place (VECTOR data is 16-aligned relative to
+    the message start) before anything is sent, so that a value that cannot be bound fails first.
+    _mlewire.sql fills in the rest when it sends it."""
     __slots__ = ('w', 'at', 'n')
 
     def __init__(self, text=''):
         w = Writer()
         w.b += bytes(9)  # action, statement id
-        w.str(text)
+        try:
+            e = text.encode('utf-8')
+        except UnicodeEncodeError:
+            # The text is code: it is never repaired (§7.1).
+            raise TypeError('the SQL statement is not well-formed Unicode (an unpaired surrogate)') from None
+        w.raw(e)
         self.at = len(w.b)
         w.b += bytes(4)  # the value count
         self.w = w
@@ -476,6 +495,8 @@ class _Columns:
 
 
 _NO_COLUMNS = _Columns(b'', (), ())
+# The columns of a batch that follows the first one of its result set: the first batch's.
+_FOLLOWING = _Columns(b'', (), ())
 
 
 @_aliases
@@ -486,7 +507,7 @@ class Column:
 
     def __init__(self, r):
         self._name, self._table = r.str(), r.str()
-        self._ptype = r.param_type()
+        self._ptype = r.type()
         self._original_name, self._schema, self._original_table = r.str(), r.str(), r.str()
         self._charset, self._collation = r.str(), r.str()
         self._flags = r.u32()
@@ -570,7 +591,7 @@ Warning_.__name__ = Warning_.__qualname__ = 'Warning'
 
 class Reply:
     __slots__ = ('columns', 'raw', 'nrows', 'total', 'more', 'more_results', 'affected', 'insert_id', 'warnings',
-                 'param_count', 'exec_us')
+                 'param_count', 'exec_us', 'id', 'scope', 'end')
 
 
 def _warning_list(ws):
@@ -579,26 +600,31 @@ def _warning_list(ws):
 
 
 def _reply(t):
-    """A reply tuple of _mlewire.sql (module.cc, parse_sql_result) as a Reply."""
+    """A reply tuple of _mlewire.sql (module.cc, sql_result) as a Reply; an ERROR raises."""
     kind = t[0]
     rep = Reply()
+    rep.end = False
     if kind == 2:
-        _, block, labels, tags, rep.total, body, at, nrows, rep.more, rep.more_results, ws, rep.exec_us = t
-        rep.columns = _Columns(block, labels, tags)
+        _, cols, rep.total, body, at, nrows, rep.more, rep.more_results, ws, rep.exec_us, rep.id, rep.scope = t
+        # The columns come with the first batch of a result set.
+        rep.columns = _Columns(*cols) if cols is not None else _FOLLOWING
         rep.raw = (body, at, nrows) if nrows else None
         rep.nrows = nrows
         rep.warnings = _warning_list(ws)
         rep.affected, rep.insert_id, rep.param_count = 0, 0, 0
         return rep
+    if kind == 0:
+        raise _host_error(t)
+    rep.raw, rep.nrows, rep.columns, rep.total, rep.more = None, 0, None, None, False
     if kind == 1:
-        _, rep.affected, rep.insert_id, ws, rep.more_results, rep.param_count, rep.exec_us = t
+        _, rep.affected, rep.insert_id, ws, rep.more_results, rep.param_count, rep.exec_us, rep.id, rep.scope = t
         rep.warnings = _warning_list(ws)
-        rep.raw, rep.nrows, rep.columns, rep.total, rep.more = None, 0, None, 0, False
         return rep
-    _, errno, state, message, row = t
-    raise _sql_error(errno, state, message, row)
-
-
+    # END: there is no further result.
+    rep.end = True
+    rep.affected, rep.insert_id, rep.warnings, rep.more_results, rep.param_count, rep.exec_us = 0, 0, [], False, 0, 0
+    rep.id = rep.scope = 0
+    return rep
 
 
 _COLUMN_MODE = {wire.T_VECTOR: wire.MODE_VECTOR, wire.T_I64: wire.MODE_INT64, wire.T_U64: wire.MODE_INT64,
@@ -610,21 +636,20 @@ _REPLACED = 'the result was replaced by a new execution of its prepared statemen
 @_aliases
 class SqlResult:
     """The results of a statement (SqlResult.java): one or more result sets or OKs, navigated with
-    next_result(). Rows arrive in chunks; a chunk's rows stay in the reply (raw: body, position,
-    count) until they are needed, then decode_rows makes the rows (or decode_columns the columns).
+    next_result(). Rows arrive in batches (§10.3); a batch's rows stay in the reply (raw: body,
+    position, count) until they are needed, then decode_rows makes the rows (or decode_columns the
+    columns).
 
-    direct: a statement run from text (not a prepared one). When mysqld buffered its whole result
-    (total > 0), the rest is fetched when the routine reads it, or drained into the worker before
-    the routine runs another statement (Api._defer, exp note 44 step 3)."""
-    __slots__ = ('_api', '_id', '_owned', '_direct', '_options', '_number', '_has_data', '_columns', '_row_type',
+    owned: a statement run from text (not a prepared one), which close() closes in the host."""
+    __slots__ = ('_api', '_id', '_scope', '_owned', '_options', '_number', '_has_data', '_columns', '_row_type',
                  '_rows', '_at', '_raw', '_more', '_more_results', '_affected', '_insert_id', '_exec_us',
                  '_warnings', '_replaced', '_total', '__weakref__')
 
-    def __init__(self, api, sid, owned, direct, options, reply):
+    def __init__(self, api, owned, options, reply):
         self._api = api
-        self._id = sid
+        self._id = reply.id
+        self._scope = reply.scope
         self._owned = owned
-        self._direct = direct
         self._options = options
         self._number = options.number
         self._replaced = False
@@ -632,8 +657,6 @@ class SqlResult:
         self._load(reply)
 
     def _load(self, reply):
-        api = self._api
-        api._drained(self)  # a former result set's rows are skipped
         self._has_data = reply.columns is not None
         self._columns = reply.columns if self._has_data else _NO_COLUMNS
         self._row_type = None
@@ -646,9 +669,7 @@ class SqlResult:
         self._insert_id = reply.insert_id
         self._exec_us = reply.exec_us
         self._warnings = reply.warnings
-        self._total = reply.total
-        if self._direct and self._more and self._total > 0:
-            api._defer(self)
+        self._total = reply.total  # None: the host does not know it
 
     def _set_raw(self, reply):
         raw = reply.raw
@@ -660,13 +681,12 @@ class SqlResult:
             self._api._raw_results.discard(self)
 
     def _fetched(self, reply):
-        """A FETCH reply arrived."""
+        """A FETCH reply arrived. Its warnings are the result's complete list so far; an empty list
+        with more rows to come means nothing new (§10.3)."""
         self._more = reply.more
         self._more_results = reply.more_results
-        if reply.warnings:
+        if reply.warnings or not reply.more:
             self._warnings = reply.warnings
-        if not self._more:
-            self._api._drained(self)
 
     def _type(self):
         t = self._row_type
@@ -688,8 +708,8 @@ class SqlResult:
         self._at = 0
 
     def _fetch(self):
-        """The next chunk of the current result set (its rows stay raw)."""
-        reply = self._api._request(FETCH, self._id, None, None)
+        """The next batch of the current result set (its rows stay raw)."""
+        reply = self._api._send(FETCH, self._scope, self._id)
         self._fetched(reply)
         return reply
 
@@ -706,25 +726,8 @@ class SqlResult:
         self._set_raw(reply)
         return True
 
-    def _drain(self):
-        """Another statement is about to run (Api._defer): the unread rows into the worker."""
-        if not self._more or self._replaced:
-            return
-        self._materialize()
-        rows = self._rows[self._at:]
-        self._at = 0
-        while self._more:
-            reply = self._fetch()
-            if reply.raw is not None:
-                body, pos, nrows = reply.raw
-                more, _ = _decode_rows_as(self._number, body, pos, nrows, len(self._columns), self._type())
-                rows += more
-        self._rows = rows
-
     def _replace(self):
         """A new execution of the prepared statement replaced these results."""
-        if self._more:
-            self._api._drained(self)
         self._replaced = True
         self._rows, self._at = [], 0
         self._set_raw_none()
@@ -796,7 +799,13 @@ class SqlResult:
             self._set_raw_none()
             return False
         self._set_raw_none()
-        self._load(self._api._request(NEXT_RESULT, self._id, None, None))
+        reply = self._api._send(NEXT_RESULT, self._scope, self._id)
+        if reply.end:
+            self._has_data = False
+            self._rows, self._at = [], 0
+            self._more = self._more_results = False
+            return False
+        self._load(reply)
         return self._has_data
 
     def get_columns(self):
@@ -826,10 +835,8 @@ class SqlResult:
 
     def close(self):
         """Ends the results; a statement run from text is closed in mysqld."""
-        if self._more:
-            self._api._drained(self)
         if self._owned and (self._more or self._more_results) and not self._replaced:
-            self._api._request(CLOSE, self._id, None, None)
+            self._api._send(CLOSE, self._scope, self._id)
         self._rows, self._at = [], 0
         self._set_raw_none()
         self._more = False
@@ -865,7 +872,7 @@ class SqlResult:
         for i in index.values():
             if collectors[i] is None:
                 collectors[i] = wire.Collector(_COLUMN_MODE.get(self._columns.tags[i], wire.MODE_LIST),
-                                               self._total)
+                                               self._total or 0)
         for row in self._rows[self._at:]:  # rows decoded before (fetch_one ...)
             for i, c in enumerate(collectors):
                 if c is not None:
@@ -918,19 +925,21 @@ def _bind_error(message, row=None):
 class PreparedStatement:
     """A prepared statement (PreparedStatement.java), from session.prepare(). Values given to bind()
     bind the markers in order at the next execute(); the first execution needs all of them, later
-    ones keep the values of markers not bound again."""
-    __slots__ = ('_session', '_api', '_id', '_sql', '_options', '_count', '_pending', '_executed',
+    ones keep the values of markers not bound again. The host keeps no values between executions
+    (§10.2): the statement keeps the last ones here and sends all of them every time."""
+    __slots__ = ('_session', '_api', '_id', '_scope', '_sql', '_options', '_count', '_pending', '_values',
                  '_deallocated', '_last', '_form_checked', '_form', '_chunks')
 
-    def __init__(self, session, sid, sql, options, count):
+    def __init__(self, session, reply, sql, options):
         self._session = session
         self._api = session._api
-        self._id = sid
+        self._id = reply.id
+        self._scope = reply.scope
         self._sql = sql
         self._options = options
-        self._count = count
+        self._count = reply.param_count
         self._pending = []
-        self._executed = False
+        self._values = None  # the values of the last execution
         self._deallocated = False
         self._last = None
         self._form_checked = False
@@ -957,17 +966,20 @@ class PreparedStatement:
     def execute(self):
         """Executes with the values bound since the last execution; None with passResultToClient."""
         self._open()
-        if not self._executed and len(self._pending) < self._count:
-            raise _bind_error('Incorrect arguments to EXECUTE: %d of %d parameter markers bound'
-                              % (len(self._pending), self._count))
+        values = list(self._pending)
+        if len(values) < self._count:
+            if self._values is None:
+                raise _bind_error('Incorrect arguments to EXECUTE: %d of %d parameter markers bound'
+                                  % (len(values), self._count))
+            values += self._values[len(values):]
         self._drop_last()
-        msg = _msg(None, self._pending)
+        msg = _msg(None, values)
         self._pending.clear()
-        reply = self._api._send(EXECUTE_PREPARED, self._id, msg)
-        self._executed = True
+        reply = self._api._send(EXECUTE_PREPARED, self._scope, self._id, msg)
+        self._values = values
         if self._options.to_client:
             return None
-        self._last = SqlResult(self._api, self._id, False, False, self._options, reply)
+        self._last = SqlResult(self._api, False, self._options, reply)
         return self._last
 
     def execute_many(self, *a):
@@ -1000,9 +1012,10 @@ class PreparedStatement:
 
     def _result(self, affected, exec_us, warnings):
         r = Reply()
-        r.columns, r.raw, r.nrows, r.total, r.more, r.more_results = None, None, 0, 0, False, False
+        r.columns, r.raw, r.nrows, r.total, r.more, r.more_results = None, None, 0, None, False, False
         r.affected, r.insert_id, r.warnings, r.param_count, r.exec_us = affected, 0, warnings, 0, exec_us
-        return SqlResult(self._api, self._id, False, False, self._options, r)
+        r.id, r.scope, r.end = self._id, self._scope, False
+        return SqlResult(self._api, False, self._options, r)
 
     def _execute_rewritten(self, rows, f):
         """The rows in chunks of the multi-row form (exp note 52): at most 1,000 rows, 65,535
@@ -1014,9 +1027,9 @@ class PreparedStatement:
         self._pending.clear()
         pc = self._count
         max_rows = min(REWRITE_MAX_ROWS, MAX_VALUES // pc)
-        # The chunks run on statements of their own: this one keeps the values bound before the
-        # batch, which a later partial bind must not inherit (independent review C11).
-        self._executed = False
+        # The chunks run on statements of their own: a later partial bind must not inherit the
+        # values bound before the batch.
+        self._values = None
         budget = self._api.batch_bytes()
         affected = exec_us = 0
         warnings = []
@@ -1089,13 +1102,12 @@ class PreparedStatement:
         self._open()
         self._drop_last()
         self._pending.clear()
-        reply = self._api._send(EXECUTE_PREPARED, self._id, msg)
-        self._executed = True
-        return reply
+        return self._api._send(EXECUTE_PREPARED, self._scope, self._id, msg)
 
     def _execute_rows(self, rows, offset):
-        """execute_many row by row on mysqld's side (EXECUTE_MANY); row indexes in errors count from
-        offset. (affected, execution us, the last message's warnings)."""
+        """execute_many row by row on mysqld's side (EXECUTE_MANY), in as many messages as the
+        limits of a message ask for (§10.6); row indexes in errors count from offset. (affected,
+        execution us, the last message's warnings)."""
         self._open()
         self._drop_last()
         self._pending.clear()
@@ -1123,12 +1135,12 @@ class PreparedStatement:
                     bad = _bind_error('Incorrect arguments to executeMany: row %d has %d values for %d parameter '
                                       'markers' % (offset + i, len(row), pc), offset + i)
                     row = None
-            # A message carries at most MAX_VALUES values (the host's limit, independent review C10).
+            # A message carries at most MAX_VALUES values (§12).
             if in_batch > 0 and (row is None or msg.size() > budget or (in_batch + 1) * pc > MAX_VALUES):
                 del b[mark:]  # the new row goes into the next message (its VECTORs aligned there)
                 msg.n = in_batch * pc
                 try:
-                    reply = api._send(EXECUTE_MANY, self._id, msg, width=pc)
+                    reply = api._send(EXECUTE_MANY, self._scope, self._id, msg, width=pc)
                 except SqlError as e:
                     if e.row is None:
                         raise
@@ -1137,6 +1149,7 @@ class PreparedStatement:
                 exec_us += reply.exec_us
                 warnings = reply.warnings
                 done += in_batch
+                self._values = list(rows[done - offset - 1])  # its last row stays bound
                 in_batch = 0
                 msg = _Msg()
                 if row is not None:
@@ -1144,7 +1157,6 @@ class PreparedStatement:
             if row is not None:
                 in_batch += 1
             i += 1
-        self._executed = self._executed or done > offset  # rows ran on this statement: its last row stays bound
         if bad is not None:
             raise bad
         return affected, exec_us, warnings
@@ -1159,7 +1171,7 @@ class PreparedStatement:
         self._chunks.clear()
         if self._last is not None:
             self._last._replace()
-        self._api._request(CLOSE, self._id, None, None)
+        self._api._send(CLOSE, self._scope, self._id)
 
     def get_parameter_count(self):
         return self._count
@@ -1389,12 +1401,18 @@ class Session:
 
     def __init__(self, api):
         object.__setattr__(self, '_api', api)
-        object.__setattr__(self, '_savepoints', 0)
         object.__setattr__(self, '_innodb_cache', {})
-        # The options of the routine calls in progress, by nesting depth: (call scope, options). A
-        # nested call's set_options must not replace its caller's, and a call must not see those of
-        # an earlier one (independent review C15).
+        # The options of the routine calls in progress, by nesting depth: (the request's scope,
+        # options). A nested call's set_options must not replace its caller's, and a call must not
+        # see those of an earlier one.
         object.__setattr__(self, '_call_options', {})
+        self._reset()
+
+    def _reset(self):
+        """RESET: what the session before left."""
+        object.__setattr__(self, '_savepoints', 0)
+        self._innodb_cache.clear()
+        self._call_options.clear()
 
     # -- user variables as members
 
@@ -1421,23 +1439,20 @@ class Session:
         return r.fetch_one()[0]
 
     def _set_variable(self, name, value):
-        api = self._api
-        msg = _msg('SET @' + quote_name(name) + ' = ?', [value])
-        api._send(EXECUTE, api.new_id(), msg)
+        self._api._send(EXECUTE, 0, 0, _msg('SET @' + quote_name(name) + ' = ?', [value]))
 
     # -- options
 
     def _call(self):
-        d = self._api.d
-        e = self._call_options.get(d.depth)
-        return e[1] if e is not None and e[0] == d.scope else None
+        q = _mlewire.request()
+        e = None if q is None else self._call_options.get(q[0])
+        return e[1] if e is not None and e[0] == q[1] else None
 
     def _effective(self, o):
         """The options of a statement: o over this call's session options over the defaults."""
         base = self._call()
         if base is None:
-            base = Options(decimal_type=_DECIMAL_TYPES[self._api.decimal_type]
-                           if self._api.decimal_type < len(_DECIMAL_TYPES) else None)
+            base = Options(decimal_type=_DECIMAL_TYPES[self._api.decimal_type])
         return base.over(None) if o is None else o.over(base)
 
     def _internal(self):
@@ -1448,9 +1463,9 @@ class Session:
     def set_options(self, *a):
         """Sets defaults for the statements of the rest of this routine call (unset ones are kept)."""
         o = _options(_arg(a, 0))
-        if o is not None:
-            d = self._api.d
-            self._call_options[d.depth] = (d.scope, o.over(self._call()))
+        q = _mlewire.request()
+        if o is not None and q is not None:
+            self._call_options[q[0]] = (q[1], o.over(self._call()))
 
     def get_option(self, *a):
         return self._effective(None).get(_str(a, 0))
@@ -1473,35 +1488,32 @@ class Session:
 
     def _run(self, sql, params, o):
         api = self._api
-        msg = _msg(sql, params)
-        sid = api.new_id()
-        reply = api._send(EXECUTE, sid, msg, TO_CLIENT if o.to_client else 0)
-        return None if o.to_client else SqlResult(api, sid, True, True, o, reply)
+        reply = api._send(EXECUTE, 0, 0, _msg(sql, params), TO_CLIENT if o.to_client else 0)
+        return None if o.to_client else SqlResult(api, True, o, reply)
 
     def _exec(self, sql, params=None):
         """Runs a statement for its effect; its results are dropped."""
         api = self._api
-        sid = api.new_id()
-        reply = api._send(EXECUTE, sid, _msg(sql, params))
+        reply = api._send(EXECUTE, 0, 0, _msg(sql, params))
         if reply.more or reply.more_results:
-            api._request(CLOSE, sid, None, None)
+            api._send(CLOSE, reply.scope, reply.id)
 
     def _column(self, sql, *params):
         """The first column of each row of an internal query (catalog lookups)."""
         api = self._api
-        sid = api.new_id()
-        reply = api._send(EXECUTE, sid, _msg(sql, params))
+        reply = api._send(EXECUTE, 0, 0, _msg(sql, params))
+        scope, sid, ncols = reply.scope, reply.id, len(reply.columns or ())
         values = []
         while True:
             if reply.raw is not None:
                 body, pos, nrows = reply.raw
-                rows, _ = _decode_rows(body, pos, nrows, len(reply.columns), None)
+                rows, _ = _decode_rows(body, pos, nrows, ncols, None)
                 values.extend(r[0] for r in rows)
             if not reply.more:
                 break
-            reply = api._request(FETCH, sid, None, None)
+            reply = api._send(FETCH, scope, sid)
         if reply.more_results:
-            api._request(CLOSE, sid, None, None)
+            api._send(CLOSE, scope, sid)
         return values
 
     def prepare(self, *a):
@@ -1509,10 +1521,8 @@ class Session:
 
     def _prepare(self, sql, options):
         o = self._effective(options)
-        api = self._api
-        sid = api.new_id()
-        reply = api._send(PREPARE, sid, _msg(sql), TO_CLIENT if o.to_client else 0)
-        return PreparedStatement(self, sid, sql, o, reply.param_count)
+        reply = self._api._send(PREPARE, 0, 0, _msg(sql), TO_CLIENT if o.to_client else 0)
+        return PreparedStatement(self, reply, sql, o)
 
     def execute_many(self, *a):
         """Prepares sql, executes it once per row (PreparedStatement.execute_many) and deallocates it
@@ -1551,14 +1561,13 @@ class Session:
         name = ('' if schema is None else quote_name(schema) + '.') + quote_name(table)
         api = self._api
         try:
-            sid = api.new_id()
-            reply = api._send(EXECUTE, sid, _msg('SHOW CREATE TABLE ' + name))
+            reply = api._send(EXECUTE, 0, 0, _msg('SHOW CREATE TABLE ' + name))
             rows = []
             if reply.raw is not None:
                 body, pos, nrows = reply.raw
                 rows, _ = _decode_rows(body, pos, nrows, len(reply.columns), None)
             if reply.more or reply.more_results:
-                api._request(CLOSE, sid, None, None)
+                api._send(CLOSE, reply.scope, reply.id)
             if not rows or str(rows[0][1]).startswith('CREATE TEMPORARY'):
                 return 'the table is a temporary one'
         except SqlError:
@@ -1659,7 +1668,8 @@ _SESSION_METHODS = frozenset(n for n in vars(Session) if not n.startswith('_'))
 # ---------------------------------------------------------------------------- the api
 
 def zone_of(text):
-    """Options.parseZone: an IANA name or an offset (+hh:mm); None if unknown."""
+    """A zone of OPTIONS (§9.8), an IANA name or an offset (+hh:mm), as a tzinfo; None if this
+    worker does not know it."""
     t = (text or '').strip()
     if not t or t.upper() in ('UTC', 'Z'):
         return _dt.timezone.utc
@@ -1677,103 +1687,62 @@ def zone_of(text):
 class Api:
     def __init__(self, dispatcher):
         self.d = dispatcher
-        self.next_id = 0
-        # A statement run from text whose rows are not all read yet (exp note 44 step 3): mysqld
-        # buffers the whole result, so before any other statement runs its rows are drained into
-        # the worker (mysqld holds at most one buffered result, 12 §11). One at a time.
-        self._pending = None
-        self._pending_seq = 0
-        self._pending_depth = 0
-        # Results whose last chunk is still raw in the arena (SqlResult._raw).
+        # Results whose last batch is still raw in the arena (SqlResult._raw).
         self._raw_results = _weakref.WeakSet()
-        self.integer_type = 0
+        # The options in force (OPTIONS): DECIMAL as Decimal (0) or float (1), and the zone.
         self.decimal_type = 0
-        self._zone = ''
         self.session = Session(self)
+
+    def reset(self):
+        """RESET ends the options (§9.8) and the session's state."""
+        self.decimal_type = 0
+        self.zone = _dt.timezone.utc
+        self.session._reset()
 
     @property
     def zone(self):
-        return self._zone
+        return wire.ZONE
 
     @zone.setter
-    def zone(self, text):
-        """The session's time zone: aware datetimes bound as parameters are converted to it."""
-        self._zone = text
-        wire.PARAM_ZONE = zone_of(text) or _dt.timezone.utc
+    def zone(self, tz):
+        """The time zone of OPTIONS, a tzinfo: TIMESTAMP values are local times in it."""
+        wire.ZONE = tz
 
     def globals(self):
         return {'session': self.session, 'mysql': _mysql(), 'SqlError': SqlError}
-
-    def new_id(self):
-        self.next_id += 1
-        return self.next_id
 
     def batch_bytes(self):
         """The bytes of parameters a batch message may carry (one mailbox arena, with room to spare)."""
         return self.d.arena_size // 4 * 3
 
     def routine_schema(self):
-        return getattr(self.d, 'schemas', {}).get(self.d.routine)
+        """The schema of the routine whose CALL is being served, or None."""
+        q = _mlewire.request()
+        routine = None if q is None else self.d.routines.get(q[2])
+        return None if routine is None else routine.schema or None
 
     def flush_raw(self):
-        """Before the worker posts a message (the arena is written over): decode raw chunks that
+        """Before the worker posts a message (the arena is written over): decode raw batches that
         are still referenced (a routine's dropped results are gone from the WeakSet already)."""
         if self._raw_results:
             for r in list(self._raw_results):
                 r._materialize()
 
-    # -- deferred drains (Dispatcher.deferDrain, drained, closeDeferred)
-
-    def _defer(self, r):
-        self._drain_other(r._id)
-        self._pending = r
-        self._pending_seq = self.d.seq
-        self._pending_depth = self.d.depth
-
-    def _drained(self, r):
-        if self._pending is r:
-            self._pending = None
-
-    def _drain_other(self, sid):
-        p = self._pending
-        if p is None or p._id == sid:
-            return
-        self._pending = None
-        if self._pending_seq == self.d.seq:
-            p._drain()  # statements of an earlier call are closed by the host
-
-    def call_ended(self, top):
-        """At the end of a call: the host closes the statements of a top-level call; a nested call's
-        unread result is closed now, so that a loop of nested calls does not pile results up."""
-        p = self._pending
-        if p is None or self._pending_depth < self.d.depth:
-            return
-        self._pending = None
-        if top or self._pending_seq != self.d.seq:
-            return
-        try:
-            self._request(CLOSE, p._id, None, None)
-        except SqlError:
-            pass  # already closed (an error in the statement)
-
-    # -- requests
-
-    def _request(self, action, sid, text, params, flags=0):
-        return self._send(action, sid, _msg(text, params), flags)
-
-    def _send(self, action, sid, msg, flags=0, width=0):
-        """One SQL request (protocol.h kSql, Dispatcher.sqlRequest) of the message msg."""
+    def _send(self, action, scope, sid, msg=None, flags=0, width=0):
+        """One SQL message and its reply (§10; _mlewire.sql): a Reply, or the SqlError of an ERROR.
+        scope and sid: the statement's handle, 0 for EXECUTE and PREPARE, which open one."""
         _mlewire.mark()  # the C++ call loop leaves the end of this call to Python
-        n = msg.n
-        # More values than the host accepts in one message would end the worker (independent review C10).
-        if n > MAX_VALUES:
-            raise _sql_error(1210, 'HY000', 'Incorrect arguments: %d values in one statement (at most %d)'
-                             % (n, MAX_VALUES))
-        self._drain_other(sid)
+        n = 0
+        b = None
+        if msg is not None:
+            n, b = msg.n, msg.w.b
+            # More values than one list may have are an error here, not a message (§10.6).
+            if n > MAX_VALUES:
+                raise _sql_error(1210, 'HY000', 'Incorrect arguments: %d values in one statement (at most %d)'
+                                 % (n, MAX_VALUES))
         self.flush_raw()  # rows still in the arena are read before it is written over
-        d = self.d
-        # Sent, nested requests served, the reply parsed: C++ (_mlewire.sql).
-        t = _sql(msg.w.b, action, sid, msg.at, n, flags, width, d.depth, d.seq, d.handle)
+        # Checked, sent, nested requests served, the reply checked and parsed: C++.
+        t = _sql(action, scope, sid, b, n, flags, width)
         if t is None:
             # MySQL's error for a packet over max_allowed_packet, but not its SQLSTATE 08S01.
             raise _sql_error(1153, 'HY000', 'the SQL statement with its parameters is larger than MLE allows '
