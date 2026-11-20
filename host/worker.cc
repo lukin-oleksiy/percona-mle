@@ -28,37 +28,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
-#include <set>
+#include <optional>
 
 namespace mle {
 
-namespace {
-
-constexpr int kTickMs =
-    10;  // futex timeout: how often KILL and death are checked
-constexpr int kExitReportMs = 1000;
-
-int64_t now_ns() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
-/** MLE_SQL_TRACE in mysqld's environment: one line per top-level CALL on
-    stderr (the error log) with the time of each stage of the routine's SQL
-    (exp note 44, step 0). Off: no clock reads. */
-bool sql_trace_enabled() {
-  static const bool on = [] {
-    const char *v = getenv("MLE_SQL_TRACE");
-    return v != nullptr && *v != '\0' && strcmp(v, "0") != 0;
-  }();
-  return on;
-}
-
-/** The stages of one top-level CALL's SQL, in nanoseconds. */
-struct SqlTrace {
-  bool on = false;
+/** The stages of one top-level CALL's SQL, in nanoseconds: printed as one
+    line on stderr (the error log) when MLE_SQL_TRACE is set in mysqld's
+    environment. */
+struct Worker::SqlTrace {
   int64_t worker = 0;  // waiting for the worker (it decodes, runs guest code)
   int64_t sql = 0;     // the SQL hook: execute, read rows into Values
   int64_t exec = 0;    // of which the server's execution (exec_us)
@@ -75,6 +52,29 @@ struct SqlTrace {
   }
 };
 
+namespace {
+
+/** The host's bounded sleep: how often kills, deadlines and the worker's
+    death are looked for while the worker is silent (§4.3). */
+constexpr int kTickMs = 10;
+constexpr int kExitReportMs = 1000;
+
+using wire::Op;
+
+int64_t now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+bool sql_trace_enabled() {
+  static const bool on = [] {
+    const char *v = getenv("MLE_SQL_TRACE");
+    return v != nullptr && *v != '\0' && strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
 void cpu_relax() {
 #if defined(__x86_64__)
   __builtin_ia32_pause();
@@ -83,6 +83,7 @@ void cpu_relax() {
 #endif
 }
 
+// The words are shared between processes: no FUTEX_PRIVATE_FLAG.
 void futex_wait(std::atomic<uint32_t> *word, uint32_t value, int timeout_ms) {
   timespec ts{timeout_ms / 1000, (timeout_ms % 1000) * 1000000L};
   syscall(SYS_futex, reinterpret_cast<uint32_t *>(word), FUTEX_WAIT, value, &ts,
@@ -95,110 +96,228 @@ void futex_wake(std::atomic<uint32_t> *word) {
 }
 
 const char *op_name(uint32_t op) {
-  switch (static_cast<wire::Op>(op)) {
-    case wire::Op::kReady:
+  switch (static_cast<Op>(op)) {
+    case Op::kReady:
       return "READY";
-    case wire::Op::kPrepare:
+    case Op::kPrepare:
       return "PREPARE";
-    case wire::Op::kCall:
+    case Op::kCall:
       return "CALL";
-    case wire::Op::kResult:
+    case Op::kResult:
       return "RESULT";
-    case wire::Op::kSql:
+    case Op::kSql:
       return "SQL";
-    case wire::Op::kSqlResult:
+    case Op::kSqlResult:
       return "SQL_RESULT";
-    case wire::Op::kFetch:
-      return "FETCH";
-    case wire::Op::kDrop:
+    case Op::kDrop:
       return "DROP";
-    case wire::Op::kReset:
+    case Op::kReset:
       return "RESET";
-    case wire::Op::kContinue:
+    case Op::kContinue:
       return "CONTINUE";
-    case wire::Op::kOptions:
+    case Op::kOptions:
       return "OPTIONS";
-    case wire::Op::kParseLibrary:
+    case Op::kParseLibrary:
       return "PARSE_LIBRARY";
-    case wire::Op::kLibrary:
+    case Op::kLibrary:
       return "LIBRARY";
-    case wire::Op::kLibraryResult:
+    case Op::kLibraryResult:
       return "LIBRARY_RESULT";
   }
-  return "?";
+  return "an unassigned op";
+}
+const char *op_name(Op op) { return op_name(static_cast<uint32_t>(op)); }
+
+constexpr uint32_t bit(Op op) { return 1U << static_cast<uint32_t>(op); }
+
+/** PREPARE, CALL and PARSE_LIBRARY end by RESULT or by interruption; DROP,
+    RESET and OPTIONS have a deadline and one-chunk messages. */
+constexpr bool is_interruptible(Op op) {
+  return op == Op::kPrepare || op == Op::kCall || op == Op::kParseLibrary;
 }
 
-/** Restores the nesting depth and the running call on every return. */
-class DepthGuard {
+/** grace x bytes / 16 MiB, exact, rounded up to the nanosecond. */
+int64_t scaled(int64_t grace_ns, uint64_t bytes) {
+  const auto product = static_cast<unsigned __int128>(grace_ns) * bytes;
+  return static_cast<int64_t>((product + wire::kGraceBytes - 1) /
+                              wire::kGraceBytes);
+}
+
+std::string ms_text(int64_t ns) { return std::to_string(ns / 1000000) + " ms"; }
+
+/** Gives back, at the end of a message's handling, the request bytes that
+    were reserved for it. */
+class Reservation {
  public:
-  DepthGuard(uint32_t *depth, std::atomic<uint64_t> *running)
-      : m_depth(depth), m_running(running), m_top(*depth == 0) {
-    ++*m_depth;
+  Reservation(CallHooks *hooks, const uint64_t *bytes)
+      : m_hooks(hooks), m_bytes(bytes) {}
+  ~Reservation() {
+    if (*m_bytes != 0) m_hooks->sql_bytes_release(*m_bytes);
   }
-  ~DepthGuard() {
-    --*m_depth;
-    if (m_top) m_running->store(0);
-  }
-  bool top() const { return m_top; }
+  Reservation(const Reservation &) = delete;
+  Reservation &operator=(const Reservation &) = delete;
 
  private:
-  uint32_t *m_depth;
-  std::atomic<uint64_t> *m_running;
-  bool m_top;
+  CallHooks *m_hooks;
+  const uint64_t *m_bytes;
 };
 
 }  // namespace
 
-void NoSql::sql(const SqlMsg &, SqlResultMsg *result) {
+const char *outcome_name(Outcome outcome) {
+  switch (outcome) {
+    case Outcome::kOk:
+      return "OK";
+    case Outcome::kGuestError:
+      return "GUEST_ERROR";
+    case Outcome::kInterrupted:
+      return "INTERRUPTED";
+    case Outcome::kExhausted:
+      return "EXHAUSTED";
+    case Outcome::kInternal:
+      return "INTERNAL";
+    case Outcome::kDied:
+      return "died";
+    case Outcome::kKilled:
+      return "killed";
+    case Outcome::kViolation:
+      return "violation";
+    case Outcome::kTimedOut:
+      return "timed out";
+    case Outcome::kIncompatible:
+      return "incompatible";
+    case Outcome::kRefused:
+      return "refused";
+  }
+  return "?";
+}
+
+void CallHooks::sql_refused(SqlRefusal why, wire::SqlAction, uint64_t,
+                            SqlResultMsg *error) {
+  // MySQL's ER_QUERY_INTERRUPTED and ER_UNKNOWN_ERROR.
+  error->sql_errno = why == SqlRefusal::kInterrupted ? 1317 : 1105;
+  error->sqlstate = why == SqlRefusal::kInterrupted ? "70100" : "HY000";
+  switch (why) {
+    case SqlRefusal::kInterrupted:
+      error->message = "Query execution was interrupted";
+      break;
+    case SqlRefusal::kPreparing:
+      error->message = "SQL is not allowed while a routine is being loaded";
+      break;
+    case SqlRefusal::kRequestTooLarge:
+      error->message =
+          "The statement and its parameters are larger than MLE allows";
+      break;
+    case SqlRefusal::kNonFiniteParameter:
+      error->message = "A parameter is not a finite number";
+      break;
+    case SqlRefusal::kReplyTooLarge:
+      error->message = "The result is larger than MLE allows";
+      break;
+  }
+}
+
+void NoSql::sql(const SqlMsg &request, SqlResultMsg *result) {
+  if (request.action == wire::SqlAction::kClose) {
+    result->kind = SqlResultKind::kOk;
+    return;
+  }
   result->kind = SqlResultKind::kError;
-  result->sql_errno = 0;
+  result->sql_errno = 1105;
   result->sqlstate = "HY000";
   result->message = "SQL is not allowed here";
+  result->failed_row =
+      request.action == wire::SqlAction::kExecuteMany ? 0 : wire::kNoRow;
 }
 
 Worker::Worker(std::unique_ptr<WorkerProcess> process,
                const WorkerOptions &options)
     : m_process(std::move(process)), m_options(options) {}
 
-Worker::~Worker() = default;  // the WorkerProcess kills the worker
+Worker::~Worker() = default;  // the WorkerProcess ends the worker
 
 // ---------------------------------------------------------------- failures
 
-Status Worker::fail(Status status, const std::string &why, std::string *error) {
+Outcome Worker::fail(Outcome outcome, const std::string &why,
+                     std::string *error) {
   m_process->kill();
   m_usable = false;
   m_failure = why;
   if (error != nullptr) *error = why;
-  return status;
+  return outcome;
 }
 
-Status Worker::died(std::string *error) {
+Outcome Worker::died(std::string *error) {
   if (m_usable) {
     m_usable = false;
     m_failure = "the MLE worker died: " +
                 m_process->exit_info(kExitReportMs).describe();
   }
   if (error != nullptr) *error = m_failure;
-  return Status::kDied;
+  return Outcome::kDied;
+}
+
+Outcome Worker::lost(Wait w, Op op, const std::string &why,
+                     std::string *error) {
+  switch (w) {
+    case Wait::kDied:
+      // Some runtimes exit when they are interrupted: a worker that ends
+      // after an interrupt was requested was ended by it (§11.4).
+      if (m_usable && m_recorded.load()) {
+        died(nullptr);
+        return fail(Outcome::kKilled,
+                    "the MLE worker ended after the interrupt (" +
+                        m_process->exit_info(kExitReportMs).describe() + ")",
+                    error);
+      }
+      return died(error);
+    case Wait::kKilled:
+      return fail(Outcome::kKilled, why, error);
+    case Wait::kTimeout:
+      return fail(Outcome::kTimedOut,
+                  std::string("the MLE worker did not answer ") + op_name(op) +
+                      " within " + std::to_string(m_options.control_timeout_ms) +
+                      " ms and was terminated",
+                  error);
+    case Wait::kProtocol:
+    case Wait::kMessage:
+      break;
+  }
+  return fail(Outcome::kViolation, "the MLE worker broke the protocol: " + why,
+              error);
 }
 
 WorkerStats Worker::stats() const {
-  // One copy: the worker may change shared memory between two reads.
+  // One copy: the worker may change the region between two reads.
   wire::WorkerStats s;
   memcpy(&s, &m_process->header()->stats, sizeof s);
   WorkerStats r;
   r.heap_max = s.heap_max;
   r.heap_used = std::min(s.heap_used, s.heap_max);
-  // At most one per 10 ms of a call: a larger count is not the watcher's.
   r.memory_gcs = s.gc_count <= (uint64_t{1} << 32) ? s.gc_count : 0;
   r.state = s.state <= uint32_t(wire::WorkerState::kCompiling) ? s.state : 0;
   r.tainted = s.tainted != 0;
   return r;
 }
 
+const HeldError *Worker::held_error(uint64_t error_id) const {
+  if (error_id == 0) return nullptr;
+  const HeldError &e = m_held[error_id % m_held.size()];
+  return e.error_id == error_id ? &e : nullptr;
+}
+
+void Worker::hold_error(SqlResultMsg *error) {
+  error->error_id = ++m_error_ids;
+  HeldError &e = m_held[error->error_id % m_held.size()];
+  e.error_id = error->error_id;
+  e.sql_errno = error->sql_errno;
+  e.sqlstate = error->sqlstate;
+  e.message = error->message;
+}
+
 // ---------------------------------------------------------------- mailbox
 
-void Worker::post(wire::Op op, uint32_t flags, const char *data, size_t len,
+void Worker::post(Op op, uint32_t flags, const char *data, size_t len,
                   uint64_t total) {
   wire::RegionHeader *h = m_process->header();
   // A DirectReply is already in the arena.
@@ -213,422 +332,871 @@ void Worker::post(wire::Op op, uint32_t flags, const char *data, size_t len,
   m.total_len = total;
   m.call_seq = m_seq;
   memcpy(&h->msg, &m, sizeof m);
-  h->to_w.fetch_add(1, std::memory_order_seq_cst);  // publishes the above
+  // The post is a store of the private count: the word is the worker's to
+  // write too, and is never read back (§4.1).
+  h->to_w.store(++m_posted, std::memory_order_seq_cst);
   if (h->w_sleep.load(std::memory_order_seq_cst) != 0) futex_wake(&h->to_w);
+  if (m_noticed) m_turn_start = now_ns();
 }
 
-Worker::Wait Worker::wait_change(CallHooks *hooks, int timeout_ms,
-                                 std::string *error) {
-  wire::RegionHeader *h = m_process->header();
-  // A quick reply needs no clock (exp note 37: the clock was ~3 % of mysqld's
-  // time in a stream of short calls).
-  for (int i = 0; i < 64; i++) {
-    const uint32_t v = h->to_h.load(std::memory_order_acquire);
-    if (v != m_seen_h) {
-      m_seen_h = v;
-      return Wait::kMessage;
-    }
-    cpu_relax();
-  }
-  const int64_t start = now_ns();
-  const int64_t spin_until = start + int64_t{m_options.spin_us} * 1000;
-  const int64_t deadline = timeout_ms < 0
-                               ? std::numeric_limits<int64_t>::max()
-                               : start + int64_t{timeout_ms} * 1000000;
-  for (uint32_t i = 0;; i++) {
-    const uint32_t v = h->to_h.load(std::memory_order_acquire);
-    if (v != m_seen_h) {
-      m_seen_h = v;
-      return Wait::kMessage;
-    }
-    if ((i & 63) == 0 && now_ns() >= spin_until) break;
-    cpu_relax();
-  }
-  while (true) {
-    h->h_sleep.store(1, std::memory_order_seq_cst);
-    if (h->to_h.load(std::memory_order_seq_cst) == m_seen_h)
-      futex_wait(&h->to_h, m_seen_h, kTickMs);
-    h->h_sleep.store(0, std::memory_order_seq_cst);
-    const uint32_t v = h->to_h.load(std::memory_order_acquire);
-    if (v != m_seen_h) {
-      m_seen_h = v;
-      return Wait::kMessage;
-    }
-    // A tick: is the worker alive, was the session killed, time is up?
-    if (!m_process->alive()) return Wait::kDied;
-    if (check_kill(hooks) == Wait::kKilled) return Wait::kKilled;
-    // Nothing runs yet (waiting for READY): a KILL ends the wait at once.
-    if (hooks != nullptr && m_running.load() == 0 && hooks->killed())
-      return Wait::kKilled;
-    if (now_ns() > deadline) {
-      if (error != nullptr) *error = "timed out waiting for the MLE worker";
-      return Wait::kTimeout;
-    }
-  }
+void Worker::clock_start(int64_t now) {
+  if (!m_noticed || m_clock_running) return;
+  m_clock_running = true;
+  m_clock_mark = now;
 }
 
-Worker::Wait Worker::check_kill(CallHooks *hooks) {
-  if (hooks == nullptr || m_running.load() == 0 || !hooks->killed())
+void Worker::clock_stop(int64_t now) {
+  if (!m_noticed || !m_clock_running) return;
+  m_clock_running = false;
+  m_clock_used += now - m_clock_mark;
+}
+
+Worker::Wait Worker::end_turn(Transfer *transfer, uint64_t turn_len,
+                              std::string *error) {
+  if (!m_noticed || transfer == nullptr || !transfer->excepted)
     return Wait::kMessage;
-  const int64_t now_ms = now_ns() / 1000000;
-  if (m_interrupted_at_ms == 0) {
-    interrupt();
-    m_interrupted_at_ms = now_ms;
-  } else if (now_ms - m_interrupted_at_ms > m_options.interrupt_grace_ms) {
-    m_process->kill();
+  const int64_t now = now_ns();
+  const Wait w = check_turn(*transfer, turn_len, now, error);
+  transfer->used_ns += now - m_turn_start;
+  return w;
+}
+
+Worker::Wait Worker::check_turn(const Transfer &transfer, uint64_t turn_len,
+                                int64_t now, std::string *error) const {
+  const int64_t grace = int64_t{m_options.interrupt_grace_ms} * 1000000;
+  const int64_t turn = now - m_turn_start;
+  const int64_t turn_limit = grace + scaled(grace, turn_len);
+  const int64_t transfer_limit = grace + scaled(grace, transfer.total_len);
+  if (turn_len != 0 && turn > turn_limit) {
+    *error = "the MLE worker took more than " + ms_text(turn_limit) +
+             " for one chunk of a message after the interrupt and was "
+             "terminated";
+    return Wait::kKilled;
+  }
+  if (transfer.used_ns + turn > transfer_limit) {
+    *error = "the MLE worker took more than " + ms_text(transfer_limit) +
+             " for the chunks of a message after the interrupt and was "
+             "terminated";
     return Wait::kKilled;
   }
   return Wait::kMessage;
 }
 
-Worker::Wait Worker::receive(Message *m, CallHooks *hooks, int timeout_ms,
-                             std::string *error) {
-  Assembler a(m_process->arena_size(), m_options.max_message);
+Worker::Wait Worker::tick(Transfer *transfer, bool worker_has_turn,
+                          uint64_t turn_len, std::string *error) {
+  if (m_kill_hooks == nullptr) return Wait::kMessage;
+  const int64_t grace = int64_t{m_options.interrupt_grace_ms} * 1000000;
+  if (!m_noticed) {
+    // The record is made by interrupt(), from any thread; here when the
+    // session finds itself killed.
+    if (!m_recorded.load() && m_kill_hooks->killed()) interrupt();
+    if (!m_recorded.load()) return Wait::kMessage;
+    // The moment of notice.
+    const int64_t now = now_ns();
+    m_noticed = true;
+    m_clock_used = 0;
+    m_clock_limit = grace;
+    m_turn_start = now;
+    if (transfer != nullptr) {
+      // A transfer in progress is excepted: its turns have their own bounds.
+      transfer->excepted = true;
+      m_clock_running = false;
+    } else {
+      m_clock_running = true;
+      m_clock_mark = now;
+      // The worker may still be taking in the host's last message.
+      if (worker_has_turn) m_clock_limit += scaled(grace, m_last_host_total);
+    }
+    return Wait::kMessage;
+  }
+  if (transfer != nullptr && transfer->excepted) {
+    // The host's turns of an excepted transfer are not counted.
+    return worker_has_turn ? check_turn(*transfer, turn_len, now_ns(), error)
+                           : Wait::kMessage;
+  }
+  if (m_clock_running &&
+      m_clock_used + now_ns() - m_clock_mark > m_clock_limit) {
+    *error = "the MLE worker did not stop within " + ms_text(m_clock_limit) +
+             " after the interrupt and was terminated";
+    return Wait::kKilled;
+  }
+  return Wait::kMessage;
+}
+
+Worker::Wait Worker::wait_post(CallHooks *hooks, Transfer *transfer,
+                               uint64_t turn_len, int64_t deadline,
+                               std::string *error) {
+  wire::RegionHeader *h = m_process->header();
+  // A message has arrived when the worker's word differs from the value
+  // seen last; the word is compared only for equality (§4.1).
+  auto arrived = [&] {
+    const uint32_t v = h->to_h.load(std::memory_order_acquire);
+    if (v == m_seen) return false;
+    m_seen = v;
+    return true;
+  };
+  // A quick reply needs no clock.
+  for (int i = 0; i < 64; i++) {
+    if (arrived()) return Wait::kMessage;
+    cpu_relax();
+  }
+  const int64_t spin_until = now_ns() + int64_t{m_options.spin_us} * 1000;
+  for (uint32_t i = 0;; i++) {
+    if (arrived()) return Wait::kMessage;
+    if ((i & 63) == 0 && now_ns() >= spin_until) break;
+    cpu_relax();
+  }
   while (true) {
-    const Wait w = wait_change(hooks, timeout_ms, error);
-    if (w != Wait::kMessage) return w;
-    // Copy out first: the worker may change shared memory at any time.
-    wire::MessageHeader h;
-    memcpy(&h, &m_process->header()->msg, sizeof h);
-    std::string why;
-    if (!check_worker_header(h, m_process->arena_size(), &why)) {
-      *error = "the MLE worker broke the protocol: " + why;
-      return Wait::kProtocol;
+    // The sleep handshake of §4.3.
+    h->h_sleep.store(1, std::memory_order_seq_cst);
+    if (h->to_h.load(std::memory_order_seq_cst) == m_seen)
+      futex_wait(&h->to_h, m_seen, kTickMs);
+    h->h_sleep.store(0, std::memory_order_release);
+    if (arrived()) return Wait::kMessage;
+    if (!m_process->alive()) {
+      // What the worker posted just before it ended is still read (§11.4).
+      if (!arrived()) return Wait::kDied;
+      m_dead = true;
+      return Wait::kMessage;
     }
-    switch (a.add(h, m_process->arena())) {
-      case Assembler::Step::kDone:
-        m->h = a.header();
-        m->body = a.release_body();
-        return Wait::kMessage;
-      case Assembler::Step::kError:
-        *error = "the MLE worker broke the protocol: " + a.error();
-        return Wait::kProtocol;
-      case Assembler::Step::kNeedMore:
-        // A long message never lets the wait reach a tick: check KILL here.
-        if (check_kill(hooks) == Wait::kKilled) return Wait::kKilled;
-        post(wire::Op::kContinue, 0, nullptr, 0, 0);
-        break;
+    // Nothing runs before READY: a kill ends the wait at once.
+    if (!m_ready && hooks != nullptr && hooks->killed()) {
+      *error = "interrupted";
+      return Wait::kKilled;
     }
+    if (const Wait w = tick(transfer, true, turn_len, error);
+        w != Wait::kMessage)
+      return w;
+    if (deadline != 0 && now_ns() > deadline) return Wait::kTimeout;
   }
 }
 
-Worker::Wait Worker::send(wire::Op op, const std::string &body,
-                          CallHooks *hooks, std::string *error,
-                          int timeout_ms) {
+Worker::Wait Worker::receive(Message *m, CallHooks *hooks, const Expect &expect,
+                             int64_t deadline, std::string *error) {
   const uint32_t arena = m_process->arena_size();
+  Assembler a(arena, wire::kMaxWorkerMessage);
+  Transfer transfer;
+  bool first = true;
+  while (true) {
+    // The turn in which the worker reads the last chunk of a host message
+    // belongs to that message's transfer.
+    Transfer *in = first ? (m_host_transfer_open && m_host_transfer.excepted
+                                ? &m_host_transfer
+                                : nullptr)
+                         : &transfer;
+    const uint64_t turn_len =
+        first ? 0
+              : std::min<uint64_t>(arena, transfer.total_len - a.received());
+    const Wait w = wait_post(hooks, in, turn_len, deadline, error);
+    if (w != Wait::kMessage) return w;
+    // Copied once, before any check: the worker can write the region at
+    // any time.
+    wire::MessageHeader h;
+    memcpy(&h, &m_process->header()->msg, sizeof h);
+    if (const Wait k = end_turn(in, turn_len, error); k != Wait::kMessage)
+      return k;
+    if (first) {
+      if (in != nullptr) clock_start(now_ns());
+      m_host_transfer_open = false;
+    }
+    const bool more = (h.flags & wire::kMore) != 0;
+    const bool result = h.op == static_cast<uint32_t>(Op::kResult);
+    if (m_dead &&
+        !((result || h.op == static_cast<uint32_t>(Op::kReady)) && !more))
+      return Wait::kDied;
+    if (!check_worker_header(h, arena, error)) return Wait::kProtocol;
+    if (first) {
+      // Everything that is checked on a whole message is checked on its
+      // first chunk (§5.2).
+      if ((expect.ops & (1U << h.op)) == 0) {
+        *error = std::string("unexpected ") + op_name(h.op) + " during " +
+                 op_name(expect.request);
+        return Wait::kProtocol;
+      }
+      if (h.depth != expect.depth || h.call_seq != expect.call_seq) {
+        *error = std::string(op_name(h.op)) + " for the wrong request";
+        return Wait::kProtocol;
+      }
+      const bool small = h.op == static_cast<uint32_t>(Op::kReady) ||
+                         h.op == static_cast<uint32_t>(Op::kLibrary) ||
+                         (result && !is_interruptible(expect.request));
+      if (small && h.total_len > wire::kMaxSmallMessage) {
+        *error = std::string(op_name(h.op)) + " larger than its limit";
+        return Wait::kProtocol;
+      }
+    }
+    const Assembler::Step step = a.add(h, m_process->arena());
+    if (step == Assembler::Step::kError) {
+      *error = a.error();
+      return Wait::kProtocol;
+    }
+    if (first && h.op == static_cast<uint32_t>(Op::kSql)) {
+      // The bound on request bytes is applied before the message is held
+      // (§5.3): only its action and statement id are looked at here.
+      if (h.total_len < wire::kSqlHeadSize) {
+        *error = "bad SQL: message truncated";
+        return Wait::kProtocol;
+      }
+      const auto action = static_cast<uint8_t>(a.body()[0]);
+      if (action > wire::kMaxSqlAction) {
+        *error = "bad SQL: bad SQL action";
+        return Wait::kProtocol;
+      }
+      if (action == static_cast<uint8_t>(wire::SqlAction::kClose)) {
+        if (h.total_len != wire::kSqlCloseSize) {
+          *error = "bad SQL: a CLOSE of the wrong length";
+          return Wait::kProtocol;
+        }
+      } else if (hooks->sql_bytes_reserve(h.total_len)) {
+        m->reserved = h.total_len;
+      } else {
+        a.discard_beyond(wire::kSqlHeadSize);
+        m->discarded = true;
+      }
+    }
+    if (first && step == Assembler::Step::kNeedMore) {
+      // Every transfer of a RESULT is excepted from the grace clock.
+      transfer = Transfer{h.total_len, result, 0};
+      if (result) clock_stop(m_noticed ? now_ns() : 0);
+    }
+    // The record is looked for after the post was observed and before the
+    // host acts on it or posts anything (§11.1 step 3).
+    if (const Wait k = tick(step == Assembler::Step::kNeedMore ? &transfer
+                                                                 : nullptr,
+                            false, 0, error);
+        k != Wait::kMessage)
+      return k;
+    if (step == Assembler::Step::kDone) {
+      if (!first && transfer.excepted) clock_start(m_noticed ? now_ns() : 0);
+      m->h = a.header();
+      m->body = a.release_body();
+      return Wait::kMessage;
+    }
+    post(Op::kContinue, 0, nullptr, 0, 0);
+    first = false;
+  }
+}
+
+Worker::Wait Worker::send(Op op, std::string_view body, CallHooks *hooks,
+                          bool begins_top, bool interruptible, int64_t deadline,
+                          std::string *error) {
+  const uint32_t arena = m_process->arena_size();
+  m_host_transfer = Transfer{body.size(), false, 0};
+  m_host_transfer_open = body.size() > arena;
+  m_last_host_total = body.size();
   size_t sent = 0;
   while (true) {
     const size_t len = std::min<size_t>(arena, body.size() - sent);
     const bool more = sent + len < body.size();
-    post(op, more ? uint32_t{wire::kMore} : 0U, body.data() + sent, len,
-         body.size());
+    const uint32_t flags = more ? uint32_t{wire::kMore} : 0U;
+    if (begins_top && sent == 0) {
+      // The call_seq is used up when the first chunk is posted (§8.2), and
+      // an interrupt can be recorded for the request from then on.
+      std::lock_guard<std::mutex> lock(m_interrupt_mutex);
+      ++m_seq;
+      m_running = interruptible ? m_seq : 0;
+      m_recorded.store(false);
+      post(op, flags, body.data(), len, body.size());
+    } else {
+      post(op, flags, body.data() + sent, len, body.size());
+    }
     sent += len;
     if (!more) return Wait::kMessage;
-    const Wait w = wait_change(hooks, timeout_ms, error);
+    const Wait w = wait_post(hooks, &m_host_transfer, len, deadline, error);
     if (w != Wait::kMessage) return w;
     wire::MessageHeader h;
     memcpy(&h, &m_process->header()->msg, sizeof h);
-    if (h.op != uint32_t(wire::Op::kContinue) || h.len != 0 ||
-        h.call_seq != m_seq || h.depth != m_depth - 1) {
-      *error = "the MLE worker broke the protocol: expected CONTINUE";
+    if (m_dead) return Wait::kDied;
+    if (const Wait k = end_turn(&m_host_transfer, len, error);
+        k != Wait::kMessage)
+      return k;
+    if (!check_worker_header(h, arena, error)) return Wait::kProtocol;
+    if (h.op != static_cast<uint32_t>(Op::kContinue) ||
+        h.depth != (m_depth == 0 ? 0 : m_depth - 1) || h.call_seq != m_seq) {
+      *error = std::string("expected CONTINUE for a chunk of ") + op_name(op);
       return Wait::kProtocol;
     }
+    if (const Wait k = tick(&m_host_transfer, false, 0, error);
+        k != Wait::kMessage)
+      return k;
   }
 }
 
-// ---------------------------------------------------------------- requests
+// ---------------------------------------------------------------- READY
 
-Status Worker::wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error,
-                          CallHooks *hooks) {
+Outcome Worker::wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error,
+                           CallHooks *hooks, std::string_view language) {
   if (!m_usable) return died(error);
+  if (m_ready) {
+    *error = "the MLE worker is ready already";
+    return Outcome::kRefused;
+  }
+  auto broke = [&](const std::string &what) {
+    return fail(Outcome::kViolation,
+                "the MLE worker broke the protocol: " + what, error);
+  };
   Message m;
   std::string why;
-  switch (receive(&m, hooks, timeout_ms, &why)) {
+  Expect expect;
+  expect.ops = bit(Op::kReady);
+  switch (receive(&m, hooks, expect,
+                  now_ns() + int64_t{timeout_ms} * 1000000, &why)) {
     case Wait::kMessage:
       break;
     case Wait::kDied:
       return died(error);
     case Wait::kKilled:
-      return fail(Status::kInterrupted, "interrupted", error);
+      return fail(Outcome::kInterrupted, "interrupted", error);
+    case Wait::kTimeout:
+      return fail(Outcome::kTimedOut,
+                  "no READY from the MLE worker within " +
+                      std::to_string(timeout_ms) + " ms",
+                  error);
     case Wait::kProtocol:
-      return fail(Status::kProtocolError, why, error);
-    default:
-      return fail(Status::kDied, "no READY from the MLE worker", error);
+      return broke(why);
   }
-  if (m.h.op != uint32_t(wire::Op::kReady) || m.h.depth != 0 ||
-      m.h.call_seq != 0 || !decode(m.body, ready, &why) ||
-      ready->version != wire::kVersion)
-    return fail(Status::kProtocolError,
-                "the MLE worker broke the protocol: bad READY " + why, error);
-  if (m.h.status != uint32_t(Status::kOk))
-    return fail(Status::kInternal,
-                "the MLE worker failed to start: " + ready->info, error);
+  auto version_text = [](uint32_t v) {
+    return std::to_string(wire::version_major(v)) + "." +
+           std::to_string(wire::version_minor(v));
+  };
+  if (m.h.status != static_cast<uint32_t>(Status::kOk)) {
+    // A failed READY: only version and info are decoded (§9.1).
+    std::string info;
+    if (!decode_ready_head(m.body, &ready->version, &info, &why))
+      return broke("bad READY: " + why);
+    ready->info = info;
+    if (wire::version_major(ready->version) != wire::kVersionMajor)
+      return fail(Outcome::kIncompatible,
+                  "incompatible MLE worker (protocol version " +
+                      version_text(ready->version) + "): " + info,
+                  error);
+    return fail(Outcome::kInternal, "the MLE worker failed to start: " + info,
+                error);
+  }
+  uint32_t version;
+  if (!decode_ready_version(m.body, &version, &why))
+    return broke("bad READY: " + why);
+  if (wire::version_major(version) != wire::kVersionMajor) {
+    ready->version = version;
+    return fail(Outcome::kIncompatible,
+                "incompatible MLE worker: it speaks protocol version " +
+                    version_text(version) + ", the host " +
+                    version_text(wire::kVersion),
+                error);
+  }
+  if (!decode(m.body, ready, &why)) return broke("bad READY: " + why);
+  if (!language.empty() &&
+      std::find(ready->languages.begin(), ready->languages.end(), language) ==
+          ready->languages.end())
+    return fail(Outcome::kIncompatible,
+                "incompatible MLE worker: it does not run the language '" +
+                    std::string(language) + "'",
+                error);
+  if (m_dead) return died(error);
+  m_languages = ready->languages;
+  m_minor = std::min(wire::version_minor(version), wire::kVersionMinor);
   m_ready = true;
-  return Status::kOk;
+  return Outcome::kOk;
 }
 
-Status Worker::request(wire::Op op, const std::string &body, CallHooks &hooks,
-                       const RoutineInfo *routine, ResultMsg *result,
-                       std::string *error, int timeout_ms) {
+// ---------------------------------------------------------------- requests
+
+std::string Worker::check_result(const Request &q, uint32_t status,
+                                 const ResultMsg &r) const {
+  const auto s = static_cast<Status>(status);
+  const bool ok = s == Status::kOk;
+  const bool call = q.op == Op::kCall;
+  if ((q.op == Op::kDrop || q.op == Op::kReset) && !ok &&
+      s != Status::kInternal)
+    return "a status that is not allowed for the request";
+  if (q.op == Op::kOptions && !ok && s != Status::kInternal &&
+      s != Status::kGuestError)
+    return "a status that is not allowed for the request";
+  if (ok == r.error.has_value()) return "RESULT status and error disagree";
+  if (s == Status::kInterrupted && !m_recorded.load())
+    return "INTERRUPTED without an interrupt";
+  const bool expect_return = call && ok && q.routine->has_return;
+  if (r.ret.has_value() != expect_return)
+    return r.ret ? "unexpected return value" : "missing return value";
+  if (call && ok) {
+    // One entry for every OUT and INOUT parameter, ascending.
+    const auto &outs = q.routine->outs;
+    if (!std::equal(r.out_params.begin(), r.out_params.end(), outs.begin(),
+                    outs.end(),
+                    [](const auto &p, uint32_t index) {
+                      return p.first == index;
+                    }))
+      return "bad OUT parameters";
+  } else if (!r.out_params.empty()) {
+    return "unexpected OUT parameters";
+  }
+  if (q.op != Op::kPrepare && !call &&
+      (!r.console_out.empty() || !r.console_err.empty() || r.console_cleared))
+    return "console output where none is allowed";
+  if (!(q.op == Op::kPrepare && q.check) && !r.findings.empty())
+    return "findings where none are allowed";
+  if (r.error) {
+    const std::string &language = r.error->language;
+    const bool own = language.empty() ||
+                     std::find(m_languages.begin(), m_languages.end(),
+                               language) != m_languages.end();
+    bool legal = own;
+    if (s == Status::kGuestError) {
+      if (call) legal = own || language == wire::kLanguageType;
+      if (q.op == Op::kOptions)
+        legal = language == wire::kLanguageTimeZone ||
+                language == wire::kLanguageOption;
+    }
+    if (!legal) return "an Error.language that is not allowed";
+  }
+  return {};
+}
+
+Outcome Worker::request(const Request &q, CallHooks &hooks, ResultMsg *result,
+                        std::string *error) {
+  *result = ResultMsg();
   if (!m_usable) return died(error);
-  if (!m_ready) {
-    *error = "the MLE worker is not ready";
-    return Status::kInternal;
+  auto refuse = [&](std::string why) {
+    *error = std::move(why);
+    return Outcome::kRefused;
+  };
+  if (!m_ready) return refuse("the MLE worker is not ready");
+  const bool top = m_depth == 0;
+  const bool interruptible = is_interruptible(q.op);
+  if (!top) {
+    if (q.op != Op::kPrepare && q.op != Op::kCall && q.op != Op::kDrop)
+      return refuse(std::string(op_name(q.op)) +
+                    " is a top-level request only");
+    // A nested request is sent while the worker waits for an SQL_RESULT,
+    // and at no other time (§8.1).
+    if (m_sql_hooks != m_depth)
+      return refuse("a nested request is not possible here");
+    if (m_depth > wire::kMaxDepth)
+      return refuse("too many nested routine calls (the limit is " +
+                    std::to_string(wire::kMaxDepth + 1) + ")");
   }
-  if (m_depth >= m_options.max_depth) {
-    *error = "too many nested routine calls (the limit is " +
-             std::to_string(m_options.max_depth) + ")";
-    // An error of the call, not of the worker (which outer calls still use).
-    if (result != nullptr) {
-      *result = ResultMsg();
-      result->error = Error{"", *error, {}, 0, ""};
+  if (interruptible && !m_options_in_force)
+    return refuse("the MLE worker has no options in force");
+  if (q.body.size() >
+      (interruptible ? wire::kMaxHostMessage : wire::kMaxSmallMessage))
+    return refuse("the request is larger than MLE allows");
+
+  if (top) {
+    // Ids whose nested DROP or PREPARE was not sent are dropped first.
+    if (!m_unsent_drops.empty() && q.op != Op::kReset) {
+      const std::vector<uint64_t> ids(m_unsent_drops.begin(),
+                                      m_unsent_drops.end());
+      m_unsent_drops.clear();
+      for (const uint64_t id : ids)
+        if (const Outcome o = drop(id, error); o != Outcome::kOk)
+          return m_usable ? o : died(error);
     }
-    return Status::kGuestError;
-  }
-  if (m_depth == 0) {
-    if (hooks.killed()) {
+    // A session that is already killed sends nothing (§11.1).
+    if (interruptible && hooks.killed()) {
       *error = "interrupted";
-      return Status::kInterrupted;
+      return Outcome::kInterrupted;
     }
-    m_seq++;
-    m_interrupted_at_ms = 0;
-    m_running.store(m_seq);
+    m_kill_hooks = interruptible ? &hooks : nullptr;
+    m_noticed = false;
+    m_clock_running = false;
+    m_clock_used = 0;
+    m_error_ids = 0;
+    m_held.fill(HeldError{});
+    m_retire_after_top = false;
+  } else {
+    // From the moment of notice no nested request is sent (§11.1 step 2).
+    std::string why;
+    if (tick(nullptr, false, 0, &why) != Wait::kMessage)
+      return lost(Wait::kKilled, q.op, why, error);
+    if (m_noticed) {
+      clock_stop(now_ns());
+      if (q.op != Op::kCall) {
+        // The id counts as not prepared; a top-level DROP follows later.
+        m_routines.erase(q.routine_id);
+        m_unsent_drops.insert(q.routine_id);
+      }
+      *error = "interrupted";
+      return Outcome::kInterrupted;
+    }
   }
-  DepthGuard guard(&m_depth, &m_running);
-  const uint32_t depth = m_depth - 1;
-  std::string why;
-  SqlTrace trace;
-  trace.on = op == wire::Op::kCall && depth == 0 && sql_trace_enabled();
-  const int64_t trace_start = trace.on ? now_ns() : 0;
 
-  auto broke = [&](const std::string &what) {
-    return fail(Status::kProtocolError,
-                "the MLE worker broke the protocol: " + what, error);
-  };
-  auto lost = [&](Wait w) {
-    // A worker that ends while a KILL is being delivered was ended by the
-    // KILL (e.g. GraalPy exits when an interrupt hits a native extension's
-    // callback, U-5): report it as such.
-    if (w == Wait::kDied && m_interrupted_at_ms != 0) {
-      died(nullptr);
-      return fail(Status::kKilled,
-                  "the MLE worker ended after KILL (" +
-                      m_process->exit_info(kExitReportMs).describe() + ")",
-                  error);
+  // The depth, the running request and the clock, restored on every return.
+  // Waiting for a nested RESULT counts on the grace clock; the rest of
+  // CallHooks::sql does not.
+  struct Frame {
+    Worker *w;
+    bool top;
+    Frame(Worker *worker, bool is_top) : w(worker), top(is_top) {
+      ++w->m_depth;
+      if (!top) w->clock_start(w->m_noticed ? now_ns() : 0);
     }
-    if (w == Wait::kDied) return died(error);
-    if (w == Wait::kKilled)
-      return fail(Status::kKilled,
-                  "the MLE worker did not stop within " +
-                      std::to_string(m_options.interrupt_grace_ms) +
-                      " ms after KILL and was terminated",
-                  error);
-    if (w == Wait::kTimeout)
-      return fail(Status::kDied,
-                  std::string("the MLE worker did not answer ") +
-                      op_name(uint32_t(op)) + " within " +
-                      std::to_string(timeout_ms) + " ms and was terminated",
-                  error);
-    return fail(Status::kProtocolError, why, error);
-  };
+    ~Frame() {
+      --w->m_depth;
+      if (top) {
+        std::lock_guard<std::mutex> lock(w->m_interrupt_mutex);
+        w->m_running = 0;
+        w->m_trace = nullptr;
+        w->m_kill_hooks = nullptr;
+      } else {
+        w->clock_stop(w->m_noticed ? now_ns() : 0);
+      }
+    }
+  } frame(this, top);
 
-  Wait w = send(op, body, &hooks, &why, timeout_ms);
-  if (w != Wait::kMessage) return lost(w);
+  SqlTrace trace;
+  if (top && q.op == Op::kCall && sql_trace_enabled()) m_trace = &trace;
+  const int64_t trace_start = m_trace == &trace ? now_ns() : 0;
+  const int64_t deadline =
+      interruptible
+          ? 0
+          : now_ns() + int64_t{m_options.control_timeout_ms} * 1000000;
+  std::string why;
+  Wait w = send(q.op, q.body, &hooks, top, interruptible, deadline, &why);
+  if (w != Wait::kMessage) return lost(w, q.op, why, error);
+
+  Expect expect;
+  expect.ops = bit(Op::kResult);
+  if (q.op == Op::kPrepare || q.op == Op::kCall)
+    expect.ops |= bit(Op::kSql) | bit(Op::kLibrary);
+  expect.depth = m_depth - 1;
+  expect.call_seq = m_seq;
+  expect.request = q.op;
   while (true) {
     Message m;
-    const int64_t t_wait = trace.on ? now_ns() : 0;
-    w = receive(&m, &hooks, timeout_ms, &why);
-    if (trace.on) trace.worker += now_ns() - t_wait;
-    if (w != Wait::kMessage) return lost(w);
-    if (m.h.depth != depth || m.h.call_seq != m_seq)
-      return broke(std::string(op_name(m.h.op)) + " for the wrong call");
+    Reservation reservation(&hooks, &m.reserved);
+    const int64_t t_wait = m_trace == &trace ? now_ns() : 0;
+    w = receive(&m, &hooks, expect, deadline, &why);
+    if (m_trace == &trace) trace.worker += now_ns() - t_wait;
+    if (w != Wait::kMessage) return lost(w, q.op, why, error);
 
-    if (m.h.op == uint32_t(wire::Op::kResult)) {
-      if (!decode(m.body, result, &why)) return broke("bad RESULT: " + why);
-      const bool ok = m.h.status == uint32_t(Status::kOk);
-      if (ok == result->error.has_value())
-        return broke("RESULT status and error disagree");
-      const bool expect_return = op == wire::Op::kCall && ok &&
-                                 routine != nullptr && routine->has_return;
-      if (result->ret.has_value() != expect_return)
-        return broke(result->ret ? "unexpected return value"
-                                 : "missing return value");
-      std::set<uint32_t> seen;
-      for (const auto &[index, value] : result->out_params)
-        if (op != wire::Op::kCall || routine == nullptr || !ok ||
-            std::find(routine->outs.begin(), routine->outs.end(), index) ==
-                routine->outs.end() ||
-            !seen.insert(index).second)
-          return broke("bad OUT parameter");
-      // A worker that ran out of heap or stack is retired once the
-      // outermost call is over (an outer call may still be using it).
-      if (guard.top() && m_process->header()->stats.tainted != 0)
-        fail(Status::kDied,
-             "the MLE worker was retired after running out of memory or "
-             "stack, or leaving threads running",
-             nullptr);
-      if (trace.on) trace.print(now_ns() - trace_start);
-      return static_cast<Status>(m.h.status);
-    }
-
-    if (m.h.op == uint32_t(wire::Op::kSql) && op == wire::Op::kCall) {
-      SqlMsg sql;
-      if (!decode(m.body, &sql, &why)) return broke("bad SQL: " + why);
-      SqlResultMsg r;
-      // A result's rows may be written straight into the arena (exp note
-      // 44, step 2): the request was decoded above, so it may be
-      // overwritten.
-      DirectReply direct;
-      direct.data = reinterpret_cast<char *>(m_process->arena());
-      direct.capacity = m_process->arena_size();
-      direct.posts = &m_posts;
-      int64_t t = trace.on ? now_ns() : 0;
-      hooks.sql_into(sql, &r, &direct);  // may run nested calls on this worker
-      if (trace.on) {
-        const int64_t t2 = now_ns();
-        trace.sql += t2 - t;
-        trace.exec += int64_t(r.exec_us) * 1000;
-        trace.requests++;
-        if (!r.columns.empty()) trace.rows += r.rows.size() / r.columns.size();
-        trace.rows += direct.rows;  // those written straight into the mailbox
-        t = t2;
+    if (m.h.op == static_cast<uint32_t>(Op::kSql)) {
+      w = serve_sql(q, m, hooks, deadline, &why);
+    } else if (m.h.op == static_cast<uint32_t>(Op::kLibrary)) {
+      w = serve_library(m, hooks, deadline, &why);
+    } else {
+      if (top) {
+        // The request is complete: no interrupt is recorded for it any more.
+        std::lock_guard<std::mutex> lock(m_interrupt_mutex);
+        m_running = 0;
       }
-      if (!m_usable) return died(error);
-      // A routine that keeps the worker busy with SQL never lets the wait
-      // reach a tick: check for KILL after every statement too.
-      if (check_kill(&hooks) == Wait::kKilled) return lost(Wait::kKilled);
-      if (direct.length > 0) {
-        // Nested calls (which use the arena) only run before the rows are
-        // written: during the statement's execution.
-        if (direct.posts_at_start != m_posts || direct.length > direct.capacity)
-          return fail(Status::kInternal,
-                      "a direct SQL result was overwritten in the mailbox",
-                      error);
-        if (trace.on) trace.bytes += direct.length;
-        post(wire::Op::kSqlResult, 0, direct.data, direct.length,
-             direct.length);
-        if (trace.on) trace.send += now_ns() - t;
-        continue;
+      if (!decode(m.body, result, &why))
+        return lost(Wait::kProtocol, q.op, "bad RESULT: " + why, error);
+      if (std::string bad = check_result(q, m.h.status, *result); !bad.empty())
+        return lost(Wait::kProtocol, q.op, bad, error);
+      auto outcome = static_cast<Outcome>(m.h.status);
+      if (outcome == Outcome::kOk && q.op == Op::kCall &&
+          !((!result->ret || is_finite(*result->ret)) &&
+            std::all_of(result->out_params.begin(), result->out_params.end(),
+                        [](const auto &p) { return is_finite(p.second); }))) {
+        // The host is the checker of floats: a value that is not finite
+        // fails the request as a conversion error, and the worker lives on
+        // (§7.2, §9.4).
+        result->ret.reset();
+        result->out_params.clear();
+        result->error = Error{wire::kLanguageType,
+                              "the routine returned a number that is not "
+                              "finite (NaN or an infinity)",
+                              {},
+                              0,
+                              "",
+                              0};
+        outcome = Outcome::kGuestError;
       }
-      std::string reply;
-      encode(r, &reply);
-      if (trace.on) {
-        const int64_t t2 = now_ns();
-        trace.encode += t2 - t;
-        trace.bytes += reply.size();
-        t = t2;
+      if (result->error) *error = result->error->message;
+      if (m_trace == &trace) trace.print(now_ns() - trace_start);
+      // Retirement (§11.5); the request keeps its outcome.
+      if (m_dead) {
+        died(nullptr);
+      } else if (outcome == Outcome::kInternal && !interruptible) {
+        m_retire_after_top = true;
+        m_retire_why = std::string("the MLE worker was retired: it answered "
+                                   "INTERNAL to ") +
+                       op_name(q.op);
       }
-      w = send(wire::Op::kSqlResult, reply, &hooks, &why);
-      if (trace.on) trace.send += now_ns() - t;
-      if (w != Wait::kMessage) return lost(w);
-      continue;
+      if (top && m_usable) {
+        uint32_t tainted;  // read once
+        memcpy(&tainted, &m_process->header()->stats.tainted, sizeof tainted);
+        if (m_retire_after_top)
+          fail(Outcome::kDied, m_retire_why, nullptr);
+        else if (tainted != 0)
+          fail(Outcome::kDied,
+               "the MLE worker was retired: it reported that it must not be "
+               "used again",
+               nullptr);
+      }
+      return outcome;
     }
-    if (m.h.op == uint32_t(wire::Op::kLibrary) &&
-        (op == wire::Op::kCall || op == wire::Op::kPrepare)) {
-      LibraryMsg lib;
-      if (!decode(m.body, &lib, &why)) return broke("bad LIBRARY: " + why);
-      LibraryResultMsg r;
-      hooks.library(lib, &r);
-      if (!m_usable) return died(error);
-      if (check_kill(&hooks) == Wait::kKilled) return lost(Wait::kKilled);
-      std::string reply;
-      encode(r, &reply);
-      w = send(wire::Op::kLibraryResult, reply, &hooks, &why);
-      if (w != Wait::kMessage) return lost(w);
-      continue;
-    }
-    return broke(std::string("unexpected ") + op_name(m.h.op) + " during " +
-                 op_name(uint32_t(op)));
+    // A nested request that failed has ended the worker already.
+    if (!m_usable) return died(error);
+    if (w != Wait::kMessage) return lost(w, q.op, why, error);
   }
 }
 
-Status Worker::parse_library(const ParseLibraryMsg &library, CallHooks &hooks,
-                             ResultMsg *result, std::string *error) {
-  std::string body;
-  encode(library, &body);
-  return request(wire::Op::kParseLibrary, body, hooks, nullptr, result, error);
+Worker::Wait Worker::serve_sql(const Request &q, Message &m, CallHooks &hooks,
+                               int64_t deadline, std::string *error) {
+  using wire::SqlAction;
+  SqlMsg sql;
+  if (m.discarded) {
+    sql.action = static_cast<SqlAction>(m.body[0]);
+    memcpy(&sql.stmt_id, m.body.data() + 1, sizeof sql.stmt_id);
+  } else if (std::string why; !decode(m.body, &sql, &why)) {
+    *error = "bad SQL: " + why;
+    return Wait::kProtocol;
+  }
+  const bool close = sql.action == SqlAction::kClose;
+  const bool many = sql.action == SqlAction::kExecuteMany;
+  SqlResultMsg r;
+  // A result's rows may be written straight into the arena: the request
+  // was copied out, so it may be overwritten.
+  DirectReply direct;
+  direct.data = reinterpret_cast<char *>(m_process->arena());
+  direct.capacity = m_process->arena_size();
+  direct.posts = &m_posts;
+
+  // Rows of an EXECUTE_MANY executed before an ERROR the host makes.
+  uint32_t executed = 0;
+  auto refuse = [&](SqlRefusal why) {
+    r = SqlResultMsg();
+    direct.length = 0;
+    r.kind = SqlResultKind::kError;
+    r.failed_row = many ? executed : wire::kNoRow;
+    hooks.sql_refused(why, sql.action, sql.stmt_id, &r);
+    r.kind = SqlResultKind::kError;
+  };
+
+  // The refusals that come before a statement runs (§10.1): after an
+  // interrupt and while serving PREPARE all SQL, else what cannot be run.
+  std::optional<SqlRefusal> refusal;
+  if (m_noticed)
+    refusal = SqlRefusal::kInterrupted;
+  else if (q.op == Op::kPrepare)
+    refusal = SqlRefusal::kPreparing;
+  else if (m.discarded)
+    refusal = SqlRefusal::kRequestTooLarge;
+  else if (!all_finite(sql.params))
+    refusal = SqlRefusal::kNonFiniteParameter;
+
+  int64_t t = m_trace != nullptr ? now_ns() : 0;
+  if (refusal) {
+    refuse(*refusal);
+  } else {
+    // The statement's time is the server's, not the worker's.
+    clock_stop(m_noticed ? now_ns() : 0);
+    ++m_sql_hooks;
+    hooks.sql_into(sql, &r, &direct);  // may run nested requests
+    --m_sql_hooks;
+    if (!m_usable) return Wait::kDied;
+    clock_start(m_noticed ? now_ns() : 0);
+    if (m_trace != nullptr) {
+      const int64_t t2 = now_ns();
+      m_trace->sql += t2 - t;
+      m_trace->exec += int64_t(r.exec_us) * 1000;
+      m_trace->requests++;
+      if (!r.columns.empty())
+        m_trace->rows += r.rows.size() / r.columns.size();
+      m_trace->rows += direct.rows;
+      t = t2;
+    }
+    if (const Wait k = tick(nullptr, false, 0, error); k != Wait::kMessage)
+      return k;
+    // An interrupt noticed meanwhile makes the reply an ERROR, also when
+    // the statement succeeded (§11.1 step 2).
+    if (m_noticed && !close &&
+        (direct.length > 0 || r.kind != SqlResultKind::kError)) {
+      if (many && sql.row_width != 0)
+        executed = static_cast<uint32_t>(sql.params.size() / sql.row_width);
+      refuse(SqlRefusal::kInterrupted);
+    }
+  }
+  if (close) {
+    // CLOSE is answered OK in every situation.
+    r = SqlResultMsg();
+    r.kind = SqlResultKind::kOk;
+    direct.length = 0;
+  }
+
+  if (direct.length > 0) {
+    // Nested requests (which use the arena) only run before the rows are
+    // written: during the statement's execution.
+    if (direct.posts_at_start != m_posts || direct.length > direct.capacity) {
+      fail(Outcome::kInternal,
+           "a direct SQL result was overwritten in the mailbox", nullptr);
+      return Wait::kDied;
+    }
+    if (m_trace != nullptr) m_trace->bytes += direct.length;
+    m_host_transfer_open = false;
+    m_last_host_total = direct.length;
+    post(Op::kSqlResult, 0, direct.data, direct.length, direct.length);
+    if (m_trace != nullptr) m_trace->send += now_ns() - t;
+    return Wait::kMessage;
+  }
+  std::string reply;
+  if (r.kind == SqlResultKind::kError) hold_error(&r);
+  encode(r, &reply);
+  if (reply.size() > wire::kMaxHostMessage) {
+    // Decided before the first chunk is posted (§5.3).
+    if (many && sql.row_width != 0)
+      executed = static_cast<uint32_t>(sql.params.size() / sql.row_width);
+    refuse(SqlRefusal::kReplyTooLarge);
+    hold_error(&r);
+    encode(r, &reply);
+  }
+  if (m_trace != nullptr) {
+    const int64_t t2 = now_ns();
+    m_trace->encode += t2 - t;
+    m_trace->bytes += reply.size();
+    t = t2;
+  }
+  const Wait w =
+      send(Op::kSqlResult, reply, &hooks, false, false, deadline, error);
+  if (m_trace != nullptr) m_trace->send += now_ns() - t;
+  return w;
 }
 
-Status Worker::prepare(const PrepareMsg &routine, CallHooks &hooks,
-                       ResultMsg *result, std::string *error) {
+Worker::Wait Worker::serve_library(Message &m, CallHooks &hooks,
+                                   int64_t deadline, std::string *error) {
+  LibraryMsg library;
+  if (std::string why; !decode(m.body, &library, &why)) {
+    *error = "bad LIBRARY: " + why;
+    return Wait::kProtocol;
+  }
+  LibraryResultMsg r;
+  auto refuse = [&r](const char *why) {
+    r = LibraryResultMsg();
+    r.message = why;
+  };
+  if (m_noticed) {
+    refuse("the statement was interrupted");
+  } else {
+    clock_stop(0);
+    hooks.library(library, &r);
+    if (!m_usable) return Wait::kDied;
+    if (const Wait k = tick(nullptr, false, 0, error); k != Wait::kMessage)
+      return k;
+    if (m_noticed) refuse("the statement was interrupted");
+  }
+  std::string reply;
+  encode(r, &reply);
+  if (reply.size() > wire::kMaxHostMessage) {
+    refuse("the library is larger than MLE allows");
+    encode(r, &reply);
+  }
+  return send(Op::kLibraryResult, reply, &hooks, false, false, deadline, error);
+}
+
+Outcome Worker::parse_library(const ParseLibraryMsg &library, CallHooks &hooks,
+                              ResultMsg *result, std::string *error) {
+  std::string body;
+  encode(library, &body);
+  return request(Request{Op::kParseLibrary, body}, hooks, result, error);
+}
+
+Outcome Worker::prepare(const PrepareMsg &routine, CallHooks &hooks,
+                        ResultMsg *result, std::string *error) {
+  if (routine.params.size() > wire::kMaxParams ||
+      routine.imports.size() > wire::kMaxImports) {
+    *error = "the routine has more parameters or imports than MLE allows";
+    return Outcome::kRefused;
+  }
   std::string body;
   encode(routine, &body);
-  const Status s =
-      request(wire::Op::kPrepare, body, hooks, nullptr, result, error);
-  if (s == Status::kOk) {
+  Request q{Op::kPrepare, body};
+  q.routine_id = routine.routine_id;
+  q.check = routine.check;
+  const Outcome o = request(q, hooks, result, error);
+  if (o == Outcome::kOk) {
     RoutineInfo info{routine.params.size(), routine.returns.has_value(), {}};
     for (uint32_t i = 0; i < routine.params.size(); i++)
       if (routine.params[i].mode != wire::ParamMode::kIn) info.outs.push_back(i);
     m_routines[routine.routine_id] = std::move(info);
+  } else if (o != Outcome::kRefused) {
+    // A PREPARE that was sent and did not answer OK leaves the id not
+    // prepared, whatever it was before (§8.3).
+    m_routines.erase(routine.routine_id);
   }
-  return s;
+  return o;
 }
 
-Status Worker::call(uint64_t routine_id, uint32_t events,
-                    const std::vector<Value> &args, CallHooks &hooks,
-                    ResultMsg *result, std::string *error) {
+Outcome Worker::call(uint64_t routine_id, uint64_t library_epoch,
+                     const std::vector<Value> &args, CallHooks &hooks,
+                     ResultMsg *result, std::string *error) {
   const auto it = m_routines.find(routine_id);
   if (it == m_routines.end() || it->second.params != args.size()) {
     *error = "routine " + std::to_string(routine_id) +
              " is not prepared with " + std::to_string(args.size()) +
              " parameters";
-    return Status::kInternal;
+    return Outcome::kRefused;
   }
-  const RoutineInfo info = it->second;  // a nested DROP may erase it
-  // The top-level call reuses one buffer (no allocation per call); a nested
-  // call, made while the outer one waits, gets its own.
+  // The RESULT is checked against the parameters in force now: a nested
+  // PREPARE or DROP may change the entry meanwhile.
+  const RoutineInfo info = it->second;
+  // The top-level call reuses one buffer; a nested call, made while the
+  // outer one waits, gets its own.
   std::string nested;
   std::string &body = m_depth == 0 ? m_call_body : nested;
   body.clear();
   Writer w(&body);
   w.u64(routine_id);
-  w.u32(events);
+  w.u64(library_epoch);
   w.u32(static_cast<uint32_t>(args.size()));
   for (const Value &v : args) w.value(v);
-  return request(wire::Op::kCall, body, hooks, &info, result, error);
+  Request q{Op::kCall, body};
+  q.routine_id = routine_id;
+  q.routine = &info;
+  return request(q, hooks, result, error);
 }
 
-Status Worker::drop(uint64_t routine_id, std::string *error) {
+Outcome Worker::drop(uint64_t routine_id, std::string *error) {
   std::string body;
   encode(DropMsg{routine_id}, &body);
   NoSql hooks;
   ResultMsg result;
-  const Status s = request(wire::Op::kDrop, body, hooks, nullptr, &result,
-                           error, m_options.control_timeout_ms);
-  if (s == Status::kOk) m_routines.erase(routine_id);
-  if (s != Status::kOk && result.error) *error = result.error->message;
-  return s;
+  Request q{Op::kDrop, body};
+  q.routine_id = routine_id;
+  const Outcome o = request(q, hooks, &result, error);
+  if (o != Outcome::kRefused) m_routines.erase(routine_id);
+  return o;
 }
 
-Status Worker::options(const OptionsMsg &options, std::string *error) {
+Outcome Worker::options(const OptionsMsg &options, Error *guest_error,
+                        std::string *error) {
+  if (std::string why; !is_valid(options, &why)) {
+    *error = "bad options: " + why;
+    return Outcome::kRefused;
+  }
   std::string body;
   encode(options, &body);
   NoSql hooks;
   ResultMsg result;
-  const Status s = request(wire::Op::kOptions, body, hooks, nullptr, &result,
-                           error, m_options.control_timeout_ms);
-  if (s != Status::kOk && result.error) *error = result.error->message;
-  return s;
+  const Outcome o = request(Request{Op::kOptions, body}, hooks, &result, error);
+  if (o == Outcome::kOk) m_options_in_force = true;
+  if (o == Outcome::kGuestError && guest_error != nullptr)
+    *guest_error = *result.error;
+  return o;
 }
 
-Status Worker::reset(std::string *error) {
+Outcome Worker::reset(std::string *error) {
   NoSql hooks;
   ResultMsg result;
-  const Status s = request(wire::Op::kReset, "", hooks, nullptr, &result,
-                           error, m_options.control_timeout_ms);
-  if (s == Status::kOk) m_routines.clear();
-  if (s != Status::kOk && result.error) *error = result.error->message;
-  return s;
+  const Outcome o = request(Request{Op::kReset, {}}, hooks, &result, error);
+  if (o == Outcome::kOk) {
+    m_routines.clear();
+    m_unsent_drops.clear();
+    m_options_in_force = false;
+  }
+  return o;
 }
 
 void Worker::interrupt() {
-  const uint64_t seq = m_running.load();
-  if (seq == 0) return;
-  unsigned char msg[9];
+  std::lock_guard<std::mutex> lock(m_interrupt_mutex);
+  if (m_running == 0) return;
+  // The record is made before the send and stands if the send fails.
+  m_recorded.store(true);
+  unsigned char msg[wire::kInterruptSize];
   msg[0] = static_cast<unsigned char>(wire::Control::kInterrupt);
-  memcpy(msg + 1, &seq, sizeof seq);
-  // Non-blocking: a worker that does not read its control socket must not
-  // block the KILL handler; SIGKILL after the grace covers it.
+  memcpy(msg + 1, &m_running, sizeof m_running);
+  // Without blocking and without a signal: a worker that does not take its
+  // INTERRUPT is ended when the grace period is over.
   [[maybe_unused]] ssize_t n = ::send(m_process->control_fd(), msg, sizeof msg,
                                       MSG_NOSIGNAL | MSG_DONTWAIT);
 }

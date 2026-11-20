@@ -21,36 +21,12 @@
 /**
   @file include/mle/protocol.h
 
-  Wire protocol v1 between the MLE host (mysqld) and an MLE worker process.
+  The constants and layouts of the MLE worker protocol, specification 1.0.
 
-  This header is the single definition of the protocol. It is shared by the
-  host library, the launcher and the worker bootstrap; the Java worker
-  (com.percona.mle.worker) mirrors these constants and must be kept in sync.
+  The protocol is defined by docs/protocol.md; section numbers in the
+  comments below refer to it. This header is shared by the host library,
+  the launcher and the workers written in C++; the Java worker mirrors it.
   No MySQL headers are used here.
-
-  Transport
-  ---------
-  One shared memory region per worker (a memfd created by the launcher):
-  a 4 KiB header (RegionHeader) followed by the arena that carries one
-  message at a time. The two sides strictly alternate: the host writes a
-  message into the arena, fills RegionHeader::msg and increments to_w; the
-  worker answers the same way through to_h. Each side spins for a while and
-  then sleeps on the futex word of the other side; the *_sleep flags tell
-  the poster whether a FUTEX_WAKE is needed.
-
-  The worker is untrusted. The host copies the message header and the
-  message body out of shared memory before it validates or decodes them,
-  and any violation ends the worker.
-
-  Out of band, a SOCK_SEQPACKET control socket carries INTERRUPT and
-  SHUTDOWN from the host; its EOF tells the worker that the host is gone.
-
-  Encoding
-  --------
-  Little-endian. Integers have fixed width. A string or byte string is a
-  u32 length followed by the bytes. Strings are well-formed UTF-8 (the host
-  converts character sets). A value is a u8 tag followed by its payload,
-  see Tag. The message bodies are described next to Op.
 */
 
 #include <atomic>
@@ -59,203 +35,130 @@
 
 namespace mle::wire {
 
-/** File descriptors a worker process starts with (besides 0, 1, 2, which
-    are /dev/null or inherited for debugging): the shared memory region and
-    its end of the control socket. */
+/** The descriptors a worker starts with (§2). */
 constexpr int kMailboxFd = 3;
 constexpr int kControlFd = 4;
+/** A worker's exit status when it cannot use the region (§2). */
+constexpr int kExitBadRegion = 2;
 
-/** "MLE1" read as a little-endian u32. */
+/** "MLE1" read as a little-endian u32 (§3). */
 constexpr uint32_t kMagic = 0x31454c4d;
-constexpr uint32_t kVersion = 3;
+/** version = major << 16 | minor (§14). */
+constexpr uint32_t kVersionMajor = 1;
+constexpr uint32_t kVersionMinor = 0;
+constexpr uint32_t kVersion = kVersionMajor << 16 | kVersionMinor;
+constexpr uint32_t version_major(uint32_t version) { return version >> 16; }
+constexpr uint32_t version_minor(uint32_t version) { return version & 0xFFFF; }
 
 constexpr size_t kCacheLine = 64;
-/** Size of RegionHeader; the arena starts here (page aligned). */
+/** Size of RegionHeader; the arena starts here. */
 constexpr size_t kHeaderSize = 4096;
+
+// Limits (§12).
 constexpr uint32_t kDefaultArenaSize = 1U << 20;
 constexpr uint32_t kMinArenaSize = 64U << 10;
-/** Upper bound of one logical message (all chunks together). */
-constexpr uint64_t kMaxMessageSize = 1ULL << 30;
-/** Largest message the host accepts from a worker (all chunks together):
-    bounds what a worker can make mysqld allocate. The worker refuses larger
-    results and SQL requests itself, with an error (Wire.MAX_WORKER_MESSAGE);
-    the host treats one as a protocol violation. */
+constexpr uint32_t kMaxArenaSize = 1U << 30;
+constexpr uint32_t kArenaGranule = 4096;
+/** A message of the host, all chunks together. */
+constexpr uint64_t kMaxHostMessage = 1ULL << 30;
+/** A message of a worker, all chunks together. */
 constexpr uint64_t kMaxWorkerMessage = 64ULL << 20;
-static_assert(kMaxWorkerMessage <= kMaxMessageSize);
-/** Default limit of nested calls (routine -> SQL -> routine ...). */
-constexpr uint32_t kDefaultMaxDepth = 32;
-/** Same limit as MySQL's VECTOR type. */
-constexpr uint32_t kMaxVectorDimensions = 16383;
-/** Same limit as MySQL's TIME type. */
-constexpr uint32_t kMaxTimeHour = 838;
-/** Oracle MLE limit for stack traces. */
-constexpr uint32_t kMaxStackFrames = 1000;
-/** Values in one list (call arguments, SQL parameters, OUT parameters):
-    MySQL's limit of prepared-statement markers. */
+/** The messages limited to one chunk: READY, LIBRARY, the RESULT of DROP,
+    RESET and OPTIONS; OPTIONS, DROP and RESET themselves. */
+constexpr uint64_t kMaxSmallMessage = 64ULL << 10;
+static_assert(kMaxSmallMessage <= kMinArenaSize);
+/** The deepest nested request (§8.2). */
+constexpr uint32_t kMaxDepth = 31;
+/** Values in one list: arguments, SQL parameters, OUT parameters. */
 constexpr uint32_t kMaxValues = 65535;
-/** Languages a worker reports in READY. */
+constexpr uint32_t kMaxParams = 65535;
+constexpr uint32_t kMaxImports = 65535;
+constexpr uint32_t kMaxColumns = 4096;
+constexpr uint32_t kMaxWarnings = 65535;
+constexpr uint32_t kMaxSettings = 256;
+constexpr size_t kMaxSettingName = 64;
+constexpr size_t kMaxSettingValue = 1024;
+constexpr size_t kMaxTimeZone = 64;
+/** A language identifier or a worker class. */
+constexpr size_t kMaxIdentifier = 32;
 constexpr uint32_t kMaxLanguages = 16;
-/** VECTOR data starts at this alignment, relative to the start of the
-    message; that is the arena start when the message fits in one chunk. */
+constexpr size_t kMaxErrorMessage = 16U << 10;
+/** Frame function, file and text, each. */
+constexpr size_t kMaxFrameText = 1U << 10;
+constexpr uint32_t kMaxStackFrames = 1000;
+constexpr size_t kMaxFinding = 4U << 10;
+constexpr uint32_t kMaxFindings = 1000;
+/** LIBRARY schema and name, each. */
+constexpr size_t kMaxLibraryName = 256;
+constexpr size_t kMaxDecimalChars = 100;
+constexpr uint32_t kMaxVectorDimensions = 16383;
+constexpr uint32_t kMaxTimeHour = 838;
+constexpr uint32_t kMaxSqlErrno = 65535;
+/** The ERRORs the host holds per top-level request, at least (§10.8). */
+constexpr uint32_t kHeldErrors = 16;
+/** VECTOR elements start at this alignment, counted from the start of the
+    message body (§7.2). */
 constexpr size_t kVectorAlignment = 16;
+/** The size that adds one grace period to a bound of the grace clock
+    (§11.1 step 3). */
+constexpr uint64_t kGraceBytes = 16ULL << 20;
 
-/** Mailbox operations. Comments give the direction and the body. */
+/** TIMESTAMP (§7.2): microseconds since 1970-01-01 00:00:00 UTC. */
+constexpr int64_t kMaxTimestamp = 253402300799999999LL;
+/** MySQL's zero timestamp. */
+constexpr int64_t kZeroTimestamp = INT64_MIN;
+/** SQL_RESULT ROWS total_rows when the host does not know it (§10.3). */
+constexpr uint64_t kUnknownTotalRows = UINT64_MAX;
+
+/** Operations (§9). 0, 7 and above 14 are not assigned. */
 enum class Op : uint32_t {
-  /** w->h. u32 protocol version, str worker class, u32 n + n x str
-      languages, str runtime version, str info. With a status other than OK
-      the worker failed to start and info says why. */
   kReady = 1,
-  /** h->w. u64 routine id, str language, str name (the routine's name, for
-      stack traces and messages), str entry, str source, u32 n + n x Param,
-      u8 has_return [, ParamType return type], u32 n + n x (str schema,
-      str library, str alias) libraries of USING (Phase 6; alias "": the
-      library's name), str schema (the routine's schema: part of the key of
-      the worker's Java routine cache), u8 check (1 at CREATE: report names
-      that are never defined, exp note 39). An empty entry means the
-      source is a routine *body* (CREATE ... AS $$ body $$): the worker
-      wraps it with the parameters as named variables (Oracle's form for
-      JavaScript). Answered by kResult (OK, or kGuestError with the compile
-      error). */
   kPrepare = 2,
-  /** h->w. u64 routine id, u32 events (Event bits), u32 n + n x value. */
   kCall = 3,
-  /** w->h. u8 has_return [, value], u32 n + n x (u32 parameter index,
-      value) for OUT and INOUT parameters, str stdout, str stderr,
-      u8 console cleared (console.clear(): the host drops the output it
-      kept before this message's), u8 has_error [, Error]. */
   kResult = 4,
-  /** w->h, only while the host waits for a CALL's RESULT. u8 SqlAction,
-      u64 statement id (chosen by the worker, unique within the call),
-      str statement text, u32 n + n x value (parameters), u8 SqlFlag bits,
-      u32 max rows per chunk (0 = host default), u32 row width (kExecuteMany:
-      values per row; 0 otherwise; v3). Statements live until
-      CLOSE, until they are drained (EXECUTE of text), or until the
-      top-level CALL ends. Answered by kSqlResult. */
   kSql = 5,
-  /** h->w. u8 SqlResultKind, then
-      kError: u32 errno, str sqlstate, str message, u32 failed row of a
-              batch (kNoRow: not a batch row; v3);
-      kOk:    u64 affected rows, u64 last insert id, warnings,
-              u8 more result sets, u32 parameter count (PREPARE),
-              u64 execution microseconds;
-      kRows:  u32 n + n x Column, u64 total rows of the result set (0 =
-              unknown: a server cursor; v2, exp note 44 step 3),
-              u32 rows + rows x columns x value,
-              u8 more rows, u8 more result sets, warnings (in a result
-              set's last chunk; a buffered one's, with total rows, also in
-              its first), u64 execution microseconds.
-      warnings = u32 n + n x (u32 level, u32 code, str message). */
   kSqlResult = 6,
-  /** Unused (P5: FETCH is an SqlAction). */
-  kFetch = 7,
-  /** h->w. u64 routine id: forget the routine. Answered by kResult. */
   kDrop = 8,
-  /** h->w. Empty: forget all routines (and the VECTOR buffers) and trim the
-      heap; sent when a session releases a worker for reuse by the same
-      account (mle_session_reset gives new workers instead). Guest globals
-      (JavaScript globalThis, Python modules) and loaded libraries are not
-      reset (17 D11: kept by decision). Answered by kResult. */
   kReset = 9,
-  /** both. Empty: acknowledges a chunk that had MessageFlag::kMore. */
   kContinue = 10,
-  /** h->w. u8 IntegerType, u8 DecimalType, str time zone (IANA name or
-      +hh:mm): the session's conversion options (mle_set_session_state) and
-      time zone. Sent before the first CALL and whenever they change.
-      Answered by kResult (kGuestError with language "MLE-TimeZone" for a
-      zone the worker does not know). */
   kOptions = 11,
-  /** h->w. str language, str name, str body: syntax check of a library
-      (CREATE LIBRARY), nothing runs. Answered by kResult (OK, or kGuestError
-      with the syntax error). Phase 6. */
   kParseLibrary = 12,
-  /** w->h, only while the host waits for a PREPARE's or CALL's RESULT.
-      str schema, str name, u64 hash of the body the worker has (0: none):
-      a database library (CREATE LIBRARY) the routine imports. Answered by
-      kLibraryResult. Phase 6. */
   kLibrary = 13,
-  /** h->w. u8 LibraryStatus, str language, str body (kBody only), u64 hash
-      of the body, str message (kRefused: why). */
   kLibraryResult = 14,
 };
 constexpr uint32_t kMaxOp = 14;
+constexpr bool is_assigned_op(uint32_t op) {
+  return op >= 1 && op <= kMaxOp && op != 7;
+}
 
-/** The answer to kLibrary. */
-enum class LibraryStatus : uint8_t {
-  /** Not there, or not importable from this routine (message says why). */
-  kRefused = 0,
-  /** The worker has the current body (same hash). */
-  kUnchanged = 1,
-  /** The body follows. */
-  kBody = 2,
-};
+/** LIBRARY_RESULT status (§9.10). */
+enum class LibraryStatus : uint8_t { kRefused = 0, kUnchanged = 1, kBody = 2 };
 constexpr uint8_t kMaxLibraryStatus = 2;
 
-/** How JavaScript gets SQL integers (Oracle's integer_type option). A safe
-    integer is within +-(2^53 - 1). */
-enum class IntegerType : uint8_t {
-  /** Number if safe, else String (Oracle's default). */
-  kUnsafeString = 0,
-  /** Number if safe, else BigInt. */
-  kUnsafeBigint = 1,
-  /** Always String. */
-  kString = 2,
-  /** Always BigInt. */
-  kBigint = 3,
-};
-constexpr uint8_t kMaxIntegerType = 3;
-
-/** How JavaScript gets DECIMAL (Oracle's decimal_type option). */
-enum class DecimalType : uint8_t { kString = 0, kNumber = 1 };
-constexpr uint8_t kMaxDecimalType = 1;
-
-/** RESULT status (MessageHeader::status). */
+/** MessageHeader::status of RESULT (§9.4) and READY (§9.1: kOk or kInternal).
+    Every other message has 0. What a request ends with in the host besides
+    these is mle::Outcome (worker.h). */
 enum class Status : uint32_t {
   kOk = 0,
   kGuestError = 1,
   kInterrupted = 2,
-  /** Heap or stack exhausted in the worker. */
   kExhausted = 3,
-  /** Bug or failure inside the worker runtime. */
   kInternal = 4,
-  /** Host side only: the worker exited or was killed by a signal. */
-  kDied = 5,
-  /** Host side only: the worker was killed after the interrupt grace. */
-  kKilled = 6,
-  /** Host side only: the worker broke the protocol and was killed. */
-  kProtocolError = 7,
 };
-/** Highest status a worker may send. */
-constexpr uint32_t kMaxWorkerStatus = 4;
+constexpr uint32_t kMaxStatus = 4;
 
-/** MessageHeader::flags */
+/** Error.language markers (§7.4). */
+inline constexpr char kLanguageType[] = "MLE-Type";
+inline constexpr char kLanguageTimeZone[] = "MLE-TimeZone";
+inline constexpr char kLanguageOption[] = "MLE-Option";
+
+/** MessageHeader::flags (§5.1). */
 enum MessageFlag : uint32_t {
-  /** More chunks of this message follow; the receiver answers kContinue. */
   kMore = 1U << 0,
 };
 constexpr uint32_t kKnownMessageFlags = kMore;
 
-/** CALL events: what happened in the session since the previous CALL to the
-    same worker (Informix "durations"). */
-enum Event : uint32_t {
-  kStatementEnd = 1U << 0,
-  kTransactionCommit = 1U << 1,
-  kTransactionRollback = 1U << 2,
-};
-constexpr uint32_t kKnownEvents =
-    kStatementEnd | kTransactionCommit | kTransactionRollback;
-
-/** Value tags. Payloads:
-    kNull      -
-    kI64/kU64  8 bytes
-    kF64/kF32  8/4 bytes, IEEE 754
-    kDecimal   str, [-]digits[.digits]
-    kString    str (UTF-8)
-    kBytes     u32 length + bytes
-    kDate .. kTimestamp  Temporal: u16 year, u8 month, u8 day, u32 hour,
-               u8 minute, u8 second, u32 microsecond, u8 negative
-    kJson      str (JSON text)
-    kVector    u32 dimensions, zero padding up to kVectorAlignment relative
-               to the message start, dimensions x float32 */
+/** Value tags (§7.2). */
 enum class Tag : uint8_t {
   kNull = 0,
   kI64 = 1,
@@ -274,65 +177,45 @@ enum class Tag : uint8_t {
 };
 constexpr uint8_t kMaxTag = 13;
 
-/** Parameter mode in PREPARE. */
+/** Param.mode (§7.4). */
 enum class ParamMode : uint8_t { kIn = 0, kOut = 1, kInOut = 2 };
 
-/** ParamType = u8 tag, u8 unsigned, u32 length, u32 precision, u32 scale,
-            str SQL type name (upper case, without length: INT, VARCHAR,
-            SET, YEAR, BIT ...; empty if unknown).
-    Param = str name, u8 mode, ParamType.
-    Column = str name (label), str table (alias), ParamType, str original
-             name, str schema, str original table, str charset, str
-             collation, u32 field flags.
-    Error = str language, str message, u32 n + n x (str function, str file,
-            u32 line, u32 column, u32 end column, str text: the frame's
-            source line, may be empty) stack frames, u32 sql
-            errno (0 = not a MySQL error), str sqlstate (empty or 5
-            characters). The language "MLE-Type" marks a value conversion
-            error (Oracle: 6000 "MLE-Type> Cannot convert value ..."). */
+/** Warning.level (§7.4). */
+enum class WarningLevel : uint32_t { kNote = 0, kWarning = 1, kError = 2 };
 
-enum class SqlResultKind : uint8_t { kError = 0, kOk = 1, kRows = 2 };
+/** SQL_RESULT kind (§9.5). */
+enum class SqlResultKind : uint8_t { kError = 0, kOk = 1, kRows = 2, kEnd = 3 };
+constexpr uint8_t kMaxSqlResultKind = 3;
 
-/** What a kSql message asks for (Phase 5 SQL API). */
+/** SQL action (§10.2). */
 enum class SqlAction : uint8_t {
-  /** Run the text: without parameters directly (the whole result is
-      buffered by the server), with parameters as a one-shot prepared
-      statement (buffered too: no cursor). The reply carries the first rows. */
   kExecute = 0,
-  /** Prepare the text under the id; reply kOk with the parameter count. */
   kPrepare = 1,
-  /** Execute the prepared id; parameters bind the leading markers (the
-      others keep their previous values: Oracle's partial re-binding). */
   kExecutePrepared = 2,
-  /** The next rows of the id's current result set. */
   kFetch = 3,
-  /** Move the id to its next result set. */
   kNextResult = 4,
-  /** Close the id (deallocate). */
   kClose = 5,
-  /** Execute the prepared id once per row of parameters (v3, exp note 51):
-      params holds the rows one after another, row_width values each. Stops
-      at the first failing row (kError with its index); else kOk with the
-      sum of the affected rows. Statements that return rows are refused
-      (after the first row). */
   kExecuteMany = 6,
 };
 constexpr uint8_t kMaxSqlAction = 6;
-/** SqlResultMsg::failed_row when an error is not about a row of a batch. */
+/** The body of an SQL message begins with u8 action, u64 statement_id; a
+    CLOSE has no other content (§5.3). */
+constexpr size_t kSqlHeadSize = 9;
+constexpr size_t kSqlCloseSize = 26;
+/** SQL_RESULT ERROR failed_row when the error does not answer EXECUTE_MANY. */
 constexpr uint32_t kNoRow = 0xFFFFFFFF;
 
-/** SqlMsg flags. */
+/** SQL flags (§10.2). */
 enum SqlFlag : uint8_t {
-  /** Send the result sets to the client (Oracle's passResultToClient). */
   kPassResultToClient = 1U << 0,
 };
 constexpr uint8_t kKnownSqlFlags = kPassResultToClient;
 
-/** Control socket messages, h->w. INTERRUPT carries the call sequence of the
-    call to interrupt: u8 kind + u64 call_seq; SHUTDOWN is u8 kind only. */
-enum class Control : uint8_t { kInterrupt = 1, kShutdown = 2 };
+/** Control socket messages (§6): u8 kind, u64 call_seq. */
+enum class Control : uint8_t { kInterrupt = 1 };
+constexpr size_t kInterruptSize = 9;
 
-/** Worker state in WorkerStats::state (advisory). */
+/** WorkerStats::state (§3.1). */
 enum class WorkerState : uint32_t {
   kStarting = 0,
   kIdle = 1,
@@ -340,35 +223,25 @@ enum class WorkerState : uint32_t {
   kCompiling = 3,
 };
 
-/** The header of the message currently in the arena. Written by the poster
-    before it bumps its sequence word. */
+/** The message header (§5.1). */
 struct MessageHeader {
   uint32_t op;
   uint32_t status;
   uint32_t flags;
-  /** Nesting level: 0 for a top-level CALL, +1 for each CALL sent while
-      the worker waits for a SQL_RESULT. */
   uint32_t depth;
-  /** Bytes of this chunk in the arena. */
   uint32_t len;
   uint32_t reserved;
-  /** Total bytes of the message over all its chunks. */
   uint64_t total_len;
-  /** Sequence number of the top-level call this message belongs to. */
   uint64_t call_seq;
 };
 static_assert(sizeof(MessageHeader) == 40);
 
-/** Written by the worker after each message; the host treats it as advisory
-    and clamps what it reports. */
+/** Worker statistics (§3.1). */
 struct WorkerStats {
   uint64_t heap_used;
   uint64_t heap_max;
-  /** GCs the worker's memory watcher forced since its last RESET (exp note 30). */
   uint64_t gc_count;
   uint32_t state;
-  /** Non-zero: the worker hit OutOfMemoryError or StackOverflowError and
-      asks to be retired after the current call. */
   uint32_t tainted;
 };
 static_assert(sizeof(WorkerStats) == 32);
@@ -376,45 +249,48 @@ static_assert(sizeof(WorkerStats) == 32);
 static_assert(std::atomic<uint32_t>::is_always_lock_free);
 static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t));
 
-/** Layout of the first kHeaderSize bytes of the region. One cache line per
-    field group, so that the two sides do not share lines they write. */
+/** The first kHeaderSize bytes of the region (§3). */
 struct alignas(kCacheLine) RegionHeader {
-  // Line 0, written once by the launcher.
+  // Line 0, written once by the launcher; for the worker.
   uint32_t magic;
   uint32_t version;
   uint64_t region_size;
   uint32_t arena_size;
-  uint32_t reserved0;
-  char pad0[kCacheLine - 24];
-  // Line 1: host -> worker sequence (futex word).
+  char reserved0[kCacheLine - 20];
+  /** Sequence word, host to worker. */
   std::atomic<uint32_t> to_w;
   char pad1[kCacheLine - 4];
-  // Line 2: worker -> host sequence (futex word).
+  /** Sequence word, worker to host. */
   std::atomic<uint32_t> to_h;
   char pad2[kCacheLine - 4];
-  // Line 3: sleep flags of the spin-then-futex wait.
   std::atomic<uint32_t> w_sleep;
+  char pad3[kCacheLine - 4];
   std::atomic<uint32_t> h_sleep;
-  char pad3[kCacheLine - 8];
-  // Line 4.
+  char pad4[kCacheLine - 4];
   MessageHeader msg;
-  char pad4[kCacheLine - sizeof(MessageHeader)];
-  // Line 5.
+  char pad5[kCacheLine - sizeof(MessageHeader)];
   WorkerStats stats;
-  char pad5[kCacheLine - sizeof(WorkerStats)];
-  char reserved[kHeaderSize - 6 * kCacheLine];
+  char pad6[kCacheLine - sizeof(WorkerStats)];
+  char reserved[kHeaderSize - 7 * kCacheLine];
 };
 
 static_assert(sizeof(RegionHeader) == kHeaderSize);
-static_assert(offsetof(RegionHeader, to_w) == 1 * kCacheLine);
-static_assert(offsetof(RegionHeader, to_h) == 2 * kCacheLine);
-static_assert(offsetof(RegionHeader, w_sleep) == 3 * kCacheLine);
-static_assert(offsetof(RegionHeader, h_sleep) == 3 * kCacheLine + 4);
-static_assert(offsetof(RegionHeader, msg) == 4 * kCacheLine);
-static_assert(offsetof(RegionHeader, stats) == 5 * kCacheLine);
+static_assert(offsetof(RegionHeader, region_size) == 8);
+static_assert(offsetof(RegionHeader, arena_size) == 16);
+static_assert(offsetof(RegionHeader, to_w) == 64);
+static_assert(offsetof(RegionHeader, to_h) == 128);
+static_assert(offsetof(RegionHeader, w_sleep) == 192);
+static_assert(offsetof(RegionHeader, h_sleep) == 256);
+static_assert(offsetof(RegionHeader, msg) == 320);
+static_assert(offsetof(RegionHeader, stats) == 384);
 
 inline constexpr size_t region_size(uint32_t arena_size) {
   return kHeaderSize + arena_size;
+}
+/** A legal arena size (§3). */
+inline constexpr bool is_valid_arena_size(uint64_t arena_size) {
+  return arena_size >= kMinArenaSize && arena_size <= kMaxArenaSize &&
+         arena_size % kArenaGranule == 0;
 }
 
 }  // namespace mle::wire

@@ -104,7 +104,7 @@ bool wait_ready(const WorkerProcess &w, ReadyMsg *m, std::string *error,
   // Copy out, then check: the worker is untrusted.
   const wire::MessageHeader h = w.header()->msg;
   if (!check_worker_header(h, w.arena_size(), error)) return false;
-  Assembler a(w.arena_size(), wire::kMaxMessageSize);
+  Assembler a(w.arena_size(), wire::kMaxSmallMessage);
   if (a.add(h, w.arena()) != Assembler::Step::kDone)
     return *error = a.error(), false;
   if (h.op != static_cast<uint32_t>(wire::Op::kReady))

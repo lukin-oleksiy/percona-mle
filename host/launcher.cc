@@ -432,10 +432,10 @@ ExitInfo WorkerProcess::exit_info(int timeout_ms) const {
 
 std::unique_ptr<Launcher> Launcher::start(const LauncherConfig &config,
                                           std::string *error) {
-  if (config.arena_size < wire::kMinArenaSize ||
-      config.arena_size % 4096 != 0) {
-    *error = "arena size must be a multiple of 4096 and at least " +
-             std::to_string(wire::kMinArenaSize);
+  if (!wire::is_valid_arena_size(config.arena_size)) {
+    *error = "arena size must be a multiple of 4096, at least " +
+             std::to_string(wire::kMinArenaSize) + " and at most " +
+             std::to_string(wire::kMaxArenaSize);
     return nullptr;
   }
   auto channel = std::make_shared<LauncherChannel>();
@@ -513,15 +513,15 @@ std::unique_ptr<WorkerProcess> Launcher::acquire(const std::string &cls,
   w->m_pidfd = fds[2];
   w->m_arena_size = ch.arena_size;
 
-  // The region must have the size we configured and be sealed against
-  // resizing: a worker that shrank it would make our accesses SIGBUS.
+  // The region must have the size we configured and all three seals: then
+  // no access to the mapping can fault, whatever the worker does (§2).
   const size_t size = wire::region_size(ch.arena_size);
+  constexpr int kSeals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
   struct stat st;
   const int seals = fcntl(w->m_mailbox, F_GET_SEALS);
   if (fstat(w->m_mailbox, &st) != 0 ||
       static_cast<size_t>(st.st_size) != size || seals < 0 ||
-      (seals & (F_SEAL_SHRINK | F_SEAL_GROW)) !=
-          (F_SEAL_SHRINK | F_SEAL_GROW)) {
+      (seals & kSeals) != kSeals) {
     *error = "worker mailbox has the wrong size or is not sealed";
     return nullptr;
   }
@@ -531,13 +531,9 @@ std::unique_ptr<WorkerProcess> Launcher::acquire(const std::string &cls,
     *error = errno_text("mmap worker mailbox");
     return nullptr;
   }
+  // Line 0 of the header is for the worker; the host uses what it
+  // configured and does not read it.
   w->m_header = static_cast<wire::RegionHeader *>(p);
-  const wire::RegionHeader &h = *w->m_header;
-  if (h.magic != wire::kMagic || h.version != wire::kVersion ||
-      h.region_size != size || h.arena_size != ch.arena_size) {
-    *error = "worker mailbox header does not match";
-    return nullptr;
-  }
   return w;
 }
 

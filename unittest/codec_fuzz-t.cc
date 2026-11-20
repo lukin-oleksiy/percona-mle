@@ -60,6 +60,21 @@ void check_one(std::string_view body) {
   ASSERT_EQ(again, body);
 }
 
+// A batch of rows without columns is decoded with the set's column count.
+void check_later_batch(std::string_view body) {
+  for (const uint32_t columns : {1u, 2u, 3u}) {
+    SqlResultMsg m;
+    std::string error;
+    if (!decode(body, &m, &error, columns)) {
+      ASSERT_FALSE(error.empty());
+      continue;
+    }
+    std::string again;
+    encode(m, &again);
+    ASSERT_EQ(again, body);
+  }
+}
+
 void check_all(std::string_view body) {
   check_one<ReadyMsg>(body);
   check_one<PrepareMsg>(body);
@@ -67,8 +82,22 @@ void check_all(std::string_view body) {
   check_one<ResultMsg>(body);
   check_one<SqlMsg>(body);
   check_one<SqlResultMsg>(body);
+  check_later_batch(body);
   check_one<DropMsg>(body);
   check_one<OptionsMsg>(body);
+  check_one<ParseLibraryMsg>(body);
+  check_one<LibraryMsg>(body);
+  check_one<LibraryResultMsg>(body);
+  // The parts of a READY that are read on their own never over-read.
+  uint32_t version;
+  std::string info, error;
+  if (!decode_ready_version(body, &version, &error)) {
+    ASSERT_FALSE(error.empty());
+  }
+  error.clear();
+  if (!decode_ready_head(body, &version, &info, &error)) {
+    ASSERT_FALSE(error.empty());
+  }
 }
 
 std::vector<std::string> seed_messages() {
@@ -91,6 +120,7 @@ std::vector<std::string> seed_messages() {
                                  Value::string("caf\xc3\xa9"),
                                  Value::bytes(std::string("\0\1\2", 3)),
                                  Value::temporal(Tag::kDatetime, t),
+                                 Value::timestamp(1704067200000000),
                                  Value::json("[1]"),
                                  Value::vector({1, 2, 3, 4, 5})};
   add(call);
@@ -98,12 +128,12 @@ std::vector<std::string> seed_messages() {
   result.ret = Value::string("ok");
   result.out_params.emplace_back(0, Value::i64(1));
   result.console_out = "out";
-  result.error = Error{"python", "boom", {{"f", "r.py", 1, 2, 0, "return 1 // 0"}}, 1146, "42S02"};
+  result.findings = {"name 'y' is never defined"};
+  result.error = Error{"python", "boom", {{"f", "r.py", 1, 2, 0, "return 1 // 0"}}, 1146, "42S02", 7};
   add(result);
   SqlMsg sql;
   sql.action = wire::SqlAction::kExecutePrepared;
   sql.stmt_id = 5;
-  sql.statement = "SELECT ?";
   sql.params = std::vector<Value>{Value::vector({0.5f})};
   add(sql);
   SqlResultMsg rows;
@@ -113,6 +143,28 @@ std::vector<std::string> seed_messages() {
                                  Value::string("x")};
   rows.warnings = {{1, 2, "w"}};
   add(rows);
+  SqlResultMsg later = rows;
+  later.columns.clear();
+  later.ncolumns = 2;
+  add(later);
+  SqlResultMsg failed;
+  failed.kind = SqlResultKind::kError;
+  failed.sql_errno = 1062;
+  failed.sqlstate = "23000";
+  failed.message = "dup";
+  failed.error_id = 1;
+  add(failed);
+  LibraryMsg library;
+  library.schema = "db1";
+  library.name = "lib";
+  library.known_version = 3;
+  add(library);
+  LibraryResultMsg body;
+  body.status = wire::LibraryStatus::kBody;
+  body.language = "js";
+  body.body = "export const x = 1";
+  body.version = 4;
+  add(body);
   PrepareMsg prepare;
   prepare.language = "js";
   prepare.name = "f_routine";
@@ -122,7 +174,10 @@ std::vector<std::string> seed_messages() {
   prepare.returns = ParamType{};
   add(prepare);
   ReadyMsg ready;
+  ready.info = "ok";
+  ready.worker_class = "jvm";
   ready.languages = {"java", "js"};
+  ready.runtime = "X";
   add(ready);
   SqlMsg next;
   next.action = wire::SqlAction::kNextResult;
@@ -130,8 +185,8 @@ std::vector<std::string> seed_messages() {
   add(next);
   add(DropMsg{11});
   OptionsMsg options;
-  options.integer_type = wire::IntegerType::kUnsafeBigint;
   options.time_zone = "Europe/Kyiv";
+  options.settings = {{"js.decimal_type", "number"}, {"js.integer_type", "bigint"}};
   add(options);
   return out;
 }
@@ -198,15 +253,28 @@ TEST(MleCodecFuzz, Assembler) {
     wire::MessageHeader h{};
     h.op = uint32_t(wire::Op::kResult);
     h.total_len = rng() % 5000;
+    const bool discard = rng() % 4 == 0;
     for (int k = 0; k < 40; k++) {
       if (rng() % 8 == 0) h.call_seq = rng() % 2;
       if (rng() % 16 == 0) h.total_len = rng() % 5000;
-      h.len = uint32_t(rng() % (arena + 20));
+      // Mostly whole arenas, so that messages of several chunks complete.
+      h.len = rng() % 4 == 0 ? uint32_t(rng() % (arena + 20)) : arena;
       h.flags = rng() % 4 == 0 ? 0U : uint32_t{wire::kMore};
+      if (rng() % 4 == 0) {
+        const uint64_t rest = h.total_len - std::min(h.total_len, a.received());
+        h.len = uint32_t(std::min<uint64_t>(rest, arena));
+        h.flags = rest > arena ? uint32_t{wire::kMore} : 0U;
+      }
       const Assembler::Step step = a.add(h, data.data());
+      if (k == 0 && discard && step == Assembler::Step::kNeedMore)
+        a.discard_beyond(9);
       ASSERT_LE(a.body().size(), a.header().total_len);
+      ASSERT_LE(a.received(), a.header().total_len);
       if (step == Assembler::Step::kDone) {
-        ASSERT_EQ(a.body().size(), a.header().total_len);
+        ASSERT_EQ(a.received(), a.header().total_len);
+        ASSERT_EQ(a.body().size(),
+                  a.discarding() ? std::min<uint64_t>(9, a.header().total_len)
+                                 : a.header().total_len);
         break;
       }
       if (step == Assembler::Step::kError) {

@@ -158,7 +158,7 @@ bool Launcher::configure(Reader &r) {
                             ", expected " + std::to_string(kVersion));
     return false;
   }
-  if (m_arena_size < wire::kMinArenaSize || m_arena_size % 4096 != 0) {
+  if (!wire::is_valid_arena_size(m_arena_size)) {
     reply_config(false, "bad arena size");
     return false;
   }
@@ -292,7 +292,8 @@ Worker *Launcher::spawn(size_t cls, std::string *error) {
     return nullptr;
   };
 
-  // The mailbox, with its header, sealed against resizing.
+  // The mailbox with line 0 of its header, sealed against shrinking,
+  // growing and further sealing (§2).
   w.mailbox = memfd_create("mle-mailbox", MFD_CLOEXEC | MFD_ALLOW_SEALING);
   if (w.mailbox < 0 || ftruncate(w.mailbox, static_cast<off_t>(region)) != 0)
     return cleanup(std::string("mailbox: ") + strerror(errno));

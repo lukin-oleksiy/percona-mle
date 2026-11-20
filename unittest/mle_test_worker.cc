@@ -15,24 +15,27 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
-// A tiny MLE worker for the launcher tests (no GraalVM). It maps the
-// mailbox, posts READY with a report in ReadyMsg::info, and then behaves as
-// the mode in argv[1] says:
-//   ready             report the process environment, wait for EOF
+// A tiny MLE worker for the tests of the launcher and of the host's side of
+// the protocol (no language runtime). It maps the mailbox and then behaves
+// as the mode in argv[1] says:
+//   ready             READY with a report of the process environment in
+//                     its info, wait for EOF
 //   escape ARGS       run the escape probes, report them, wait for EOF
 //   exit N            exit with status N at once (no READY)
 //   segv              crash at once (no READY)
 //   oom               READY, then allocate memory until killed
 //   ignore_eof        READY, then never exit on its own
 //   fork N            fork N children that sleep, report how many worked
-//   proto BEHAVIOUR   READY, then answer requests, well (good) or badly
-//                     (see proto_loop), for the host's protocol checks
+//   proto [SCRIPT]    READY (or SCRIPT in its place), then answer requests
+//                     as a conforming worker, or as the scripts the test
+//                     sends say (proto_script.h)
 
 #include <dirent.h>
 #include <linux/futex.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -42,6 +45,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -49,6 +53,7 @@
 #include "escape_probes.h"
 #include "mle/codec.h"
 #include "mle/protocol.h"
+#include "proto_script.h"
 
 namespace {
 
@@ -68,20 +73,20 @@ wire::RegionHeader *map_mailbox() {
 
 void post_ready(wire::RegionHeader *h, const std::string &info) {
   ReadyMsg m;
+  m.info = info;
   m.worker_class = "test";
   m.languages = {"none"};
   m.runtime = "mle_test_worker";
-  m.info = info;
   std::string body;
   encode(m, &body);
-  if (body.size() > h->arena_size) _exit(92);
+  if (body.size() > wire::kMaxSmallMessage) _exit(92);
   memcpy(reinterpret_cast<char *>(h) + wire::kHeaderSize, body.data(),
          body.size());
   h->msg = wire::MessageHeader{};
   h->msg.op = static_cast<uint32_t>(wire::Op::kReady);
   h->msg.len = static_cast<uint32_t>(body.size());
   h->msg.total_len = body.size();
-  h->to_h.fetch_add(1, std::memory_order_seq_cst);
+  h->to_h.store(1, std::memory_order_seq_cst);
   if (h->h_sleep.load(std::memory_order_seq_cst) != 0)
     syscall(SYS_futex, reinterpret_cast<uint32_t *>(&h->to_h), FUTEX_WAKE, 1,
             nullptr, nullptr, 0);
@@ -156,111 +161,373 @@ std::string environment_report() {
   return r;
 }
 
-void post_msg(wire::RegionHeader *h, wire::Op op, uint32_t status,
-              uint32_t flags, uint32_t depth, uint32_t len, uint64_t total,
-              uint64_t seq, const std::string &body) {
-  memcpy(reinterpret_cast<char *>(h) + wire::kHeaderSize, body.data(),
-         std::min<size_t>(body.size(), h->arena_size));
-  h->msg = wire::MessageHeader{};
-  h->msg.op = static_cast<uint32_t>(op);
-  h->msg.status = status;
-  h->msg.flags = flags;
-  h->msg.depth = depth;
-  h->msg.len = len;
-  h->msg.total_len = total;
-  h->msg.call_seq = seq;
-  h->to_h.fetch_add(1, std::memory_order_seq_cst);
-  if (h->h_sleep.load(std::memory_order_seq_cst) != 0)
-    syscall(SYS_futex, reinterpret_cast<uint32_t *>(&h->to_h), FUTEX_WAKE, 1,
-            nullptr, nullptr, 0);
-}
+/** The "proto" mode: a worker that keeps the protocol unless a script
+    tells it otherwise. */
+class Proto {
+ public:
+  explicit Proto(wire::RegionHeader *h)
+      : m_h(h),
+        m_arena(reinterpret_cast<char *>(h) + wire::kHeaderSize),
+        m_arena_size(h->arena_size) {}
 
-/** Answers host requests. behaviour "good" answers correctly; every other
-    behaviour breaks one rule, once, at the first CALL (or PREPARE where
-    noted). */
-[[noreturn]] void proto_loop(wire::RegionHeader *h, const std::string &how) {
-  if (how == "silent") signal(SIGTERM, SIG_IGN);
-  uint32_t seen = 0;
-  while (true) {
-    while (h->to_w.load(std::memory_order_acquire) == seen) usleep(10);
-    seen = h->to_w.load(std::memory_order_acquire);
-    const wire::MessageHeader m = h->msg;
-    const bool call = m.op == static_cast<uint32_t>(wire::Op::kCall);
-    ResultMsg good;
-    if (call) good.ret = Value::i64(42);
-    std::string body;
-    encode(good, &body);
-    const auto len = static_cast<uint32_t>(body.size());
-    auto answer = [&](const std::string &b, uint32_t status = 0,
-                      uint32_t depth_delta = 0, uint64_t seq_delta = 0) {
-      post_msg(h, wire::Op::kResult, status, 0, m.depth + depth_delta,
-               static_cast<uint32_t>(b.size()), b.size(),
-               m.call_seq + seq_delta, b);
-    };
-    if (how == "sql_in_prepare" &&
-        m.op == static_cast<uint32_t>(wire::Op::kPrepare)) {
-      SqlMsg sql;
-      sql.statement = "SELECT 1";
-      std::string b;
-      encode(sql, &b);
-      post_msg(h, wire::Op::kSql, 0, 0, m.depth,
-               static_cast<uint32_t>(b.size()), b.size(), m.call_seq, b);
-      continue;
+  /** READY, or the script in its place; then requests for ever. */
+  [[noreturn]] void run(const std::string &ready_script) {
+    if (ready_script.empty()) {
+      ReadyMsg m;
+      m.info = "proto";
+      m.worker_class = "test";
+      m.languages = {"none"};
+      m.runtime = "mle_test_worker";
+      std::string body;
+      encode(m, &body);
+      send(wire::Op::kReady, 0, 0, 0, body, 0);
+    } else {
+      Request ready;
+      run_script(ready_script, ready);
     }
-    if (!call || how == "good") {
-      answer(body);
-      continue;
-    }
-    if (how == "bad_op") {
-      post_msg(h, static_cast<wire::Op>(99), 0, 0, m.depth, len, len,
-               m.call_seq, body);
-    } else if (how == "big_len") {
-      post_msg(h, wire::Op::kResult, 0, 0, m.depth, h->arena_size + 1,
-               h->arena_size + 1ULL, m.call_seq, body);
-    } else if (how == "bad_body") {
-      answer(std::string("\x05", 1));
-    } else if (how == "wrong_depth") {
-      answer(body, 0, 5);
-    } else if (how == "wrong_seq") {
-      answer(body, 0, 0, 1);
-    } else if (how == "status_without_error") {
-      answer(body, static_cast<uint32_t>(wire::Status::kGuestError));
-    } else if (how == "out_for_in") {
-      // An OUT value for a parameter that is not OUT or INOUT.
-      ResultMsg r = good;
-      r.out_params = {{0, Value::i64(1)}};
-      std::string b;
-      encode(r, &b);
-      answer(b);
-    } else if (how == "missing_return") {
-      ResultMsg r;
-      std::string b;
-      encode(r, &b);
-      answer(b);
-    } else if (how == "host_status") {
-      answer(body, static_cast<uint32_t>(wire::Status::kKilled));
-    } else if (how == "chunk_lie") {
-      post_msg(h, wire::Op::kResult, 0, wire::kMore, m.depth, len, len,
-               m.call_seq, body);
-    } else if (how == "die") {
-      _exit(7);
-    } else if (how == "silent") {
-      // never answers
-    } else if (how == "bad_stats") {
-      h->stats.heap_used = ~0ULL;
-      h->stats.heap_max = 100;
-      h->stats.state = 77;
-      answer(body);
-    } else if (how == "tainted") {
-      h->stats.tainted = 1;
-      answer(body);
-    } else if (how == "resize_mailbox") {
-      const int rc = ftruncate(wire::kMailboxFd, 0);  // sealed: must fail
-      if (rc == 0) _exit(8);
-      answer(body);
+    while (true) {
+      std::string body;
+      const wire::MessageHeader h = receive(&body);
+      serve(h, std::move(body));
     }
   }
-}
+
+ private:
+  struct Routine {
+    bool has_return = false;
+    std::vector<uint32_t> outs;
+    std::string call_script;
+  };
+  /** The request a script runs for. */
+  struct Request {
+    wire::MessageHeader h{};
+    std::string body;
+    Routine routine;
+  };
+
+  void post(const wire::MessageHeader &m, std::string_view bytes) {
+    memcpy(m_arena, bytes.data(), std::min<size_t>(bytes.size(), m_arena_size));
+    m_h->msg = m;
+    m_h->to_h.store(++m_posted, std::memory_order_seq_cst);
+    if (m_h->h_sleep.load(std::memory_order_seq_cst) != 0)
+      syscall(SYS_futex, reinterpret_cast<uint32_t *>(&m_h->to_h), FUTEX_WAKE,
+              1, nullptr, nullptr, 0);
+  }
+
+  /** The sleep handshake of the specification, §4.3. */
+  void wait_host() {
+    while (true) {
+      m_h->w_sleep.store(1, std::memory_order_seq_cst);
+      if (m_h->to_w.load(std::memory_order_seq_cst) == m_seen)
+        syscall(SYS_futex, reinterpret_cast<uint32_t *>(&m_h->to_w), FUTEX_WAIT,
+                m_seen, nullptr, nullptr, 0);
+      m_h->w_sleep.store(0, std::memory_order_release);
+      const uint32_t v = m_h->to_w.load(std::memory_order_acquire);
+      if (v != m_seen) {
+        m_seen = v;
+        return;
+      }
+    }
+  }
+
+  wire::MessageHeader header(wire::Op op, uint32_t status, uint32_t depth,
+                             uint64_t seq) {
+    wire::MessageHeader m{};
+    m.op = static_cast<uint32_t>(op);
+    m.status = status;
+    m.depth = depth;
+    m.call_seq = seq;
+    return m;
+  }
+
+  /** A whole message of the host, its chunks answered with CONTINUE. The
+      host is trusted, and this worker is a test of it: a chunk or a
+      CONTINUE that breaks §5.2 ends the worker with status 98. */
+  wire::MessageHeader receive(std::string *body) {
+    wait_host();
+    const wire::MessageHeader first = m_h->msg;
+    wire::MessageHeader m = first;
+    body->assign(m_arena, m.len);
+    while (true) {
+      const bool more = (m.flags & wire::kMore) != 0;
+      if (m.op != first.op || m.status != 0 || m.depth != first.depth ||
+          m.call_seq != first.call_seq || m.total_len != first.total_len ||
+          m.reserved != 0 || (m.flags & ~wire::kKnownMessageFlags) != 0 ||
+          (more ? m.len != m_arena_size || body->size() >= m.total_len
+                : body->size() != m.total_len))
+        _exit(98);
+      if (!more) return first;
+      if (auto it = m_armed.find(wire::Op::kContinue); it != m_armed.end()) {
+        const std::string script = std::move(it->second);
+        m_armed.erase(it);
+        Request r;
+        r.h = first;
+        run_script(script, r);
+      } else {
+        post(header(wire::Op::kContinue, 0, first.depth, first.call_seq), {});
+      }
+      wait_host();
+      m = m_h->msg;
+      body->append(m_arena, m.len);
+    }
+  }
+
+  void send(wire::Op op, uint32_t status, uint32_t depth, uint64_t seq,
+            std::string_view body, uint32_t chunk_delay_ms) {
+    wire::MessageHeader m = header(op, status, depth, seq);
+    m.total_len = body.size();
+    size_t sent = 0;
+    while (true) {
+      const size_t len = std::min<size_t>(m_arena_size, body.size() - sent);
+      const bool more = sent + len < body.size();
+      m.len = static_cast<uint32_t>(len);
+      m.flags = more ? uint32_t{wire::kMore} : 0U;
+      if (sent != 0 && chunk_delay_ms != 0) usleep(chunk_delay_ms * 1000);
+      post(m, body.substr(sent, len));
+      sent += len;
+      if (!more) return;
+      wait_host();
+      const wire::MessageHeader go = m_h->msg;
+      if (go.op != static_cast<uint32_t>(wire::Op::kContinue) ||
+          go.status != 0 || go.flags != 0 || go.len != 0 || go.reserved != 0 ||
+          go.total_len != 0 || go.depth != depth || go.call_seq != seq)
+        _exit(98);
+    }
+  }
+
+  void log(const wire::MessageHeader &h, const std::string &body) {
+    m_log.append(reinterpret_cast<const char *>(&h), sizeof h);
+    m_log += body;
+  }
+
+  /** The host's reply to an SQL or LIBRARY message; nested requests that
+      come before it are served. */
+  void receive_reply() {
+    while (true) {
+      std::string body;
+      const wire::MessageHeader h = receive(&body);
+      const auto op = static_cast<wire::Op>(h.op);
+      if (op != wire::Op::kPrepare && op != wire::Op::kCall &&
+          op != wire::Op::kDrop) {
+        if (m_logging) log(h, body);
+        return;
+      }
+      serve(h, std::move(body));
+    }
+  }
+
+  static std::string script_of(const std::string &text,
+                               std::string_view prefix) {
+    if (text.compare(0, prefix.size(), prefix) != 0) return {};
+    return mle_test::unhex(std::string_view(text).substr(prefix.size()));
+  }
+
+  void serve(const wire::MessageHeader &h, std::string body) {
+    Request r;
+    r.h = h;
+    r.body = std::move(body);
+    const auto op = static_cast<wire::Op>(h.op);
+    std::string script, error;
+    switch (op) {
+      case wire::Op::kPrepare: {
+        PrepareMsg p;
+        if (!decode(r.body, &p, &error)) _exit(95);
+        Routine routine;
+        routine.has_return = p.returns.has_value();
+        for (uint32_t i = 0; i < p.params.size(); i++)
+          if (p.params[i].mode != wire::ParamMode::kIn)
+            routine.outs.push_back(i);
+        routine.call_script = script_of(p.source, "call:");
+        m_routines[p.routine_id] = std::move(routine);
+        script = script_of(p.source, "prepare:");
+        break;
+      }
+      case wire::Op::kCall: {
+        CallMsg c;
+        if (!decode(r.body, &c, &error)) _exit(95);
+        const auto it = m_routines.find(c.routine_id);
+        if (it == m_routines.end() || it->second.outs.size() > c.args.size())
+          _exit(95);
+        r.routine = it->second;
+        script = r.routine.call_script;
+        break;
+      }
+      case wire::Op::kParseLibrary: {
+        ParseLibraryMsg p;
+        if (!decode(r.body, &p, &error)) _exit(95);
+        script = script_of(p.body, "script:");
+        break;
+      }
+      case wire::Op::kDrop: {
+        DropMsg d;
+        if (!decode(r.body, &d, &error)) _exit(95);
+        m_routines.erase(d.routine_id);
+        break;
+      }
+      case wire::Op::kReset:
+        m_routines.clear();
+        break;
+      case wire::Op::kOptions: {
+        OptionsMsg o;
+        if (!decode(r.body, &o, &error)) _exit(95);
+        break;
+      }
+      default:
+        _exit(96);  // not a request
+    }
+    if (auto it = m_armed.find(op); it != m_armed.end()) {
+      script = std::move(it->second);
+      m_armed.erase(it);
+    }
+    if (script.empty())
+      answer(r);
+    else
+      run_script(script, r);
+  }
+
+  /** The RESULT of a conforming worker. */
+  void answer(const Request &r) {
+    ResultMsg m;
+    const auto op = static_cast<wire::Op>(r.h.op);
+    if (op == wire::Op::kCall) {
+      if (r.routine.has_return) m.ret = Value::i64(42);
+      for (const uint32_t index : r.routine.outs)
+        m.out_params.emplace_back(index, Value::i64(index));
+    }
+    if (op == wire::Op::kCall || op == wire::Op::kPrepare) {
+      m.console_out = std::move(m_log);
+      m_log.clear();
+      m_logging = false;
+    }
+    std::string body;
+    encode(m, &body);
+    send(wire::Op::kResult, 0, r.h.depth, r.h.call_seq, body, 0);
+  }
+
+  void await_interrupt(uint64_t seq) {
+    while (true) {
+      unsigned char buf[32];
+      const ssize_t n = recv(wire::kControlFd, buf, sizeof buf, 0);
+      if (n == 0) _exit(0);  // the host is gone
+      uint64_t got;
+      if (n != static_cast<ssize_t>(wire::kInterruptSize) ||
+          buf[0] != static_cast<unsigned char>(wire::Control::kInterrupt))
+        continue;
+      memcpy(&got, buf + 1, sizeof got);
+      if (got != seq) continue;
+      // In the log the datagram is an entry of its own, with op 0.
+      if (m_logging) {
+        wire::MessageHeader h{};
+        h.total_len = static_cast<uint64_t>(n);
+        log(h, std::string(reinterpret_cast<const char *>(buf), n));
+      }
+      return;
+    }
+  }
+
+  void run_script(std::string_view script, const Request &r) {
+    using mle_test::Step;
+    Reader in(script);
+    while (in.remaining() != 0) {
+      uint8_t step;
+      if (!in.u8(&step)) _exit(97);
+      switch (static_cast<Step>(step)) {
+        case Step::kPost: {
+          wire::MessageHeader m{};
+          uint32_t depth_delta;
+          int64_t seq_delta;
+          std::string arena;
+          if (!in.u32(&m.op) || !in.u32(&m.status) || !in.u32(&m.flags) ||
+              !in.u32(&m.len) || !in.u64(&m.total_len) ||
+              !in.u32(&depth_delta) || !in.i64(&seq_delta) ||
+              !in.u32(&m.reserved) || !in.bytes(&arena))
+            _exit(97);
+          if (m.len == mle_test::kAuto)
+            m.len = static_cast<uint32_t>(arena.size());
+          if (m.total_len == mle_test::kAuto) m.total_len = arena.size();
+          m.depth = r.h.depth + depth_delta;
+          m.call_seq = r.h.call_seq + static_cast<uint64_t>(seq_delta);
+          post(m, arena);
+          break;
+        }
+        case Step::kWait:
+          wait_host();
+          break;
+        case Step::kMessage: {
+          uint32_t op, status, delay;
+          std::string body;
+          if (!in.u32(&op) || !in.u32(&status) || !in.u32(&delay) ||
+              !in.bytes(&body))
+            _exit(97);
+          send(static_cast<wire::Op>(op), status, r.h.depth, r.h.call_seq, body,
+               delay);
+          if (op != static_cast<uint32_t>(wire::Op::kResult) &&
+              op != static_cast<uint32_t>(wire::Op::kReady))
+            receive_reply();
+          break;
+        }
+        case Step::kSleep: {
+          uint32_t ms;
+          if (!in.u32(&ms)) _exit(97);
+          usleep(ms * 1000);
+          break;
+        }
+        case Step::kAwaitInterrupt:
+          await_interrupt(r.h.call_seq);
+          break;
+        case Step::kExit: {
+          uint32_t status;
+          if (!in.u32(&status)) _exit(97);
+          _exit(static_cast<int>(status));
+        }
+        case Step::kTainted:
+          m_h->stats.tainted = 1;
+          break;
+        case Step::kBadStats:
+          m_h->stats.heap_used = ~0ULL;
+          m_h->stats.heap_max = 100;
+          m_h->stats.state = 77;
+          break;
+        case Step::kArm: {
+          uint32_t op;
+          std::string armed;
+          if (!in.u32(&op) || !in.bytes(&armed)) _exit(97);
+          m_armed[static_cast<wire::Op>(op)] = std::move(armed);
+          break;
+        }
+        case Step::kResize:
+          if (ftruncate(wire::kMailboxFd, 0) == 0) _exit(8);  // sealed
+          break;
+        case Step::kAnswer:
+          answer(r);
+          break;
+        case Step::kLoop: {
+          uint32_t count;
+          std::string body;
+          if (!in.u32(&count) || !in.bytes(&body)) _exit(97);
+          for (uint32_t i = 0; i < count; i++) run_script(body, r);
+          break;
+        }
+        case Step::kLog:
+          m_logging = true;
+          log(r.h, r.body);
+          break;
+        default:
+          _exit(97);
+      }
+    }
+  }
+
+  wire::RegionHeader *m_h;
+  char *m_arena;
+  uint32_t m_arena_size;
+  uint32_t m_posted = 0;
+  uint32_t m_seen = 0;
+  std::map<uint64_t, Routine> m_routines;
+  std::map<wire::Op, std::string> m_armed;
+  std::string m_log;
+  bool m_logging = false;
+};
 
 }  // namespace
 
@@ -299,10 +566,8 @@ int main(int argc, char **argv) {
     post_ready(h, "ignoring EOF");
     while (true) pause();
   }
-  if (mode == "proto" && argc == 3) {
-    post_ready(h, "proto");
-    proto_loop(h, argv[2]);
-  }
+  if (mode == "proto")
+    Proto(h).run(argc > 2 ? mle_test::unhex(argv[2]) : std::string());
   if (mode == "fork" && argc == 3) {
     int ok = 0;
     for (int i = 0; i < atoi(argv[2]); i++) {

@@ -21,9 +21,9 @@
 /**
   @file include/mle/value.h
 
-  A typed SQL value as carried by the MLE wire protocol (protocol.h, Tag).
-  Owns its bytes. No MySQL types: the conversion from and to MySQL values is
-  done by the component.
+  A typed SQL value as the MLE worker protocol carries it (docs/protocol.md
+  §7.2). Owns its bytes. No MySQL types: the component converts from and to
+  MySQL values.
 */
 
 #include <cstdint>
@@ -39,9 +39,9 @@ namespace mle {
 
 using wire::Tag;
 
-/** The fields of MYSQL_TIME that the protocol carries. DATE uses only the
-    date part, TIME only hour (may exceed 23), minute, second, microsecond
-    and negative. */
+/** The specification's Civil: a calendar date and clock time without a
+    time zone. DATE uses only the date part, TIME only hour (up to 838),
+    minute, second, microsecond and negative. */
 struct Temporal {
   uint16_t year = 0;
   uint8_t month = 0;
@@ -74,8 +74,13 @@ class Value {
     return {Tag::kBytes, std::move(data)};
   }
   static Value json(std::string text) { return {Tag::kJson, std::move(text)}; }
-  /** tag is one of kDate, kTime, kDatetime, kTimestamp. */
+  /** tag is one of kDate, kTime, kDatetime. */
   static Value temporal(Tag tag, const Temporal &t) { return {tag, t}; }
+  /** An instant: microseconds since 1970-01-01 00:00:00 UTC, or
+      wire::kZeroTimestamp. */
+  static Value timestamp(int64_t microseconds) {
+    return {Tag::kTimestamp, microseconds};
+  }
   static Value vector(std::vector<float> v) {
     return {Tag::kVector, std::move(v)};
   }
@@ -91,6 +96,7 @@ class Value {
   /** kDecimal, kString, kBytes, kJson. */
   const std::string &as_text() const { return std::get<std::string>(m_data); }
   const Temporal &as_temporal() const { return std::get<Temporal>(m_data); }
+  int64_t as_timestamp() const { return std::get<int64_t>(m_data); }
   const std::vector<float> &as_vector() const {
     return std::get<std::vector<float>>(m_data);
   }
@@ -113,6 +119,11 @@ class Value {
 
 /** Name of a tag for messages, e.g. "VECTOR". */
 const char *tag_name(Tag tag);
+
+/** False for an F64, F32 or VECTOR that holds a NaN or an infinity. A float
+    of a worker that is not finite is an error of guest code, not a malformed
+    message (§7.2). */
+bool is_finite(const Value &v);
 
 }  // namespace mle
 
