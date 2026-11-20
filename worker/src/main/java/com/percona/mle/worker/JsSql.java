@@ -123,9 +123,11 @@ final class JsSql implements GuestSql.Lang {
         for (const [k, v] of [['session', B.session], ['mysql', mysql], ['SqlError', SqlError]])
           Object.defineProperty(globalThis, k, { value: v, writable: false, configurable: false });
         return {
-          throwSql: (code, state, message, row) => {
+          // id: of a statement's error as mysqld sent it; the routine hands the error back by it.
+          throwSql: (code, state, message, row, id) => {
             const e = new SqlError(state, message, code);
             if (row >= 0) e.row = row;
+            if (id) Object.defineProperty(e, '$mle$id', { value: id });
             throw e;
           },
           throwError: (message, type) => { throw type ? new TypeError(message) : new Error(message); },
@@ -176,7 +178,8 @@ final class JsSql implements GuestSql.Lang {
   @Override
   public RuntimeException sqlError(MleSqlException e) {
     try {
-      h.getMember("throwSql").execute(e.getErrorCode(), e.getSqlState(), e.getMessage(), e.getRow());
+      h.getMember("throwSql").execute(e.getErrorCode(), e.getSqlState(), e.getMessage(), e.getRow(),
+          e.getErrorId() == 0 ? null : Long.toUnsignedString(e.getErrorId()));
     } catch (PolyglotException p) {
       return p;
     }
@@ -252,6 +255,8 @@ final class JsSql implements GuestSql.Lang {
         yield vector.execute(bb);
       }
       case Values.Temporal t -> temporal(t);
+      // An instant, as a Date is; the zero timestamp is an invalid Date.
+      case Values.Timestamp t -> date.execute(t.zero() ? Double.NaN : (double) t.millis());
       default -> raw;
     };
   }

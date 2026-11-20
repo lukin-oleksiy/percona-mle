@@ -29,7 +29,8 @@ import java.util.Set;
 /**
  * A prepared statement (Oracle's PreparedStatement), from {@link Session#prepare}. Values given
  * to {@link #bind} bind the markers in order at the next {@link #execute()}; the first execution
- * needs all of them, later ones keep the values of markers not bound again.
+ * needs all of them, later ones keep the values of markers not bound again (the worker remembers
+ * the last execution's values, {@link Statements#bind}: mysqld gets all of them every time).
  */
 public final class PreparedStatement {
   private final Session session;
@@ -120,7 +121,7 @@ public final class PreparedStatement {
   /** Chunks of a rewritten batch smaller than this (its last rows) run row by row. */
   static final int REWRITE_MIN_ROWS = 16;
   private static final int REWRITE_MAX_ROWS = 1000;
-  /** The values one message may carry (kMaxValues in protocol.h). */
+  /** The values one message may carry (protocol §12). */
   private static final int MAX_VALUES = com.percona.mle.worker.SqlBridge.MAX_VALUES;
   /**
    * Errors a row's values cause (NULL in a NOT NULL column, duplicate key, out of range, truncated
@@ -227,7 +228,7 @@ public final class PreparedStatement {
       if (bad != null) throw bad;
     }
     return new SqlResult(session, id, false, options,
-        new MleSql.Reply(id, false, List.of(), List.of(), false, false, affected, 0, warnings, 0, execUs, 0));
+        new MleSql.Reply(id, false, List.of(), List.of(), false, false, affected, 0, warnings, 0, execUs, 0, false));
   }
 
   /** The multi-row form with k rows, prepared once. */
@@ -288,8 +289,10 @@ public final class PreparedStatement {
         try {
           r = com.percona.mle.worker.SqlBridge.requestMany(id, batch.toArray(), parameterCount);
         } catch (MleSqlException e) {
+          // The error's row counts the rows of this message that ran before it.
           throw e.getRow() < 0 ? e
-              : new MleSqlException(e.getErrorCode(), e.getSqlState(), e.getMessage(), done + e.getRow());
+              : new MleSqlException(e.getErrorCode(), e.getSqlState(), e.getMessage(), done + e.getRow(),
+                  e.getErrorId());
         }
         affected += r.affectedRows();
         execUs += r.executionMicros();
@@ -309,7 +312,7 @@ public final class PreparedStatement {
     if (bad != null) throw bad;
     lastWarnings = warnings;
     return new SqlResult(session, id, false, options,
-        new MleSql.Reply(id, false, List.of(), List.of(), false, false, affected, 0, warnings, 0, execUs, 0));
+        new MleSql.Reply(id, false, List.of(), List.of(), false, false, affected, 0, warnings, 0, execUs, 0, false));
   }
 
   /** About the bytes value v takes in a message (to fill one mailbox arena per batch message). */

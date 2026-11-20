@@ -24,52 +24,83 @@ import java.lang.invoke.VarHandle;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * The worker's side of the shared memory mailbox (protocol.h): mapped with FFM, sequence words
- * read and written with VarHandle atomics, futex waits through a syscall downcall.
+ * The worker's side of the shared memory mailbox (§3 to §5): mapped with FFM, sequence words read
+ * and written with VarHandle atomics, futex waits through a syscall downcall.
  *
  * <p>Messages are decoded in place from the arena when they fit in one chunk; larger messages
  * are reassembled in a native buffer. Messages are written in place by {@link MessageWriter}.
+ * Every header of the host is checked in full; one that breaks §5 is a protocol failure.
  */
 final class Mailbox {
   private static final VarHandle INT = ValueLayout.JAVA_INT.varHandle();
+  /** The bytes kept of a message that is discarded (PREPARE's routine_id is in them). */
+  private static final long HEAD = 8;
 
   final MemorySegment region;
   final MemorySegment arena;
   final int arenaSize;
+  /** The region's version (§3). */
+  final int version;
   private final MemorySegment toW;
   private final MemorySegment toH;
   private final int spin;
+  /** The value of the host's word seen last (§4.1). */
   private int seenW;
+  /** The worker's post count: stored into its word, never read back from it. */
+  private int posts;
   private MemorySegment assembly = MemorySegment.NULL;
   /** The last message was a large one: its buffer goes when the next message arrives. */
   private boolean dropAssembly;
 
-  /** A received message. body is valid until the worker posts its next message. */
-  record Message(int op, int status, int depth, long callSeq, MemorySegment body) {}
+  /**
+   * A received message. body is valid until the worker posts its next message. discarded: the
+   * worker could not hold the message (§5.3); the transfer was completed, and body is only its
+   * first bytes (at most 8).
+   */
+  record Message(int op, int depth, long callSeq, MemorySegment body, boolean discarded, boolean chunked) {}
 
-  private Mailbox(MemorySegment region, int spin) {
+  /**
+   * What the receiver expects (§8): called with the first chunk's header before anything is
+   * answered; it ends the process (ProtocolFailure) for a message that is out of place.
+   */
+  interface Admission {
+    void check(int op, int depth, long callSeq);
+  }
+
+  private Mailbox(MemorySegment region, int arenaSize, int version, int spin) {
     this.region = region;
-    this.arenaSize = region.get(ValueLayout.JAVA_INT, Wire.OFF_ARENA_SIZE);
+    this.arenaSize = arenaSize;
+    this.version = version;
     this.arena = region.asSlice(Wire.HEADER_SIZE, arenaSize);
     this.toW = region.asSlice(Wire.OFF_TO_W, 4);
     this.toH = region.asSlice(Wire.OFF_TO_H, 4);
     this.spin = spin;
   }
 
+  /**
+   * Maps the region (§2 step 3). A wrong magic or size ends the process with status 2 before the
+   * region is touched.
+   */
   static Mailbox open(int spin) {
+    long fileSize = Native.fileSize(Wire.MAILBOX_FD);
+    if (fileSize < Wire.HEADER_SIZE) Runtime.getRuntime().halt(Wire.EXIT_BAD_REGION);
     MemorySegment header = Native.mapShared(Wire.MAILBOX_FD, Wire.HEADER_SIZE);
     int magic = header.get(ValueLayout.JAVA_INT, Wire.OFF_MAGIC);
     int version = header.get(ValueLayout.JAVA_INT, Wire.OFF_VERSION);
     long size = header.get(ValueLayout.JAVA_LONG, Wire.OFF_REGION_SIZE);
+    long arenaSize = Integer.toUnsignedLong(header.get(ValueLayout.JAVA_INT, Wire.OFF_ARENA_SIZE));
     Native.unmap(header);
-    if (magic != Wire.MAGIC || version != Wire.VERSION)
-      throw new IllegalStateException("not an MLE mailbox of protocol version " + Wire.VERSION);
-    return new Mailbox(Native.mapShared(Wire.MAILBOX_FD, size), spin);
+    if (magic != Wire.MAGIC || size != Wire.HEADER_SIZE + arenaSize || size != fileSize)
+      Runtime.getRuntime().halt(Wire.EXIT_BAD_REGION);
+    // The launcher keeps §3's bounds of the arena; the one-chunk messages rely on the lower one.
+    if (arenaSize < Wire.MIN_ARENA_SIZE || arenaSize > Wire.MAX_ARENA_SIZE || arenaSize % 4096 != 0)
+      throw new IllegalStateException("an arena of " + arenaSize + " bytes");
+    return new Mailbox(Native.mapShared(Wire.MAILBOX_FD, size), (int) arenaSize, version, spin);
   }
 
   // ------------------------------------------------------------ raw hand-off
 
-  /** Waits until the host bumps to_w: spin, then sleep on the futex. */
+  /** Waits until the host's word differs from the value seen: spin, then sleep on the futex (§4.3). */
   private void waitHost() {
     for (int i = 0; i < spin; i++) {
       int v = (int) INT.getAcquire(region, Wire.OFF_TO_W);
@@ -83,7 +114,7 @@ final class Mailbox {
       INT.setVolatile(region, Wire.OFF_W_SLEEP, 1);
       int v = (int) INT.getVolatile(region, Wire.OFF_TO_W);
       if (v == seenW) Native.futexWait(toW, seenW);
-      INT.setVolatile(region, Wire.OFF_W_SLEEP, 0);
+      INT.setRelease(region, Wire.OFF_W_SLEEP, 0);
       v = (int) INT.getAcquire(region, Wire.OFF_TO_W);
       if (v != seenW) {
         seenW = v;
@@ -107,8 +138,12 @@ final class Mailbox {
     return true;
   }
 
+  /**
+   * Posts what is in msg and the arena (§4.1, §4.2): the new count is stored into the worker's
+   * word, and that store and the load of the host's sleep flag are sequentially consistent.
+   */
   private void post() {
-    int unused = (int) INT.getAndAdd(region, Wire.OFF_TO_H, 1);
+    INT.setVolatile(region, Wire.OFF_TO_H, ++posts);
     if ((int) INT.getVolatile(region, Wire.OFF_H_SLEEP) != 0) Native.futexWake(toH);
   }
 
@@ -118,6 +153,7 @@ final class Mailbox {
     region.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_FLAGS, flags);
     region.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_DEPTH, depth);
     region.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_LEN, (int) len);
+    region.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_RESERVED, 0);
     region.set(ValueLayout.JAVA_LONG, Wire.OFF_MSG + Wire.MSG_TOTAL_LEN, total);
     region.set(ValueLayout.JAVA_LONG, Wire.OFF_MSG + Wire.MSG_CALL_SEQ, seq);
   }
@@ -130,52 +166,85 @@ final class Mailbox {
     return region.get(ValueLayout.JAVA_LONG, Wire.OFF_MSG + field);
   }
 
+  private static boolean hostOp(int op) {
+    return switch (op) {
+      case Wire.PREPARE, Wire.CALL, Wire.SQL_RESULT, Wire.DROP, Wire.RESET, Wire.OPTIONS, Wire.PARSE_LIBRARY,
+           Wire.LIBRARY_RESULT -> true;
+      default -> false;
+    };
+  }
+
   // ------------------------------------------------------------ messages
 
-  /** Waits for the next message from the host and reassembles it if it is chunked. */
-  Message receive() {
+  /**
+   * Waits for the next message of the host and reassembles it if it comes in chunks (§5.2). The
+   * first chunk's header is checked as a whole message's would be, admission included, before
+   * the first CONTINUE; every later chunk must repeat it.
+   */
+  Message receive(Admission admission) {
     waitHost();
     int op = msgInt(Wire.MSG_OP);
     int status = msgInt(Wire.MSG_STATUS);
     int flags = msgInt(Wire.MSG_FLAGS);
     int depth = msgInt(Wire.MSG_DEPTH);
     long len = Integer.toUnsignedLong(msgInt(Wire.MSG_LEN));
+    int reserved = msgInt(Wire.MSG_RESERVED);
     long total = msgLong(Wire.MSG_TOTAL_LEN);
     long seq = msgLong(Wire.MSG_CALL_SEQ);
     if (dropAssembly) {  // a large message's buffer is not kept for the worker's life
       assembly = MemorySegment.NULL;
       dropAssembly = false;
     }
-    // The checks of the host's own assembler (codec.cc): one chunk is the whole message, a chunk
-    // with more to follow leaves bytes to follow, and the chunks agree on depth and total.
-    boolean more = (flags & Wire.FLAG_MORE) != 0;
-    if (len > arenaSize || len > total || (more ? len == total : len != total))
-      throw new IllegalStateException("bad message header");
-    if (!more) return new Message(op, status, depth, seq, arena.asSlice(0, len));
+    if (!hostOp(op)) throw ProtocolFailure.exit("op " + op + " from the host");
+    if (status != 0 || reserved != 0 || (flags & ~Wire.FLAG_MORE) != 0)
+      throw ProtocolFailure.exit("bad header of op " + op + ": status " + status + ", flags " + flags);
+    boolean more = flags == Wire.FLAG_MORE;
+    boolean small = op == Wire.OPTIONS || op == Wire.DROP || op == Wire.RESET;
+    if (total < 0 || total > (small ? Wire.MAX_SMALL_MESSAGE : Wire.MAX_HOST_MESSAGE))
+      throw ProtocolFailure.exit("op " + op + " of " + Long.toUnsignedString(total) + " bytes");
+    // One chunk is the whole message; of several, every one but the last is a whole arena.
+    if (more ? total <= arenaSize || len != arenaSize : len != total || total > arenaSize)
+      throw ProtocolFailure.exit("bad chunk of op " + op + ": len " + len + " of " + total);
+    admission.check(op, depth, seq);
+    if (!more) return new Message(op, depth, seq, arena.asSlice(0, len), false, false);
 
-    if (assembly.byteSize() < total) assembly = Arena.ofAuto().allocate(total, Wire.VECTOR_ALIGNMENT);
+    // A message the worker has no memory for is still received to its end, without its bytes (§5.3).
+    boolean discard = false;
+    MemorySegment head = MemorySegment.NULL;
+    if (assembly.byteSize() < total) {
+      try {
+        assembly = Arena.ofAuto().allocate(total, Wire.VECTOR_ALIGNMENT);
+      } catch (OutOfMemoryError e) {
+        discard = true;
+        head = MemorySegment.ofArray(arena.asSlice(0, HEAD).toArray(ValueLayout.JAVA_BYTE));
+      }
+    }
     dropAssembly = assembly.byteSize() > 4L * arenaSize;
     long have = 0;
     while (true) {
-      MemorySegment.copy(arena, 0, assembly, have, len);
+      if (!discard) MemorySegment.copy(arena, 0, assembly, have, len);
       have += len;
       if (!more) break;
-      header(Wire.CONTINUE, Wire.OK, 0, depth, 0, 0, seq);
+      header(Wire.CONTINUE, 0, 0, depth, 0, 0, seq);
       post();
       waitHost();
       flags = msgInt(Wire.MSG_FLAGS);
-      more = (flags & Wire.FLAG_MORE) != 0;
       len = Integer.toUnsignedLong(msgInt(Wire.MSG_LEN));
-      if (msgInt(Wire.MSG_OP) != op || msgLong(Wire.MSG_CALL_SEQ) != seq || msgInt(Wire.MSG_DEPTH) != depth
-          || msgLong(Wire.MSG_TOTAL_LEN) != total || len > arenaSize || have + len > total
-          || (more && have + len == total))
-        throw new IllegalStateException("bad message chunk");
+      if (msgInt(Wire.MSG_OP) != op || msgInt(Wire.MSG_STATUS) != 0 || msgInt(Wire.MSG_DEPTH) != depth
+          || msgInt(Wire.MSG_RESERVED) != 0 || msgLong(Wire.MSG_TOTAL_LEN) != total
+          || msgLong(Wire.MSG_CALL_SEQ) != seq || (flags & ~Wire.FLAG_MORE) != 0)
+        throw ProtocolFailure.exit("a chunk of op " + op + " that does not repeat the first chunk's header");
+      more = flags == Wire.FLAG_MORE;
+      if (more ? len != arenaSize || have + len >= total : len < 1 || len > arenaSize || have + len != total)
+        throw ProtocolFailure.exit("bad chunk of op " + op + ": len " + len + " after " + have + " of " + total);
     }
-    if (have != total) throw new IllegalStateException("truncated message");
-    return new Message(op, status, depth, seq, assembly.asSlice(0, total));
+    return new Message(op, depth, seq, discard ? head : assembly.asSlice(0, total), discard, true);
   }
 
-  /** Posts the message in w (written in place, or spilled and sent in chunks). */
+  /**
+   * Posts the message in w (written in place, or spilled and sent in chunks). The writer keeps
+   * the size limits of §12; between the chunks the host posts CONTINUE and nothing else.
+   */
   void send(int op, int status, int depth, long seq, MessageWriter w) {
     long total = w.size();
     if (!w.spilled()) {
@@ -194,7 +263,10 @@ final class Mailbox {
       sent += len;
       if (!more) return;
       waitHost();
-      if (msgInt(Wire.MSG_OP) != Wire.CONTINUE) throw new IllegalStateException("expected CONTINUE");
+      if (msgInt(Wire.MSG_OP) != Wire.CONTINUE || msgInt(Wire.MSG_STATUS) != 0 || msgInt(Wire.MSG_FLAGS) != 0
+          || msgInt(Wire.MSG_DEPTH) != depth || msgInt(Wire.MSG_LEN) != 0 || msgInt(Wire.MSG_RESERVED) != 0
+          || msgLong(Wire.MSG_TOTAL_LEN) != 0 || msgLong(Wire.MSG_CALL_SEQ) != seq)
+        throw ProtocolFailure.exit("expected CONTINUE for op " + op);
     }
   }
 

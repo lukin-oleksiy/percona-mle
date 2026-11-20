@@ -66,6 +66,10 @@ final class Native {
   private static final MethodHandle READ =
       fn("read", FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
 
+  private static final MethodHandle LSEEK =
+      fn("lseek", FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT));
+
+  static final int SEEK_END = 2;
   static final int PROT_READ = 1;
   static final int PROT_WRITE = 2;
   static final int MAP_SHARED = 1;
@@ -86,6 +90,15 @@ final class Native {
           (MemorySegment) MMAP.invokeExact(MemorySegment.NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0L);
       if (p.address() == -1L) throw new IllegalStateException("mmap failed");
       return p.reinterpret(size);
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /** The size of the file behind fd (lseek to its end); -1 on error. */
+  static long fileSize(int fd) {
+    try {
+      return (long) LSEEK.invokeExact(fd, 0L, SEEK_END);
     } catch (Throwable t) {
       throw rethrow(t);
     }

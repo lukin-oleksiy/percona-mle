@@ -210,7 +210,7 @@ final class JsOracle {
       case Long l -> {
         if (t.is("YEAR")) yield l;
         if (t.is("BIT")) yield (l >= -MAX_SAFE && l <= MAX_SAFE) ? (Object) l : Long.toUnsignedString(l);
-        if (o.integerType == Wire.INT_STRING) yield l.toString();
+        if (o.integerType == Options.INT_STRING) yield l.toString();
         yield (l >= -MAX_SAFE && l <= MAX_SAFE) ? (Object) l : l.toString();
       }
       case BigInteger b -> b.toString();
@@ -227,6 +227,8 @@ final class JsOracle {
         case Wire.T_DATE -> (double) ((LocalDate) tm.toJava()).atStartOfDay(o.zone).toInstant().toEpochMilli();
         default -> (double) ((LocalDateTime) tm.toJava()).atZone(o.zone).toInstant().toEpochMilli();
       };
+      // An instant, as a Date is; the zero timestamp is an invalid Date.
+      case Values.Timestamp ts -> ts.zero() ? Double.NaN : (double) ts.millis();
       default -> v;  // Double, Float, String
     };
   }
@@ -389,6 +391,7 @@ final class JsOracle {
       case Wire.T_DATE, Wire.T_DATETIME, Wire.T_TIMESTAMP -> {
         Value ms = h.getMember("date_ms").execute(v);
         if (ms.isNull() || !Double.isFinite(ms.asDouble())) throw cannot(v, t, h);
+        if (t.tag() == Wire.T_TIMESTAMP) return Instant.ofEpochMilli((long) ms.asDouble());
         LocalDateTime dt = LocalDateTime.ofInstant(Instant.ofEpochMilli((long) ms.asDouble()), o.zone);
         return t.tag() == Wire.T_DATE ? dt.toLocalDate() : dt;
       }

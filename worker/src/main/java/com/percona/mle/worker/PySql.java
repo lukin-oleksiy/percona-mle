@@ -46,8 +46,8 @@ import org.graalvm.polyglot.proxy.ProxyObject;
  * the globals session, mysql and SqlError in every Python routine.
  *
  * <p>Values: int (all integers, exact), float, decimal.Decimal (float with decimalType NUMBER),
- * str, bytes, JSON parsed (dict, list ...), datetime.date, datetime.datetime (naive, mysqld's
- * zone), datetime.timedelta (TIME), numpy.float32 arrays for VECTOR (array.array('f') without
+ * str, bytes, JSON parsed (dict, list ...), datetime.date, datetime.datetime (naive; a TIMESTAMP in the
+ * session's zone), datetime.timedelta (TIME), numpy.float32 arrays for VECTOR (array.array('f') without
  * numpy); NULL and a zero date are None (a Java null: "is None" holds, its type shows as
  * ForeignNone). Parameters: the same types, plus bool, set (text), list/tuple/dict
  * (JSON; not for VECTOR columns), numpy arrays and array.array (VECTOR), bytearray/memoryview (bytes).
@@ -183,10 +183,13 @@ final class PySql implements GuestSql.Lang {
               # Body-form routines get fresh globals per call from a prepared dict (Phase 7).
               (fn.__mle_base__ if hasattr(fn, '__mle_base__') else fn.__globals__)[name] = value
 
-          def throw_sql(code, state, message, row=-1):
+          def throw_sql(code, state, message, row=-1, id=None):
+              # id: of a statement's error as mysqld sent it; the routine hands the error back by it.
               e = SqlError(state, message, code)
               if row >= 0:
                   e.row = row
+              if id:
+                  setattr(e, '$mle$id', id)
               raise e
 
           def throw_error(message, type_error):
@@ -261,7 +264,8 @@ final class PySql implements GuestSql.Lang {
   @Override
   public RuntimeException sqlError(MleSqlException e) {
     try {
-      throwSql.execute(e.getErrorCode(), e.getSqlState(), e.getMessage(), e.getRow());
+      throwSql.execute(e.getErrorCode(), e.getSqlState(), e.getMessage(), e.getRow(),
+          e.getErrorId() == 0 ? null : Long.toUnsignedString(e.getErrorId()));
     } catch (PolyglotException p) {
       return p;
     }
@@ -318,9 +322,10 @@ final class PySql implements GuestSql.Lang {
     return o;
   }
 
+  /** No session setting concerns Python's values (js.decimal_type is JavaScript's): DECIMAL is Decimal. */
   @Override
   public SqlOptions defaults() {
-    return new SqlOptions().decimalType(SqlOptions.DECIMAL_TYPES.get(options.decimalType));
+    return new SqlOptions();
   }
 
   // ------------------------------------------------------------ columns (numpy)
@@ -503,6 +508,8 @@ final class PySql implements GuestSql.Lang {
       case MleJson j -> json.execute(j.text());
       case float[] f -> vectorValue(f);
       case Values.Temporal t -> temporal(t);
+      // The local time in the session's zone (a naive datetime); None for the zero timestamp.
+      case Values.Timestamp t -> t.zero() ? null : datetime.execute(t.local().toString());
       default -> raw;
     };
   }

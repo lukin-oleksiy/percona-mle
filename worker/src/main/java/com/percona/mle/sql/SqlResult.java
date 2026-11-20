@@ -100,13 +100,13 @@ public final class SqlResult implements Iterable<Row> {
   private long execUs;
   private List<Warning> warnings = List.of();
   private boolean replaced;
-  /** The current result set's row count (0: not known), and its rows received so far. */
+  /** The current result set's row count (-1: not known), and its rows received so far. */
   private long total;
   private long received;
 
   /**
    * A statement run from text, with or without parameters (not a prepared one): when mysqld
-   * buffered its whole result (it then says how many rows: total > 0; a cursor's result is not
+   * buffered its whole result (it then says how many rows: total >= 0; a cursor's result is not
    * buffered and not drained) it sends it in chunks. The rest is fetched when the routine reads
    * it, or drained into the worker before the routine runs another statement (exp note 44 step 3),
    * so mysqld holds at most one such result (12 §11; with parameters too: independent review C14).
@@ -140,7 +140,7 @@ public final class SqlResult implements Iterable<Row> {
     warnings = warnings(r);
     total = r.totalRows();
     received = rows.size();
-    if (direct && moreRows && total > 0) com.percona.mle.worker.SqlBridge.deferDrain(id, this::drain);
+    if (direct && moreRows && total >= 0) com.percona.mle.worker.SqlBridge.deferDrain(id, this::drain);
   }
 
   /** Another statement is about to run: the unread rows into the worker (see direct). */
@@ -162,7 +162,9 @@ public final class SqlResult implements Iterable<Row> {
     received += n;
     moreRows = r.moreRows();
     moreResults = r.moreResults();
-    if (!r.warnings().isEmpty()) warnings = warnings(r);
+    // The last batch's list is the result's complete one, also when it is empty; an earlier
+    // batch's is either that so far, or empty for "nothing new".
+    if (!moreRows || !r.warnings().isEmpty()) warnings = warnings(r);
     if (!moreRows) com.percona.mle.worker.SqlBridge.drained(id);
   }
 
@@ -170,7 +172,7 @@ public final class SqlResult implements Iterable<Row> {
   public long remainingRows() {
     long here = rows.size() - pos;
     if (!moreRows) return here;
-    return total > 0 ? here + total - received : -1;
+    return total >= 0 ? here + total - received : -1;
   }
 
   private static List<Warning> warnings(MleSql.Reply r) {
@@ -308,7 +310,17 @@ public final class SqlResult implements Iterable<Row> {
       pos = 0;
       return false;
     }
-    load(session.request(Session.NEXT_RESULT, id, null, null, 0, 0));
+    MleSql.Reply r = session.request(Session.NEXT_RESULT, id, null, null, 0, 0);
+    if (r.end()) {  // the rows left were skipped, and nothing follows
+      com.percona.mle.worker.SqlBridge.drained(id);
+      hasData = false;
+      rows = List.of();
+      pos = 0;
+      moreRows = false;
+      moreResults = false;
+      return false;
+    }
+    load(r);
     return hasData;
   }
 

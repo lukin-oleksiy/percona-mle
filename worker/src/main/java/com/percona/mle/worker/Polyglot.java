@@ -771,7 +771,17 @@ final class Polyglot {
   /** Set by the dispatcher for a CREATE's PREPARE: also check the code (Python names). */
   boolean check;
 
-  /** CREATE (exp note 39): the check's findings as marked stderr lines (warnings in mysqld). */
+  /** What the check of the PREPARE being served found (RESULT's findings, §9.4). */
+  private List<String> findings = List.of();
+
+  /** The findings of the last PREPARE with check; none are left behind. */
+  List<String> takeFindings() {
+    List<String> f = findings;
+    findings = List.of();
+    return f;
+  }
+
+  /** CREATE (exp note 39): the check's findings, one per name (warnings in mysqld). */
   private void checkPython(String source, List<JavaRoutines.Param> params, List<LibraryFileSystem.Import> imports) {
     try {
       List<String> names = new java.util.ArrayList<>();
@@ -780,8 +790,10 @@ final class Polyglot {
       for (LibraryFileSystem.Import i : imports) known.add(i.alias().isEmpty() ? i.name() : i.alias());
       Value found = context.getBindings("python").getMember("_mle_helpers").getHashValue("check_names")
           .execute(source, names.toArray(), known.toArray());
-      for (long i = 0; i < found.getArraySize(); i++)
-        System.err.println("\u001fmle-check:" + found.getArrayElement(i).asString());
+      List<String> list = new java.util.ArrayList<>();
+      for (long i = 0; i < found.getArraySize() && list.size() < Wire.MAX_FINDINGS; i++)
+        list.add(found.getArrayElement(i).asString());
+      findings = list;
     } catch (PolyglotException e) {
       // A check that fails is no reason to refuse the routine; KILL still stops the statement.
       if (e.isInterrupted() || e.isCancelled() || e.isResourceExhausted()) throw e;
@@ -865,30 +877,32 @@ final class Polyglot {
         if (seen == null || seen != l.stamp()) pyLibraries.put(schema + "/" + name, l.stamp());
         return module;
       }
-      default -> {
+      case "java" -> {
         // A Java library: compiled once per version into its own class loader; the namespace's
         // members are its classes (static side: static methods, constructors with new).
         return javaLibrary(schema + "." + name, l);
       }
+      default -> throw new IllegalArgumentException("the library " + schema + "." + name + " is in the language "
+          + l.language() + ", which this worker cannot run");
     }
   }
 
   /** Python libraries evaluated (in PySql's cache), by "schema/name": their stamps. */
   private final Map<String, Long> pyLibraries = new HashMap<>();
 
-  /** JavaScript libraries' module namespaces, by "schema/name": {hash, namespace}. */
+  /** JavaScript libraries' module namespaces, by "schema/name": {stamp, namespace}. */
   private final Map<String, Object[]> jsLibraries = new HashMap<>();
 
-  private Value jsLibrary(String schema, String name, long hash) {
+  private Value jsLibrary(String schema, String name, long stamp) {
     String key = schema + "/" + name;
     Object[] hit = jsLibraries.get(key);
-    if (hit != null && (long) hit[0] == hash) return (Value) hit[1];
+    if (hit != null && (long) hit[0] == stamp) return (Value) hit[1];
     // The virtual path, not Oracle's "/schema/name": a host directory of that name does not hide
     // the library. The module map keeps one instance per version for every importer.
     LibraryFileSystem.checkJsName(schema, name);
     LibraryFileSystem.evaluating(schema, name);
     Value ns = jsModule(LibraryFileSystem.ROOT + "/" + schema + "/" + name + ".mjs");
-    jsLibraries.put(key, new Object[] {hash, ns});
+    jsLibraries.put(key, new Object[] {stamp, ns});
     return ns;
   }
 
@@ -1344,6 +1358,10 @@ final class Polyglot {
             ? (Object) (double) ((LocalDateTime) t.toJava()).atZone(zone).toInstant().toEpochMilli()
             : t.toJava().toString();
       };
+      // An instant: a JavaScript Date (invalid for the zero timestamp); for Python the local time
+      // in the session's zone (None for the zero timestamp).
+      case Values.Timestamp t -> js ? (Object) (t.zero() ? Double.NaN : (double) t.millis())
+          : t.zero() ? null : t.local().toString();
       default -> v;  // Double, Float, String
     };
   }
@@ -1410,10 +1428,18 @@ final class Polyglot {
         if (v.isDate()) return v.asDate();
         throw new Values.ConversionException("cannot convert " + v + " to DATE");
       }
-      case Wire.T_DATETIME, Wire.T_TIMESTAMP -> {
+      case Wire.T_DATETIME -> {
         if (v.isDate() && v.isTime() && !v.isTimeZone()) return LocalDateTime.of(v.asDate(), v.asTime());
         // An aware datetime: in the session's time zone (as JavaScript Dates).
         if (v.isInstant()) return LocalDateTime.ofInstant(v.asInstant(), options.zone);
+        if (v.isDate()) return v.asDate();
+        throw new Values.ConversionException("cannot convert " + v + " to " + t.sqlName());
+      }
+      case Wire.T_TIMESTAMP -> {
+        // An instant as it is (a JavaScript Date, an aware datetime); a naive datetime is the
+        // local time in the session's time zone (Values.writeAs).
+        if (v.isInstant()) return v.asInstant();
+        if (v.isDate() && v.isTime()) return LocalDateTime.of(v.asDate(), v.asTime());
         if (v.isDate()) return v.asDate();
         throw new Values.ConversionException("cannot convert " + v + " to " + t.sqlName());
       }

@@ -36,7 +36,7 @@ public final class SqlBridge {
     return javaSession;
   }
 
-  /** MleSql: one Phase 5 SQL request (see Dispatcher#sqlRequest). */
+  /** MleSql: one SQL message and its reply (see Dispatcher#sqlRequest). */
   public static com.percona.mle.api.MleSql.Reply request(int action, long id, String text, Object[] params,
       int flags, int maxRows) {
     Dispatcher d = dispatcher;
@@ -51,7 +51,7 @@ public final class SqlBridge {
   public static com.percona.mle.api.MleSql.Reply requestRaw(int action, long id, String text, Object[] params,
       int flags, int maxRows, boolean vectorBuffers, com.percona.mle.sql.RowSink sink) {
     return dispatcher().sqlRequest(action, id, text, params, flags, maxRows,
-        vectorBuffers ? Dispatcher.RAW_BUFFERS : Dispatcher.RAW, sink);
+        vectorBuffers ? Dispatcher.RAW_BUFFERS : Dispatcher.RAW, sink, 0);
   }
 
   /** EXECUTE_MANY of prepared statement id: params are rows of rowWidth values (exp note 51). */
@@ -84,11 +84,6 @@ public final class SqlBridge {
     if (d != null) d.drained(id);
   }
 
-  /** The running top-level call's sequence number. */
-  public static long callSeq() {
-    return dispatcher().callSeq();
-  }
-
   /** The running routine call (a nested routine's session options are its own): unique per call. */
   public static long callScope() {
     return dispatcher().callScope();
@@ -99,7 +94,7 @@ public final class SqlBridge {
     return dispatcher().depth();
   }
 
-  /** Whether the running call was killed. */
+  /** Whether the running call was killed; asking tells the routine, so the call ends interrupted. */
   public static boolean interrupted() {
     return dispatcher().interrupted();
   }
@@ -116,10 +111,9 @@ public final class SqlBridge {
     return d;
   }
 
+  /** A statement id of the running routine call. */
   public static long newStatementId() {
-    Dispatcher d = dispatcher;
-    if (d == null) throw new IllegalStateException("MLE worker not running");
-    return d.newStatementId();
+    return dispatcher().newStatementId();
   }
 
   public static org.graalvm.polyglot.Value importPython(String module) {

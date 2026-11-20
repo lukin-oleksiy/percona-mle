@@ -23,8 +23,10 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Captures System.out and System.err of routines; the output goes back to the host with each
- * RESULT, which keeps the console buffers (they survive a worker crash). Capped per message.
+ * Captures System.out and System.err of routines. The RESULT of a PREPARE or CALL carries
+ * everything printed since the last one that did, at whatever depth (§9.4); output printed at
+ * another time waits for the next, and RESET discards what waits. Each stream keeps at most
+ * LIMIT bytes for a RESULT: the end of what was printed.
  */
 final class Console {
   static final int LIMIT = 1 << 20;
@@ -63,6 +65,15 @@ final class Console {
     cleared = true;
   }
 
+  /** RESET: what waits for a RESULT is dropped, a console.clear() too. */
+  synchronized void discard() {
+    System.out.flush();
+    System.err.flush();
+    out.take();
+    err.take();
+    cleared = false;
+  }
+
   synchronized boolean takeCleared() {
     boolean c = cleared;
     cleared = false;
@@ -81,35 +92,40 @@ final class Console {
 
   private static final byte[] EMPTY = new byte[0];
 
+  /** Keeps the last LIMIT bytes written: up to twice as many are held before the older are dropped. */
   private static final class Capture extends OutputStream {
     private final ByteArrayOutputStream buf = new ByteArrayOutputStream();
-    private boolean truncated;
 
     @Override
     public synchronized void write(int b) {
-      if (room(1)) buf.write(b);
+      buf.write(b);
+      trim();
     }
 
     @Override
     public synchronized void write(byte[] b, int off, int len) {
-      int n = Math.min(len, LIMIT - buf.size());
-      if (n > 0) buf.write(b, off, n);
-      if (n < len) truncated = true;
+      if (len > LIMIT) {  // only its end can stay
+        off += len - LIMIT;
+        len = LIMIT;
+        buf.reset();
+      }
+      buf.write(b, off, len);
+      trim();
     }
 
-    private boolean room(int n) {
-      if (buf.size() + n <= LIMIT) return true;
-      truncated = true;
-      return false;
+    private void trim() {
+      if (buf.size() <= 2 * LIMIT) return;
+      byte[] all = buf.toByteArray();
+      buf.reset();
+      buf.write(all, all.length - LIMIT, LIMIT);
     }
 
     synchronized byte[] take() {
-      if (buf.size() == 0 && !truncated) return EMPTY;  // the usual case: no garbage per call
-      if (truncated) buf.writeBytes("\n[output truncated]\n".getBytes(StandardCharsets.UTF_8));
-      byte[] r = buf.toByteArray();
+      int n = buf.size();
+      if (n == 0) return EMPTY;  // the usual case: no garbage per call
+      byte[] all = buf.toByteArray();
       buf.reset();
-      truncated = false;
-      return r;
+      return n <= LIMIT ? all : java.util.Arrays.copyOfRange(all, n - LIMIT, n);
     }
   }
 }

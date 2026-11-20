@@ -23,7 +23,7 @@ package com.percona.mle.worker;
  * <p>System properties: mle.class (worker class name for READY), mle.spin (spin iterations
  * before sleeping on the futex, default 2000), mle.prewarm (comma list of java, js, python,
  * numpy: loaded before READY; vectors: the vector helper, warmed up after READY while idle),
- * mle.maxDepth (nested calls, default 32), mle.python.venv.
+ * mle.python.venv.
  */
 public final class Main {
   private Main() {}
@@ -35,14 +35,20 @@ public final class Main {
       Mailbox mb = Mailbox.open(Integer.getInteger("mle.spin", 2000));
       console.install();
       Options options = new Options();
+      Values.options = options;
       Polyglot polyglot = new Polyglot(console, options);
       Control control = new Control(Thread.currentThread(), polyglot);
       control.start();
       MemoryWatch.start();
       JavaRoutines java = new JavaRoutines();
-      Dispatcher d = new Dispatcher(mb, java, polyglot, console, control, options,
-          Integer.getInteger("mle.maxDepth", 32));
+      Dispatcher d = new Dispatcher(mb, java, polyglot, console, control, options);
       SqlBridge.dispatcher = d;
+      // A region of a major version this worker does not implement: a failed READY, then exit (§14).
+      if (mb.version >>> 16 != Wire.VERSION_MAJOR) {
+        d.ready(Wire.INTERNAL, "worker speaks " + Wire.VERSION_MAJOR + ".0, host " + (mb.version >>> 16) + "."
+            + (mb.version & 0xFFFF));
+        Runtime.getRuntime().halt(1);
+      }
       int status = Wire.OK;
       String info;
       try {
@@ -66,11 +72,13 @@ public final class Main {
         t.printStackTrace();
       }
       d.ready(status, info);
+      // A worker that cannot serve exits after its failed READY (§2 step 5).
+      if (status != Wire.OK) Runtime.getRuntime().halt(1);
       // mle.pool_prewarm=vectors (exp note 35): the vector helper's kernels, after READY and
       // only while no request comes, so a session never waits for more than one step (~70 ms).
       // A worker started for a waiting session gets its first request at once (the grace
       // below) and skips it; a pool worker warms up while it waits in the pool.
-      if (status == Wire.OK && System.getProperty("mle.prewarm", "").contains("vectors")
+      if (System.getProperty("mle.prewarm", "").contains("vectors")
           && !mb.awaitPending(50_000_000L) && VectorWarmup.run(mb::pending))
         System.gc();  // as after starting: the warm-up's garbage, before waiting in the pool
       d.loop();

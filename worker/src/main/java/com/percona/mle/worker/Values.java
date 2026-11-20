@@ -25,17 +25,26 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 
 /**
  * SQL values on the wire and their Java forms.
  *
  * <p>Decoding gives a neutral form: null, Long, Long or BigInteger (BIGINT UNSIGNED), Double,
- * Float, BigDecimal, String, byte[], {@link Temporal}, MleJson, or {@link VectorRef} (a VECTOR
- * still in the message body). {@link #converter} turns it into a routine's parameter type;
- * {@link #writeAs} turns a routine's result into the declared SQL type.
+ * Float, BigDecimal, String, byte[], {@link Temporal} (DATE, TIME, DATETIME), {@link Timestamp},
+ * MleJson, or {@link VectorRef} (a VECTOR still in the message body). {@link #converter} turns it
+ * into a routine's parameter type; {@link #writeAs} turns a routine's result into the declared
+ * SQL type.
+ *
+ * <p>What the host sends is checked against §7.2 (a value outside its domain is a protocol
+ * failure); what guest code gives is checked before it is written, so that the worker never sends
+ * a value outside its domain: such a value is a ConversionException.
  */
 final class Values {
   private Values() {}
@@ -48,7 +57,14 @@ final class Values {
     }
   }
 
-  /** ParamType from protocol.h; typeName is INT, VARCHAR, SET, YEAR, BIT ... or empty. */
+  /** The session's options: their zone is where a language's local time stands for a TIMESTAMP. */
+  static Options options = new Options();
+
+  static ZoneId zone() {
+    return options.zone;
+  }
+
+  /** Type of §7.4; typeName is INT, VARCHAR, SET, YEAR, BIT ... (NULL for a column without a type). */
   record ParamType(int tag, boolean unsigned, long length, long precision, long scale, String typeName) {
     ParamType(int tag, boolean unsigned, long length, long precision, long scale) {
       this(tag, unsigned, length, precision, scale, "");
@@ -64,7 +80,7 @@ final class Values {
     }
   }
 
-  /** A DATE, TIME, DATETIME or TIMESTAMP as on the wire (MYSQL_TIME fields). */
+  /** A DATE, TIME or DATETIME as on the wire (Civil, §7.2). */
   record Temporal(int tag, int year, int month, int day, long hour, int minute, int second, int micro, boolean negative) {
     Object toJava() {
       try {
@@ -88,6 +104,43 @@ final class Values {
     }
   }
 
+  /**
+   * A TIMESTAMP: microseconds since 1970-01-01 00:00:00 UTC, or MySQL's zero timestamp. An
+   * instant; where a language has only local time, it is the time in the session's zone.
+   */
+  record Timestamp(long micros) {
+    boolean zero() {
+      return micros == Wire.ZERO_TIMESTAMP;
+    }
+
+    long millis() {
+      return Math.floorDiv(micros, 1000L);
+    }
+
+    Instant instant() {
+      if (zero()) throw new ConversionException("the zero TIMESTAMP has no Java equivalent");
+      return Instant.ofEpochSecond(Math.floorDiv(micros, 1_000_000L), Math.floorMod(micros, 1_000_000L) * 1000L);
+    }
+
+    /** The local time in the session's zone. */
+    LocalDateTime local() {
+      return LocalDateTime.ofInstant(instant(), zone());
+    }
+  }
+
+  /** The wire value of an instant; out of the TIMESTAMP range is a conversion error. */
+  static long timestampMicros(Instant i) {
+    long micros;
+    try {
+      micros = Math.addExact(Math.multiplyExact(i.getEpochSecond(), 1_000_000L), i.getNano() / 1000);
+    } catch (ArithmeticException e) {
+      micros = -1;
+    }
+    if (micros < 0 || micros > Wire.MAX_TIMESTAMP)
+      throw new ConversionException("TIMESTAMP value out of range: " + i);
+    return micros;
+  }
+
   /** A VECTOR in the message body; valid only until the next message is posted. */
   record VectorRef(MemorySegment data, int dims) {
     float[] toArray() {
@@ -101,12 +154,58 @@ final class Values {
 
   // ------------------------------------------------------------ decoding
 
-  static ParamType readParamType(MessageReader r) {
-    return new ParamType(r.u8(), r.flag(), r.u32(), r.u32(), r.u32(), r.str());
+  /** A Type of a Param or return value: its tag is one of a declared type (§7.4). */
+  static ParamType readType(MessageReader r) {
+    ParamType t = readColumnType(r);
+    if (t.tag() == Wire.T_NULL) throw ProtocolFailure.exit("a parameter type with tag 0");
+    return t;
   }
 
-  static Object read(MessageReader r) {
+  /** A Type of a Column: tag 0 for a column without a type. */
+  static ParamType readColumnType(MessageReader r) {
     int tag = r.u8();
+    if (tag > Wire.MAX_TAG) throw ProtocolFailure.exit("a type with tag " + tag);
+    return new ParamType(tag, r.bool(), r.u32(), r.u32(), r.u32(), r.str());
+  }
+
+  private static boolean decimal(String s) {
+    int n = s.length(), i = 0;
+    if (n == 0 || n > Wire.MAX_DECIMAL_CHARS) return false;
+    if (s.charAt(0) == '-') i++;
+    int digits = i;
+    while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++;
+    if (i == digits) return false;
+    if (i == n) return true;
+    if (s.charAt(i++) != '.') return false;
+    digits = i;
+    while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++;
+    return i > digits && i == n;
+  }
+
+  private static Temporal readCivil(MessageReader r, int tag) {
+    Temporal t = new Temporal(tag, r.u16(), r.u8(), r.u8(), r.u32(), r.u8(), r.u8(), (int) r.u32(), r.bool());
+    boolean date = t.year() <= 9999 && t.month() <= 12 && t.day() <= 31;
+    boolean ok = switch (tag) {
+      case Wire.T_DATE -> date && t.hour() == 0 && t.minute() == 0 && t.second() == 0 && t.micro() == 0
+          && !t.negative();
+      case Wire.T_TIME -> t.year() == 0 && t.month() == 0 && t.day() == 0 && t.hour() <= Wire.MAX_TIME_HOUR
+          && t.minute() <= 59 && t.second() <= 59 && t.micro() >= 0 && t.micro() <= 999999
+          && !(t.hour() == Wire.MAX_TIME_HOUR && t.minute() == 59 && t.second() == 59 && t.micro() != 0);
+      default -> date && t.hour() <= 23 && t.minute() <= 59 && t.second() <= 59 && t.micro() >= 0
+          && t.micro() <= 999999 && !t.negative();
+    };
+    if (!ok) throw ProtocolFailure.exit("a " + Wire.TAG_NAMES[tag] + " outside its domain: " + t);
+    return t;
+  }
+
+  /**
+   * A value of the host whose declared type has the tag declared: it is NULL or has that tag
+   * (§7.3); with tag 0 (a column without a type) it is NULL.
+   */
+  static Object read(MessageReader r, int declared) {
+    int tag = r.u8();
+    if (tag != Wire.T_NULL && tag != declared)
+      throw ProtocolFailure.exit("a value with tag " + tag + " where the declared type has " + declared);
     return switch (tag) {
       case Wire.T_NULL -> null;
       case Wire.T_I64 -> r.u64();
@@ -114,26 +213,38 @@ final class Values {
         long v = r.u64();
         yield v >= 0 ? (Object) v : new BigInteger(Long.toUnsignedString(v));
       }
+      // Any bit pattern: the host sends no NaN or infinity, and the worker does not end for one.
       case Wire.T_F64 -> r.f64();
       case Wire.T_F32 -> r.f32();
-      case Wire.T_DECIMAL -> new BigDecimal(r.str());
-      case Wire.T_STRING -> r.str();
-      case Wire.T_BYTES -> r.bytes();
-      case Wire.T_JSON -> new MleJson(r.str());
-      case Wire.T_DATE, Wire.T_TIME, Wire.T_DATETIME, Wire.T_TIMESTAMP ->
-          new Temporal(tag, r.u16(), r.u8(), r.u8(), r.u32(), r.u8(), r.u8(), (int) r.u32(), r.flag());
-      case Wire.T_VECTOR -> {
-        int dims = (int) r.u32();
-        r.skipAlignment(Wire.VECTOR_ALIGNMENT);
-        yield new VectorRef(r.slice(dims * 4L), dims);
+      case Wire.T_DECIMAL -> {
+        String d = r.str();
+        if (!decimal(d)) throw ProtocolFailure.exit("a DECIMAL that is not digits[.digits]");
+        yield new BigDecimal(d);
       }
-      default -> throw new IllegalStateException("unknown value tag " + tag);
+      case Wire.T_STRING -> r.lstr();
+      case Wire.T_BYTES -> r.bytes();
+      case Wire.T_JSON -> new MleJson(r.lstr());
+      case Wire.T_DATE, Wire.T_TIME, Wire.T_DATETIME -> readCivil(r, tag);
+      case Wire.T_TIMESTAMP -> {
+        long micros = r.u64();
+        if (micros != Wire.ZERO_TIMESTAMP && (micros < 0 || micros > Wire.MAX_TIMESTAMP))
+          throw ProtocolFailure.exit("a TIMESTAMP of " + micros);
+        yield new Timestamp(micros);
+      }
+      case Wire.T_VECTOR -> {
+        long dims = r.u32();
+        if (dims < 1 || dims > Wire.MAX_VECTOR_DIMENSIONS) throw ProtocolFailure.exit("a VECTOR of " + dims);
+        r.skipPadding(Wire.VECTOR_ALIGNMENT);
+        yield new VectorRef(r.slice(dims * 4L), (int) dims);
+      }
+      default -> throw ProtocolFailure.exit("unknown value tag " + tag);
     };
   }
 
   /** The plain Java form of a neutral value (for SQL results and Object parameters). */
   static Object toJava(Object v) {
     if (v instanceof Temporal t) return t.toJava();
+    if (v instanceof Timestamp t) return t.local();
     if (v instanceof VectorRef ref) return ref.toArray();
     return v;
   }
@@ -159,6 +270,12 @@ final class Values {
     w.u8(neg ? 1 : 0);
   }
 
+  private static void writeTimestamp(MessageWriter w, Instant i) {
+    long micros = timestampMicros(i);
+    w.u8(Wire.T_TIMESTAMP);
+    w.u64(micros);
+  }
+
   private static void writeDate(MessageWriter w, int tag, LocalDate d) {
     writeTemporal(w, tag, d.getYear(), d.getMonthValue(), d.getDayOfMonth(), 0, 0, 0, 0, false);
   }
@@ -181,7 +298,8 @@ final class Values {
   }
 
   private static void writeVector(MessageWriter w, float[] f) {
-    if (f.length > Wire.MAX_VECTOR_DIMENSIONS) throw new ConversionException("VECTOR too large: " + f.length);
+    if (f.length < 1 || f.length > Wire.MAX_VECTOR_DIMENSIONS)
+      throw new ConversionException("a VECTOR has 1 to " + Wire.MAX_VECTOR_DIMENSIONS + " dimensions, not " + f.length);
     w.u8(Wire.T_VECTOR);
     w.u32(f.length);
     w.align(Wire.VECTOR_ALIGNMENT);
@@ -190,7 +308,7 @@ final class Values {
 
   private static void writeVector(MessageWriter w, MemorySegment s) {
     long dims = s.byteSize() / 4;
-    if (s.byteSize() % 4 != 0 || dims > Wire.MAX_VECTOR_DIMENSIONS)
+    if (s.byteSize() % 4 != 0 || dims < 1 || dims > Wire.MAX_VECTOR_DIMENSIONS)
       throw new ConversionException("not a VECTOR: a segment of " + s.byteSize() + " bytes");
     w.u8(Wire.T_VECTOR);
     w.u32(dims);
@@ -240,6 +358,9 @@ final class Values {
       }
       case LocalDate d -> writeDate(w, Wire.T_DATE, d);
       case LocalDateTime t -> writeDateTime(w, Wire.T_DATETIME, t);
+      case Instant i -> writeTimestamp(w, i);
+      case OffsetDateTime t -> writeTimestamp(w, t.toInstant());
+      case ZonedDateTime t -> writeTimestamp(w, t.toInstant());
       case LocalTime t -> writeTime(w, Duration.ofNanos(t.toNanoOfDay()));
       case Duration d -> writeTime(w, d);
       case float[] f -> writeVector(w, f);
@@ -252,8 +373,8 @@ final class Values {
   private static final int DECIMAL_MAX_DIGITS = 65, DECIMAL_MAX_SCALE = 30;
 
   /**
-   * d as DECIMAL text mysqld accepts (digits and a point, at most 100 characters: the host ends a
-   * worker that sends more, independent review C13). Digits after the 30th decimal place are rounded as
+   * d as DECIMAL text mysqld accepts (digits and a point, at most 100 characters: §7.2, and the
+   * host ends a worker that sends anything else). Digits after the 30th decimal place are rounded as
    * MySQL rounds them; more than 65 digits before the point is an error. Nothing is expanded
    * before it is known to be short ('1e2000000000' has a short BigDecimal and a huge plain text).
    */
@@ -269,7 +390,10 @@ final class Values {
       if ((long) d.precision() - d.scale() > DECIMAL_MAX_DIGITS)  // rounded up to one digit more
         throw new ConversionException("value is out of range for " + (target.equals("SQL") ? "a DECIMAL parameter" : target));
     }
-    return d.toPlainString();
+    String text = d.toPlainString();
+    if (!decimal(text)) throw new ConversionException("value is out of range for "
+        + (target.equals("SQL") ? "a DECIMAL parameter" : target));
+    return text;
   }
 
   private static void i64(MessageWriter w, long v) {
@@ -314,12 +438,17 @@ final class Values {
         w.u64(b.longValue());
       }
       case Wire.T_F64 -> {
+        double d = toNumber(v, t).doubleValue();
+        if (!Double.isFinite(d)) throw cannot(v, t);
         w.u8(Wire.T_F64);
-        w.f64(toNumber(v, t).doubleValue());
+        w.f64(d);
       }
       case Wire.T_F32 -> {
+        // A double beyond FLOAT's range is the server's to refuse: the host checks every float.
+        double d = toNumber(v, t).doubleValue();
+        if (!Double.isFinite(d)) throw cannot(v, t);
         w.u8(Wire.T_F32);
-        w.f32(toNumber(v, t).floatValue());
+        w.f32((float) d);
       }
       case Wire.T_DECIMAL -> writeString(w, Wire.T_DECIMAL, decimalText(toBigDecimal(v, t), t.sqlName()));
       case Wire.T_STRING -> {
@@ -344,10 +473,22 @@ final class Values {
         if (!(v instanceof LocalDate d)) throw cannot(v, t);
         writeDate(w, Wire.T_DATE, d);
       }
-      case Wire.T_DATETIME, Wire.T_TIMESTAMP -> {
+      case Wire.T_DATETIME -> {
         switch (v) {
-          case LocalDateTime d -> writeDateTime(w, t.tag(), d);
-          case LocalDate d -> writeDateTime(w, t.tag(), d.atStartOfDay());
+          case LocalDateTime d -> writeDateTime(w, Wire.T_DATETIME, d);
+          case LocalDate d -> writeDateTime(w, Wire.T_DATETIME, d.atStartOfDay());
+          case Instant i -> writeDateTime(w, Wire.T_DATETIME, LocalDateTime.ofInstant(i, zone()));
+          default -> throw cannot(v, t);
+        }
+      }
+      case Wire.T_TIMESTAMP -> {
+        // A local time is the time in the session's zone (in the hour a zone repeats: the earlier).
+        switch (v) {
+          case Instant i -> writeTimestamp(w, i);
+          case OffsetDateTime d -> writeTimestamp(w, d.toInstant());
+          case ZonedDateTime d -> writeTimestamp(w, d.toInstant());
+          case LocalDateTime d -> writeTimestamp(w, d.atZone(zone()).toInstant());
+          case LocalDate d -> writeTimestamp(w, d.atStartOfDay(zone()).toInstant());
           default -> throw cannot(v, t);
         }
       }
@@ -476,9 +617,14 @@ final class Values {
     if (c == MleJson.class) return nonNull(c, (v, a) -> v instanceof MleJson j ? j : new MleJson(String.valueOf(v)));
     if (c == LocalDate.class || c == LocalDateTime.class || c == Duration.class)
       return nonNull(c, (v, a) -> {
-        Object j = v instanceof Temporal t ? t.toJava() : v;
+        Object j = v instanceof Temporal t ? t.toJava() : v instanceof Timestamp t ? t.local() : v;
         if (!c.isInstance(j)) throw wrong(v, c);
         return j;
+      });
+    if (c == Instant.class)
+      return nonNull(c, (v, a) -> {
+        if (!(v instanceof Timestamp t)) throw wrong(v, c);
+        return t.instant();
       });
     if (c == LocalTime.class)
       return nonNull(c, (v, a) -> {
@@ -517,6 +663,7 @@ final class Values {
   private static ConversionException wrong(Object v, Class<?> c) {
     String from = switch (v) {
       case Temporal t -> Wire.TAG_NAMES[t.tag()];
+      case Timestamp t -> "TIMESTAMP";
       case VectorRef r -> "VECTOR";
       default -> v.getClass().getSimpleName();
     };

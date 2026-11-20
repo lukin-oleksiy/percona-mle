@@ -20,16 +20,17 @@ package com.percona.mle.worker;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.nio.charset.StandardCharsets;
 
 /**
  * Encodes a message body directly into the mailbox arena. When the message outgrows the arena it
- * "spills" into a growing native buffer, and {@link Mailbox#send} sends it in chunks.
+ * "spills" into a growing native buffer, and {@link Mailbox#send} sends it in chunks. The worker
+ * has the turn while it composes: nothing that could post a message (guest code, a nested request)
+ * runs between reset() and the post (§4.1).
  */
 final class MessageWriter {
   /**
-   * The message would be larger than the host accepts (Wire.MAX_WORKER_MESSAGE): thrown before
-   * anything larger is allocated, so an oversized value cannot exhaust the worker's memory here.
+   * The message would be larger than its limit (§12): thrown before anything larger is
+   * allocated, so an oversized value cannot exhaust the worker's memory here.
    */
   static final class TooLarge extends RuntimeException {
     @java.io.Serial private static final long serialVersionUID = 1L;
@@ -42,6 +43,7 @@ final class MessageWriter {
   private final MemorySegment arena;
   private MemorySegment buf;
   private long pos;
+  private long limit;
   private boolean spilled;
 
   MessageWriter(MemorySegment arena) {
@@ -49,9 +51,16 @@ final class MessageWriter {
     reset();
   }
 
+  /** A new message of at most 64 MiB. */
   void reset() {
+    reset(Wire.MAX_WORKER_MESSAGE);
+  }
+
+  /** A new message of at most limit bytes (64 KiB for the messages of one chunk). */
+  void reset(long limit) {
     buf = arena;
     pos = 0;
+    this.limit = limit;
     spilled = false;
   }
 
@@ -72,9 +81,9 @@ final class MessageWriter {
   }
 
   private void ensure(long n) {
+    if (n < 0 || pos + n > limit) throw new TooLarge();
     if (pos + n <= buf.byteSize()) return;
-    if (n < 0 || pos + n > Wire.MAX_WORKER_MESSAGE) throw new TooLarge();
-    long size = Math.min(Math.max(buf.byteSize() * 2, pos + n), Wire.MAX_WORKER_MESSAGE);
+    long size = Math.min(Math.max(buf.byteSize() * 2, pos + n), limit);
     MemorySegment bigger = Arena.ofAuto().allocate(size, Wire.VECTOR_ALIGNMENT);
     MemorySegment.copy(buf, 0, bigger, 0, pos);
     buf = bigger;
@@ -85,6 +94,10 @@ final class MessageWriter {
     ensure(1);
     buf.set(ValueLayout.JAVA_BYTE, pos, (byte) v);
     pos += 1;
+  }
+
+  void bool(boolean v) {
+    u8(v ? 1 : 0);
   }
 
   void u16(int v) {
@@ -118,14 +131,23 @@ final class MessageWriter {
   }
 
   void bytes(byte[] b) {
-    u32(b.length);
-    ensure(b.length);
-    MemorySegment.copy(b, 0, buf, ValueLayout.JAVA_BYTE, pos, b.length);
-    pos += b.length;
+    bytes(b, 0, b.length);
   }
 
+  void bytes(byte[] b, int from, int length) {
+    u32(length);
+    ensure(length);
+    MemorySegment.copy(b, from, buf, ValueLayout.JAVA_BYTE, pos, length);
+    pos += length;
+  }
+
+  /**
+   * A str or lstr: well-formed UTF-8. The text is data or a message of guest code: an unpaired
+   * surrogate becomes U+FFFD (§7.1). Code and names are checked by their senders (Text.wellFormed)
+   * before they get here, so for them this changes nothing.
+   */
   void str(String s) {
-    bytes(s.getBytes(StandardCharsets.UTF_8));
+    bytes(Text.utf8(s));
   }
 
   /** Zero bytes up to the next multiple of alignment (relative to the message start). */

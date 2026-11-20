@@ -84,9 +84,20 @@ final class JavaRoutines {
 
   record Param(String name, int mode, Values.ParamType type) {}
 
-  /** outs: indexes of OUT and INOUT parameters (passed as one-element arrays). */
+  /**
+   * outs: indexes of OUT and INOUT parameters (passed as one-element arrays), ascending. link:
+   * what the routine was compiled from, when it has USING libraries (null otherwise).
+   */
   record Routine(long id, MethodHandle invoker, Values.Converter[] converters, String[] names, Values.ParamType ret,
-      int[] outs, Values.ParamType[] types) {}
+      int[] outs, Values.ParamType[] types, Link link) {}
+
+  /**
+   * A routine with USING libraries is linked with the versions of them it was compiled with
+   * (protocol §9.10): the PREPARE's fields, to compile it again when a version changes, and each
+   * library's version by "schema/name".
+   */
+  record Link(String schema, String name, String entry, String source, List<Param> params, Values.ParamType ret,
+      List<LibraryFileSystem.Import> imports, Map<String, Long> versions) {}
 
   /** Routine name and form by routine loader name, for stack frames. */
   record Origin(String name, boolean bodyForm, String[] lines) {
@@ -299,11 +310,13 @@ final class JavaRoutines {
 
   /**
    * With database libraries (USING, Phase 6): Java libraries are compiled with the routine (their
-   * classes are the routine's); a changed library applies when the routine is loaded again.
+   * classes are the routine's); when a library has another version at a later call, the routine
+   * is compiled again before it runs ({@link #linked}).
    */
   void prepare(long id, String schema, String routineName, String entry, String source, List<Param> params,
       Values.ParamType ret, List<LibraryFileSystem.Import> imports) throws CompileException {
     List<String[]> libraries = new ArrayList<>();
+    Map<String, Long> versions = new HashMap<>();
     for (LibraryFileSystem.Import i : imports) {
       LibraryFileSystem.Library l;
       try {
@@ -311,12 +324,43 @@ final class JavaRoutines {
       } catch (IOException e) {
         throw new CompileException(e.getMessage() == null ? e.toString() : e.getMessage());
       }
+      versions.put(i.schema() + "/" + i.name(), l.version());
       // A JavaScript or Python library in USING is not compiled in: the routine reaches it with
       // Mle.importLibrary (USING is what lets it import a library of another schema).
       if (!l.language().equals("java")) continue;
       libraries.add(new String[] {i.schema() + "." + i.name(), new String(l.body(), StandardCharsets.UTF_8)});
     }
     prepareWith(id, schema, routineName, entry, source, params, ret, libraries);
+    if (!imports.isEmpty()) {
+      Routine r = routines.get(id);
+      routines.put(id, new Routine(id, r.invoker(), r.converters(), r.names(), r.ret(), r.outs(), r.types(),
+          new Link(schema, routineName, entry, source, params, ret, imports, versions)));
+    }
+  }
+
+  /**
+   * r as it may run in the request being served: each of its USING libraries is resolved for the
+   * request (mysqld is asked unless an answer holds), and when one has another version than r was
+   * compiled with, r is compiled again and prepared under its id. A refused library or code that
+   * no longer compiles fails the call.
+   */
+  Routine linked(Routine r) throws CompileException {
+    Link k = r.link();
+    if (k == null) return r;
+    boolean same = true;
+    for (LibraryFileSystem.Import i : k.imports()) {
+      LibraryFileSystem.Library l;
+      try {
+        l = LibraryFileSystem.library(i.schema(), i.name());
+      } catch (IOException e) {
+        throw new CompileException(e.getMessage() == null ? e.toString() : e.getMessage());
+      }
+      Long version = k.versions().get(i.schema() + "/" + i.name());
+      same &= version != null && version == l.version();
+    }
+    if (same) return r;
+    prepare(r.id(), k.schema(), k.name(), k.entry(), k.source(), k.params(), k.ret(), k.imports());
+    return routines.get(r.id());
   }
 
   /** CREATE LIBRARY ... LANGUAGE JAVA: compiles the library alone; the error or null. */
@@ -348,7 +392,7 @@ final class JavaRoutines {
     Cached hit = noCache ? null : cache.get(key);
     if (hit != null) {
       Routine r = hit.routine();
-      routines.put(id, new Routine(id, r.invoker(), r.converters(), r.names(), r.ret(), r.outs(), r.types()));
+      routines.put(id, new Routine(id, r.invoker(), r.converters(), r.names(), r.ret(), r.outs(), r.types(), null));
       origins.put(hit.loaderName(), hit.origin());
       return;
     }
@@ -422,7 +466,7 @@ final class JavaRoutines {
     }
     mh = mh.asType(MethodType.genericMethodType(n)).asSpreader(Object[].class, n);
     Values.ParamType[] types = params.stream().map(Param::type).toArray(Values.ParamType[]::new);
-    Routine routine = new Routine(id, mh, converters, names, ret, outs, types);
+    Routine routine = new Routine(id, mh, converters, names, ret, outs, types, null);
     routines.put(id, routine);
     if (!noCache) cache.put(key, new Cached(routine, LOADER_PREFIX + id, origin));
   }

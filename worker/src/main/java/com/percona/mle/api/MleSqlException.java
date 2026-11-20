@@ -26,6 +26,7 @@ public class MleSqlException extends RuntimeException {
   private final int errorCode;
   private final String sqlState;
   private final long row;
+  private final long errorId;
 
   public MleSqlException(int errorCode, String sqlState, String message) {
     this(errorCode, sqlState, message, -1);
@@ -33,10 +34,24 @@ public class MleSqlException extends RuntimeException {
 
   /** row: the failing row of a batch (executeMany), from 0; -1 when the error is not about a row. */
   public MleSqlException(int errorCode, String sqlState, String message, long row) {
+    this(errorCode, sqlState, message, row, 0);
+  }
+
+  /**
+   * errorId: the id mysqld gave the error when a statement failed with it, by which the routine
+   * hands the same error back when it ends with this exception; 0 for an error the routine raises.
+   */
+  public MleSqlException(int errorCode, String sqlState, String message, long row, long errorId) {
     super(message);
     this.errorCode = errorCode;
     this.sqlState = sqlState;
     this.row = row;
+    this.errorId = errorId;
+  }
+
+  /** The id of the statement error this exception came from; 0 if it did not come from one. */
+  public long getErrorId() {
+    return errorId;
   }
 
   /** The failing row of a batch (executeMany), from 0; -1 when the error is not about a row of a batch. */

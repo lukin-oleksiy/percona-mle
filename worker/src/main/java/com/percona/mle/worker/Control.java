@@ -22,23 +22,40 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 /**
- * The control socket (fd 4): INTERRUPT(call_seq) and SHUTDOWN from the host; EOF means the host
- * is gone, and the worker ends.
+ * The control socket (fd 4, §6) and the worker's side of interruption (§11.1). The socket carries
+ * INTERRUPT(call_seq) from the host; a datagram of another kind or length is ignored; its end of
+ * file means the host is gone, and the worker ends.
  *
- * <p>An INTERRUPT applies only to the top-level call with that sequence number. One that arrives
- * before its call has started (e.g. while the worker is still starting) is remembered and applied
- * when the call begins. Java code is interrupted cooperatively (Thread.interrupt); code that
- * ignores it is ended by the host with SIGKILL after the grace period.
+ * <p>Three variables under this object's lock, shared by the thread that serves requests and the
+ * control thread: running (the call_seq of the interruptible top-level request being served),
+ * last (the highest call_seq the worker began to serve) and pending (an INTERRUPT that came before
+ * its request). An INTERRUPT is delivered to the running request only, once; one for a request not
+ * begun yet waits for it; any other is ignored.
+ *
+ * <p>Delivering starts a thread that stops the request's guest code: Java code cooperatively
+ * (Thread.interrupt; code that ignores it is ended by the host when its grace period is over),
+ * JavaScript and Python with Context.interrupt. Each of its steps first checks, under the lock,
+ * that the request still runs: once the request's status is fixed (end()), an interrupt that was
+ * not acted on is cancelled, and none reaches a later request.
  */
 final class Control implements Runnable {
   private final Thread main;
   private final Polyglot polyglot;
   private boolean guest;
   private Thread interrupter;
-  private long running = -1;
-  private long pending = -1;
+  private boolean isRunning;
+  private long running;
+  private boolean hasPending;
+  private long pending;
   private long last;
-  private boolean interrupted;
+  /** The running request's interrupt was delivered. */
+  private boolean delivered;
+  /**
+   * The delivered interrupt was acted on: the runtime was told to stop, or the worker refused
+   * work for it (SQL, a nested request), or guest code was told (mysql.sleep). The request then
+   * ends INTERRUPTED; until then the interrupt can still be cancelled.
+   */
+  private boolean acted;
 
   Control(Thread main, Polyglot polyglot) {
     this.main = main;
@@ -53,26 +70,29 @@ final class Control implements Runnable {
 
   @Override
   public void run() {
+    // Larger than an INTERRUPT, so that a datagram of another length is seen as one.
     MemorySegment buf = Arena.global().allocate(64);
     while (true) {
       long n = Native.read(Wire.CONTROL_FD, buf);
-      if (n <= 0) Runtime.getRuntime().halt(0);  // the host closed the session or died
-      int kind = buf.get(ValueLayout.JAVA_BYTE, 0);
-      if (kind == Wire.CTL_SHUTDOWN) Runtime.getRuntime().halt(0);
-      if (kind == Wire.CTL_INTERRUPT && n >= 9) interrupt(buf.get(ValueLayout.JAVA_LONG_UNALIGNED, 1));
+      if (n <= 0) Runtime.getRuntime().halt(0);  // the host closed its end or died
+      if (n == Wire.CTL_INTERRUPT_SIZE && buf.get(ValueLayout.JAVA_BYTE, 0) == Wire.CTL_INTERRUPT)
+        interrupt(buf.get(ValueLayout.JAVA_LONG_UNALIGNED, 1));
     }
   }
 
   private synchronized void interrupt(long seq) {
-    if (seq == running) {
-      // The host may send more than one INTERRUPT per KILL (its KILL handler, then its wait
-      // loop): one interrupter per call, which escalates by itself.
-      if (interrupted) return;
-      interrupted = true;
-      stop();
-    } else if (seq > last) {
+    if (isRunning && seq == running) {
+      // The host may send several INTERRUPTs for one request: one delivery.
+      if (!delivered) deliver();
+    } else if (Long.compareUnsigned(seq, last) > 0) {
+      hasPending = true;
       pending = seq;
     }
+  }
+
+  private void deliver() {
+    delivered = true;
+    stop();
   }
 
   /**
@@ -92,10 +112,10 @@ final class Control implements Runnable {
         // A first guest routine may still be building the context: wait for it while the call
         // runs (a repeated INTERRUPT is ignored, so this interrupter must not give up early).
         while (ctx == null && stillRunning(seq, 20)) ctx = polyglot.contextIfCreated();
-        if (ctx == null || interruptContext(ctx, 500)) return;
+        if (ctx == null || !act(seq) || interruptContext(ctx, 500)) return;
         if (interruptMain(seq)) interruptContext(ctx, 4500);
       } else {
-        interruptMain(seq);
+        if (!interruptMain(seq)) return;
         if (stillRunning(seq, 500)) {
           if (ctx == null) ctx = polyglot.contextIfCreated();  // made by the Java code meanwhile
           if (ctx != null) interruptContext(ctx, 4500);
@@ -107,71 +127,105 @@ final class Control implements Runnable {
     t.start();
   }
 
+  /** The interrupt of request seq is acted on now, if that request still runs. */
+  private synchronized boolean act(long seq) {
+    if (!isRunning || running != seq) return false;
+    acted = true;
+    return true;
+  }
+
   /**
-   * Thread.interrupt of the main thread, only while call seq still runs: end() clears the flag, so
-   * an interrupt after it would reach the next call.
+   * Thread.interrupt of the main thread, only while request seq still runs: end() clears the
+   * flag, so an interrupt after it would reach the next request.
    */
   private synchronized boolean interruptMain(long seq) {
-    if (running != seq) return false;
+    if (!act(seq)) return false;
     main.interrupt();
     return true;
   }
 
+  /**
+   * A Context.interrupt that starts after the request ended finds no thread in the context (the
+   * main thread has left it: Polyglot.settleInterrupt) and returns at once.
+   */
   private static boolean interruptContext(org.graalvm.polyglot.Context c, long ms) {
     try {
       c.interrupt(java.time.Duration.ofMillis(ms));
       return true;
     } catch (Exception e) {
-      return false;  // timed out or the context is gone: escalate, or the host's SIGKILL
+      return false;  // timed out or the context is gone: escalate, or the host ends the worker
     }
   }
 
-  /** Whether call seq is still running after up to ms (end() wakes the wait). */
+  /** Whether request seq is still running after up to ms (end() wakes the wait). */
   private synchronized boolean stillRunning(long seq, long ms) {
     long until = System.currentTimeMillis() + ms;
-    for (long left = ms; running == seq && left > 0; left = until - System.currentTimeMillis()) {
+    for (long left = ms; isRunning && running == seq && left > 0; left = until - System.currentTimeMillis()) {
       try {
         wait(left);
       } catch (InterruptedException e) {
         return false;
       }
     }
-    return running == seq;
+    return isRunning && running == seq;
   }
 
-  /** The thread running a Context.interrupt for the ended call, if any (see Polyglot). */
+  /** The thread running a Context.interrupt for the ended request, if any (see Polyglot). */
   synchronized Thread takeInterrupter() {
     Thread t = interrupter;
     interrupter = null;
     return t;
   }
 
-  /** Whether the running call was interrupted (polled by long host waits, e.g. mysql.sleep). */
-  synchronized boolean isInterrupted() {
-    return interrupted;
+  /** Whether the running request's interrupt was delivered. */
+  synchronized boolean delivered() {
+    return delivered;
   }
 
-  /** A top-level call starts (on the main thread); guest: a JS or Python routine. */
-  synchronized void begin(long seq, boolean guest) {
+  /**
+   * Whether the running request's interrupt was delivered; if so, it counts as acted on: the
+   * caller refuses work for it or tells guest code (mysql.sleep, the vector helper).
+   */
+  synchronized boolean refuse() {
+    if (delivered) acted = true;
+    return delivered;
+  }
+
+  /** Whether the running request's interrupt was delivered and acted on: its requests end INTERRUPTED. */
+  synchronized boolean stopped() {
+    return delivered && acted;
+  }
+
+  /**
+   * The worker begins to serve top-level request seq (it has received it completely), on the main
+   * thread. interruptible: PREPARE, CALL, PARSE_LIBRARY; guest: its code is JavaScript or Python.
+   */
+  synchronized void begin(long seq, boolean interruptible, boolean guest) {
+    last = seq;
+    boolean now = hasPending && pending == seq;
+    hasPending = false;
+    if (!interruptible) return;
     MemoryWatch.begin();
+    isRunning = true;
     running = seq;
     this.guest = guest;
-    interrupted = false;
-    if (pending == seq) {
-      pending = -1;
-      interrupted = true;
-      stop();
-    }
+    delivered = false;
+    acted = false;
+    if (now) deliver();
   }
 
-  /** The top-level call ended; true if it was interrupted. Clears the thread's interrupt flag. */
+  /**
+   * The interruptible top-level request ends: the worker has fixed the status of its RESULT.
+   * True if its interrupt was delivered and acted on; one not acted on is cancelled here. Clears
+   * the thread's interrupt flag.
+   */
   synchronized boolean end() {
-    MemoryWatch.end();
-    last = Math.max(last, running);
-    running = -1;
+    if (isRunning) MemoryWatch.end();
+    isRunning = false;
     notifyAll();  // an interrupter waiting to escalate
-    boolean r = interrupted;
-    interrupted = false;
+    boolean r = delivered && acted;
+    delivered = false;
+    acted = false;
     Thread.interrupted();
     return r;
   }

@@ -27,19 +27,20 @@ import java.util.List;
  * SQL from a routine (Oracle's Session object; the JavaScript global {@code session}): statements
  * run in mysqld in the calling session and transaction, with the routine's privileges, and only
  * in stored procedures (functions and triggers: error 6120). Methods must be called on the
- * routine's thread, during a call.
+ * routine's thread, during a call; statements and results belong to the call that made them
+ * (their states are kept by its {@link Statements}) and cannot be used by another.
  *
  * <p>One Session per language: its {@link ValueMapper} decides how values look. Options set with
  * {@link #setOptions} hold for the rest of the top-level routine call.
  */
 public final class Session {
-  static final int EXECUTE = 0;
-  static final int PREPARE = 1;
-  static final int EXECUTE_PREPARED = 2;
-  static final int FETCH = 3;
-  static final int NEXT_RESULT = 4;
-  static final int CLOSE = 5;
-  static final int TO_CLIENT = 1;
+  static final int EXECUTE = Statements.EXECUTE;
+  static final int PREPARE = Statements.PREPARE;
+  static final int EXECUTE_PREPARED = Statements.EXECUTE_PREPARED;
+  static final int FETCH = Statements.FETCH;
+  static final int NEXT_RESULT = Statements.NEXT_RESULT;
+  static final int CLOSE = Statements.CLOSE;
+  static final int TO_CLIENT = Statements.TO_CLIENT;
 
   private final ValueMapper mapper;
   /**

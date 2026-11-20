@@ -27,8 +27,9 @@ import java.util.List;
  * languages (Oracle's session/SqlResult/... for JavaScript, the same model for Python and Java)
  * are built on it.
  *
- * <p>Statements are identified by ids from {@link #newStatementId()}; all of a call's statements
- * are closed when the routine call returns. A statement run from text is closed by mysqld once
+ * <p>Statements are identified by ids from {@link #newStatementId()}, which belong to the routine
+ * call that made them: all of a call's statements are closed when it returns, and another call
+ * (a later one, or one nested in a statement of this one) cannot use them. A statement run from text is closed by mysqld once
  * its results are read; a prepared one lives until {@link #close}. Errors are {@link
  * MleSqlException}s with MySQL's error number and SQLSTATE; uncaught, they reach the client
  * unchanged.
@@ -46,12 +47,14 @@ public final class MleSql {
    * One reply: a result set (hasRows, with the first rows; moreRows: {@link #fetch} for more) or
    * an OK (affected rows, insert id); moreResults: {@link #nextResult} for the next result set.
    * Values: Long, BigInteger (BIGINT UNSIGNED), Double, BigDecimal, String, byte[], LocalDate,
-   * LocalDateTime, Duration, MleJson, float[] (VECTOR) or null. totalRows: the rows of the whole
-   * result set, also those of later fetches (0: not known, e.g. mysqld reads them with a cursor).
+   * LocalDateTime (DATETIME, and TIMESTAMP in the session's time zone), Duration, MleJson, float[]
+   * (VECTOR) or null. totalRows: the rows of the whole result set, also those of later fetches
+   * (-1: not known, e.g. mysqld reads them with a cursor). end: the reply to {@link #nextResult}
+   * when there is no further result.
    */
   public record Reply(long statementId, boolean hasRows, List<Column> columns, List<Object[]> rows,
       boolean moreRows, boolean moreResults, long affectedRows, long insertId, List<Warning> warnings,
-      int parameterCount, long executionMicros, long totalRows) {}
+      int parameterCount, long executionMicros, long totalRows, boolean end) {}
 
   private static final int EXECUTE = 0;
   private static final int PREPARE = 1;
@@ -80,7 +83,10 @@ public final class MleSql {
     return SqlBridge.request(PREPARE, id, sql, null, toClient ? TO_CLIENT : 0, 0);
   }
 
-  /** Executes a prepared statement; params bind the leading markers, the others keep their values. */
+  /**
+   * Executes a prepared statement; params bind the leading markers, the others keep the values of
+   * the last execution (the worker remembers them: mysqld gets all values every time).
+   */
   public static Reply executePrepared(long id, Object[] params, int maxRows) {
     return SqlBridge.request(EXECUTE_PREPARED, id, null, params, 0, maxRows);
   }

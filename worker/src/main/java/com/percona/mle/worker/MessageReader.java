@@ -19,11 +19,11 @@ package com.percona.mle.worker;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.nio.charset.StandardCharsets;
 
 /**
- * Reads a message body in place (from the arena or the reassembly buffer). The host is trusted,
- * but a malformed message still ends in an exception, never in a read outside the body.
+ * Reads a message body of the host in place (from the arena or the reassembly buffer). A body that
+ * is not what §7 and §9 define is a protocol failure: the process ends (ProtocolFailure), nothing
+ * is thrown.
  */
 final class MessageReader {
   private final MemorySegment s;
@@ -34,19 +34,20 @@ final class MessageReader {
   }
 
   private void need(long n) {
-    if (n < 0 || pos + n > s.byteSize()) throw new IllegalStateException("message truncated");
+    if (n < 0 || n > s.byteSize() - pos) throw ProtocolFailure.exit("message body truncated");
   }
 
   long position() {
     return pos;
   }
 
-  boolean atEnd() {
-    return pos == s.byteSize();
+  long remaining() {
+    return s.byteSize() - pos;
   }
 
+  /** The body is consumed exactly (§5.1). */
   void finish() {
-    if (!atEnd()) throw new IllegalStateException("trailing bytes in message");
+    if (pos != s.byteSize()) throw ProtocolFailure.exit("trailing bytes in a message body");
   }
 
   int u8() {
@@ -54,8 +55,10 @@ final class MessageReader {
     return Byte.toUnsignedInt(s.get(ValueLayout.JAVA_BYTE, pos++));
   }
 
-  boolean flag() {
-    return u8() != 0;
+  boolean bool() {
+    int v = u8();
+    if (v > 1) throw ProtocolFailure.exit("a bool of " + v);
+    return v == 1;
   }
 
   int u16() {
@@ -73,9 +76,13 @@ final class MessageReader {
     return v;
   }
 
-  int count() {
+  /**
+   * The count of a list whose elements take at least minSize bytes each: checked against the
+   * bytes left and against the list's limit before anything is allocated for it (§7.1).
+   */
+  int count(long minSize, long limit) {
     long n = u32();
-    if (n > s.byteSize() - pos) throw new IllegalStateException("count beyond message");
+    if (n > limit || n > remaining() / minSize) throw ProtocolFailure.exit("a list of " + n + " elements");
     return (int) n;
   }
 
@@ -103,20 +110,30 @@ final class MessageReader {
   byte[] bytes() {
     long n = u32();
     need(n);
-    if (n > Integer.MAX_VALUE - 8) throw new IllegalStateException("value too large: " + n + " bytes");
     byte[] b = new byte[(int) n];
     MemorySegment.copy(s, ValueLayout.JAVA_BYTE, pos, b, 0, (int) n);
     pos += n;
     return b;
   }
 
+  /** A str: well-formed UTF-8, or the host broke the protocol. */
   String str() {
-    return new String(bytes(), StandardCharsets.UTF_8);
+    String t = Text.decode(bytes());
+    if (t == null) throw ProtocolFailure.exit("a str that is not well-formed UTF-8");
+    return t;
   }
 
-  void skipAlignment(int alignment) {
+  /** An lstr: the server's data, which may be ill-formed UTF-8 and is repaired here (§7.1). */
+  String lstr() {
+    return Text.decodeRepairing(bytes());
+  }
+
+  /** The zero bytes up to the next multiple of alignment, counted from the start of the body. */
+  void skipPadding(int alignment) {
     long pad = (alignment - pos % alignment) % alignment;
     need(pad);
+    for (long i = 0; i < pad; i++)
+      if (s.get(ValueLayout.JAVA_BYTE, pos + i) != 0) throw ProtocolFailure.exit("VECTOR padding is not zero");
     pos += pad;
   }
 
