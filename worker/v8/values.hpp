@@ -21,8 +21,8 @@
   MySQL values and JavaScript values in the V8 worker, by Oracle's rules as the JVM worker's GraalJS
   has them (JsOracle.java): wire values (docs/protocol.md §7.2) of arguments, SQL rows and
   parameters to V8 values, and V8 results to wire values of the declared SQL type. Of the host's
-  values the tags and the lengths are checked (§1): a value outside its domain gives guest code
-  an unspecified value (an Invalid Date, a number). What guest code gives outside the wire's
+  values the lengths are checked (§1) and each is decoded by its own tag: a value outside its
+  domain gives guest code an unspecified value (an Invalid Date, a number). What guest code gives outside the wire's
   domains is a ConversionError, so that no value of guest code breaks the protocol.
 */
 
@@ -84,7 +84,7 @@ constexpr int kMaxDecimalType = 1;
 struct Options {
   IntegerType integer_type = IntegerType::kUnsafeString;
   DecimalType decimal_type = DecimalType::kString;
-  /** The zone (nullptr: a fixed offset). */
+  /** The zone (nullptr: a fixed offset). Without OPTIONS: +00:00 (§1). */
   const std::chrono::time_zone *zone = nullptr;
   std::chrono::seconds offset{0};
 
@@ -98,6 +98,17 @@ struct Options {
   /** The local date-time in the zone of milliseconds since the epoch. */
   void local(double ms, int *year, unsigned *month, unsigned *day, unsigned *hour, unsigned *minute,
              unsigned *second, unsigned *micro) const;
+
+ private:
+  /** The interval of one offset of the zone, in seconds since the epoch (instants) or of local
+      time: a value inside it costs a compare and an add, only one outside looks the zone up
+      (Appendix A). The local interval leaves out the local times its bounding transitions repeat
+      or skip. Empty: begin > end. */
+  struct Interval {
+    int64_t begin = 1, end = 0, offset = 0;
+    bool holds(int64_t t) const { return t >= begin && t < end; }
+  };
+  mutable Interval m_instants, m_locals;
 };
 
 /** A Civil value as on the wire (§7.2): a DATE, TIME or DATETIME. */
@@ -125,10 +136,10 @@ class Values {
   /** A value of an SQL row under its column's type t (Oracle's SQL API rules: as an argument,
       but a SET stays a string).
 
-      argument() and column() decode the value by its own tag; a value that is not NULL and whose
-      tag is not t's is a protocol failure (§1). They throw ConversionError for a value JavaScript
-      cannot hold, and only after they have read the value completely: the caller can go on
-      reading the message. */
+      argument() and column() decode and convert the value by its own tag (§1 item 2), and do not
+      compare it with t's: t only refines it (YEAR, BIT, SET). They throw ConversionError for a
+      value JavaScript cannot hold, and only after they have read the value completely: the
+      caller can go on reading the message. */
   v8::Local<v8::Value> column(Reader &r, const ParamType &t);
 
   /** While it lives, column() uses a statement's integerType and decimalType, not the session's. */
@@ -158,6 +169,7 @@ class Values {
 
   /** String(v) for a value: a symbol is "Symbol(description)"; GuestThrew if guest code throws. */
   std::string text(v8::Local<v8::Value> v);
+  v8::Local<v8::String> string_of(v8::Local<v8::Value> v);
 
   v8::Isolate *isolate() const { return m_iso; }
   v8::Local<v8::Context> context() const { return m_ctx.Get(m_iso); }
@@ -180,8 +192,11 @@ class Values {
 };
 
 /** A UTF-8 std::string of a V8 string (or of String(v)), repaired (§7.1): each unpaired surrogate
-    becomes U+FFFD. For data and messages, never for code or names. */
+    becomes U+FFFD. For data and messages, never for code or names. One pass over the string. */
 std::string utf8(v8::Isolate *iso, v8::Local<v8::Value> v);
+/** Writes s as a str, repaired as utf8() does, in one pass into the message; false if it does not
+    fit. */
+bool write_utf8(v8::Isolate *iso, Writer &w, v8::Local<v8::String> s);
 /** The UTF-8 of a V8 string that is code or a name (SQL text, a library's name), which is never
     repaired; nullopt if it has an unpaired surrogate. */
 std::optional<std::string> utf8_exact(v8::Isolate *iso, v8::Local<v8::String> s);

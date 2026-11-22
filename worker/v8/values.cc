@@ -217,12 +217,12 @@ int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
 /** Seconds since the epoch within the years a zone is asked about: tzdb's get_info throws beyond
     std::chrono's years, and a Date reaches 275760. Outside 1000 BC to AD 11000, where no MySQL
     date is, a time takes the offset at that edge. */
-std::chrono::seconds zone_range(std::chrono::seconds s) {
-  using namespace std::chrono;
-  constexpr seconds low = sys_days{year{-1000} / January / 1}.time_since_epoch();
-  constexpr seconds high = sys_days{year{11000} / January / 1}.time_since_epoch();
-  return std::clamp(s, low, high);
-}
+constexpr std::chrono::seconds kZoneLow =
+    std::chrono::sys_days{std::chrono::year{-1000} / std::chrono::January / 1}.time_since_epoch();
+constexpr std::chrono::seconds kZoneHigh =
+    std::chrono::sys_days{std::chrono::year{11000} / std::chrono::January / 1}.time_since_epoch();
+
+std::chrono::seconds zone_range(std::chrono::seconds s) { return std::clamp(s, kZoneLow, kZoneHigh); }
 
 /** Java's Instant.toString() of milliseconds since the epoch ("1969-12-31T23:59:59.999Z",
     "+10000-01-01T00:00:00Z"), as the GraalJS worker's TIMESTAMP messages show an instant. */
@@ -285,6 +285,32 @@ std::string duration_text(const Temporal &t) {
 
 // ------------------------------------------------------------ strings
 
+namespace {
+
+/** The most UTF-8 bytes a string of n UTF-16 units can need: 2 per unit of a one-byte string, 3
+    per unit otherwise (a pair is 4 bytes for 2 units; an unpaired surrogate becomes U+FFFD, 3). */
+size_t utf8_bound(Local<v8::String> s) { return size_t(s->Length()) * (s->IsOneByte() ? 2 : 3); }
+
+/** Strings up to this bound are encoded into a buffer of the bound, in one pass; longer ones are
+    measured first (two passes, but no buffer three times their size). */
+constexpr size_t kOnePassBound = 16U << 20;
+
+size_t write_utf8_into(v8::Isolate *iso, Local<v8::String> s, std::span<std::byte> to) {
+  // With room for the bound, V8 encodes without checking the room per character; an unpaired
+  // surrogate becomes U+FFFD (§7.1).
+  return static_cast<size_t>(s->WriteUtf8(iso, reinterpret_cast<char *>(to.data()), static_cast<int>(to.size()),
+                                          nullptr, v8::String::NO_NULL_TERMINATION | v8::String::REPLACE_INVALID_UTF8));
+}
+
+std::string utf8_of(v8::Isolate *iso, Local<v8::String> s) {
+  const size_t bound = utf8_bound(s);
+  std::string out(bound <= kOnePassBound ? bound : size_t(s->Utf8Length(iso)), '\0');
+  out.resize(write_utf8_into(iso, s, std::as_writable_bytes(std::span(out.data(), out.size()))));
+  return out;
+}
+
+}  // namespace
+
 std::string utf8(v8::Isolate *iso, Local<Value> v) {
   if (v.IsEmpty()) return "";
   Local<v8::String> s;
@@ -294,27 +320,33 @@ std::string utf8(v8::Isolate *iso, Local<Value> v) {
     const v8::TryCatch tc(iso);
     if (!v->ToString(iso->GetCurrentContext()).ToLocal(&s)) return "?";
   }
-  std::string out(s->Utf8Length(iso), '\0');
-  // An unpaired surrogate becomes U+FFFD (3 bytes, as Utf8Length counted it).
-  s->WriteUtf8(iso, out.data(), static_cast<int>(out.size()), nullptr,
-               v8::String::NO_NULL_TERMINATION | v8::String::REPLACE_INVALID_UTF8);
-  return out;
+  return utf8_of(iso, s);
+}
+
+bool write_utf8(v8::Isolate *iso, Writer &w, Local<v8::String> s) {
+  const auto fill = [&](std::span<std::byte> to) { return write_utf8_into(iso, s, to); };
+  const size_t bound = utf8_bound(s);
+  if (bound <= kOnePassBound && w.str_in_place(bound, fill)) return true;
+  // Longer, or the bound does not fit what is left of the message: its exact length.
+  return w.str_in_place(size_t(s->Utf8Length(iso)), fill);
 }
 
 std::optional<std::string> utf8_exact(v8::Isolate *iso, Local<v8::String> s) {
-  if (!s->ContainsOnlyOneByte()) {
-    const v8::String::Value units(iso, s);
-    const auto high = [](uint16_t c) { return c >= 0xD800 && c <= 0xDBFF; };
-    const auto low = [](uint16_t c) { return c >= 0xDC00 && c <= 0xDFFF; };
-    for (int i = 0; i < units.length(); i++) {
-      const uint16_t c = (*units)[i];
-      if (high(c) && i + 1 < units.length() && low((*units)[i + 1]))
-        i++;
-      else if (high(c) || low(c))
-        return std::nullopt;
-    }
+  std::string out = utf8_of(iso, s);
+  // A one-byte string has no surrogates; another is looked at only if its encoding has a U+FFFD,
+  // which a repair or the text itself put there.
+  if (s->IsOneByte() || out.find("\xEF\xBF\xBD") == std::string::npos) return out;
+  const v8::String::Value units(iso, s);
+  const auto high = [](uint16_t c) { return c >= 0xD800 && c <= 0xDBFF; };
+  const auto low = [](uint16_t c) { return c >= 0xDC00 && c <= 0xDFFF; };
+  for (int i = 0; i < units.length(); i++) {
+    const uint16_t c = (*units)[i];
+    if (high(c) && i + 1 < units.length() && low((*units)[i + 1]))
+      i++;
+    else if (high(c) || low(c))
+      return std::nullopt;
   }
-  return utf8(iso, s);
+  return out;
 }
 
 Local<v8::String> v8_string(v8::Isolate *iso, std::string_view s) {
@@ -351,6 +383,7 @@ std::string ParamType::sql_name() const {
 // ------------------------------------------------------------ time zones
 
 bool Options::set_zone(std::string_view text) {
+  m_instants = m_locals = Interval{};
   if (!text.empty() && (text[0] == '+' || text[0] == '-')) {
     const auto digit = [&](size_t i) { return text[i] >= '0' && text[i] <= '9'; };
     if (text.size() != 6 || !digit(1) || !digit(2) || text[3] != ':' || !digit(4) || !digit(5)) return false;
@@ -380,10 +413,27 @@ double Options::epoch_ms(int year, unsigned month, unsigned day, int64_t hour, u
   const local_seconds t = d + hours(hour) + minutes(minute) + seconds(second);
   seconds off = offset;
   if (zone != nullptr) {
-    // Java's atZone: a local time in a gap moves forward by the gap (the offset before it); in an
-    // overlap the earlier offset.
-    const local_info info = zone->get_info(local_seconds{zone_range(t.time_since_epoch())});
-    off = info.first.offset;
+    const int64_t at = t.time_since_epoch().count();
+    if (m_locals.holds(at)) {
+      off = seconds(m_locals.offset);
+    } else {
+      // Java's atZone: a local time in a gap moves forward by the gap (the offset before it); in
+      // an overlap the earlier offset.
+      const local_info info = zone->get_info(local_seconds{zone_range(t.time_since_epoch())});
+      off = info.first.offset;
+      if (info.result == local_info::unique) {
+        // The local times of this offset that no neighbouring offset repeats or skips: from the
+        // transition at its start, shifted by the larger of the two offsets there, to the one
+        // at its end, shifted by the smaller (Appendix A). Within the years zone_range asks.
+        const sys_info &s = info.first;
+        const seconds begin = std::max(s.begin.time_since_epoch(), kZoneLow);
+        const seconds end = std::min(s.end.time_since_epoch(), kZoneHigh);
+        const seconds before = begin > kZoneLow ? zone->get_info(sys_seconds{begin - seconds(1)}).offset : s.offset;
+        const seconds after = end < kZoneHigh ? zone->get_info(sys_seconds{end}).offset : s.offset;
+        m_locals = {(begin + std::max(s.offset, before)).count(), (end + std::min(s.offset, after)).count(),
+                    s.offset.count()};
+      }
+    }
   }
   // Milliseconds as Java's toEpochMilli (floor), as a double for Date (beyond its range: NaN).
   return static_cast<double>((t.time_since_epoch() - off).count() * 1000 + micro / 1000);
@@ -394,7 +444,17 @@ void Options::local(double ms, int *year, unsigned *month, unsigned *day, unsign
   using namespace std::chrono;
   const sys_time<milliseconds> t{milliseconds(static_cast<int64_t>(std::floor(ms)))};
   seconds off = offset;
-  if (zone != nullptr) off = zone->get_info(sys_seconds{zone_range(floor<seconds>(t).time_since_epoch())}).offset;
+  if (zone != nullptr) {
+    const seconds at = floor<seconds>(t).time_since_epoch();
+    if (m_instants.holds(at.count())) {
+      off = seconds(m_instants.offset);
+    } else {
+      const sys_info s = zone->get_info(sys_seconds{zone_range(at)});
+      off = s.offset;
+      // The offset holds from one transition to the next (Appendix A).
+      m_instants = {s.begin.time_since_epoch().count(), s.end.time_since_epoch().count(), s.offset.count()};
+    }
+  }
   const auto local = t + off;
   const auto days = floor<std::chrono::days>(local);
   const auto rest = local - days;
@@ -549,14 +609,16 @@ std::string Values::str(Local<Value> v) {
   return utf8(m_iso, s);
 }
 
-std::string Values::text(Local<Value> v) {
-  if (v->IsString()) return utf8(m_iso, v);
-  if (v->IsSymbol()) return symbol_text(m_iso, v.As<v8::Symbol>());
+Local<v8::String> Values::string_of(Local<Value> v) {
+  if (v->IsString()) return v.As<v8::String>();
+  if (v->IsSymbol()) return v8_string(m_iso, symbol_text(m_iso, v.As<v8::Symbol>()));
   // ToString runs the object's toString or valueOf: what that throws stays pending.
   Local<v8::String> s;
   if (!v->ToString(context()).ToLocal(&s)) throw GuestThrew{};
-  return utf8(m_iso, s);
+  return s;
 }
+
+std::string Values::text(Local<Value> v) { return utf8(m_iso, string_of(v)); }
 
 Local<Value> Values::integer(int64_t v, bool is_unsigned, const ParamType *t) {
   const bool big = is_unsigned && v < 0;  // above BIGINT's range
@@ -622,10 +684,9 @@ Local<Value> Values::argument(Reader &r, const ParamType &t) { return value(r, t
 Local<Value> Values::column(Reader &r, const ParamType &t) { return value(r, t, false); }
 
 Local<Value> Values::value(Reader &r, const ParamType &t, bool argument) {
+  // The value is decoded and converted by its own tag, which is not compared with its type's
+  // (§1 item 2): another tag gives guest code a value of that tag's type.
   const auto tag = r.get<uint8_t>();
-  // The value is decoded by its own tag, which is its type's unless it is NULL (§1, §7.3).
-  if (tag != static_cast<uint8_t>(t.tag) && tag != static_cast<uint8_t>(w::Tag::kNull))
-    protocol_failure("a value whose tag is not its type's");
   switch (static_cast<w::Tag>(tag)) {
     case w::Tag::kNull:
       return v8::Null(m_iso);
@@ -901,8 +962,8 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
     }
     case w::Tag::kString: {
       // Oracle: "Convert to String" (a symbol too); what a toString throws is the routine's error.
-      const std::string s = text(v);
-      need(put_tag(wr, w::Tag::kString) && wr.str(s));
+      const Local<v8::String> s = string_of(v);
+      need(put_tag(wr, w::Tag::kString) && write_utf8(m_iso, wr, s));
       return;
     }
     case w::Tag::kJson: {
@@ -1024,7 +1085,7 @@ void Values::write_param(Writer &wr, Local<Value> v) {
   } else if (v->IsBoolean()) {
     need(put_tag(wr, w::Tag::kI64) && wr.put<int64_t>(v->BooleanValue(m_iso) ? 1 : 0));
   } else if (v->IsString()) {
-    need(put_tag(wr, w::Tag::kString) && wr.str(utf8(m_iso, v)));
+    need(put_tag(wr, w::Tag::kString) && write_utf8(m_iso, wr, v.As<v8::String>()));
   } else if (v->IsNumber()) {
     const double d = v.As<v8::Number>()->Value();
     if (!std::isfinite(d)) throw ConversionError{"cannot bind " + str(v)};

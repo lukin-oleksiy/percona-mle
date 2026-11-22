@@ -118,7 +118,10 @@ class Mailbox {
   static void taint();
 
   /** Writes the statistics (§3.1): for reporting only, and not on every request. A worker calls
-      it when the figures changed enough to matter and when it becomes idle after a RESET. */
+      it when the figures changed enough to matter (after a full collection) and when it becomes
+      ready after start and after a RESET. state stays 1 (ready) while it serves: 2 and 3 are
+      optional and would cost a write per request. A figure the runtime does not have is 0
+      (heap_max 0: no known limit). */
   static void stats(uint32_t state, uint64_t heap_used = 0, uint64_t heap_max = 0, uint64_t gc_count = 0);
 };
 

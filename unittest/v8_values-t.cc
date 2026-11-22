@@ -183,6 +183,75 @@ TEST_F(V8Values, Zones) {
   EXPECT_EQ(mi, 30u);
 }
 
+TEST_F(V8Values, ZoneIntervals) {
+  // The cached offset interval (Appendix A) gives what a lookup of every value gives: local times
+  // and instants every 10 minutes through 2026 in Kyiv, Lord Howe (a 30-minute shift) and a
+  // fixed offset, each against an Options that has looked nothing up.
+  for (const char *zone : {"Europe/Kyiv", "Australia/Lord_Howe", "+05:30"}) {
+    Options cached;
+    ASSERT_TRUE(cached.set_zone(zone));
+    int differ = 0;
+    constexpr int64_t kSteps = 366 * 24 * 6;
+    // Forward through the year, then back, then by large strides.
+    for (int64_t step = 0; step < 3 * kSteps; step++) {
+      const int64_t minute = 10 * (step < kSteps ? step : step < 2 * kSteps ? 2 * kSteps - 1 - step : step * 7919 % kSteps);
+      Options fresh;
+      ASSERT_TRUE(fresh.set_zone(zone));
+      const int64_t hour = minute / 60;
+      const auto mi = static_cast<unsigned>(minute % 60);
+      if (cached.epoch_ms(2026, 1, 1, hour, mi, 0, 0) != fresh.epoch_ms(2026, 1, 1, hour, mi, 0, 0)) differ++;
+      const double ms = 1767225600000.0 + double(minute) * 60000;
+      std::array<unsigned, 7> a{}, b{};
+      int ya, yb;
+      Options fresh2;
+      ASSERT_TRUE(fresh2.set_zone(zone));
+      cached.local(ms, &ya, &a[0], &a[1], &a[2], &a[3], &a[4], &a[5]);
+      fresh2.local(ms, &yb, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]);
+      if (ya != yb || a != b) differ++;
+    }
+    EXPECT_EQ(differ, 0) << zone;
+  }
+  // The repeated hour after a cached summer time: its first occurrence (EEST); the hour after it
+  // in winter time. Kyiv: 2026-10-25 04:00 EEST becomes 03:00 EET.
+  Options o;
+  ASSERT_TRUE(o.set_zone("Europe/Kyiv"));
+  EXPECT_EQ(o.epoch_ms(2026, 10, 25, 2, 30, 0, 0), 1792884600000.0);       // 23:30 UTC, +3
+  EXPECT_EQ(o.epoch_ms(2026, 10, 25, 3, 30, 0, 0), 1792888200000.0);       // 00:30 UTC, +3 (first)
+  EXPECT_EQ(o.epoch_ms(2026, 10, 25, 4, 30, 0, 0), 1792895400000.0);       // 02:30 UTC, +2
+  EXPECT_EQ(o.epoch_ms(2026, 10, 25, 3, 30, 0, 0), 1792888200000.0);       // after winter: still the first
+  // Without OPTIONS: +00:00.
+  Options none;
+  EXPECT_EQ(none.epoch_ms(2026, 1, 1, 0, 0, 0, 0), 1767225600000.0);
+}
+
+TEST_F(V8Values, EarlyYears) {
+  // Years 0 to 99 keep their value (B.4: not 1900 to 1999), as arguments and back.
+  m_opt.set_zone("+00:00");
+  for (const uint16_t year : {uint16_t{0}, uint16_t{1}, uint16_t{50}, uint16_t{99}, uint16_t{100}}) {
+    std::array<std::byte, 64> buf{};
+    Writer wr(buf);
+    mle::v8w::write_temporal(wr, mle::v8w::Temporal{w::Tag::kDate, year, 3, 4, 0, 0, 0, 0, false});
+    Reader r(std::span<const std::byte>(buf.data(), wr.size()), 0);
+    v8::Local<v8::Value> d = m_values->argument(r, type(w::Tag::kDate, "DATE"));
+    const v8::Local<v8::Value> got =
+        js("(d) => d.getUTCFullYear()").As<v8::Function>()->Call(m_ctx, v8::Undefined(m_iso), 1, &d).ToLocalChecked();
+    EXPECT_EQ(got.As<v8::Number>()->Value(), year);
+    std::array<std::byte, 64> back{};
+    Writer bw(back);
+    m_values->write_as(bw, d, type(w::Tag::kDate, "DATE"));
+    Reader br(std::span<const std::byte>(back.data(), bw.size()), 0);
+    br.get<uint8_t>();
+    EXPECT_EQ(mle::v8w::read_temporal(br, w::Tag::kDate).year, year);
+  }
+  // A Date for DATE: rounded to the nearest second, then its local date (23:59:59.5 is the next day).
+  std::array<std::byte, 64> buf{};
+  Writer wr(buf);
+  m_values->write_as(wr, js("new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 500))"), type(w::Tag::kDate, "DATE"));
+  Reader r(std::span<const std::byte>(buf.data(), wr.size()), 0);
+  r.get<uint8_t>();
+  EXPECT_EQ(mle::v8w::read_temporal(r, w::Tag::kDate).day, 2);
+}
+
 TEST_F(V8Values, Integers) {
   // BIGINT within 2^53: a number; beyond: a string (UNSAFE_STRING) or a BigInt (UNSAFE_BIGINT)
   EXPECT_EQ(round_trip("9007199254740991", type(w::Tag::kI64, "BIGINT")), "9007199254740991");
@@ -395,6 +464,23 @@ TEST_F(V8Values, Text) {
   EXPECT_FALSE(mle::v8w::utf8_exact(m_iso, js("'\\uDE00\\uD83D'").As<v8::String>()).has_value());
   EXPECT_EQ(mle::v8w::utf8_exact(m_iso, js("'gr\\u00FC\\u00DF \\uD83D\\uDE00'").As<v8::String>()).value(),
             "gr\xC3\xBC\xC3\x9F \xF0\x9F\x98\x80");
+  // A U+FFFD of the text itself is no repair.
+  EXPECT_EQ(mle::v8w::utf8_exact(m_iso, js("'a\\uFFFD\\u0100'").As<v8::String>()).value(), "a\xEF\xBF\xBD\xC4\x80");
+  // Into a message in one pass; with less room than three bytes a unit, by its exact length.
+  std::vector<std::byte> buf;
+  Writer grown(buf, 4 + 8);
+  ASSERT_TRUE(mle::v8w::write_utf8(m_iso, grown, js("'\\u0100\\uD800\\u00FC\\u0041'").As<v8::String>()));
+  EXPECT_EQ(grown.size(), 12u);
+  EXPECT_EQ(std::string(reinterpret_cast<const char *>(buf.data()) + 4, 8), "\xC4\x80\xEF\xBF\xBD\xC3\xBC" "A");
+  std::vector<std::byte> small;
+  Writer full(small, 4 + 7);
+  EXPECT_FALSE(mle::v8w::write_utf8(m_iso, full, js("'\\u0100\\uD800\\u00FC\\u0041'").As<v8::String>()));
+  EXPECT_EQ(full.size(), 0u);
+  // A string longer than the one-pass bound (16 MiB of UTF-8).
+  std::vector<std::byte> big;
+  Writer large(big, 64U << 20);
+  ASSERT_TRUE(mle::v8w::write_utf8(m_iso, large, js("'\\u0100'.repeat(9 << 20)").As<v8::String>()));
+  EXPECT_EQ(large.size(), 4 + (18U << 20));
 }
 
 TEST_F(V8Values, Domains) {
@@ -451,10 +537,19 @@ TEST_F(V8Values, Malformed) {
   EXPECT_TRUE(fails(bytes(99)));                          // an unknown tag
   EXPECT_TRUE(fails(bytes(0, 0)));                        // a trailing byte
   EXPECT_FALSE(fails(bytes(0)));
-  // a value that is not NULL under a type of another tag (§1 item 2)
-  EXPECT_TRUE(fails(bytes(1, 5, 0, 0, 0, 0, 0, 0, 0), w::Tag::kString));
+  // A value under a type of another tag is decoded and converted by its own tag, not compared
+  // with the type (§1 item 2).
+  EXPECT_FALSE(fails(bytes(1, 5, 0, 0, 0, 0, 0, 0, 0), w::Tag::kString));
   EXPECT_FALSE(fails(bytes(1, 5, 0, 0, 0, 0, 0, 0, 0), w::Tag::kI64));
-  EXPECT_TRUE(fails(text_value(w::Tag::kString, "x"), w::Tag::kJson));
+  EXPECT_FALSE(fails(text_value(w::Tag::kString, "x"), w::Tag::kJson));
+  {
+    const std::vector<std::byte> five = bytes(1, 5, 0, 0, 0, 0, 0, 0, 0), x = text_value(w::Tag::kString, "{x");
+    Reader a(five), b(x);
+    const v8::Local<v8::Value> number = m_values->argument(a, type(w::Tag::kString)),
+                               text = m_values->column(b, type(w::Tag::kJson));  // not parsed as JSON
+    EXPECT_TRUE(number->IsNumber() && number.As<v8::Number>()->Value() == 5);
+    EXPECT_TRUE(text->IsString() && str(text) == "{x");
+  }
   // a VECTOR longer than the message; its padding cut
   EXPECT_TRUE(fails(bytes(13, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x3F), w::Tag::kVector));
   EXPECT_TRUE(fails(bytes(13, 1, 0, 0, 0, 0, 0), w::Tag::kVector));

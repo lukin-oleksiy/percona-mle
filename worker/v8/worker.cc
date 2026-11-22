@@ -110,6 +110,11 @@ std::string frame_line(std::string s) {
   return s;
 }
 
+/** The language of a PREPARE or PARSE_LIBRARY: one READY announced (§1 item 4). */
+void check_language(std::string_view language) {
+  if (language != kJs) protocol_failure("a request for a language the worker did not announce");
+}
+
 /** The exact UTF-8 of a string argument that is a name; nullopt (and a TypeError thrown) if it is
     not a well-formed string. */
 std::optional<std::string> name_argument(v8::Isolate *iso, Local<Value> v, const char *what) {
@@ -453,11 +458,19 @@ void Worker::handle(const Message &m) {
 }
 
 void Worker::too_large(const Message &m, Request &q, Reply *reply) {
-  // §5.3: the transfer is complete and its chunks are gone; the worker itself is sound.
-  if (static_cast<w::Op>(m.op) == w::Op::kPrepare) {
+  // §5.3: the transfer is complete and its chunks are gone.
+  const auto op = static_cast<w::Op>(m.op);
+  if (op == w::Op::kPrepare || op == w::Op::kDrop) {
     q.routine_id = m.head;
     drop_routine(m.head);  // the id is not prepared (§8.3)
   }
+  if (op == w::Op::kOptions || op == w::Op::kDrop || op == w::Op::kReset) {
+    // At most 64 KiB: a worker that cannot hold even these asks to be retired.
+    Mailbox::taint();
+    reply->fail(w::Status::kInternal, "", "the MLE worker cannot hold a request of 64 KiB");
+    return;
+  }
+  // The worker itself is sound.
   reply->fail(w::Status::kExhausted, "", "the request is larger than this MLE worker can hold");
 }
 
@@ -510,7 +523,7 @@ void Worker::options(const Message &m, Reply *reply) {
 
 void Worker::parse_library(const Message &m, Reply *reply) {
   Reader r(m.body);
-  r.str();  // the language: the host sends none but READY's (§9.9)
+  check_language(r.str());
   const std::string name(r.str()), body(r.str());
   v8::TryCatch tc(m_isolate);
   try {
@@ -531,7 +544,7 @@ void Worker::prepare(const Message &m, Request &q, Reply *reply) {
   // The whole message is taken out of the arena before guest code, which may post, runs.
   Reader r(m.body);
   const auto id = r.get<uint64_t>();
-  r.str();  // the language: the host sends none but READY's (§9.2)
+  check_language(r.str());
   const std::string name(r.str()), entry(r.str()), source(r.str());
   const uint32_t n = r.count(w::kMaxParams, 23);
   const std::shared_ptr<Routine> routine(new Routine, [this](Routine *gone) {

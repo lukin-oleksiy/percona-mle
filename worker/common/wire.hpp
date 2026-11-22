@@ -119,6 +119,23 @@ class Writer {
     return s.size() <= UINT32_MAX && put(static_cast<uint32_t>(s.size())) &&
            bytes(std::as_bytes(std::span(s.data(), s.size())));
   }
+  /** A str whose bytes fill(span) writes in place, at most max of them; fill returns how many it
+      wrote. For text whose encoded length is known only once it is encoded: one pass (§7.1).
+      False, and nothing written, if max bytes do not fit. */
+  template <class F>
+  bool str_in_place(size_t max, F &&fill) {
+    const size_t at = m_p;
+    if (max > UINT32_MAX || !put<uint32_t>(0)) return false;
+    if (max > m_b.size() - m_p && !grow(max)) {
+      m_p = at;
+      return false;
+    }
+    const size_t n = std::min<size_t>(fill(m_b.subspan(m_p, max)), max);
+    const auto len = static_cast<uint32_t>(n);
+    std::memcpy(m_b.data() + at, &len, sizeof len);
+    m_p += n;
+    return true;
+  }
   /** Zero bytes up to the next kVectorAlignment (relative to the message start). */
   bool align() {
     static constexpr std::array<std::byte, wire::kVectorAlignment> kZero{};
