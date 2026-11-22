@@ -2125,7 +2125,9 @@ transition to the next), so that a value inside it costs a compare and
 an add; only a value outside it looks the zone up. For local time to
 instant, the interval excludes the local times that its bounding
 transitions repeat or skip, so §7.2's rules for them still apply. A
-worker that maps instants to local time does the same with its zone. For
+worker that maps instants to local time does the same with its zone
+where its runtime's zone lookup costs per value (Python's `zoneinfo`
+already caches it). For
 `SYSTEM` without an IANA name the host derives the transitions from the
 C library's local time, caches them alike and applies §7.2's rules for
 repeated and skipped hours itself. The host reads the session's current
@@ -2269,7 +2271,10 @@ a reading was needed:
 * A `Date` given for DATE is rounded to the nearest second, then its
   local date is taken (Oracle's conversion table for DATE).
 * Local time is that of the zone in OPTIONS, not the zone of the worker's
-  process.
+  process: in conversions and in every local-time method guest code calls
+  on a `Date` (`getHours()`, `toString()`, …). Options change only while
+  nothing is prepared (§9.8), so a worker can switch its engine's zone
+  then.
 
 Python: TIMESTAMP is an aware `datetime` in the zone of OPTIONS
 (`zoneinfo.ZoneInfo`, or a fixed `timezone` for an offset): it shows the
