@@ -41,10 +41,38 @@ constexpr size_t kDecimalMaxScale = 30;
 
 bool safe(int64_t v) { return v >= -kMaxSafe && v <= kMaxSafe; }
 
+/** ECMAScript's StrWhiteSpaceChar (what Number() strips): white space, the Zs category and line
+    terminators. */
+bool js_space(char32_t c) {
+  return c == 0x09 || c == 0x0A || c == 0x0B || c == 0x0C || c == 0x0D || c == 0x20 || c == 0xA0 ||
+         c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F ||
+         c == 0x205F || c == 0x3000 || c == 0xFEFF;
+}
+
+/** The code point that starts at s[i] (well-formed UTF-8), and its length. */
+char32_t code_point(std::string_view s, size_t i, size_t *len) {
+  const auto b = static_cast<unsigned char>(s[i]);
+  const size_t n = b < 0x80 ? 1 : b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
+  if (i + n > s.size()) {
+    *len = 1;
+    return b;
+  }
+  char32_t c = n == 1 ? b : n == 2 ? (b & 0x1F) : n == 3 ? (b & 0x0F) : (b & 0x07);
+  for (size_t k = 1; k < n; k++) c = (c << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+  *len = n;
+  return c;
+}
+
+/** s without the white space Number() ignores at either end. */
 std::string trim(std::string_view s) {
-  const auto space = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; };
-  while (!s.empty() && space(s.front())) s.remove_prefix(1);
-  while (!s.empty() && space(s.back())) s.remove_suffix(1);
+  size_t len = 0;
+  while (!s.empty() && js_space(code_point(s, 0, &len))) s.remove_prefix(len);
+  while (!s.empty()) {
+    size_t start = s.size() - 1;
+    while (start > 0 && (static_cast<unsigned char>(s[start]) & 0xC0) == 0x80) start--;
+    if (!js_space(code_point(s, start, &len))) break;
+    s.remove_suffix(s.size() - start);
+  }
   return std::string(s);
 }
 
@@ -946,8 +974,10 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
     case w::Tag::kDate:
     case w::Tag::kDatetime: {
       if (!v->IsDate()) cannot(v, t);
-      const double ms = v.As<v8::Date>()->ValueOf();
+      double ms = v.As<v8::Date>()->ValueOf();
       if (!std::isfinite(ms)) cannot(v, t);
+      // Oracle (Table 27.3): to DATE "rounding off any time part to the closest second".
+      if (t.tag == w::Tag::kDate) ms = std::floor((ms + 500) / 1000) * 1000;
       int year;
       unsigned month, day, hour, minute, second, micro;
       m_opt->local(ms, &year, &month, &day, &hour, &minute, &second, &micro);

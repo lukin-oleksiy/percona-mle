@@ -28,8 +28,6 @@ our @KNOWN = (
   # The V8 worker strips only ASCII white space from a numeric string (the JVM worker: what
   # JavaScript's Number() strips), and keeps a Date's local date for DATE (the JVM worker rounds
   # the time part off to the closest second, as Oracle's Table 27.3 says).
-  ['js_conversions', qr/(?<=\\ufeff" => )7\.5$/m, 'error'],
-  ['js_conversions', qr/(?<=59, 500\)\) => )2024-01-02T/, '2024-01-01T'],
   # Libraries created with LANGUAGE JS show it in information_schema.LIBRARIES.
   ['libraries', qr/(?<=jslib\tlib\d\t)JAVASCRIPT$/m, 'JS'],
   ['libraries', qr/SyntaxError: lib3:3:10 Expected an operand but found \*/, "SyntaxError: lib3:3:11 Unexpected token '*'"],

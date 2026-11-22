@@ -230,7 +230,7 @@ SELECT @r;
 CALL js_probe('js_d', '"\\u00a0\\u2003 7.5\\u2028\\ufeff"', @r);
 SELECT @r;
 @r
-"\u00a0\u2003 7.5\u2028\ufeff" => error
+"\u00a0\u2003 7.5\u2028\ufeff" => 7.5
 CALL js_probe('js_i', '"\\n\\t 7\\r"', @r);
 SELECT @r;
 @r
@@ -254,7 +254,7 @@ CALL js_probe('js_date', 'new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 400)) ;; new
 SELECT @r;
 @r
 new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 400)) => 2024-01-01T00:00:00.000Z
-new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 500)) => 2024-01-01T00:00:00.000Z
+new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 500)) => 2024-01-02T00:00:00.000Z
 new Date(Date.UTC(2024, 0, 1, 0, 0, 0, 0)) => 2024-01-01T00:00:00.000Z
 #
 # 9. getOption always gives a value: a statement's own options over the
