@@ -1,0 +1,46 @@
+--echo #
+--echo # component_mle: a session's fixed options replaced (protocol §9.8,
+--echo # Appendix A). mle_set_session_state() may replace them while the session
+--echo # has no program cached; the host first drops the ids of mle_eval() code
+--echo # and of routines that are gone. The session's workers stay and take the
+--echo # new options before their next request. A worker's globalThis counter
+--echo # shows whether code ran in the same worker.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+
+--connect (con1, localhost, root,,test)
+--echo # mle_eval() fixes the options; its code is no cached program.
+SELECT mle_eval('javascript', 'globalThis.e = (globalThis.e || 0) + 1') AS eval_1;
+SELECT mle_set_session_state('{"integer_type": "BIGINT"}') AS replaced;
+SELECT mle_eval('javascript', 'globalThis.e = (globalThis.e || 0) + 1') AS same_worker;
+CREATE FUNCTION kinds(i BIGINT) RETURNS VARCHAR(20) LANGUAGE JAVASCRIPT
+  AS $$ return typeof i $$;
+SELECT kinds(1) AS new_options;
+
+--echo # A program is cached: refused (Oracle's 1123), the options stay.
+--error ER_CANT_INITIALIZE_UDF
+SELECT mle_set_session_state('{"integer_type": "STRING"}');
+SELECT kinds(2) AS unchanged;
+
+--echo # The routine is dropped: nothing is cached or prepared any more.
+DROP FUNCTION kinds;
+SELECT mle_session_state('stored_programs') AS programs;
+SELECT mle_set_session_state('{"integer_type": "STRING"}') AS replaced_again;
+CREATE FUNCTION kinds(i BIGINT) RETURNS VARCHAR(20) LANGUAGE JAVASCRIPT
+  AS $$ return typeof i $$;
+SELECT kinds(3) AS string_now;
+SELECT mle_eval('javascript', 'globalThis.e = (globalThis.e || 0) + 1') AS still_same_worker;
+
+--echo # Values are checked when they are set.
+DROP FUNCTION kinds;
+--error ER_UDF_ERROR
+SELECT mle_set_session_state('{"decimal_type": "float"}');
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

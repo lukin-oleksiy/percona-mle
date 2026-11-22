@@ -362,6 +362,16 @@ struct ResultMsg {
   std::vector<std::string> findings;
   std::optional<Error> error;
   bool operator==(const ResultMsg &) const = default;
+  /** Back to a RESULT with nothing in it, without building a new one. */
+  void clear() {
+    ret.reset();
+    out_params.clear();
+    console_out.clear();
+    console_err.clear();
+    console_cleared = false;
+    findings.clear();
+    error.reset();
+  }
 };
 
 /** SQL (§9.5, §10.2). */

@@ -1,0 +1,53 @@
+#
+# component_mle: a session's fixed options replaced (protocol §9.8,
+# Appendix A). mle_set_session_state() may replace them while the session
+# has no program cached; the host first drops the ids of mle_eval() code
+# and of routines that are gone. The session's workers stay and take the
+# new options before their next request. A worker's globalThis counter
+# shows whether code ran in the same worker.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+# mle_eval() fixes the options; its code is no cached program.
+SELECT mle_eval('javascript', 'globalThis.e = (globalThis.e || 0) + 1') AS eval_1;
+eval_1
+1
+SELECT mle_set_session_state('{"integer_type": "BIGINT"}') AS replaced;
+replaced
+1
+SELECT mle_eval('javascript', 'globalThis.e = (globalThis.e || 0) + 1') AS same_worker;
+same_worker
+2
+CREATE FUNCTION kinds(i BIGINT) RETURNS VARCHAR(20) LANGUAGE JAVASCRIPT
+AS $$ return typeof i $$;
+SELECT kinds(1) AS new_options;
+new_options
+bigint
+# A program is cached: refused (Oracle's 1123), the options stay.
+SELECT mle_set_session_state('{"integer_type": "STRING"}');
+ERROR HY000: Can't initialize function 'mle_set_session_state'; Cannot set options of an active session. Please reset the session first.
+SELECT kinds(2) AS unchanged;
+unchanged
+bigint
+# The routine is dropped: nothing is cached or prepared any more.
+DROP FUNCTION kinds;
+SELECT mle_session_state('stored_programs') AS programs;
+programs
+0
+SELECT mle_set_session_state('{"integer_type": "STRING"}') AS replaced_again;
+replaced_again
+1
+CREATE FUNCTION kinds(i BIGINT) RETURNS VARCHAR(20) LANGUAGE JAVASCRIPT
+AS $$ return typeof i $$;
+SELECT kinds(3) AS string_now;
+string_now
+string
+SELECT mle_eval('javascript', 'globalThis.e = (globalThis.e || 0) + 1') AS still_same_worker;
+still_same_worker
+3
+# Values are checked when they are set.
+DROP FUNCTION kinds;
+SELECT mle_set_session_state('{"decimal_type": "float"}');
+ERROR HY000: mle_set_session_state<int> UDF failed; invalid decimal_type 'float'
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

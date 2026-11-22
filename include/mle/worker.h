@@ -187,6 +187,12 @@ class CallHooks {
   /** True once the session was killed or its statement ran out of time;
       polled at every bounded sleep and after every message of the worker. */
   virtual bool killed() { return false; }
+  /** The worker has not posted within the spin time: from now on the host
+      sleeps in bounded sleeps (§4.3) until it does. Called once per wait,
+      before the first sleep, and followed by a look for a kill: the hook
+      may set up a faster way to notice one (a kill handler) that a short
+      request does not need. */
+  virtual void sleeping() {}
   /** A database library the routine imports (§9.10); by default REFUSED.
       Not called once an interrupt was noticed. Must not use the Worker. */
   virtual void library(const LibraryMsg &request, LibraryResultMsg *result) {

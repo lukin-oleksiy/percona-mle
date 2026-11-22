@@ -99,168 +99,26 @@ std::string session_time_zone(MYSQL_THD thd) {
   return std::string(session_time_zone_name(thd));
 }
 
-namespace {
-
-/** "+05:30", "-3:00" -> seconds east of UTC. */
-bool parse_offset(std::string_view text, int32_t *seconds) {
-  if (text.size() < 5 || text.size() > 6 || (text[0] != '+' && text[0] != '-'))
-    return false;
-  const size_t colon = text.find(':');
-  if (colon != text.size() - 3) return false;
-  int hours = 0, minutes = 0;
-  for (size_t i = 1; i < text.size(); i++) {
-    if (i == colon) continue;
-    if (text[i] < '0' || text[i] > '9') return false;
-    (i < colon ? hours : minutes) = (i < colon ? hours : minutes) * 10 + (text[i] - '0');
-  }
-  if (minutes > 59) return false;
-  const int32_t total = hours * 3600 + minutes * 60;
-  // MySQL's and the protocol's range: -13:59 to +14:00.
-  if (text[0] == '-' ? total > 13 * 3600 + 59 * 60 : total > 14 * 3600)
-    return false;
-  *seconds = text[0] == '-' ? -total : total;
-  return true;
-}
-
-std::string offset_name(int32_t seconds) {
-  char b[16];
-  const int32_t a = seconds < 0 ? -seconds : seconds;
-  snprintf(b, sizeof b, "%c%02d:%02d", seconds < 0 ? '-' : '+', a / 3600,
-           a % 3600 / 60);
-  return b;
-}
-
-}  // namespace
-
-namespace {
-
-std::atomic<uint64_t> g_zone_ids{0};
-
-/** Around a change of offset local times repeat or are skipped: the
-    interval a TimeZone remembers ends this far from each change (no zone
-    moves its clock by more). */
-constexpr int64_t kChangeMargin = 26 * 3600;
-
-}  // namespace
-
-bool TimeZone::set(std::string_view name) {
-  m_id = ++g_zone_ids;
-  m_zone = nullptr;
-  m_from = m_to = 0;
-  m_offset = 0;
-  if (int32_t offset = 0; parse_offset(name, &offset)) {
-    // One offset for all time.
-    m_from = INT64_MIN;
-    m_to = INT64_MAX;
-    m_offset = offset;
-    return true;
-  }
-  // SYSTEM is mysqld's own zone: by its name in the zone data if it has
-  // one, else by the C library (m_zone stays nullptr).
-  const std::string system = name == "SYSTEM" ? system_time_zone() : "";
-  if (name == "SYSTEM") {
-    int32_t offset = 0;
-    if (system.empty() || parse_offset(system, &offset)) return true;
-    name = system;
-  }
-  try {
-    m_zone = std::chrono::locate_zone(name);
-  } catch (const std::runtime_error &) {
-    // No such zone, or no zone data on this host: for SYSTEM the C library
-    // still converts.
-    return !system.empty();
-  }
-  return true;
-}
-
-bool TimeZone::lookup(int64_t local, const mle::Temporal &t, int64_t *seconds) {
-  namespace ch = std::chrono;
-  if (m_zone == nullptr) {
-    // mysqld's own zone, by the C library's rules.
-    struct tm tm {};
-    tm.tm_year = t.year - 1900;
-    tm.tm_mon = t.month - 1;
-    tm.tm_mday = t.day;
-    tm.tm_hour = static_cast<int>(t.hour);
-    tm.tm_min = t.minute;
-    tm.tm_sec = t.second;
-    tm.tm_isdst = -1;
-    errno = 0;
-    const time_t at = mktime(&tm);
-    if (at == static_cast<time_t>(-1) && errno != 0) return false;
-    *seconds = at;
-    return true;
-  }
-  const ch::local_info info = m_zone->get_info(ch::local_seconds{ch::seconds{local}});
-  switch (info.result) {
-    case ch::local_info::unique: {
-      const int64_t offset = info.first.offset.count();
-      *seconds = local - offset;
-      // The offset holds from first.begin to first.end; near either end a
-      // local time may belong to the neighbour too.
-      const int64_t begin = info.first.begin.time_since_epoch().count();
-      const int64_t end = info.first.end.time_since_epoch().count();
-      constexpr int64_t kFar = INT64_MAX / 4;
-      m_from = begin < -kFar ? INT64_MIN : begin + offset + kChangeMargin;
-      m_to = end > kFar ? INT64_MAX : end + offset - kChangeMargin;
-      m_offset = offset;
-      return true;
-    }
-    case ch::local_info::ambiguous:
-      // The zone repeats this local time: its first occurrence (as the
-      // server takes it).
-      *seconds = local - info.first.offset.count();
-      return true;
-    case ch::local_info::nonexistent:
-      // The zone skips this local time: the instant of the change (as the
-      // server takes it).
-      *seconds = info.first.end.time_since_epoch().count();
-      return true;
-  }
-  return false;
-}
-
-bool TimeZone::instant(const mle::Temporal &t, int64_t *microseconds) {
-  if (t.year == 0 && t.month == 0 && t.day == 0 && t.hour == 0 &&
-      t.minute == 0 && t.second == 0 && t.microsecond == 0) {
-    *microseconds = mle::wire::kZeroTimestamp;
-    return true;
-  }
-  namespace ch = std::chrono;
-  const ch::year_month_day date{ch::year{t.year}, ch::month{t.month}, ch::day{t.day}};
-  if (!date.ok() || t.hour > 23 || t.minute > 59 || t.second > 59 ||
-      t.microsecond > 999999)
-    return false;
-  const int64_t local = ch::local_days{date}.time_since_epoch().count() * int64_t{86400} +
-                        t.hour * 3600 + t.minute * 60 + t.second;
-  int64_t seconds = local - m_offset;
-  if ((local < m_from || local >= m_to) && !lookup(local, t, &seconds))
-    return false;
-  *microseconds = seconds * 1000000 + t.microsecond;
-  return mle::is_valid_timestamp(*microseconds) &&
-         *microseconds != mle::wire::kZeroTimestamp;
-}
-
 TimeZone *ZoneCache::current(MYSQL_THD thd, std::string *name) {
-  const std::string_view now = session_time_zone_name(thd);
-  if (!m_known || now != m_name) {
-    m_name.assign(now);
-    m_known = m_zone.set(now);
+  MYSQL_LEX_CSTRING now{nullptr, 0};
+  if (mysql_service_mysql_thd_attributes->get(thd, "time_zone_name", &now) ||
+      now.str == nullptr)
+    now = {"", 0};
+  // By identity: the server's name of a zone lives as long as its zone
+  // object (the server frees neither while it runs), so the same address
+  // is the same zone; a name is compared only when the address differs.
+  if (!m_looked_up || now.str != m_server_name) {
+    m_server_name = now.str;
+    const std::string_view text(now.str, now.length);
+    if (!m_looked_up || text != m_name) {
+      m_name.assign(text);
+      m_known = m_zone.set(text);
+    }
+    m_looked_up = true;
   }
   if (m_known) return &m_zone;
   if (name != nullptr) *name = m_name;
   return nullptr;
-}
-
-std::string options_time_zone(std::string_view zone) {
-  if (zone == "SYSTEM") return system_time_zone();
-  if (int32_t offset = 0; parse_offset(zone, &offset)) return offset_name(offset);
-  // Zones that count leap seconds have no instants the protocol can carry.
-  if (zone.empty() || zone.size() > mle::wire::kMaxTimeZone ||
-      zone.rfind("leap/", 0) == 0 || zone.rfind("right/", 0) == 0 ||
-      !mle::is_valid_utf8(zone))
-    return "";
-  return std::string(zone);
 }
 
 mle::Temporal utc_fields(int64_t microseconds) {
@@ -812,8 +670,11 @@ Routine *Routine::create(stored_program_handle sp) {
   r->qualified_name = get_string("qualified_name");
   r->schema = get_string("database_name");
   // Known once the host is: an anonymous definer has an empty user name.
-  if (const std::string host = get_string("sp_definer_host"); !host.empty())
-    r->definer_key = account_key(get_string("sp_definer_user"), host);
+  if (const std::string host = get_string("sp_definer_host"); !host.empty()) {
+    r->definer_user = get_string("sp_definer_user");
+    r->definer_host = host;
+    r->definer_key = account_key(r->definer_user, r->definer_host);
+  }
   for (uint32_t i = 0; i < n; i++) {
     ParamInfo p;
     const char *name = nullptr;

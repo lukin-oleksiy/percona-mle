@@ -902,8 +902,10 @@ void encode(const ResultMsg &m, std::string *out) {
 }
 
 bool decode(std::string_view body, ResultMsg *m, std::string *error) {
-  return decode_with(body, Sender::kWorker, m, error,
-                     [](Reader &r, ResultMsg *x) {
+  // On every call: cleared in place rather than replaced (decode_with).
+  m->clear();
+  Reader reader(body, Sender::kWorker);
+  const auto fields = [](Reader &r, ResultMsg *x) {
     bool has;
     if (!r.flag(&has)) return false;
     if (has) {
@@ -930,7 +932,10 @@ bool decode(std::string_view body, ResultMsg *m, std::string *error) {
       if (!get_error(r, &*x->error)) return false;
     }
     return true;
-  });
+  };
+  if (fields(reader, m) && reader.finish()) return true;
+  if (error != nullptr) *error = reader.error();
+  return false;
 }
 
 void encode(const SqlMsg &m, std::string *out) {

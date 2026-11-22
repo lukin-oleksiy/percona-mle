@@ -458,6 +458,14 @@ Worker::Wait Worker::wait_post(CallHooks *hooks, Transfer *transfer,
     if ((i & 63) == 0 && now_ns() >= spin_until) break;
     cpu_relax();
   }
+  // A long wait: what the hooks set up for it (a kill handler) is in place
+  // before the kill is looked for and the first sleep.
+  if (hooks != nullptr && m_ready) {
+    hooks->sleeping();
+    if (const Wait w = tick(transfer, true, turn_len, error);
+        w != Wait::kMessage)
+      return w;
+  }
   while (true) {
     // The sleep handshake of §4.3.
     h->h_sleep.store(1, std::memory_order_seq_cst);
@@ -797,7 +805,7 @@ std::string Worker::check_result(const Request &q, uint32_t status,
 
 Outcome Worker::request(const Request &q, CallHooks &hooks, ResultMsg *result,
                         std::string *error) {
-  *result = ResultMsg();
+  result->clear();
   forget_record();
   if (!m_usable) return died(error);
   auto refuse = [&](std::string why) {

@@ -67,6 +67,7 @@
 #include <mysql/components/services/mysql_string.h>
 
 #include "mle/codec.h"
+#include "time_zone.hpp"
 
 namespace mle_component {
 
@@ -105,49 +106,9 @@ std::string session_time_zone(MYSQL_THD thd = nullptr);
     session's zone changes); empty if the server does not tell. */
 std::string_view session_time_zone_name(MYSQL_THD thd = nullptr);
 
-/**
-  A time zone, to turn the local time the server gives for a TIMESTAMP into
-  the instant the protocol carries (§7.2). It remembers the interval of
-  local time around the value converted last in which the zone has one
-  offset: a value inside it costs a comparison and a subtraction.
-*/
-class TimeZone {
- public:
-  /** name as session_time_zone() gives it. False for a zone that is not
-      known here (the zone data of the operating system has no such name). */
-  bool set(std::string_view name);
-  /** The instant of a local time in this zone, in microseconds since
-      1970-01-01 00:00:00 UTC; MySQL's zero timestamp for a zero local time.
-      False if the fields are no date or the instant is outside the
-      protocol's range. */
-  bool instant(const mle::Temporal &local, int64_t *microseconds);
-  /** Takes the interval other has found, if other is this zone. */
-  void learn(const TimeZone &other) {
-    if (other.m_id != m_id) return;
-    m_from = other.m_from;
-    m_to = other.m_to;
-    m_offset = other.m_offset;
-  }
-
- private:
-  /** The instant, in seconds, of local (seconds since the epoch on the
-      zone's clock) by the zone's rules; sets the interval when local has
-      one offset. */
-  bool lookup(int64_t local, const mle::Temporal &fields, int64_t *seconds);
-
-  /** The rules: a zone of the zone data, or (nullptr) the C library's for
-      mysqld's own zone; unused while the interval is everything. */
-  const std::chrono::time_zone *m_zone = nullptr;
-  /** Local times in [m_from, m_to) are the instants local - m_offset. */
-  int64_t m_from = 0;
-  int64_t m_to = 0;
-  int64_t m_offset = 0;
-  /** Which zone this is: copies of one set() share it. */
-  uint64_t m_id = 0;
-};
-
-/** A session's current zone, kept between statements: looked up again only
-    when the session's zone has another name. */
+/** A session's current zone, kept between statements (time_zone.hpp). The
+    session's zone is read only when a TIMESTAMP is converted, and is
+    looked up again only when the server's zone object is another one. */
 class ZoneCache {
  public:
   /** The zone of thd's session now; nullptr (and *name, for the message)
@@ -157,16 +118,14 @@ class ZoneCache {
   void learn(const TimeZone &zone) { m_zone.learn(zone); }
 
  private:
+  /** The server's name of the zone looked up last: its address is the
+      zone's identity. */
+  const char *m_server_name = nullptr;
+  bool m_looked_up = false;
   std::string m_name;
   bool m_known = false;
   TimeZone m_zone;
 };
-
-/** A session's time zone as OPTIONS names it (§9.8): an offset "+hh:mm" or
-    an IANA name; SYSTEM as mysqld's own zone (system_time_zone()). Empty
-    for a zone the protocol cannot express: a name that is too long, a zone
-    that counts leap seconds. */
-std::string options_time_zone(std::string_view session_zone);
 
 /** The calendar fields, in UTC, of an instant that is not the zero
     timestamp. */
@@ -186,6 +145,9 @@ struct Routine {
       empty while the routine is created (the author is the current
       account then) and on a server that does not tell. */
   std::string definer_key;
+  /** The definer's user and host as the server gives them (for an account
+      lookup); empty with definer_key. */
+  std::string definer_user, definer_host;
   std::vector<ParamInfo> params;
   std::optional<ParamInfo> ret;
   /** PREPARE for the workers (body form: empty entry). */

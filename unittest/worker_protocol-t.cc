@@ -100,6 +100,7 @@ class Hooks : public CallHooks {
   }
   void sql_bytes_release(uint64_t bytes) override { bytes_held -= bytes; }
   bool killed() override { return kill.load(); }
+  void sleeping() override { ++sleeps; }
   void library(const LibraryMsg &q, LibraryResultMsg *r) override {
     libraries.push_back(q);
     if (on_library)
@@ -119,6 +120,8 @@ class Hooks : public CallHooks {
   uint64_t bytes_held = 0;
   uint64_t bytes_peak = 0;
   std::atomic<bool> kill{false};
+  /** Waits that went on past the spin time. */
+  int sleeps = 0;
 };
 
 // ---------------------------------------------------------------- scripts
@@ -534,6 +537,42 @@ TEST_F(MleWorkerProtocol, GoodWorker) {
   EXPECT_EQ(w->reset(&err), Outcome::kOk) << err;
   EXPECT_TRUE(w->usable());
   EXPECT_EQ(w->depth(), 0u);
+}
+
+// A request that waits long tells the hooks once per wait (a kill handler
+// is set up only for it); a kill during the wait is still noticed.
+TEST_F(MleWorkerProtocol, LongWaitsTellTheHooks) {
+  auto w = start();
+  ASSERT_NE(w, nullptr);
+  prepare(*w, 1, Script().sleep(50).answer());
+  ResultMsg res;
+  std::string err;
+  hooks.sleeps = 0;
+  ASSERT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kOk) << err;
+  EXPECT_EQ(hooks.sleeps, 1);
+  prepare(*w, 2, Script().sleep(5000).answer());
+  std::thread killer = kill_after(30);
+  const auto t0 = Clock::now();
+  EXPECT_NE(w->call(2, 0, {}, hooks, &res, &err), Outcome::kOk);
+  killer.join();
+  EXPECT_TRUE(w->interrupted());
+  EXPECT_LT(ms_since(t0), 4000);
+}
+
+// The host sends no language the worker did not announce (§1 item 4).
+TEST_F(MleWorkerProtocol, LanguageNotInReady) {
+  auto w = start();
+  ASSERT_NE(w, nullptr);
+  ResultMsg res;
+  std::string err;
+  PrepareMsg p = routine(1, "");
+  p.language = "js";
+  EXPECT_EQ(w->prepare(p, hooks, &res, &err), Outcome::kRefused);
+  EXPECT_NE(err.find("language 'js'"), std::string::npos) << err;
+  EXPECT_EQ(w->parse_library({"python", "lib", "x"}, hooks, &res, &err),
+            Outcome::kRefused);
+  EXPECT_TRUE(w->usable());
+  EXPECT_FALSE(w->is_prepared(1));
 }
 
 // What the host does not send (§8, §9.8, §12): the worker is not involved.

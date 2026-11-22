@@ -55,6 +55,9 @@ extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_store);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_security_context);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_options);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_factory);
+extern REQUIRES_SERVICE_PLACEHOLDER(
+    mysql_account_database_security_context_lookup);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_system_variable_reader);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_kill_handler);
 extern REQUIRES_SERVICE_PLACEHOLDER(dynamic_privilege_register);
@@ -228,11 +231,14 @@ bool session_killed(MYSQL_THD thd) {
 class Hooks : public mle::CallHooks {
  public:
   /** sql: the request's statements (a CALL of a routine), or nullptr for a
-      request that runs no SQL: every action but CLOSE then gets no_sql. */
-  explicit Hooks(MYSQL_THD thd, SqlBudget *budget = nullptr,
-                 SqlRunner *sql = nullptr, const Routine *routine = nullptr,
+      request that runs no SQL: every action but CLOSE then gets no_sql.
+      session: the session whose KILL handler a long wait installs. */
+  explicit Hooks(MYSQL_THD thd, Session *session = nullptr,
+                 SqlBudget *budget = nullptr, SqlRunner *sql = nullptr,
+                 const Routine *routine = nullptr,
                  const char *no_sql = kNoSqlWhileLoading)
       : m_thd(thd),
+        m_session(session),
         m_budget(budget),
         m_sql(sql),
         m_routine(routine),
@@ -342,9 +348,13 @@ class Hooks : public mle::CallHooks {
   }
 
   bool killed() override { return session_killed(m_thd); }
+  void sleeping() override {
+    if (m_session != nullptr) m_session->install_kill_handler();
+  }
 
  private:
   MYSQL_THD m_thd;
+  Session *m_session;
   SqlBudget *m_budget;
   SqlRunner *m_sql;
   const Routine *m_routine;
@@ -468,37 +478,33 @@ class Session::KillGuard {
  public:
   KillGuard(Session *s, mle::Worker *worker) : m_session(s) {
     if (worker->depth() != 0) return;  // nested: its worker is listed
-    const size_t n = s->m_running_n.load();
+    const size_t n = s->m_running_n.load(std::memory_order_relaxed);
     m_pushed = n < kMaxRunning;
     if (m_pushed) {
-      s->m_running[n].store(worker);
-      s->m_running_n.store(n + 1);
+      // Released for the handler, which runs on the killing thread.
+      s->m_running[n].store(worker, std::memory_order_release);
+      s->m_running_n.store(n + 1, std::memory_order_release);
     }
-    if (!s->m_kill_installed) {
-      // Fails if another component's handler is installed (e.g. a V8
-      // routine called us): the workers' KILL polling still works.
-      s->m_kill_installed = !mysql_service_mysql_thd_kill_handler->set(
-          s->m_thd,
-          [](MYSQL_THD, uint16_t, void *data) {
-            auto *session = static_cast<Session *>(data);
-            const size_t count = session->m_running_n.load();
-            for (size_t i = 0; i < count && i < kMaxRunning; i++)
-              if (mle::Worker *w = session->m_running[i].load()) w->interrupt();
-          },
-          s);
-      m_installed = s->m_kill_installed;
+    // The outermost guard owns the handler, which a long wait installs.
+    m_outermost = !s->m_kill_guarded;
+    if (m_outermost) {
+      s->m_kill_guarded = true;
+      s->m_kill_tried = false;
     }
   }
   ~KillGuard() {
-    if (m_installed) {
-      (void)mysql_service_mysql_thd_kill_handler->set(m_session->m_thd,
-                                                      nullptr, nullptr);
+    if (m_outermost) {
+      if (m_session->m_kill_installed)
+        (void)mysql_service_mysql_thd_kill_handler->set(m_session->m_thd,
+                                                        nullptr, nullptr);
       m_session->m_kill_installed = false;
+      m_session->m_kill_guarded = false;
     }
     if (m_pushed) {
-      const size_t n = m_session->m_running_n.load() - 1;
-      m_session->m_running[n].store(nullptr);
-      m_session->m_running_n.store(n);
+      const size_t n =
+          m_session->m_running_n.load(std::memory_order_relaxed) - 1;
+      m_session->m_running[n].store(nullptr, std::memory_order_release);
+      m_session->m_running_n.store(n, std::memory_order_release);
     }
   }
   KillGuard(const KillGuard &) = delete;
@@ -507,9 +513,27 @@ class Session::KillGuard {
  private:
   Session *m_session;
   bool m_pushed = false;
-  /** This guard installed the handler: it is the outermost one. */
-  bool m_installed = false;
+  /** The first guard of the session's requests in progress. */
+  bool m_outermost = false;
 };
+
+void Session::install_kill_handler() {
+  if (!m_kill_guarded || m_kill_installed || m_kill_tried) return;
+  m_kill_tried = true;
+  // Fails if another component's handler is installed (e.g. a V8 routine
+  // called us): the workers' KILL polling still works.
+  m_kill_installed = !mysql_service_mysql_thd_kill_handler->set(
+      m_thd,
+      [](MYSQL_THD, uint16_t, void *data) {
+        auto *session = static_cast<Session *>(data);
+        const size_t count = session->m_running_n.load(std::memory_order_acquire);
+        for (size_t i = 0; i < count && i < kMaxRunning; i++)
+          if (mle::Worker *w =
+                  session->m_running[i].load(std::memory_order_acquire))
+            w->interrupt();
+      },
+      this);
+}
 
 // ------------------------------------------------------------- lifetime
 
@@ -559,76 +583,124 @@ Session::Session(MYSQL_THD thd) : m_thd(thd), m_mark(engine_session_begin()) {
 }
 
 Session::~Session() {
-  for (auto &[key, slot] : m_workers)
-    engine_release_worker(std::move(slot.worker), slot.kind, slot.principal, m_mark);
+  for (auto &[key, slot] : m_workers) release(slot, true);
   for (auto &w : m_retired) engine_release_worker(std::move(w));
   engine_session_end(m_mark);
   --g_counters.sessions;
 }
 
-std::string account_key(std::string_view user, std::string_view host) {
-  // MySQL's quoting: unambiguous ('a@b'@'c' is not 'a'@'b@c').
-  // Built in place: it runs on every call (exp note 37).
-  std::string key;
-  key.reserve(user.size() + host.size() + 8);
-  key += '\'';
-  for (char c : user) {
-    key += c;
-    if (c == '\'') key += c;
-  }
-  key += "'@'";
-  // Host names compare without case (a definer's host may be written in
-  // another case than the account's).
-  for (char c : host) {
-    key += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-    if (c == '\'') key += c;
-  }
-  key += '\'';
-  return key;
+void Session::release(Slot &slot, bool reuse) {
+  // A worker that recorded an account of its principal that did not exist
+  // is never kept (protocol §1): given back without its principal.
+  engine_release_worker(std::move(slot.worker), slot.kind,
+                        reuse && !slot.unknown_account ? slot.principal
+                                                       : std::string(),
+                        m_mark);
 }
 
-bool principal_has_account(std::string_view principal,
-                           std::string_view account) {
-  if (principal == account) return true;
-  const size_t n = account.size() + kCodeOf.size();
-  return principal.size() > n &&
-         ((principal.starts_with(account) &&
-           principal.substr(account.size(), kCodeOf.size()) == kCodeOf) ||
-          (principal.ends_with(account) &&
-           principal.substr(principal.size() - n, kCodeOf.size()) == kCodeOf));
-}
+namespace {
+/** Principals a session keeps (principal()) before it forgets them. */
+constexpr size_t kPrincipalsKept = 32;
 
-std::string Session::principal(const Routine *routine) const {
-  // Read on every call: a security context's address says nothing (a
-  // COM_CHANGE_USER rewrites the session's context in place, a new routine
-  // may get a dropped one's address).
+/** Whether the account exists now: as the server looks up the definer of a
+    stored program (the account's own user and host). A lookup that fails
+    for any reason counts as "does not exist": the worker is then only
+    retired sooner and not kept. */
+bool account_exists(const std::string &user, const std::string &host) {
+  Security_context_handle ctx = nullptr;
+  if (mysql_service_mysql_security_context_factory->create(&ctx) ||
+      ctx == nullptr)
+    return false;
+  bool exists = !mysql_service_mysql_account_database_security_context_lookup
+                     ->lookup(ctx, user.c_str(), host.c_str(), nullptr, nullptr);
+  if (exists) {
+    // The account found is this one, not another of the user whose host
+    // pattern matches this host's text.
+    MYSQL_LEX_CSTRING u{"", 0}, h{"", 0};
+    exists = !mysql_service_mysql_security_context_options->get(ctx, "priv_user", &u) &&
+             !mysql_service_mysql_security_context_options->get(ctx, "priv_host", &h) &&
+             account_key({u.str, u.length}, {h.str, h.length}) ==
+                 account_key(user, host);
+  }
+  (void)mysql_service_mysql_security_context_factory->destroy(ctx);
+  return exists;
+}
+}  // namespace
+
+const Session::Principal &Session::principal(const Routine *routine,
+                                             unsigned language) {
+  // The account of the context in force, read on every call and compared
+  // byte for byte: a security context's address says nothing (a
+  // COM_CHANGE_USER rewrites the session's context in place, a view's
+  // context lives as long as its statement).
   Security_context_handle sctx = nullptr;
   MYSQL_LEX_CSTRING user{"", 0}, host{"", 0};
-  if (mysql_service_mysql_thd_security_context->get(m_thd, &sctx) ||
-      mysql_service_mysql_security_context_options->get(sctx, "priv_user",
-                                                        &user) ||
-      mysql_service_mysql_security_context_options->get(sctx, "priv_host",
-                                                        &host))
-    return "?";
-  std::string key =
-      account_key({user.str, user.length}, {host.str, host.length});
-  // A DEFINER routine runs as its definer: the keys are equal.
-  if (routine != nullptr && !routine->definer_key.empty() &&
-      routine->definer_key != key) {
-    key += kCodeOf;
-    key += routine->definer_key;
+  const bool told =
+      !mysql_service_mysql_thd_security_context->get(m_thd, &sctx) &&
+      !mysql_service_mysql_security_context_options->get(sctx, "priv_user",
+                                                         &user) &&
+      !mysql_service_mysql_security_context_options->get(sctx, "priv_host",
+                                                         &host);
+  const std::string_view u = told ? std::string_view(user.str, user.length) : "";
+  const std::string_view h = told ? std::string_view(host.str, host.length) : "";
+  const uint64_t id = routine != nullptr ? routine->id : 0;
+  const WorkerKind kind = kind_of(language);
+  // Forgotten when an account is dropped, renamed or created.
+  const uint64_t forgets = engine_forgets();
+  for (const auto &p : m_principals)
+    if (p->routine_id == id && p->kind == kind && p->forgets == forgets &&
+        p->told == told && p->user == u && p->host == h)
+      return *p;
+  // A reference handed out earlier stays valid while a request runs.
+  if (m_calls == 0 && m_principals.size() >= kPrincipalsKept) {
+    std::erase_if(m_principals,
+                  [forgets](const auto &p) { return p->forgets != forgets; });
+    if (m_principals.size() >= kPrincipalsKept) m_principals.clear();
   }
-  return key;
+  auto p = std::make_unique<Principal>();
+  p->routine_id = id;
+  p->kind = kind;
+  p->told = told;
+  p->user = u;
+  p->host = h;
+  p->forgets = forgets;
+  if (told) {
+    p->rights_key = account_key(u, h);
+    p->principal = p->rights_key;
+    // A DEFINER routine runs as its definer: the keys are equal.
+    if (routine != nullptr && !routine->definer_key.empty() &&
+        routine->definer_key != p->rights_key) {
+      p->owner_user = routine->definer_user;
+      p->owner_host = routine->definer_host;
+      p->owner_key = routine->definer_key;
+      p->principal += kCodeOf;
+      p->principal += routine->definer_key;
+    }
+  } else {
+    p->principal = "?";
+  }
+  p->slot = p->principal;
+  p->slot += '\0';
+  p->slot += kind_name(kind);
+  m_principals.push_back(std::move(p));
+  return *m_principals.back();
+}
+
+bool Session::accounts_exist(const Principal &who) const {
+  if (!who.told) return false;
+  // As the incarnation the session knows: one dropped or renamed since the
+  // session began is not, even if an account of that name exists again.
+  const auto exists = [this](const std::string &user, const std::string &host,
+                             const std::string &key) {
+    return !engine_account_forgotten(key, m_mark, false) &&
+           account_exists(user, host);
+  };
+  return exists(who.user, who.host, who.rights_key) &&
+         (who.owner_key.empty() ||
+          exists(who.owner_user, who.owner_host, who.owner_key));
 }
 
 // ------------------------------------------------------------- workers
-
-std::string Session::slot_key(const std::string &principal, unsigned language) {
-  std::string key = principal;
-  key += '\0';
-  key += kind_name(kind_of(language));
-  return key;
-}
 
 std::string Session::display_key(const std::string &key) {
   const size_t nul = key.find('\0');
@@ -645,6 +717,7 @@ void Session::drop_worker(const std::string &key) {
   else
     engine_release_worker(std::move(it->second.worker), it->second.kind);
   m_workers.erase(it);
+  ++m_slot_erasures;
 }
 
 void Session::settle(const std::string &key, mle::Worker *worker) {
@@ -654,37 +727,43 @@ void Session::settle(const std::string &key, mle::Worker *worker) {
     drop_worker(key);
 }
 
-Session::Slot *Session::worker_for(const std::string &key,
+Session::Slot *Session::worker_for(const Principal &who,
                                    const Routine &routine) {
-  const std::string principal = key.substr(0, key.find('\0'));
-  const WorkerKind kind = kind_of(routine.language);
-  const std::string language = worker_language(routine.language);
+  const std::string &key = who.slot;
+  const WorkerKind kind = who.kind;
+  const std::string_view language = worker_language(routine.language);
 
-  auto it = m_workers.find(key);
+  auto it = who.slot_erasures == m_slot_erasures ? who.slot_at
+                                                 : m_workers.find(key);
   if (it != m_workers.end()) {
     Slot &slot = it->second;
     bool keep = slot.worker && slot.worker->usable();
     // A worker runs its kind's languages, but an installation may lack one
-    // of them (a JVM worker without Python): the host sends no other.
-    if (keep) {
+    // of them (a JVM worker without Python): the host sends no other
+    // (§1 item 4). Checked once per language.
+    if (keep && (slot.languages_checked & routine.language) == 0) {
       const auto &languages = slot.worker->languages();
       if (std::find(languages.begin(), languages.end(), language) ==
           languages.end()) {
         engine_error("incompatible MLE worker: it does not run the language '" +
-                     language + "'");
+                     std::string(language) + "'");
         return nullptr;
       }
+      slot.languages_checked |= routine.language;
     }
-    // A worker whose principal names an account that was dropped, renamed
-    // or created after the worker started is retired: an account of that
-    // name is another one now (§1).
+    // A worker whose principal names an account that was dropped or
+    // renamed, or that recorded an account that did not exist when it
+    // started and an account was created since, is retired: an account of
+    // that name is another one now (§1).
     if (keep && slot.worker->depth() == 0) {
       const uint64_t forgets = engine_forgets();
       if (forgets != slot.forgets) {
-        if (engine_account_forgotten(slot.principal, slot.forgets)) {
+        if (engine_account_forgotten(slot.principal, slot.forgets,
+                                     slot.unknown_account)) {
           log_info("The worker of " + display_key(key) +
-                   " was retired: an account of its principal was dropped, "
-                   "renamed or created.");
+                   " was retired: an account of its principal was dropped "
+                   "or renamed, or one that did not exist when the worker "
+                   "started may have been created.");
           keep = false;
         } else {
           slot.forgets = forgets;
@@ -708,17 +787,25 @@ Session::Slot *Session::worker_for(const std::string &key,
   if (session_killed(m_thd)) return nullptr;
 
   if (it == m_workers.end()) {
+    // Read first: an account dropped or created from here on retires it.
     const uint64_t forgets = engine_forgets();
+    // What the worker records at its start (§1): whether every account of
+    // its principal exists. One that does not is served by a new worker,
+    // never by one kept from another session.
+    const bool unknown = !accounts_exist(who);
     AcquireError why = AcquireError::kNone;
     std::string error;
     // A worker kept from an earlier session of this principal (warm, RESET
     // when it was given back), else a new one from the pool.
     std::unique_ptr<mle::Worker> worker =
-        engine_reuse_worker(principal, kind, language, max_workers());
+        unknown ? nullptr
+                : engine_reuse_worker(who.principal, kind, std::string(language),
+                                      max_workers());
     Hooks hooks(m_thd);
     if (!worker)
-      worker = engine_new_worker(kind, language, max_workers(), spin_us(),
-                                 interrupt_grace_ms(), &hooks, &why, &error);
+      worker = engine_new_worker(kind, std::string(language), max_workers(),
+                                 spin_us(), interrupt_grace_ms(), &hooks, &why,
+                                 &error);
     if (why == AcquireError::kFailed && hooks.killed())
       return nullptr;  // KILL while waiting for the worker: the server reports it
     switch (why) {
@@ -747,14 +834,23 @@ Session::Slot *Session::worker_for(const std::string &key,
     }
     Slot &slot = m_workers[key];
     slot.worker = std::move(worker);
-    slot.principal = principal;
+    slot.principal = who.principal;
     slot.kind = kind;
     slot.forgets = forgets;
+    slot.unknown_account = unknown;
+    slot.languages_checked = routine.language;  // READY had it
     it = m_workers.find(key);
   }
+  who.slot_at = it;
+  who.slot_erasures = m_slot_erasures;
 
   Slot &slot = it->second;
-  slot.worker->set_timing(spin_us(), interrupt_grace_ms());
+  // The sysvars are read only after they changed.
+  if (const uint64_t timing = timing_generation();
+      slot.timing_generation != timing) {
+    slot.worker->set_timing(spin_us(), interrupt_grace_ms());
+    slot.timing_generation = timing;
+  }
   if (options_in(key, slot, routine)) return &slot;
   // The worker was lost on the way (or retired for an INTERNAL answer).
   mle::Worker *const worker = slot.worker.get();
@@ -772,8 +868,10 @@ bool Session::options_in(const std::string &key, Slot &slot,
   mle::Worker &worker = *slot.worker;
   // A worker comes to a session without options (new, or RESET when it was
   // given back), and the session gives it only its fixed options: what is
-  // in force is right, and nothing is compared.
-  if (worker.options_in_force()) return true;
+  // in force is right unless the session replaced them since.
+  if (worker.options_in_force() &&
+      slot.options_generation == m_options_generation)
+    return true;
   // The session's fixed options (§9.8), or, before its first request, what
   // they will be once a worker has taken them: the zone and the settings
   // now in effect.
@@ -797,11 +895,13 @@ bool Session::options_in(const std::string &key, Slot &slot,
   std::string error;
   switch (worker.options(options, &refused, &error)) {
     case Outcome::kOk:
-      // Fixed from here until the session's state is reset.
+      // Fixed from here until the session's state is reset or they are
+      // replaced.
       if (!m_fixed) {
         m_fixed = std::move(first);
         m_fixed_zone = std::move(zone);
       }
+      slot.options_generation = m_options_generation;
       return true;
     case Outcome::kGuestError:
       // The worker has no options in force and lives on; the statement
@@ -845,6 +945,10 @@ bool Session::interrupted(Outcome outcome, const mle::Worker &worker) const {
     case Outcome::kRefused:
     case Outcome::kIncompatible:
       return false;  // nothing was sent
+    case Outcome::kOk:
+      // The host looked for a kill after the RESULT's post and before it
+      // took it (§11.1 step 3): one that came in time made the record.
+      return worker.interrupted();
     default:
       // Whatever the RESULT says, and also when the worker had to be ended.
       return worker.interrupted() || session_killed(m_thd);
@@ -854,7 +958,7 @@ bool Session::interrupted(Outcome outcome, const mle::Worker &worker) const {
 bool Session::prepare_in(const std::string &key, Slot &slot, Routine &routine) {
   mle::Worker *const worker = slot.worker.get();
   if (worker->is_prepared(routine.id)) return true;
-  Hooks hooks(m_thd, &m_budget, nullptr, &routine);
+  Hooks hooks(m_thd, this, &m_budget, nullptr, &routine);
   ResultMsg result;
   std::string error;
   Outcome outcome;
@@ -877,13 +981,13 @@ bool Session::prepare_in(const std::string &key, Slot &slot, Routine &routine) {
   return false;
 }
 
-mle::Worker *Session::prepared_worker(const std::string &key,
+mle::Worker *Session::prepared_worker(const Principal &who,
                                       Routine &routine) {
   for (int attempt = 0; attempt < 2; attempt++) {
-    Slot *slot = worker_for(key, routine);
+    Slot *slot = worker_for(who, routine);
     if (slot == nullptr) return nullptr;
     mle::Worker *const worker = slot->worker.get();
-    if (!prepare_in(key, *slot, routine)) return nullptr;
+    if (!prepare_in(who.slot, *slot, routine)) return nullptr;
     // A worker can ask to be retired with the RESULT of the PREPARE: then
     // once more, in a new one.
     if (worker->usable()) return worker;
@@ -896,7 +1000,6 @@ mle::Worker *Session::prepared_worker(const std::string &key,
 
 bool Session::parse(Routine &routine) {
   if (!check_create_privilege(m_thd, routine)) return false;
-  const Request request(this);
   enum_sql_command command = SQLCOM_END;
   (void)mysql_service_mysql_thd_attributes->get(m_thd, "sql_command_id", &command);
   const bool creating =
@@ -908,13 +1011,14 @@ bool Session::parse(Routine &routine) {
   // principal.
   const Routine *owner =
       creating && m_running_routine != nullptr ? m_running_routine : &routine;
-  const std::string key = slot_key(principal(owner), routine.language);
-  Slot *slot = worker_for(key, routine);
+  const Principal &who = principal(owner, routine.language);
+  const Request request(this);
+  Slot *slot = worker_for(who, routine);
   if (slot == nullptr) return false;
   // CREATE: the worker also checks the code; what it finds becomes the
   // statement's warnings.
   routine.prepare.check = creating;
-  const bool ok = prepare_in(key, *slot, routine);
+  const bool ok = prepare_in(who.slot, *slot, routine);
   routine.prepare.check = false;
   return ok;
 }
@@ -934,12 +1038,13 @@ bool Session::execute(Routine &routine) {
   m_trace.reset();
   std::vector<Value> args = std::move(m_args);  // reused; a nested call allocates
   if (!routine.read_args(&args, &m_zones)) return false;
+  // Valid until this request ends (nested calls add, never remove).
+  const Principal &who = principal(&routine, routine.language);
+  const std::string &key = who.slot;
   const Request request(this);
-  const std::string key =
-      slot_key(principal(&routine), routine.language);  // a copy: nested calls change it
   // Its slot may go while the call runs (a nested request can lose the
   // worker); the worker itself lives until this request ends.
-  mle::Worker *const worker = prepared_worker(key, routine);
+  mle::Worker *const worker = prepared_worker(who, routine);
   if (worker == nullptr) return false;
 
   // Whose code runs, for what it evaluates with mle_eval(): restored when
@@ -953,7 +1058,7 @@ bool Session::execute(Routine &routine) {
 
   // The call's statements; closed when it returns.
   SqlRunner sql(m_thd, &m_budget, &m_zones);
-  Hooks hooks(m_thd, &m_budget, &sql, &routine);
+  Hooks hooks(m_thd, this, &m_budget, &sql, &routine);
   ResultMsg result;
   std::string error;
   Outcome outcome;
@@ -1261,7 +1366,7 @@ std::optional<std::string> Session::state(const Session *s,
 
 long Session::worker_pid() {
   // The current principal's worker (the JVM worker's first, if it has several).
-  const std::string who = principal();
+  const std::string who = principal(nullptr, kJavaScript).principal;
   long pid = -1;
   for (const auto &[key, slot] : m_workers)
     if (slot.principal == who && slot.worker && (pid == -1 || slot.kind == WorkerKind::kJvm))
@@ -1275,10 +1380,10 @@ void Session::reset_output(bool out, bool err) {
 }
 
 void Session::clear_state(bool reuse) {
-  for (auto &[key, slot] : m_workers)
-    engine_release_worker(std::move(slot.worker), slot.kind, reuse ? slot.principal : "",
-                          m_mark);
+  for (auto &[key, slot] : m_workers) release(slot, reuse);
   m_workers.clear();
+  ++m_slot_erasures;
+  m_principals.clear();
   m_programs.clear();
   // Everything a later account could read with mle_session_state().
   m_stack.clear();
@@ -1311,12 +1416,37 @@ void Session::account_changed() {
   m_mark = engine_session_begin();
 }
 
+bool Session::options_replaceable() {
+  // Never while a request of the session is in progress: its options are
+  // fixed (§9.8).
+  if (m_calls > 0) return false;
+  // First the ids of mle_eval() code and of routines that are gone: their
+  // DROPs, where a worker was too busy to take them then, go out now
+  // (Appendix A). (Each is dropped when its handle goes; a routine dropped
+  // by another session stays cached here until the server evicts it.)
+  std::vector<std::string> lost;
+  for (auto &[key, slot] : m_workers) {
+    if (!slot.worker || !slot.worker->usable()) continue;
+    std::string error;
+    (void)slot.worker->send_pending_drops(&error);
+    if (!slot.worker->usable()) lost.push_back(key);
+  }
+  for (const std::string &key : lost) {
+    log_warning("The worker of " + display_key(key) + " was lost: " +
+                log_safe(m_workers[key].worker->failure()));
+    drop_worker(key);
+  }
+  // Oracle's rule: not while the session has stored programs cached; and
+  // the protocol's: not while an id is prepared in a worker of the session.
+  if (has_programs()) return false;
+  for (const auto &[key, slot] : m_workers)
+    if (slot.worker && slot.worker->has_prepared()) return false;
+  return true;
+}
+
 bool Session::set_settings(
     const std::vector<std::pair<std::string, std::string>> &settings) {
-  // Oracle's rule: not while the session has stored programs cached. And
-  // never while a request of the session is in progress: its options are
-  // fixed (§9.8).
-  if (has_programs() || m_calls > 0) return false;
+  if (!options_replaceable()) return false;
   for (const auto &[name, value] : settings) {
     if (value.empty())
       m_settings.erase(name);
@@ -1324,16 +1454,14 @@ bool Session::set_settings(
       m_settings[name] = value;
   }
   // Options that were fixed already (the session ran code and has no
-  // program cached any more) end here: the session's workers are released
-  // (a kept one gets RESET), and the next request fixes the new options in
-  // the workers it takes.
+  // program cached any more) end here, as at a reset: the next request
+  // fixes the new ones, zone included. The session's workers stay; each
+  // gets the new options (OPTIONS replaces those in force: nothing is
+  // prepared in it) before its next request.
   if (m_fixed) {
-    for (auto &[key, slot] : m_workers)
-      engine_release_worker(std::move(slot.worker), slot.kind, slot.principal,
-                            m_mark);
-    m_workers.clear();
     m_fixed.reset();
     m_fixed_zone.clear();
+    ++m_options_generation;
   }
   return true;
 }
@@ -1450,12 +1578,13 @@ bool Session::parse_library(unsigned language, const std::string &name,
     return false;
   }
   repair_utf8(&m.name);
+  const Principal &who = principal(nullptr, routine.language);
+  const std::string &key = who.slot;
   const Request request(this);
-  const std::string key = slot_key(principal(), routine.language);
-  Slot *slot = worker_for(key, routine);
+  Slot *slot = worker_for(who, routine);
   if (slot == nullptr) return false;
   mle::Worker *const worker = slot->worker.get();
-  Hooks hooks(m_thd);
+  Hooks hooks(m_thd, this);
   ResultMsg result;
   std::string error;
   Outcome outcome;
@@ -1483,7 +1612,7 @@ std::optional<std::string> Session::eval(unsigned language,
   routine.language = language;
   routine.name = "mle_eval";
   routine.qualified_name = "mle_eval";
-  routine.definer_key = principal();  // the code is the caller's
+  routine.definer_key = principal(nullptr, language).principal;  // the code is the caller's
   if (!has_global_privilege(m_thd, privilege_of(routine))) {
     my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), privilege_of(routine));
     return std::nullopt;
@@ -1517,20 +1646,20 @@ std::optional<std::string> Session::eval(unsigned language,
   // made: it runs where that routine's owner's code runs with these rights
   // (not in the worker of the account's own code, when the owner is
   // another account).
+  const Principal &who = principal(m_running_routine, routine.language);
+  const std::string &key = who.slot;
   const Request request(this);
-  const std::string key =
-      slot_key(principal(m_running_routine), routine.language);
   // Dropped however it ends: the id is used once.
   struct Dropped {
     Session *session;
     const Routine &routine;
     ~Dropped() { session->forget(routine); }
   } dropped{this, routine};
-  mle::Worker *const worker = prepared_worker(key, routine);
+  mle::Worker *const worker = prepared_worker(who, routine);
   if (worker == nullptr) return std::nullopt;
   // A function in a SELECT: no statements (they need a stored program's
   // context).
-  Hooks hooks(m_thd, &m_budget, nullptr, &routine,
+  Hooks hooks(m_thd, this, &m_budget, nullptr, &routine,
               "mle_eval cannot run SQL: put the code in a procedure to run SQL");
   ResultMsg result;
   std::string error;

@@ -1,0 +1,84 @@
+--echo #
+--echo # component_mle: accounts that change (protocol §1, Appendix A). DROP
+--echo # USER and RENAME USER name the account: the workers whose principal
+--echo # names it are retired. A created account is not named: a creation
+--echo # retires only the workers that recorded at their start an account of
+--echo # their principal that did not exist (an orphan definer, a session that
+--echo # outlived its account). A counter the worker keeps in Python's
+--echo # builtins shows whether a call ran in the same worker.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE USER author@localhost, caller@localhost;
+GRANT EXECUTE ON test.* TO caller@localhost;
+--connect (admin, localhost, root,,test)
+CREATE DEFINER = author@localhost FUNCTION author_calls() RETURNS INT
+  SQL SECURITY INVOKER LANGUAGE PYTHON AS $$
+    import builtins
+    builtins.mle_n = getattr(builtins, 'mle_n', 0) + 1
+    return builtins.mle_n
+$$;
+--echo # An orphan definer: the account does not exist (a warning).
+CREATE DEFINER = ghost@localhost FUNCTION ghost_calls() RETURNS INT
+  SQL SECURITY INVOKER LANGUAGE PYTHON AS $$
+    import builtins
+    builtins.mle_g = getattr(builtins, 'mle_g', 0) + 1
+    return builtins.mle_g
+$$;
+--disconnect admin
+--connection default
+
+--connect (con1, localhost, caller,,test)
+SELECT author_calls() AS first_call, author_calls() AS second_call;
+SELECT ghost_calls() AS ghost_first, ghost_calls() AS ghost_second;
+
+--echo # A creation that no worker's start recorded as missing: nothing is
+--echo # retired (the rule before the revision retired every worker of two
+--echo # accounts here).
+--connection default
+CREATE USER someone@localhost;
+--connection con1
+SELECT author_calls() AS same_worker;
+
+--echo # The orphan definer's account is created: the worker that ran its code
+--echo # recorded it as missing and is retired before the statement reports
+--echo # success; the next call starts afresh. The other worker stays.
+--connection default
+CREATE USER ghost@localhost;
+--connection con1
+SELECT ghost_calls() AS new_worker;
+SELECT author_calls() AS still_the_same;
+
+--echo # RENAME USER and CREATE ROLE are creations too.
+--connection default
+CREATE ROLE some_role;
+RENAME USER someone@localhost TO someone_else@localhost;
+--connection con1
+SELECT author_calls() AS unaffected, ghost_calls() AS unaffected_too;
+
+--echo # DROP USER names the account: the worker whose principal names it is
+--echo # retired. Its code now has an owner that does not exist: the new
+--echo # worker records that, and a later creation of that name retires it.
+--connection default
+DROP USER author@localhost;
+--connection con1
+SELECT author_calls() AS after_drop, author_calls() AS again;
+--connection default
+CREATE USER author@localhost;
+--connection con1
+SELECT author_calls() AS after_create;
+SELECT author_calls() AS kept_now;
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION author_calls;
+DROP FUNCTION ghost_calls;
+DROP USER author@localhost, caller@localhost, ghost@localhost,
+  someone_else@localhost;
+DROP ROLE some_role;
+REVOKE CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

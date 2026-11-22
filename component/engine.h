@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace mle {
 class Worker;
@@ -140,7 +141,9 @@ std::unique_ptr<mle::Worker> engine_new_worker(WorkerKind kind, const std::strin
   A session gives a worker back. With the principal it ran for, a healthy
   idle worker is reset (RESET: no routines, memory trimmed) and kept for a
   later session of the same principal and kind (mle.worker_cache_size,
-  mle.worker_cache_timeout; 12 §17); otherwise it is destroyed (killed).
+  mle.worker_cache_timeout; 12 §17); otherwise it is destroyed (killed). A
+  worker that recorded at its start an account of its principal that did
+  not exist is given back without its principal: never kept (protocol §1).
 */
 void engine_release_worker(std::unique_ptr<mle::Worker> worker, WorkerKind kind = WorkerKind::kJvm,
                            const std::string &principal = "",
@@ -166,31 +169,30 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal, W
     (protocol §1). */
 void engine_forget_account(const std::string &principal);
 
-/** CREATE USER, CREATE ROLE or RENAME USER ran: an account was created.
-    The server does not say which, so every worker whose principal can name
-    an account that did not exist when the worker started is treated as
-    engine_forget_account() treats the workers of a dropped one (protocol
-    §1). Those are the workers of a principal of two accounts: an account
-    that owns code need not exist, one whose rights apply does. */
+/** CREATE USER, CREATE ROLE or RENAME USER ran: an account may have been
+    created under a name. The server does not say which, so the workers
+    that recorded at their start an account of their principal that did
+    not exist then are retired before their next top-level request
+    (protocol §1, Appendix A: "Accounts that change"); no other. */
 void engine_account_created();
 
-/** How many accounts were forgotten so far; it only grows. Lock-free. */
+/** How many accounts were dropped, renamed or created so far; it only
+    grows. Lock-free. */
 uint64_t engine_forgets();
-/** Whether an account of the principal was dropped or renamed, or may have
-    been created, after the count of engine_forgets() was since. */
-bool engine_account_forgotten(const std::string &principal, uint64_t since);
+/** Whether a worker of the principal must be retired: an account of it was
+    dropped or renamed after the count of engine_forgets() was since, or,
+    when unknown_at_start, an account may have been created since. With an
+    account as the principal and the session's mark as since: whether the
+    session outlived that account (it is not the one the session knew). */
+bool engine_account_forgotten(std::string_view principal, uint64_t since,
+                              bool unknown_at_start);
 
 /** Heap in use over all session workers that report one (JVM: the Java
     heap, V8: its heap), % of their summed limits (mle_memory_used). */
 long engine_memory_used_percent();
 
-/**
-  mysqld's system time zone (time_zone = SYSTEM), as Java and the workers
-  understand it: an IANA name (TZ=Area/City or /etc/localtime), else the
-  current UTC offset "+hh:mm" (POSIX TZ strings like GMT-3 mean UTC+3 to
-  libc but UTC-3 to Java).
-*/
-std::string system_time_zone();
+/** mysqld's system time zone as the workers understand it. */
+std::string system_time_zone();  // time_zone.hpp
 
 /**
   mle.cgroup_base = AUTO: the parent of mysqld's cgroup, if it is delegated

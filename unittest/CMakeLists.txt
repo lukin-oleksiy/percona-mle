@@ -43,6 +43,22 @@ FOREACH(test ${MLE_TESTS})
     )
 ENDFOREACH()
 
+# component_mle's parts without MySQL dependencies: the rule for accounts
+# that change (protocol §1) and the time zones of TIMESTAMP values
+# (protocol Appendix A).
+MYSQL_ADD_EXECUTABLE(mle_accounts-t accounts-t.cc
+  ${PROJECT_SOURCE_DIR}/component/accounts.cc
+  ADD_TEST mle_accounts
+  LINK_LIBRARIES ${MLE_GMOCK_LIB} ${MLE_GTEST_MAIN_LIB} ${MLE_GTEST_LIB} Threads::Threads
+  )
+TARGET_INCLUDE_DIRECTORIES(mle_accounts-t PRIVATE ${PROJECT_SOURCE_DIR}/component)
+MYSQL_ADD_EXECUTABLE(mle_time_zone-t time_zone-t.cc
+  ${PROJECT_SOURCE_DIR}/component/time_zone.cc
+  ADD_TEST mle_time_zone
+  LINK_LIBRARIES mle_host ${MLE_GMOCK_LIB} ${MLE_GTEST_MAIN_LIB} ${MLE_GTEST_LIB} Threads::Threads
+  )
+TARGET_INCLUDE_DIRECTORIES(mle_time_zone-t PRIVATE ${PROJECT_SOURCE_DIR}/component)
+
 # A minimal worker (no GraalVM) for the launcher tests.
 MYSQL_ADD_EXECUTABLE(mle_test_worker mle_test_worker.cc
   LINK_LIBRARIES mle_host

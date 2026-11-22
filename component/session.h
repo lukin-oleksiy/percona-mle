@@ -38,17 +38,25 @@
   creator's, and the server does not tell the definer then: the routine is
   checked in the worker of the account of the context in force. Code that
   a routine's SQL submits (a routine it creates, mle_eval) has that
-  routine's principal. A worker whose principal names an account that was
-  dropped, renamed, or created after the worker started is retired before
-  its next top-level request.
+  routine's principal. The principal is kept per routine and kind for the
+  account of the security context (compared byte for byte), and forgotten
+  when an account is dropped, renamed or created. Accounts that change
+  (accounts.hpp): a worker whose principal names an account that was
+  dropped or renamed is retired before its next top-level request; one
+  that recorded at its start an account of its principal that did not
+  exist (an owner that does not exist, a session that outlived its
+  account) is retired so when an account may have been created, and is
+  never kept for another session.
 
   Options (§9.8, Appendix A: Oracle's rule). A session has one set of fixed
   options: its time zone and settings as they are when a worker first takes
   them, before the session's first PREPARE, CALL or PARSE_LIBRARY. They
   hold until mle_session_reset() (or COM_CHANGE_USER), whatever the session
-  does to its zone meanwhile. Every worker the session uses gets them once,
-  when the session takes it (new, or kept and RESET): OPTIONS goes only to
-  a worker with nothing prepared, and nothing is compared on a request.
+  does to its zone meanwhile, or until mle_set_session_state() replaces
+  them while no id is prepared in the session's workers. Every worker the
+  session uses gets them once, when the session takes it (new, or kept and
+  RESET) or after they were replaced: OPTIONS goes only to a worker with
+  nothing prepared, and a request compares two numbers at most.
 
   Only the session's own thread uses it (deinit gets the THD explicitly; the
   KILL handler touches only the list of running workers). UNINSTALL is
@@ -132,12 +140,18 @@ class Session {
   bool has_programs() const { return !m_programs.empty(); }
   /** The pid of the current principal's worker, or -1 (debug UDF). */
   long worker_pid();
+  /** Whether mle_set_session_state() may replace the session's options
+      now (protocol §9.8, Appendix A): no request of it in progress, no
+      program cached, and no id prepared in its workers once the ids of
+      mle_eval() code and of routines that are gone were dropped (which
+      this does first). */
+  bool options_replaceable();
   /** mle_set_session_state(): settings by their OPTIONS names (protocol
-      Appendix B.2); an empty value is the setting's default. False while
-      the session has programs cached (Oracle's rule) or a request of it is
-      in progress. They become part of the session's fixed options at its
-      next request; options fixed earlier end, with the session's workers
-      released. */
+      Appendix B.2), values checked by the caller; an empty value is the
+      setting's default. False unless options_replaceable(). They become
+      part of the session's fixed options at its next request: options
+      fixed earlier end, and each worker of the session gets the new ones
+      before its next request. */
   bool set_settings(
       const std::vector<std::pair<std::string, std::string>> &settings);
 
@@ -150,28 +164,69 @@ class Session {
     /** engine_forgets() when no account of the principal was known to be
         dropped, renamed or created. */
     uint64_t forgets = 0;
+    /** An account of the principal did not exist when the worker started
+        (protocol §1): retired at a creation, never kept. */
+    bool unknown_account = false;
+    /** Language bits checked against the worker's READY. */
+    unsigned languages_checked = 0;
+    /** m_options_generation when the worker took the session's options. */
+    uint64_t options_generation = 0;
+    /** timing_generation() when the worker got mle.spin_us and
+        mle.interrupt_grace_ms. */
+    uint64_t timing_generation = 0;
   };
-  /** The key of a slot in m_workers: the principal and the kind of the
-      language's worker ('\0' between: not in account names). */
-  static std::string slot_key(const std::string &principal, unsigned language);
   /** The key as the error log shows it: "'u'@'h' (v8)". */
   static std::string display_key(const std::string &key);
 
   explicit Session(MYSQL_THD thd);
 
-  /** The principal for the security context in force and, with a routine,
-      its definer: the account of the context when both are the same,
-      else "<account> running code of <definer>". Code of different owners
-      never shares a worker, where it could change the language's shared
-      objects (JSON.parse, builtins, statics) under the other's code. */
-  std::string principal(const Routine *routine = nullptr) const;
+  /** A worker's principal (§1) for a routine and a worker kind under the
+      security context in force: the account of the context when the
+      routine's definer is that account (or there is no routine), else
+      "<account> running code of <definer>". Code of different owners never
+      shares a worker, where it could change the language's shared objects
+      (JSON.parse, builtins, statics) under the other's code. Immutable. */
+  struct Principal {
+    // What it was computed for (the cache key).
+    uint64_t routine_id = 0;
+    WorkerKind kind = WorkerKind::kJvm;
+    /** The server told the context's account (else principal is "?"). */
+    bool told = false;
+    std::string user, host;  // the context's priv_user and priv_host
+    uint64_t forgets = 0;    // engine_forgets() then
+    // What it is.
+    std::string principal;
+    /** The key of its slot in m_workers: principal, '\0', the kind's name
+        ('\0' is not in account names). */
+    std::string slot;
+    std::string rights_key;  // account_key(user, host)
+    /** The account that owns the code when it is another one; empty
+        owner_key: the rights account owns it. */
+    std::string owner_user, owner_host, owner_key;
+    /** Where its slot was found last, valid while m_slot_erasures equals
+        slot_erasures (a map's element stays where it is until erased). */
+    mutable std::map<std::string, Slot>::iterator slot_at;
+    mutable uint64_t slot_erasures = 0;
+  };
+  /** The principal for the routine (nullptr: code the session submits) and
+      the language's worker kind; kept per routine, kind and the context's
+      account, until an account is dropped, renamed or created. The
+      reference is valid while a request of the session is in progress, or
+      until the next call. */
+  const Principal &principal(const Routine *routine, unsigned language);
+  /** Whether every account of the principal exists now, as the incarnation
+      the session knows (protocol §1). */
+  bool accounts_exist(const Principal &who) const;
+  /** Gives the slot's worker back to the engine: kept for its principal
+      when reuse allows and no account of it was unknown at its start. */
+  void release(Slot &slot, bool reuse);
   /** Releases the workers (kept for their principals if reuse) and forgets
       programs, console, stack trace, settings. */
   void clear_state(bool reuse);
   /** The principal's worker, started if needed and ready for a request: at
       top level with the session's options in force. nullptr after reporting
       the error (or for a session that is killed: the server reports it). */
-  Slot *worker_for(const std::string &key, const Routine &routine);
+  Slot *worker_for(const Principal &who, const Routine &routine);
   /** OPTIONS with the session's fixed options when the slot's worker has
       none in force; the first OPTIONS a worker of the session answers OK
       fixes them. False after reporting. */
@@ -180,7 +235,7 @@ class Session {
   bool prepare_in(const std::string &key, Slot &slot, Routine &routine);
   /** The principal's worker with the routine prepared in it; nullptr after
       reporting the error. */
-  mle::Worker *prepared_worker(const std::string &key, Routine &routine);
+  mle::Worker *prepared_worker(const Principal &who, Routine &routine);
   /** What a request's outcome is for the client when an interrupt may have
       been requested (§11.1 step 4). */
   bool interrupted(mle::Outcome outcome, const mle::Worker &worker) const;
@@ -202,14 +257,30 @@ class Session {
   class Request;
   /** The KILL handler on the session while interruptible requests run. The
       server keeps one handler per session and refuses to replace it, so it
-      is installed with the first request and interrupts every worker that
-      has a top-level request of this session in progress (a chain of calls
-      can pass through several workers). */
+      is installed once for the outermost request, and interrupts every
+      worker that has a top-level request of this session in progress (a
+      chain of calls can pass through several workers). It is installed only
+      when a request waits long enough for the host to sleep (install_kill_
+      handler()): setting it takes the server's lock on the session twice,
+      which a short call does not need (the host looks for a kill at every
+      bounded sleep and after every message, §11.1). */
   class KillGuard;
   static constexpr size_t kMaxRunning = 64;
   std::array<std::atomic<mle::Worker *>, kMaxRunning> m_running{};
   std::atomic<size_t> m_running_n{0};
+  /** A KillGuard is in place (the outermost one owns the handler). */
+  bool m_kill_guarded = false;
   bool m_kill_installed = false;
+  /** Installing was tried for the outermost request (and failed: another
+      component's handler is set). */
+  bool m_kill_tried = false;
+
+ public:
+  /** A request of the session waits long for its worker: the KILL handler
+      is installed for the rest of the outermost request (KillGuard). */
+  void install_kill_handler();
+
+ private:
   /** Requests of this session in progress (nested: routine -> SQL ->
       routine). */
   size_t m_calls = 0;
@@ -226,6 +297,14 @@ class Session {
   std::map<std::string, Slot> m_workers;
   /** Argument buffer of the top-level call, reused. */
   std::vector<mle::Value> m_args;
+  /** Principals computed so far (principal()); pruned only while no
+      request of the session is in progress. */
+  std::vector<std::unique_ptr<const Principal>> m_principals;
+  /** Incremented when a slot leaves m_workers (Principal::slot_at). */
+  uint64_t m_slot_erasures = 1;
+  /** Incremented when the session's options are replaced: a worker that
+      took older ones takes the new ones before its next request. */
+  uint64_t m_options_generation = 1;
   /** The session's settings that are not at their default, by name: what
       mle_set_session_state() gave for the options to be fixed next. */
   std::map<std::string, std::string> m_settings;

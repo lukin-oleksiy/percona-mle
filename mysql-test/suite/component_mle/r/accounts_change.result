@@ -1,0 +1,84 @@
+#
+# component_mle: accounts that change (protocol §1, Appendix A). DROP
+# USER and RENAME USER name the account: the workers whose principal
+# names it are retired. A created account is not named: a creation
+# retires only the workers that recorded at their start an account of
+# their principal that did not exist (an orphan definer, a session that
+# outlived its account). A counter the worker keeps in Python's
+# builtins shows whether a call ran in the same worker.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE USER author@localhost, caller@localhost;
+GRANT EXECUTE ON test.* TO caller@localhost;
+CREATE DEFINER = author@localhost FUNCTION author_calls() RETURNS INT
+SQL SECURITY INVOKER LANGUAGE PYTHON AS $$
+import builtins
+builtins.mle_n = getattr(builtins, 'mle_n', 0) + 1
+return builtins.mle_n
+$$;
+# An orphan definer: the account does not exist (a warning).
+CREATE DEFINER = ghost@localhost FUNCTION ghost_calls() RETURNS INT
+SQL SECURITY INVOKER LANGUAGE PYTHON AS $$
+import builtins
+builtins.mle_g = getattr(builtins, 'mle_g', 0) + 1
+return builtins.mle_g
+$$;
+Warnings:
+Note	1449	The user specified as a definer ('ghost'@'localhost') does not exist
+SELECT author_calls() AS first_call, author_calls() AS second_call;
+first_call	second_call
+1	2
+SELECT ghost_calls() AS ghost_first, ghost_calls() AS ghost_second;
+ghost_first	ghost_second
+1	2
+# A creation that no worker's start recorded as missing: nothing is
+# retired (the rule before the revision retired every worker of two
+# accounts here).
+CREATE USER someone@localhost;
+SELECT author_calls() AS same_worker;
+same_worker
+3
+# The orphan definer's account is created: the worker that ran its code
+# recorded it as missing and is retired before the statement reports
+# success; the next call starts afresh. The other worker stays.
+CREATE USER ghost@localhost;
+Warnings:
+Warning	4005	User 'ghost'@'localhost' is referenced as a definer account in a stored routine.
+SELECT ghost_calls() AS new_worker;
+new_worker
+1
+SELECT author_calls() AS still_the_same;
+still_the_same
+4
+# RENAME USER and CREATE ROLE are creations too.
+CREATE ROLE some_role;
+RENAME USER someone@localhost TO someone_else@localhost;
+SELECT author_calls() AS unaffected, ghost_calls() AS unaffected_too;
+unaffected	unaffected_too
+5	2
+# DROP USER names the account: the worker whose principal names it is
+# retired. Its code now has an owner that does not exist: the new
+# worker records that, and a later creation of that name retires it.
+DROP USER author@localhost;
+Warnings:
+Warning	4005	User 'author'@'localhost' is referenced as a definer account in a stored routine.
+SELECT author_calls() AS after_drop, author_calls() AS again;
+after_drop	again
+1	2
+CREATE USER author@localhost;
+Warnings:
+Warning	4005	User 'author'@'localhost' is referenced as a definer account in a stored routine.
+SELECT author_calls() AS after_create;
+after_create
+1
+SELECT author_calls() AS kept_now;
+kept_now
+2
+DROP FUNCTION author_calls;
+DROP FUNCTION ghost_calls;
+DROP USER author@localhost, caller@localhost, ghost@localhost,
+someone_else@localhost;
+DROP ROLE some_role;
+REVOKE CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

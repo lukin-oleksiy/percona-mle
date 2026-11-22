@@ -16,6 +16,7 @@
 # component_mle: LANGUAGE JAVASCRIPT, PYTHON and JAVA stored programs run in
 # MLE worker processes (design: 11-phase4-component.md).
 MYSQL_ADD_COMPONENT(mle
+  accounts.cc
   component.cc
   engine.cc
   routine.cc
@@ -23,6 +24,7 @@ MYSQL_ADD_COMPONENT(mle
   settings.cc
   sql.cc
   status.cc
+  time_zone.cc
   udfs.cc
   LINK_LIBRARIES mle_host
   MODULE_ONLY

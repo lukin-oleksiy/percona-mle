@@ -229,6 +229,15 @@ int check_prewarm(MYSQL_THD thd, SYS_VAR *, void *save, struct st_mysql_value *v
   return 0;
 }
 
+/** Incremented when mle.spin_us or mle.interrupt_grace_ms changes: a
+    session gives its workers the new values then, not on every call. */
+std::atomic<uint64_t> g_timing_generation{1};
+
+void update_timing(MYSQL_THD, SYS_VAR *, void *val_ptr, const void *save) {
+  *static_cast<uint *>(val_ptr) = *static_cast<const uint *>(save);
+  g_timing_generation.fetch_add(1, std::memory_order_release);
+}
+
 void update_prewarm(MYSQL_THD thd, SYS_VAR *, void *val_ptr, const void *save) {
   *static_cast<char **>(val_ptr) = *static_cast<char *const *>(save);
   restart_engine(thd, "pool_prewarm");
@@ -501,7 +510,7 @@ bool register_settings() {
   if (reg("spin_us", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
           "Microseconds a session spins waiting for its worker before it "
           "sleeps.",
-          nullptr, nullptr, &spin_us, &g_spin_us))
+          nullptr, update_timing, &spin_us, &g_spin_us))
     return true;
 
   uint_check_arg_s grace;
@@ -512,7 +521,7 @@ bool register_settings() {
   if (reg("interrupt_grace_ms", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
           "Milliseconds a worker has to stop a killed statement's routine "
           "before the worker is killed.",
-          nullptr, nullptr, &grace, &g_interrupt_grace_ms))
+          nullptr, update_timing, &grace, &g_interrupt_grace_ms))
     return true;
 
   // SQL from routines (12-phase5-sql-api.md §4, §11). Larger than Oracle's
@@ -712,6 +721,9 @@ uint32_t sql_chunk_rows() { return g_sql_chunk_rows; }
 bool sql_exec_time() { return g_sql_exec_time; }
 int spin_us() { return static_cast<int>(g_spin_us); }
 int interrupt_grace_ms() { return static_cast<int>(g_interrupt_grace_ms); }
+uint64_t timing_generation() {
+  return g_timing_generation.load(std::memory_order_acquire);
+}
 
 unsigned language_bit(std::string_view name) {
   auto is = [&](const char *n) {

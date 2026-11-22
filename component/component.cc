@@ -100,6 +100,8 @@ REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_store);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_security_context);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_options);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_factory);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_account_database_security_context_lookup);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_kill_handler);
 REQUIRES_SERVICE_PLACEHOLDER(dynamic_privilege_register);
 REQUIRES_SERVICE_PLACEHOLDER(global_grants_check);
@@ -361,14 +363,16 @@ class Libraries {
 };
 
 /* COM_CHANGE_USER: the session's MLE state belonged to the old account.
-   DROP USER / RENAME USER: that account's kept workers go, and the workers
-   sessions hold for it are retired before their next top-level request.
-   The end of a statement, before it reports success: the library epoch
-   changes if the statement's command can change a library, a routine or a
-   right (protocol §9.10), and a command that creates an account retires
-   the workers that may name it (protocol §1; the server raises no event
-   that names a created account). A change of a global variable changes the
-   epoch too. */
+   DROP USER / RENAME USER (the event names the account dropped or renamed
+   away): that account's kept workers go, and the workers sessions hold for
+   it are retired before their next top-level request. The end of a
+   statement, before it reports success: the library epoch changes if the
+   statement's command can change a library, a routine or a right (protocol
+   §9.10), and a command that creates an account (CREATE USER, CREATE ROLE,
+   RENAME USER: the server names no created account) retires the workers
+   that recorded at their start an account of their principal that did not
+   exist (protocol §1, Appendix A). A change of a global variable changes
+   the epoch too. */
 namespace Event_tracking_implementation {
 mysql_event_tracking_connection_subclass_t
     Event_tracking_connection_implementation::filtered_sub_events =
@@ -499,6 +503,8 @@ BEGIN_COMPONENT_REQUIRES(mle)
   REQUIRES_SERVICE(mysql_thd_attributes),
   REQUIRES_SERVICE(mysql_thd_security_context),
   REQUIRES_SERVICE(mysql_security_context_options),
+  REQUIRES_SERVICE(mysql_security_context_factory),
+  REQUIRES_SERVICE(mysql_account_database_security_context_lookup),
   REQUIRES_SERVICE(mysql_thd_kill_handler),
   REQUIRES_SERVICE(dynamic_privilege_register),
   REQUIRES_SERVICE(global_grants_check),

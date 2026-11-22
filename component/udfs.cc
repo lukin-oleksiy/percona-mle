@@ -263,8 +263,11 @@ class mle_set_session_state_impl {
     utf8_arg(ctx, 0);
     ctx.mark_result_nullable(false);
     ctx.mark_result_const(false);
-    // Oracle reports this when the function is set up (error 1123).
-    if (Session *s = Session::current(false); s != nullptr && s->has_programs())
+    // Oracle reports this when the function is set up (error 1123). The
+    // ids of mle_eval() code and of routines that are gone are dropped
+    // first (protocol Appendix A).
+    if (Session *s = Session::current(false);
+        s != nullptr && !s->options_replaceable())
       throw std::invalid_argument(
           "Cannot set options of an active session. Please reset the "
           "session first.");

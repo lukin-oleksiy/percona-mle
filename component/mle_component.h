@@ -34,6 +34,7 @@
 
 #include <mysql/components/services/mysql_current_thread_reader.h>
 
+#include "accounts.hpp"
 #include "engine.h"
 
 namespace mle_component {
@@ -133,15 +134,6 @@ unsigned enabled_languages();
 bool console_warnings(MYSQL_THD thd);
 /** mle.max_workers, mle.spin_us, mle.interrupt_grace_ms. */
 uint32_t max_workers();
-/** An account as 'user'@'host' (quotes doubled): the key of workers. */
-std::string account_key(std::string_view user, std::string_view host);
-/** In a worker's principal, between the account whose rights apply and the
-    other account that owns the code (a routine of another definer that runs
-    with the invoker's rights). */
-inline constexpr std::string_view kCodeOf = " running code of ";
-/** Whether the principal is the account's: runs for it or runs its code. */
-bool principal_has_account(std::string_view principal,
-                           std::string_view account);
 /** mysqld's plugin_dir and datadir: never readable by workers (keyring
     component configuration, data files). */
 bool server_private_paths(std::vector<std::string> *paths);
@@ -154,6 +146,8 @@ size_t worker_cache_size();
 uint32_t worker_cache_timeout();
 int spin_us();
 int interrupt_grace_ms();
+/** Changes when spin_us() or interrupt_grace_ms() may have changed. */
+uint64_t timing_generation();
 /** SQL from routines (sql.cc): mle.sql_result_max, mle.sql_row_max,
     mle.sql_statements_max, mle.sql_chunk_rows. */
 size_t sql_result_max();
