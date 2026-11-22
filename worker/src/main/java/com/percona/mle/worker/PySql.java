@@ -628,9 +628,14 @@ final class PySql implements GuestSql.Lang {
         l.getSecond(), (int) Math.floorMod(micros, 1_000_000L), options.times.fold(second) ? 1 : 0);
   }
 
+  /** The zone Python has (set_zone's), so that the same one costs no call. */
+  private String zoneName;
+
   /** The zone of OPTIONS for TIMESTAMPs (its tzinfo is made when first needed). */
   void zone(String name) {
+    if (name.equals(zoneName)) return;
     setZone.execute(name);
+    zoneName = name;
   }
 
   @Override

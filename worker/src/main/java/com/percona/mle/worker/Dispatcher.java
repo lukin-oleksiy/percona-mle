@@ -72,6 +72,12 @@ final class Dispatcher {
   private boolean tainted;
   /** RESET asked for a GC (memory back before the worker waits); run when idle, not on the way. */
   private boolean gcWhenIdle;
+  /**
+   * RESET ended the options in force and the languages still have the session's: they get the
+   * defaults when a request that runs guest code comes first, before it. The next session's
+   * OPTIONS usually names the same zone, which then costs the languages nothing.
+   */
+  private boolean defaultsDue;
   /** How long a reset worker waits for a request before it collects (exp note 38). */
   private static final long IDLE_GC_NS = 200_000_000L;
   private final ThreadWatch threads = new ThreadWatch();
@@ -312,6 +318,10 @@ final class Dispatcher {
     current = q;
     boolean top = q.depth == 0;
     if (top) {
+      if (defaultsDue && q.op != Wire.OPTIONS && q.op != Wire.DROP && q.op != Wire.RESET) {
+        defaultsDue = false;
+        polyglot.applyOptions();
+      }
       FrameLimit.reset();
       LibraryFileSystem.requestStart();
       sqlErrors.clear();
@@ -372,10 +382,11 @@ final class Dispatcher {
     polyglot.reset();
     schemas.clear();
     LibraryFileSystem.reset();
-    // What guest code printed and no RESULT carried is dropped; the options end.
+    // What guest code printed and no RESULT carried is dropped; the options end (in the
+    // languages when guest code runs next: defaultsDue).
     console.discard();
     options.reset();
-    polyglot.applyOptions();
+    defaultsDue = true;
     // A worker with a thread a routine left is not kept for reuse (the host retires it).
     if (!tainted && threads.strangers()) tainted = true;
     // The host took the memory watcher's count with the session's statistics.
@@ -422,6 +433,7 @@ final class Dispatcher {
     options.integerType = integerType;
     options.decimalType = decimalType;
     options.zone(zoneText, zone);
+    defaultsDue = false;
     polyglot.applyOptions();
     result(q, Wire.OK, null);
   }
