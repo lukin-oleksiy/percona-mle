@@ -111,9 +111,10 @@ The host MUST obey these rules towards the region:
 * It keeps all protocol state (its post count, the last value it saw of
   the worker's word, depths, sequence numbers, sizes) in private memory
   and never reads it back from the region.
-* It copies a message header out of the region once, before it checks it,
-  and copies a chunk's bytes before it decodes them. It never reads the
-  same bytes of the region twice for one decision.
+* It reads each byte of a message from the region at most once: it
+  copies a field (or the whole header or chunk) to private memory before
+  it checks or uses it, and never reads the same bytes of the region
+  twice for one decision.
 * It never reads back anything it wrote into the region.
 
 A worker trusts the host, and the host owes it correct messages: every
@@ -126,9 +127,10 @@ host as the host validates a worker. It MUST check only what keeps a
    elements can be empty against the limits of §12 (a first batch of a
    result set has at least one column);
 2. every tag, kind, status, mode, action and operation it reads; it
-   decodes each value by the value's own tag and need not compare that
-   tag with its Column's or Param's type (a host that sends another tag
-   gives guest code a value of that tag's type, nothing worse);
+   decodes and converts each value by the value's own tag and need not
+   compare that tag with its Column's or Param's type (a host that sends
+   another tag gives guest code a value of that tag's type, nothing
+   worse);
 3. every number it uses to find its own state: the argument count of a
    CALL against the routine's Params, a routine id against what is
    prepared, the values of a row against the set's column count,
@@ -139,7 +141,9 @@ host as the host validates a worker. It MUST check only what keeps a
    language of a PREPARE or PARSE_LIBRARY is one it announced in READY.
 
 It need not check that options are in force (§9.8), nor the value of a
-setting it does not use.
+setting it does not use. A worker without options in force serves with
+zone `+00:00` and each setting's default; what guest code sees is then
+unspecified, but never unsafe.
 
 It need not check the domains of §7.2, the well-formedness of the host's
 str, reserved or unused fields, or what the host guarantees about order
@@ -175,11 +179,13 @@ view or trigger that is their definer, not the session's user. The host
 never substitutes rights: it only refuses a worker whose principal
 differs. An account here is one
 incarnation of it: the host retires every worker whose principal names an
-account that was dropped or renamed (away from that name). An account
-created under a name, or renamed to it, needs no retirement: the server
-already gives it the routines defined under that name, and every worker
-of an earlier account of that name was retired when that account was
-dropped or renamed. The host MUST NOT send a worker a PREPARE, CALL or
+account that was dropped or renamed (away from that name), and, once an
+account may have been created under a name or renamed to it, every
+worker whose principal names an account that did not exist when the
+worker started (an owner that does not exist, a session whose account was
+dropped while it stayed connected). It does so before the statement that
+changed the accounts reports success. So no worker serves two
+incarnations of one account. The host MUST NOT send a worker a PREPARE, CALL or
 PARSE_LIBRARY of another principal, nor a library body that its
 principal's routine may not have (§9.10), and runs a worker's SQL only
 with the rights of its principal's second account. So code that took over
@@ -600,8 +606,8 @@ zone repeats is taken as its first occurrence, one that the zone skips as
 the server takes it (Appendix A); in the other direction an instant in a
 repeated hour reaches the server as a local time and is stored as its
 first occurrence. Both
-directions use the server's own rules for zones and for a repeated local
-time. If the host cannot convert in the session's current zone, a result
+directions follow the server's rules for a repeated or skipped local
+time (Appendix A: the zone data can differ). If the host cannot convert in the session's current zone, a result
 fails with SQL_RESULT ERROR, an argument fails the statement before CALL
 is sent, and a returned value fails as a conversion error. Wire value 0
 is 1970-01-01 00:00:00 UTC.
@@ -664,8 +670,10 @@ vector gets a copy.)
 
 * **From the host**, a value whose declared type is known (an argument, a
   row value under its Column) is NULL or has exactly the tag of this table.
-  A worker MAY rely on it; it need not check it (§1, item 2), and if it
-  does, another tag is a protocol failure. A column
+  A worker decodes and converts each value by its own tag (§1, item 2)
+  and need not compare it with the declared type; it MAY rely on the
+  match only for what guest code sees. A worker that does compare treats
+  a difference as a protocol failure. A column
   without a type (`SELECT NULL`) has `Type.tag` 0 and only NULL values.
 * **From a worker**, a value (a return value, an OUT parameter, an SQL
   parameter) may have any tag: the host converts it to the target type
@@ -886,7 +894,7 @@ str schema, bool check, u64 library_epoch
 
 Compile a routine and prepare it under `routine_id` (§8.3).
 
-* `language`: one of READY's languages (the host sends no other).
+* `language`: one of READY's languages (the host sends no other; a worker checks it, §1 item 4, and exits on another).
 * `name`: the routine's name, for messages and stack traces.
 * `entry`: empty — `source` is a routine *body*; the worker makes it a
   function whose parameters are the routine's parameters by name. `<eval>`
@@ -944,7 +952,7 @@ bool has_error [, Error]
 | 0 | OK | done | absent |
 | 1 | GUEST_ERROR | guest code failed or did not compile, or a value did not convert | present |
 | 2 | INTERRUPTED | stopped by INTERRUPT (§11.1) | present |
-| 3 | EXHAUSTED | the runtime's heap or stack is exhausted (not a limit guest code can catch, below), or the worker cannot hold a host message (§5.3) | present |
+| 3 | EXHAUSTED | the runtime's heap or stack is exhausted (not a limit guest code can catch, below), or the worker cannot hold a PREPARE, CALL or PARSE_LIBRARY (§5.3; for OPTIONS, DROP, RESET: INTERNAL) | present |
 | 4 | INTERNAL | the worker itself failed | present |
 
 Any other status is a violation. Rules (each a violation if broken):
@@ -1008,11 +1016,11 @@ A worker MUST set `TAINTED` when it answers EXHAUSTED because its
 runtime's heap or stack was exhausted, and when it answers INTERNAL
 because its own state may be damaged.
 
-EXHAUSTED is for exhaustion that may leave the runtime unsound. A limit
-of the language that guest code can catch and that leaves the runtime
-sound (Python's `RecursionError`, JavaScript's `RangeError` for the call
-stack size) is an ordinary error of guest code: uncaught, the request
-ends GUEST_ERROR, without `TAINTED`.
+When the runtime's own heap or stack is exhausted, the answer is
+EXHAUSTED only if the runtime may be unsound. A limit of the language
+that guest code can catch and that leaves the runtime sound (Appendix
+B.5) is an ordinary error of guest code: uncaught, the request ends
+GUEST_ERROR, without `TAINTED`.
 
 ### 9.5 SQL (5), SQL_RESULT (6)
 
@@ -1073,9 +1081,9 @@ What a worker needs to know of the session.
   chunk (§12). A setting that is absent has its default; the host may
   leave out those that have it. A worker ignores names it does not know
   and settings it does not use, and answers GUEST_ERROR with language
-  `MLE-Option` for a value it does not accept for a setting it uses. (The
-  host checks values when they are set; the worker's check is a
-  backstop.)
+  `MLE-Option` for a value it does not accept for a setting it uses. (A
+  host checks the values of the settings it defines when they are set;
+  the worker's check is a backstop.)
 
 A worker has **options in force** from an OPTIONS it answered OK until
 RESET. The host MUST NOT send PREPARE, CALL or PARSE_LIBRARY to a worker
@@ -1090,9 +1098,12 @@ id is prepared in any worker of the session (Appendix A); an OPTIONS
 that failed fixes nothing. Every worker the session uses gets the same fixed options: the
 host MUST NOT send PREPARE, CALL or PARSE_LIBRARY to a worker whose
 options in force differ from them. It sends OPTIONS only to a worker in
-which no id is prepared (after READY or RESET), so options never change
-under prepared routines. A statement that would change the fixed options
-while a request of the session is in progress fails with an error.
+which no id is prepared (after READY, after RESET, or after the host
+dropped its last id), so options never change under prepared routines; a
+later OPTIONS answered OK replaces the options in force. A statement that
+would change the fixed options while a request of the session is in
+progress, or replace them while an id is prepared in a worker of the
+session, fails with an error.
 
 RESULT OK: these options are in force. GUEST_ERROR with language
 `MLE-TimeZone` (the worker does not know the zone, or the text is not a
@@ -1104,6 +1115,8 @@ none), and the host fails the user's statement.
 ```
 str language, str name, str body
 ```
+
+`language` as in PREPARE (§9.2).
 
 Syntax check of a library (CREATE LIBRARY). No guest code runs. RESULT OK,
 or GUEST_ERROR with the syntax error. Top level only. Interruptible.
@@ -1613,10 +1626,10 @@ depth. The requirements:
   worker stops the outer code as well. What a language runs while it
   unwinds (cleanup handlers) may run; it gets ERROR for all SQL except
   CLOSE, and for imports — from the host, or from the worker itself
-  without a message — and the worker bounds it. (Where the interrupt is
-  an exception guest code can catch, the worker raises it again until
-  the code stops; how long cleanup may run is the worker's choice, and
-  the host's grace clock bounds the whole.)
+  without a message — and the worker bounds it, with a bound of its
+  choice (it does not know the grace period; where the interrupt is an
+  exception guest code can catch, it raises it again until the code
+  stops; a worker that does not stop in time is ended, step 3).
 * INTERRUPTED is only for a delivered interrupt (§10.6).
 
 DROP, RESET and OPTIONS are not interruptible; they have a deadline
@@ -1825,7 +1838,7 @@ what it finds.
 
 **A host**
 
-1. Obeys the region rules of §1 (private state, copy once, no read-back).
+1. Obeys the region rules of §1 (private state, each byte read at most once, no read-back).
 2. Validates everything by §13 and ends the worker on a violation; never
    turns guest-reachable input into a violation.
 3. Bounds every wait (§4.3), keeps the deadlines of §11.2 as absolute, and
@@ -2087,12 +2100,14 @@ two clock reads per statement and is measured only on request.
 are fixed when it first runs a stored program and hold until
 `mle_session_reset()`; `mle_set_session_state()` is refused while the
 session has stored programs cached. OPTIONS is therefore sent once per
-worker and session. `mle_session_reset()` releases the session's workers
+worker and set of fixed options. `mle_session_reset()` releases the session's workers
 (a kept one gets RESET, and OPTIONS with the new values when a session
 takes it). A session with no program cached (it ran only `mle_eval()`,
 or its routines were dropped) may call `mle_set_session_state()`: that
 ends the fixed options as a reset does, and the next request fixes the
-new ones. The host checks a setting's value in
+new ones. Before it decides, the host DROPs the ids its session still has
+prepared for `mle_eval()` code and for routines that no longer exist
+(`mle_eval()` code is not a cached program). The host checks a setting's value in
 `mle_set_session_state()`, so a worker's `MLE-Option` is not reached in
 practice.
 
@@ -2107,11 +2122,18 @@ in the session's current zone; the host converts with the system's zone
 data. Wanted: a server service that exposes the stored instant. The
 host keeps the interval of the session zone's current offset (from one
 transition to the next), so that a value inside it costs a compare and
-an add; only a value outside it looks the zone up. A worker that maps
-instants to local time does the same with its zone. For `SYSTEM` without
-an IANA name the host derives the intervals from the C library's local
-time and caches them alike; repeated and skipped hours then follow the C
-library, which can differ from the server.
+an add; only a value outside it looks the zone up. For local time to
+instant, the interval excludes the local times that its bounding
+transitions repeat or skip, so §7.2's rules for them still apply. A
+worker that maps instants to local time does the same with its zone. For
+`SYSTEM` without an IANA name the host derives the transitions from the
+C library's local time, caches them alike and applies §7.2's rules for
+repeated and skipped hours itself. The host reads the session's current
+zone only when it converts a TIMESTAMP, and compares it with the cached
+one by identity, not by name. The host uses the system's zone data;
+where the server's time zone tables differ from it, values near the
+transitions that differ are converted differently from the server's own
+conversions.
 
 **A handed-back SQL error.** While it is still the session's current
 error it reaches the client unchanged. An older one is raised anew with
@@ -2128,24 +2150,27 @@ definers run in different workers for the same invoker.
 **A killed session** still waits, for each worker it keeps, up to the
 deadline of the DROP or RESET it sends.
 
-**Accounts that change.** The server tells the host which account was
-dropped, but not which was renamed: after a RENAME USER the host checks
-the accounts of every worker's principal and retires the workers that
-name an account that no longer exists. CREATE USER and CREATE ROLE retire
-nothing (§1).
+**Accounts that change.** The server's authentication events name the
+account that DROP USER drops and the one RENAME USER renames away; the
+host retires the workers whose principal names it. A created account
+(CREATE USER, CREATE ROLE, the new name of a RENAME USER) is not named:
+then the host retires only the workers that recorded, when they started,
+an account of their principal that did not exist (§1); there are none
+unless an owner did not exist or a session outlived its account.
 
-**Cost per request.** Nothing in the protocol needs per-request work
-that grows with the session: a top-level CALL of a prepared routine is
-one message each way with no other exchange. Measured on the JVM path
-(22 Nov), the host's fixed cost is what an implementation adds around
-that exchange; so the host keeps per session (not per request) the
-fixed options, the zone's offset interval, and per routine and
-statement the principal it computed; it forgets held errors (§10.8) by
-a generation number rather than by clearing; and it copies a RESULT's
-fields out of the region only when it needs them. A worker encodes text
+**Cost per request.** The protocol requires per request only one
+message each way, the checks of its header and body, and the interrupt
+record (§11.1 step 1). Measured, the host's fixed cost per call is what
+an implementation adds around that exchange; so the host keeps per
+session (not per request) the fixed options and the zone's offset
+interval; it keeps the principal it computed keyed by the routine and
+the security context's account (an identity compare), forgotten when an
+account is dropped or renamed; it forgets held errors (§10.8) by a
+generation number rather than by clearing; and it copies from the
+region only the fields it uses (§1). A worker encodes text
 in one pass, repairing (§7.1) only where its encoder found something to
 repair, and allocates nothing per call that it can reuse. The measured
-regressions and their causes are in `docs/protocol-review.md` §17–18.
+regressions and their causes are in `protocol-review.md` §17 and §18.
 
 **Workers and sessions.** A kept worker is given to any session that
 needs its principal; a stricter host gives it to sessions of one account
@@ -2205,7 +2230,7 @@ they are not tied to one language.
 | Name | Values | Meaning |
 |---|---|---|
 | `integer_type` | `unsafe_string` (default), `unsafe_bigint`, `string`, `bigint` | JavaScript: how I64 and U64 arrive: a number when \|n\| ≤ 2^53 − 1 and otherwise a string / a BigInt; always a string; always a BigInt. Other languages have 64-bit integers and ignore it. |
-| `decimal_type` | `string` (default), `number` | JavaScript: DECIMAL as a string or a number. Python: DECIMAL as `Decimal` or `float`. Java ignores it (`BigDecimal`). |
+| `decimal_type` | `string` (default), `number` | JavaScript: DECIMAL as a string or a number. Python: DECIMAL as `Decimal` or `float` (SQL results; arguments are always `Decimal`). Java ignores it (`BigDecimal`). |
 
 A setting of one language only would be named with its prefix
 (`python.…`).
@@ -2219,16 +2244,21 @@ A setting of one language only would be named with its prefix
 | Java | the body of a static method | `Class.method` in the source |
 
 Loading runs guest code in JavaScript (script top level) and Python
-(module level), not in Java.
+(module level), not in Java. In JavaScript each routine's script runs in
+a scope of its own (top-level `let`, `const`, `class` and function names
+of two routines, or of two PREPAREs of one routine, do not meet), and
+the worker binds the entry function at PREPARE.
 
 ### B.4 Types
 
 The mapping of tags to language values is not part of the protocol; the
 MySQL test suite fixes it per language. For JavaScript it is Oracle's
-(Tables 27.2–27.5 of its documentation); both JavaScript workers follow
-it alike. The points where a reading was needed:
+(the data type conversion tables of "JavaScript Stored Programs" in the
+MySQL manual); both JavaScript workers follow it alike. The points where
+a reading was needed:
 
-* I64 and U64 by `integer_type`, DECIMAL by `decimal_type`; TIME as a
+* I64 and U64 by `integer_type`, DECIMAL by `decimal_type`, in every
+  conversion of a value to JavaScript (arguments and SQL results); TIME as a
   string; VECTOR as `Float32Array`; JSON as Oracle's Table 27.5
   (numbers rounded with `Math.round` where an integer is needed).
 * DATE, DATETIME and TIMESTAMP as `Date`. A zero date, a date with a
@@ -2237,14 +2267,17 @@ it alike. The points where a reading was needed:
   impossible date (31 February) rolls over. Years 0–99 keep their value
   (they are not taken as 1900–1999).
 * A `Date` given for DATE is rounded to the nearest second, then its
-  local date is taken (Table 27.3).
+  local date is taken (Oracle's conversion table for DATE).
 * Local time is that of the zone in OPTIONS, not the zone of the worker's
   process.
 
-Python: TIMESTAMP is a naive `datetime` in the zone of OPTIONS (as guest
-code saw it before 1.0; an aware `datetime` would be the instant).
-`decimal_type` applies to SQL results; routine arguments are always
-`Decimal`. Java: `java.time` types, `BigDecimal`.
+Python: TIMESTAMP is an aware `datetime` in the zone of OPTIONS
+(`zoneinfo.ZoneInfo`, or a fixed `timezone` for an offset): it shows the
+local fields and keeps the instant, so it goes back as TIMESTAMP; a naive
+`datetime` (DATETIME) goes back as DATETIME. `decimal_type` applies to
+SQL results; routine arguments are always `Decimal`. Java: DATE `LocalDate`, TIME `Duration`,
+DATETIME `LocalDateTime`, TIMESTAMP `Instant`, DECIMAL
+`BigDecimal`.
 
 ### B.5 Errors a worker raises itself
 
@@ -2252,6 +2285,14 @@ A value guest code gives that has no wire form (NaN as a parameter, a
 number outside the declared type, an unsupported object) is a conversion
 error in the language (`TypeError` in JavaScript, `ValueError` in Python)
 for SQL parameters, and GUEST_ERROR / `MLE-Type` for results.
+
+Limits of the language (§9.4):
+
+| Language | Caught by guest code, runtime sound: GUEST_ERROR | EXHAUSTED with `TAINTED` |
+|---|---|---|
+| JavaScript | `RangeError` (call stack size exceeded) | heap exhausted (the engine's out-of-memory) |
+| Python | `RecursionError` | `MemoryError`, a native stack overflow |
+| Java | — | `StackOverflowError`, `OutOfMemoryError` (the JVM's state may be damaged) |
 
 ### B.6 What RESET keeps
 

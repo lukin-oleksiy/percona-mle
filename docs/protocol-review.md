@@ -569,4 +569,31 @@ the worker spends about the same time. The cost is per-request work on the host 
 then in force asked for (options compared per request) or that the implementation added while
 following them (principal, grace clock, error records, copies of the RESULT). The later revision
 (options fixed per session, `TAINTED` in the header, no statistics per request) removes the
-first; the rest is implementation. HEAD (`61590fe`) is being measured the same way.
+first; the rest is implementation. HEAD (`61590fe`) was measured the same way (§18).
+
+## 18. Revision from the measurements and the implementers' questions (22 Nov)
+
+The measurements of §17 put no rule of the wire at fault; one rule of the host's handling did:
+§1 asked the host to copy every chunk before decoding it, so a RESULT was copied whole. Changed:
+
+| Section | Was | Now | Why |
+|---|---|---|---|
+| §1 region rules | copy a chunk's bytes before decoding | read each byte at most once: copy a field (or the chunk) before checking or using it | the whole-RESULT copy was measured per call |
+| §1 item 2, §7.3 | a value's tag must match its Column's or Param's | the worker decodes and converts by the value's own tag and need not compare | no safety in the compare; a worker that compares still exits on a difference |
+| §1 item 4, §9.2, §9.9 | — | the language of PREPARE and PARSE_LIBRARY is checked against READY | workers disagreed |
+| §1 | options in force: not said what a worker without them does | it serves with `+00:00` and defaults; unspecified for guest code, never unsafe | the check is not needed for safety |
+| §1 principal | retire on any account created after the worker started | retire on drop and rename (named by the server) and, on a creation, only workers that recorded an account that did not exist at their start; before the statement reports success | every CREATE USER retired every two-account worker; a first draft that dropped the creation rule was unsound (a session outliving its dropped account, orphan definers) |
+| §3.1 | `state` 0–3 | 2 and 3 optional; 0 for figures the runtime lacks | no writes per request |
+| §9.4, B.5 | EXHAUSTED for stack exhaustion | only exhaustion that may leave the runtime unsound; catchable language limits are GUEST_ERROR without TAINTED (table per language) | a runaway recursion retired the Python worker |
+| §5.3 | — | a worker that cannot hold a 64 KiB OPTIONS, DROP, RESET answers INTERNAL with TAINTED | EXHAUSTED is not legal for them |
+| §9.8, App. A | fixed options until reset | also replaced while nothing is prepared in the session (Oracle's `mle_set_session_state()`); the host first DROPs `mle_eval()` ids and ids of dropped routines; settings a worker does not use are ignored | Oracle's rule; workers disagreed |
+| §11.1 | "the worker bounds it" | a bound of its choice; the grace clock ends a worker that does not stop | catchable interrupts |
+| §7.2, App. A TIMESTAMP | "the server's own rules for zones" | the server's rules for repeated and skipped hours; zone data can differ; both sides cache the offset interval (excluding the repeated and skipped local times); SYSTEM without a name via the C library with §7.2's rules applied by the host; the zone is read only when converting, compared by identity | the measured TIMESTAMP regression; the measured zone-name cost |
+| App. A | — | cost per request: what the protocol requires and what the host keeps per session; the principal cache key (routine and the security context's account) | §17 |
+| B.2–B.4, B.7 | — | JavaScript type points; where Oracle is silent, the choices both JavaScript workers make; Python TIMESTAMP is an aware `datetime` (round-trips as TIMESTAMP); Java's types; JavaScript routines are scripts, each in a scope of its own | implementers' questions |
+
+Review of the draft (ec3ed59), text only: "not yet consistent", 12 findings; all applied (the account
+rule, decode and convert by tag, the copy rule, EXHAUSTED against §5.3 and language names out of
+the body, the replacement of options, TIMESTAMP against §7.2, the principal cache key, defaults
+without options, script scope, cross-references). Python's TIMESTAMP changes from a naive to an
+aware `datetime` (the reviewer's point: the naive form does not round-trip).
