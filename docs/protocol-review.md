@@ -653,3 +653,26 @@ GraalJS converts a body-form argument with the declared type's converter (safe, 
 value's own tag"); the JavaScript entry form (test harness only) ignores `integer_type` and
 `decimal_type`; Python `ZoneInfo` with an IANA name is not covered by MySQL tests (no zone tables
 in the test server).
+
+## 21. Measured: the aligned code (`cc02a53`) against the pre-specification code (22 Nov)
+
+Same scripts, builds and pinning; the machine was quiet (load 0.8–2.5). Files `final-*` in
+`exp/bench/proto10/`. Goal of this round (the user): parity — no case slower than before.
+
+**Faster in every round:** calls −13..−16 % (call_invoker −16 %); TIMESTAMP −21..−24 % (js),
+−16..−28 % (py), −11..−15 % (java); ret −5..−11 %; lev py/java −6..−12 %; lib_js −10 %;
+prep −3..−7 %; types py/java −4..−5 %; nested_js_py −7..−9 %; vector_arg −8..−13 %.
+
+**No difference:** fetches, rows, mix, write1000, topk, connect, cold start without a language.
+
+**Not yet at parity (all implementation, no rule of the specification):**
+
+| Case | Change | Cause |
+|---|---|---|
+| types_js | +59 % | the GraalJS `Date.prototype.toString` override asks `Intl.DateTimeFormat.formatToParts` for the zone's name on every call |
+| echo 64 KiB | +5..+6 % | `Text.utf8` counts `?` bytes with a scalar loop |
+| 10k SELECTs, stmts_* | +3..+5 % | component per statement: the kill handler installed per statement, warnings read, buffers grown, `text_info` |
+| cold start java (no pool), idle PSS java | +3.9 %, +4.5 MB | not yet profiled (likely the zone code at start) |
+| errors_py, write200_py | +3 % | stack-trace capture and JIT; borderline |
+
+Being fixed (JVM worker and host), then measured again.
