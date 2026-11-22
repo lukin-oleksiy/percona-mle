@@ -306,12 +306,13 @@ final class Mailbox {
   // ------------------------------------------------------------ stats
 
   /**
-   * Writes the statistics (§3.1): for reporting only, and not on every request. Any thread;
-   * nothing is synchronized.
+   * Writes the statistics (§3.1): for reporting only, and not on every request (MemoryWatch's
+   * thread writes them while calls run, the main thread at READY and after RESET). Any thread;
+   * nothing is synchronized. A heap without a limit has heap_max 0.
    */
   void stats(int state, long heapUsed, long heapMax) {
     region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_HEAP_USED, heapUsed);
-    region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_HEAP_MAX, heapMax);
+    region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_HEAP_MAX, heapMax == Long.MAX_VALUE ? 0 : heapMax);
     region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_GC_COUNT, MemoryWatch.gcs());
     region.set(ValueLayout.JAVA_INT, Wire.OFF_STATS + Wire.STATS_STATE, state);
   }

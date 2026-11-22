@@ -68,9 +68,60 @@ final class Text {
     return b.toString();
   }
 
-  /** s as well-formed UTF-8, repaired. */
+  /**
+   * s as well-formed UTF-8, repaired (§7.1), in one pass where nothing needs repair: the JDK's
+   * encoder (vectorized for Latin-1 strings) writes '?' for an unpaired surrogate, so only output
+   * with more '?' than s has is encoded again, repairing. (A scan for unpaired surrogates before
+   * getBytes cost ~0.7 ns per character after a large fetch, protocol-review.md §17.)
+   */
   static byte[] utf8(String s) {
-    return repair(s).getBytes(StandardCharsets.UTF_8);
+    byte[] b = s.getBytes(StandardCharsets.UTF_8);
+    int marks = 0;
+    for (byte x : b) marks += x == '?' ? 1 : 0;
+    if (marks == 0) return b;
+    int own = 0;  // String.indexOf is vectorized, for either coder of a String
+    for (int i = s.indexOf('?'); i >= 0 && own <= marks; i = s.indexOf('?', i + 1)) own++;
+    return own == marks ? b : utf8Repairing(s);
+  }
+
+  /** s as UTF-8, each unpaired surrogate as U+FFFD (EF BF BD); longer than a message may be: TooLarge. */
+  private static byte[] utf8Repairing(String s) {
+    int n = s.length();
+    long length = 0;
+    for (int i = 0; i < n; i++) {
+      char c = s.charAt(i);
+      // A pair is 4 bytes, 2 for each of its chars; a lone surrogate is 3 (U+FFFD).
+      length += c < 0x80 ? 1 : c < 0x800 ? 2 : Character.isSurrogate(c)
+          && (Character.isHighSurrogate(c) ? i + 1 < n && Character.isLowSurrogate(s.charAt(i + 1))
+              : i > 0 && Character.isHighSurrogate(s.charAt(i - 1))) ? 2 : 3;
+    }
+    if (length > Wire.MAX_WORKER_MESSAGE) throw new MessageWriter.TooLarge();
+    byte[] out = new byte[(int) length];
+    int p = 0;
+    for (int i = 0; i < n; i++) {
+      char c = s.charAt(i);
+      if (c < 0x80) {
+        out[p++] = (byte) c;
+      } else if (c < 0x800) {
+        out[p++] = (byte) (0xC0 | c >> 6);
+        out[p++] = (byte) (0x80 | (c & 0x3F));
+      } else if (!Character.isSurrogate(c)) {
+        out[p++] = (byte) (0xE0 | c >> 12);
+        out[p++] = (byte) (0x80 | (c >> 6 & 0x3F));
+        out[p++] = (byte) (0x80 | (c & 0x3F));
+      } else if (Character.isHighSurrogate(c) && i + 1 < n && Character.isLowSurrogate(s.charAt(i + 1))) {
+        int cp = Character.toCodePoint(c, s.charAt(++i));
+        out[p++] = (byte) (0xF0 | cp >> 18);
+        out[p++] = (byte) (0x80 | (cp >> 12 & 0x3F));
+        out[p++] = (byte) (0x80 | (cp >> 6 & 0x3F));
+        out[p++] = (byte) (0x80 | (cp & 0x3F));
+      } else {
+        out[p++] = (byte) 0xEF;
+        out[p++] = (byte) 0xBF;
+        out[p++] = (byte) 0xBD;
+      }
+    }
+    return out;
   }
 
   /** s repaired and cut at a character boundary so that its UTF-8 form has at most maxBytes bytes. */

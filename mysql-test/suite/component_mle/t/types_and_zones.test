@@ -1,0 +1,184 @@
+--echo #
+--echo # component_mle, JVM worker: values by protocol-1.0 Appendix B.4 and B.5.
+--echo # JavaScript's local time is the zone of OPTIONS (not the worker's process);
+--echo # Python's TIMESTAMP is an aware datetime in that zone, and goes back as
+--echo # TIMESTAMP; Java's TIMESTAMP is an Instant; catchable language limits
+--echo # (RangeError, RecursionError) do not retire the worker; each JavaScript
+--echo # routine runs in a scope of its own.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE tz (id INT PRIMARY KEY, ts TIMESTAMP(6) NULL, dt DATETIME(6) NULL);
+--connect (con1, localhost, root,,test)
+SET sql_mode = 'ALLOW_INVALID_DATES';
+SET time_zone = '+05:30';
+
+--echo #
+--echo # 1. JavaScript: local time in the zone of OPTIONS; years 0 to 99 keep
+--echo #    their value, an impossible day rolls over, a zero date is an Invalid
+--echo #    Date; a Date for DATE is rounded to the second, then its local date.
+--echo #
+CREATE FUNCTION js_local(dt DATETIME, ts TIMESTAMP) RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  const f = (v) => v === null ? 'null' : isNaN(v) ? 'Invalid Date'
+      : v.getFullYear() + '-' + (v.getMonth() + 1) + '-' + v.getDate() + ' ' + v.getHours() + ':'
+        + v.getMinutes() + ' offset ' + v.getTimezoneOffset()
+  return f(dt) + ' | ' + f(ts) + ' | ' + new Date(2024, 6, 1, 12).toISOString()
+$$;
+CREATE FUNCTION js_strings(dt DATETIME) RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  return [String(dt), dt.toTimeString(), dt.toDateString(), new Date(NaN).toString()].join(' | ')
+$$;
+CREATE FUNCTION js_date(dt DATETIME(3)) RETURNS DATE LANGUAGE JAVASCRIPT AS $$ return dt $$;
+SELECT js_local('2024-07-01 12:00:00', '2024-07-01 12:00:00') AS plus_0530;
+SELECT js_strings('2024-07-01 12:00:00') AS plus_0530;
+SELECT js_local('0050-02-30 01:00:00', NULL) AS year_50_feb_30;
+SELECT js_local('0000-00-00 00:00:00', '0000-00-00 00:00:00') AS zero;
+SELECT js_date('2024-07-01 23:59:59.499') AS same_day, js_date('2024-07-01 23:59:59.500') AS next_day;
+SET time_zone = '-03:00';
+SELECT mle_session_reset();
+SELECT js_local('2024-07-01 12:00:00', '2024-07-01 12:00:00') AS minus_0300;
+SELECT js_strings('2024-07-01 12:00:00') AS minus_0300;
+SET time_zone = '-13:00';
+SELECT mle_session_reset();
+SELECT js_strings('2024-07-01 12:00:00') AS minus_1300;
+SET time_zone = '+00:00';
+SELECT mle_session_reset();
+SELECT js_local('2024-07-01 12:00:00', '2024-07-01 12:00:00') AS utc;
+SELECT js_strings('0050-02-01 00:00:00') AS utc;
+SET time_zone = '+05:30';
+SELECT mle_session_reset();
+
+--echo #
+--echo # 2. Python: TIMESTAMP as an aware datetime in the zone of OPTIONS
+--echo #    (datetime.timezone for an offset), as an argument and in a result; it
+--echo #    goes back as TIMESTAMP. A naive datetime goes as DATETIME. DECIMAL
+--echo #    arguments are Decimal whatever decimal_type says (it is for results).
+--echo #
+CREATE FUNCTION py_ts(ts TIMESTAMP(6), dt DATETIME) RETURNS TEXT LANGUAGE PYTHON AS $$
+return str(ts) + ' | ' + repr(ts) + ' | ' + repr(dt)
+$$;
+CREATE FUNCTION py_ts_back(ts TIMESTAMP(6)) RETURNS TIMESTAMP(6) LANGUAGE PYTHON AS $$
+return ts
+$$;
+CREATE FUNCTION py_aware_as_datetime(ts TIMESTAMP) RETURNS DATETIME LANGUAGE PYTHON AS $$
+return ts
+$$;
+CREATE FUNCTION py_dec(d DECIMAL(5,2)) RETURNS TEXT LANGUAGE PYTHON AS $$
+return repr(d)
+$$;
+CREATE PROCEDURE py_rows(OUT o TEXT) LANGUAGE PYTHON AS $$
+import datetime
+aware = datetime.datetime(2024, 7, 1, 12, tzinfo=datetime.timezone.utc)
+naive = datetime.datetime(2024, 7, 1, 12)
+session.run_sql("INSERT INTO test.tz VALUES (1, ?, ?), (2, ?, ?)", [aware, aware, naive, naive])
+rows = session.run_sql("SELECT id, ts, dt, CAST(1.5 AS DECIMAL(3,1)) FROM test.tz ORDER BY id").fetch_all()
+o = ' / '.join(repr(tuple(r)) for r in rows)
+$$;
+SELECT py_ts('2024-07-01 12:00:00.123456', '2024-07-01 12:00:00') AS plus_0530;
+SELECT py_ts(NULL, '2024-02-29 23:59:59') AS null_ts;
+SELECT py_ts_back('2024-07-01 12:00:00.123456') AS back, py_aware_as_datetime('2024-07-01 12:00:00') AS as_datetime;
+SELECT mle_session_reset();
+SELECT mle_set_session_state('{"decimal_type":"NUMBER"}');
+SELECT py_dec(1.25) AS argument_stays_decimal;
+CALL py_rows(@o);
+SELECT @o AS rows_with_number;
+SELECT id, ts, dt FROM tz ORDER BY id;
+SET time_zone = '+00:00';
+SELECT mle_session_reset();
+SELECT py_ts('2024-07-01 12:00:00', '2024-07-01 12:00:00') AS utc;
+
+--echo #
+--echo # 3. Java: TIMESTAMP is an Instant (arguments, results, rows).
+--echo #
+CREATE FUNCTION j_ts(ts TIMESTAMP(3)) RETURNS TEXT LANGUAGE JAVA AS $$
+return ts.getClass().getSimpleName() + " " + ts;
+$$;
+CREATE FUNCTION j_ts_back(ts TIMESTAMP) RETURNS TIMESTAMP LANGUAGE JAVA AS $$
+return ts.plusSeconds(60);
+$$;
+CREATE PROCEDURE j_rows(OUT r TEXT) LANGUAGE JAVA AS $$
+Row row = Mle.session().runSql("SELECT ts, dt FROM test.tz WHERE id = 1").fetchOne();
+r[0] = row.get(0).getClass().getSimpleName() + " " + row.get(0) + " | " + row.get(1).getClass().getSimpleName() + " " + row.get(1);
+$$;
+SELECT j_ts('2024-07-01 12:00:00.250') AS arg, j_ts_back('2024-07-01 12:00:00') AS back;
+CALL j_rows(@r);
+SELECT @r AS row_values;
+
+--echo #
+--echo # 4. Language limits that guest code can catch end the request with
+--echo #    GUEST_ERROR and leave the worker in service (Appendix B.5).
+--echo #
+--write_file $MYSQLTEST_VARDIR/tmp/types_and_zones.sql
+CREATE FUNCTION py_rec(n INT) RETURNS INT LANGUAGE PYTHON AS $$
+    def f(k):
+        return 0 if k == 0 else 1 + f(k - 1)
+    return f(n)
+$$;
+CREATE FUNCTION py_rec_caught(n INT) RETURNS TEXT LANGUAGE PYTHON AS $$
+    def f(k):
+        return 0 if k == 0 else 1 + f(k - 1)
+    try:
+        return str(f(n))
+    except RecursionError as e:
+        return 'caught ' + type(e).__name__
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/types_and_zones.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/types_and_zones.sql
+CREATE LIBRARY deep LANGUAGE JAVASCRIPT AS $$
+export function deep(n) { return n === 0 ? 0 : 1 + deep(n - 1) }
+$$;
+CREATE FUNCTION js_deep(n INT) RETURNS TEXT LANGUAGE JAVASCRIPT USING (deep AS d) AS $$
+try { return String(d.deep(n)) } catch (e) { return 'caught ' + e.name + ' ' + (e instanceof RangeError) }
+$$;
+CREATE FUNCTION js_deep_uncaught(n INT) RETURNS INT LANGUAGE JAVASCRIPT USING (deep AS d) AS $$ return d.deep(n) $$;
+let $spawned0 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_workers_spawned', Value, 1);
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_rec(100000);
+SELECT py_rec(10), py_rec_caught(100000);
+SELECT js_deep(10), js_deep(10000000);
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_deep_uncaught(10000000);
+SELECT js_deep_uncaught(5);
+let $spawned1 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_workers_spawned', Value, 1);
+--let $assert_text = No worker was retired for RecursionError or RangeError
+--let $assert_cond = $spawned1 = $spawned0
+--source include/assert.inc
+
+--echo #
+--echo # 5. Each JavaScript routine's code has a scope of its own.
+--echo #
+CREATE FUNCTION js_scope1() RETURNS INT LANGUAGE JAVASCRIPT AS $$
+const x = 1; class A {}; function g() { return 1 } let y = 2; return x + y + g()
+$$;
+CREATE FUNCTION js_scope2() RETURNS INT LANGUAGE JAVASCRIPT AS $$
+const x = 10; class A {}; function g() { return 10 } let y = 20; return x + y + g()
+$$;
+SELECT js_scope1(), js_scope2(), js_scope1(), js_scope2();
+
+--disconnect con1
+--connection default
+DROP FUNCTION js_local;
+DROP FUNCTION js_date;
+DROP FUNCTION js_strings;
+DROP FUNCTION py_ts;
+DROP FUNCTION py_ts_back;
+DROP FUNCTION py_aware_as_datetime;
+DROP FUNCTION py_dec;
+DROP PROCEDURE py_rows;
+DROP FUNCTION j_ts;
+DROP FUNCTION j_ts_back;
+DROP PROCEDURE j_rows;
+DROP FUNCTION py_rec;
+DROP FUNCTION py_rec_caught;
+DROP FUNCTION js_deep;
+DROP FUNCTION js_deep_uncaught;
+DROP LIBRARY deep;
+DROP FUNCTION js_scope1;
+DROP FUNCTION js_scope2;
+DROP TABLE tz;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

@@ -84,7 +84,7 @@ AS $$ res = new Date().toString() $$;
 CALL d1(@today);
 SELECT @today;
 @today
-<date> GMT+0300 (GMT+3)
+<date> GMT+0300 (GMT+03:00)
 #
 # The session state example (27.3.5): output accumulates, a runtime
 # error keeps a stack trace, the counts, and mle_session_reset().

@@ -518,8 +518,9 @@ TEST_F(MleJavaWorker, AMistakenHostDoesNotMakeTheWorkerUnsafe) {
        Value::timestamp(wire::kMaxTimestamp + 12345), true},
       {"a column name that is not UTF-8", {"c\xff\xfe", "t", type(Tag::kI64)},
        Value::i64(7), true},
+      // Decoded by its own tag (§1 item 2): guest code gets a string.
       {"a tag that is not the column's", {"c", "t", type(Tag::kI64)},
-       Value::string("seven"), false},
+       Value::string("seven"), true},
   };
   for (const Case &c : cases) {
     SCOPED_TRACE(c.what);

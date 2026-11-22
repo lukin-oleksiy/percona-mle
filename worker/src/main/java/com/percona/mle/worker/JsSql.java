@@ -286,7 +286,7 @@ final class JsSql implements GuestSql.Lang {
       return String.format("%s%02d:%02d:%02d%s", t.negative() ? "-" : "", t.hour(), t.minute(), t.second(),
           t.micro() == 0 ? "" : String.format(".%06d", t.micro()));
     // As an argument is (Values.Temporal.jsMillis): a zero date is an invalid Date.
-    return date.execute(t.jsMillis(options.zone));
+    return date.execute(t.jsMillis(options.times));
   }
 
   @Override
@@ -310,7 +310,10 @@ final class JsSql implements GuestSql.Lang {
         BigInteger b = new BigInteger(p.asString());
         yield b.bitLength() <= 63 ? (Object) b.longValue() : b;
       }
-      case 6 -> LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli((long) p.asDouble()), options.zone);
+      case 6 -> {
+        long ms = (long) p.asDouble();
+        yield options.times.localDateTime(Math.floorDiv(ms, 1000L), (int) Math.floorMod(ms, 1000L) * 1_000_000);
+      }
       case 7 -> {
         byte[] b = buffer(p);
         float[] f = new float[b.length / 4];

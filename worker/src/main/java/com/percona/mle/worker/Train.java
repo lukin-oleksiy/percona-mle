@@ -50,7 +50,7 @@ public final class Train {
         Values.writeParam(w, 2.5);
         Values.writeParam(w, new float[] {1, 2, 3});
         MessageReader r = new MessageReader(w.body());
-        for (int tag : new int[] {Wire.T_I64, Wire.T_STRING, Wire.T_F64, Wire.T_VECTOR}) Values.toJava(Values.read(r, tag));
+        for (int k = 0; k < 4; k++) Values.toJava(Values.read(r));
       }
     }
 

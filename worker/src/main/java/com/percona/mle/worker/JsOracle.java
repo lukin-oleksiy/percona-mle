@@ -235,7 +235,7 @@ final class JsOracle {
       case Values.Temporal tm -> switch (tm.tag()) {
         case Wire.T_TIME -> formatTime(tm);
         // Oracle's rules (Values.Temporal.jsMillis): a zero date is an invalid Date.
-        default -> tm.jsMillis(o.zone);
+        default -> tm.jsMillis(o.times);
       };
       // An instant, as a Date is; the zero timestamp is an invalid Date.
       case Values.Timestamp ts -> ts.zero() ? Double.NaN : (double) ts.millis();
@@ -439,7 +439,7 @@ final class JsOracle {
         // A DATE keeps the Date's value with the time part rounded off to the closest second
         // (Oracle's Table 27.3), so 23:59:59.5 is the next day.
         if (t.tag() == Wire.T_DATE) millis = Math.floorDiv(millis + 500, 1000L) * 1000L;
-        LocalDateTime dt = LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), o.zone);
+        LocalDateTime dt = o.times.localDateTime(Math.floorDiv(millis, 1000L), (int) Math.floorMod(millis, 1000L) * 1_000_000);
         return t.tag() == Wire.T_DATE ? dt.toLocalDate() : dt;
       }
       case Wire.T_TIME -> {

@@ -68,8 +68,6 @@ final class Dispatcher {
   private long serials;
   /** The call_seq of the last top-level request: the next one's is 1 more (§8.2). */
   private long lastSeq;
-  /** Options are in force from an OPTIONS answered OK until RESET (§9.8). */
-  private boolean optionsInForce;
   /** Once set, every RESULT carries the TAINTED flag: the host retires the worker (§11.5). */
   private boolean tainted;
   /** RESET asked for a GC (memory back before the worker waits); run when idle, not on the way. */
@@ -276,14 +274,15 @@ final class Dispatcher {
     }
   }
 
-  /** While the worker is idle (§8.1): a top-level request with the next call_seq. */
+  /**
+   * While the worker is idle (§8.1): a top-level request with the next call_seq. Whether options
+   * are in force is not checked (§1): without them the worker serves with +00:00 and the defaults.
+   */
   private void checkTopLevel(int op, int depth, long seq) {
-    boolean needsOptions = op == Wire.PREPARE || op == Wire.CALL || op == Wire.PARSE_LIBRARY;
-    if (!(needsOptions || op == Wire.DROP || op == Wire.RESET || op == Wire.OPTIONS) || depth != 0
-        || seq != lastSeq + 1)
+    boolean request = op == Wire.PREPARE || op == Wire.CALL || op == Wire.PARSE_LIBRARY;
+    if (!(request || op == Wire.DROP || op == Wire.RESET || op == Wire.OPTIONS) || depth != 0 || seq != lastSeq + 1)
       throw ProtocolFailure.exit("op " + op + " at depth " + depth + " with call_seq " + Long.toUnsignedString(seq)
           + " while idle after request " + Long.toUnsignedString(lastSeq));
-    if (needsOptions && !optionsInForce) throw ProtocolFailure.exit("op " + op + " without options in force");
   }
 
   /** The worker itself failed where it cannot answer: its state towards the host is not known. */
@@ -313,6 +312,14 @@ final class Dispatcher {
       sqlErrors.clear();
     }
     try {
+      // OPTIONS, DROP and RESET are at most 64 KiB: a worker that cannot hold even these is in
+      // no state to serve (§5.3).
+      if (m.discarded() && (q.op == Wire.DROP || q.op == Wire.RESET || q.op == Wire.OPTIONS)) {
+        if (top) control.begin(q.seq, false, false);
+        tainted = true;
+        result(q, Wire.INTERNAL, internal("the request is larger than this worker can hold"));
+        return;
+      }
       switch (q.op) {
         case Wire.PREPARE -> prepare(q, m);
         case Wire.CALL -> call(q, m);
@@ -364,7 +371,6 @@ final class Dispatcher {
     console.discard();
     options.reset();
     polyglot.applyOptions();
-    optionsInForce = false;
     // A worker with a thread a routine left is not kept for reuse (the host retires it).
     if (!tainted && threads.strangers()) tainted = true;
     // The host took the memory watcher's count with the session's statistics.
@@ -376,8 +382,8 @@ final class Dispatcher {
 
   /**
    * OPTIONS (§9.8): a setting that is absent has its default. Names this worker does not know are
-   * ignored. A zone it does not know or a value it does not accept leaves the worker without
-   * options in force, as it was: OPTIONS comes only to a worker that has none.
+   * ignored. A zone it does not know or a value it does not accept leaves the options as they were;
+   * one answered OK replaces them (the host sends it only while no id is prepared).
    */
   private void options(Request q, Mailbox.Message m) {
     MessageReader r = q.reader.reset(m.body, m.length);
@@ -410,9 +416,8 @@ final class Dispatcher {
     }
     options.integerType = integerType;
     options.decimalType = decimalType;
-    options.zone = zone;
+    options.zone(zoneText, zone);
     polyglot.applyOptions();
-    optionsInForce = true;
     result(q, Wire.OK, null);
   }
 
@@ -629,7 +634,7 @@ final class Dispatcher {
             + types.length + " parameters");
       try {
         Object[] a = n == 0 ? NO_VALUES : new Object[n];
-        for (int i = 0; i < n; i++) a[i] = Values.read(r, types[i].tag());
+        for (int i = 0; i < n; i++) a[i] = Values.read(r);
         args = a;
       } catch (OutOfMemoryError e) {
         args = null;
@@ -707,6 +712,8 @@ final class Dispatcher {
       failedGuest(q, pe, stopped);
       return;
     }
+    // Java's limits (Appendix B.5): the JVM's state may be damaged, so the worker is retired.
+    if (t instanceof StackOverflowError) tainted = true;
     if (stopped && !(t instanceof OutOfMemoryError)) {
       result(q, Wire.INTERRUPTED, guest("java", "interrupted"));
       return;
@@ -1248,7 +1255,7 @@ final class Dispatcher {
   /**
    * Decodes the SQL_RESULT m of an exchange and moves the statement to its next state. Checked
    * are the reply's kind against the action and the statement's state, its counts against its
-   * bytes, the values' tags against their columns, failed_row against the rows sent (rowsSent, of
+   * bytes (values are decoded by their own tags, §1 item 2), failed_row against the rows sent (rowsSent, of
    * an EXECUTE_MANY) and that a batch has columns: its own, its set's, or for a prepared id the
    * ones the worker keeps for it (§10.3). The state is moved before anything is thrown that
    * guest code can see: an MleSqlException for ERROR, a failure of the sink, a value Java cannot
@@ -1320,7 +1327,7 @@ final class Dispatcher {
         for (long i = 0; i < nrows; i++) {
           if (sink == null) row = new Object[ncols];
           for (int c = 0; c < ncols; c++) {
-            Object v = Values.read(r, tags[c]);
+            Object v = Values.read(r);
             row[c] = v instanceof Values.VectorRef ref ? vector(ref, form, sink != null) : v;
           }
           if (sink == null) {

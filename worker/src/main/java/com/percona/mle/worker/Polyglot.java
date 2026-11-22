@@ -175,13 +175,103 @@ final class Polyglot {
     this.options = options;
   }
 
-  /** OPTIONS: the JavaScript converters read the integer and decimal types from $o. */
+  /**
+   * OPTIONS: the JavaScript converters read the integer and decimal types from $o; JavaScript's
+   * local time is that of the zone of OPTIONS (Appendix B.4), and Python's TIMESTAMPs are aware
+   * datetimes in it.
+   */
   void applyOptions() {
-    if (jsOracle == null) return;
-    Value o = jsOracle.getMember("$o");
-    o.putMember("int", options.integerType);
-    o.putMember("dec", options.decimalType);
+    if (jsOracle != null) {
+      Value o = jsOracle.getMember("$o");
+      o.putMember("int", options.integerType);
+      o.putMember("dec", options.decimalType);
+      jsZone();
+    }
+    if (pySql != null) pySql.zone(options.zoneName);
   }
+
+  /** The zone of JavaScript's local time now. */
+  private String jsZone;
+
+  /**
+   * GraalJS takes the zone of local time from the context (the process's zone, or the builder's
+   * timeZone()), fixed when the context is made; the context lives as long as the worker and
+   * serves sessions of any zone. So the JavaScript realm's zone is set directly (JSRealm is in this
+   * class loader, as the FrameLimit instrument is); the main thread is entered. Options change
+   * only while nothing is prepared (§9.8).
+   */
+  private void jsZone() {
+    // The ICU id the V8 worker gives the zone (Date.prototype.toString() shows its name): +00:00
+    // is UTC, a whole hour Etc/GMT with IANA's sign (west positive), another offset GMT+05:30; an
+    // IANA name as it is. java.time knows them all.
+    String name = options.zoneName;
+    if (Options.isOffset(name) && name.length() == 6) {
+      int hours = Integer.parseInt(name.substring(1, 3));
+      if (name.substring(1).equals("00:00")) name = "UTC";
+      // (IANA has Etc/GMT-14 to Etc/GMT+12: -13:00 is GMT-13:00.)
+      else if (name.endsWith(":00") && (name.charAt(0) == '+' || hours <= 12))
+        name = "Etc/GMT" + (name.charAt(0) == '+' ? "-" : "+") + hours;
+      else name = "GMT" + name;
+    } else if (!Options.isOffset(name)) {
+      name = options.zone instanceof java.time.ZoneOffset ? "UTC" : options.zone.getId();  // "UTC", "Z"
+    }
+    if (name.equals(jsZone)) return;
+    try {
+      if (setLocalTimeZone == null) {
+        Class<?> realm = Class.forName("com.oracle.truffle.js.runtime.JSRealm", true, Polyglot.class.getClassLoader());
+        getMainRealm = realm.getMethod("getMain", com.oracle.truffle.api.nodes.Node.class);
+        setLocalTimeZone = realm.getMethod("setLocalTimeZone", String.class);
+      }
+      setLocalTimeZone.invoke(getMainRealm.invoke(null, (Object) null), name);
+      if (jsZoneChanged != null) jsZoneChanged.executeVoid();
+    } catch (ReflectiveOperationException e) {
+      // GraalJS without this method: local time stays the process's (a build problem, not the session's)
+      throw new IllegalStateException("cannot set JavaScript's time zone: " + e, e);
+    }
+    jsZone = name;
+  }
+
+  private static java.lang.reflect.Method getMainRealm, setLocalTimeZone;
+
+  /** Tells the Date methods below that the zone changed (they keep its formatter). */
+  private Value jsZoneChanged;
+
+  /**
+   * Date.prototype.toString() and toTimeString() as V8 (and Oracle's MLE) show them: GraalJS names
+   * the zone in short ("GMT+3", "EET") unless in its V8 compatibility mode, which changes much else;
+   * V8 gives ICU's long name ("Eastern European Summer Time", "GMT+05:30", "Coordinated Universal
+   * Time"). The rest is GraalJS's own: toDateString(), the local fields, the offset.
+   */
+  private static final String DATE_STRINGS = """
+      (() => {
+        const P = Date.prototype, toDateString = P.toDateString, getTime = P.getTime;
+        let format = null;
+        const zoneName = (d) => {
+          if (format === null) format = new Intl.DateTimeFormat('en-US', { timeZoneName: 'long' });
+          const part = format.formatToParts(d).find((p) => p.type === 'timeZoneName');
+          return part === undefined ? '' : part.value;
+        };
+        const two = (n) => (n < 10 ? '0' : '') + n;
+        const time = (d) => {
+          const o = -d.getTimezoneOffset(), a = Math.abs(o);
+          return two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds()) + ' GMT'
+              + (o < 0 ? '-' : '+') + two(Math.floor(a / 60)) + two(a % 60) + ' (' + zoneName(d) + ')';
+        };
+        const methods = {
+          toString() {
+            if (Number.isNaN(getTime.call(this))) return 'Invalid Date';
+            return toDateString.call(this) + ' ' + time(this);
+          },
+          toTimeString() {
+            if (Number.isNaN(getTime.call(this))) return 'Invalid Date';
+            return time(this);
+          },
+        };
+        for (const n of ['toString', 'toTimeString'])
+          Object.defineProperty(P, n, { value: methods[n], writable: true, enumerable: false, configurable: true });
+        return () => { format = null; };
+      })()
+      """;
 
   static boolean isGuest(String language) {
     return LANGUAGES.contains(language);
@@ -228,6 +318,7 @@ final class Polyglot {
       if (JS) {
         js = jsHelpers(c);
         jsOracle = JsOracle.helpers(c);
+        jsZoneChanged = c.eval(Source.create("js", DATE_STRINGS));
         // USING in JavaScript routines (Phase 6): $c.lib(...) gets every library's module.
         jsOracle.putMember("libBridge",
             (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString(), true));
@@ -1116,6 +1207,7 @@ final class Polyglot {
     pythonHelper0(c, "register_row").execute(c.asValue(GuestSql.GPyRow.class).getMember("static"));
     pySql = new PySql(c, options, a -> libraryModule(a[0].asString(), a[1].asString(), false),
         a -> importJs(a[0].asString()));
+    pySql.zone(options.zoneName);
     python = h;
   }
 
@@ -1202,28 +1294,28 @@ final class Polyglot {
       throw new JavaRoutines.CompileException("the source does not define a function " + entry);
     Value[] converters = new Value[params.size()];
     if (jsRoutine == null)
-      for (int i = 0; i < converters.length; i++)
-        converters[i] = converter(h, types[i].tag(), language, options.decimalType);
+      for (int i = 0; i < converters.length; i++) converters[i] = converter(h, types[i].tag(), language);
     routines.put(id, new Routine(language, fn, converters, ret, types, outs, jsRoutine, imports));
   }
 
   /**
-   * How a Python or JavaScript argument of the tag is made from its host form. decimalType: the
-   * session's decimal_type (Appendix B.2), fixed while the routine is prepared (§9.8): Python's
-   * DECIMAL is a Decimal, or a float with NUMBER.
+   * How a Python or JavaScript argument of the tag is made from its host form. Python's DECIMAL
+   * argument is always a Decimal (decimal_type is for SQL results, Appendix B.2), its TIMESTAMP an
+   * aware datetime in the zone of OPTIONS (B.4).
    */
-  private static Value converter(Helpers h, int tag, String language, int decimalType) {
+  private Value converter(Helpers h, int tag, String language) {
+    boolean python = language.equals("python");
     return switch (tag) {
       case Wire.T_BYTES -> h.bytes();
       case Wire.T_VECTOR -> h.vector();
       case Wire.T_JSON -> h.json();
-      case Wire.T_DATE -> h.date();
-      case Wire.T_DATETIME, Wire.T_TIMESTAMP -> h.datetime();
+      // Python's are made from their fields in invoke.
+      case Wire.T_DATE -> python ? null : h.date();
+      case Wire.T_DATETIME, Wire.T_TIMESTAMP -> python ? null : h.datetime();
       case Wire.T_TIME -> h.time();
-      case Wire.T_DECIMAL -> language.equals("python") && decimalType == Options.DECIMAL_NUMBER ? h.toNumber()
-          : h.decimal();
+      case Wire.T_DECIMAL -> h.decimal();
       // BIGINT UNSIGNED beyond 2^63 comes as a string (hostForm): Python makes it an int.
-      case Wire.T_U64 -> language.equals("python") ? h.bigint() : null;
+      case Wire.T_U64 -> python ? h.bigint() : null;
       case Wire.T_I64 -> null;
       default -> null;
     };
@@ -1238,14 +1330,29 @@ final class Polyglot {
     Object[] args = new Object[neutral.length];
     boolean js = r.language().equals("js");
     for (int i = 0; i < args.length; i++) {
-      if (!js && neutral[i] instanceof Values.VectorRef ref) {
-        Object a = vectorArgument(i, ref);
-        if (a != null) {
-          args[i] = a;
-          continue;
+      if (!js) {
+        switch (neutral[i]) {
+          case Values.VectorRef ref -> {
+            Object a = vectorArgument(i, ref);
+            if (a != null) {
+              args[i] = a;
+              continue;
+            }
+          }
+          // A date or naive datetime, or an aware datetime in the zone of OPTIONS (None for the
+          // zero timestamp), built from its fields.
+          case Values.Temporal t when t.tag() != Wire.T_TIME -> {
+            args[i] = pySql.civil(t, true);
+            continue;
+          }
+          case Values.Timestamp t -> {
+            args[i] = t.zero() ? null : pySql.timestamp(t);
+            continue;
+          }
+          case null, default -> {}
         }
       }
-      Object v = hostForm(neutral[i], js, options.zone);
+      Object v = hostForm(neutral[i], js, options.times);
       args[i] = v == null || r.converters()[i] == null ? v : r.converters()[i].execute(v);
     }
     // USING (Phase 6): the libraries' current modules, bound before each call.
@@ -1330,7 +1437,7 @@ final class Polyglot {
   }
 
   /** The neutral value in the form the language's converter takes. */
-  private static Object hostForm(Object v, boolean js, java.time.ZoneId zone) {
+  private static Object hostForm(Object v, boolean js, ZoneCache zone) {
     return switch (v) {
       case null -> null;
       // A JS number; beyond 2^53 a string (Oracle's UNSAFE_STRING default). Passed as a Long,
@@ -1359,13 +1466,11 @@ final class Polyglot {
         // JavaScript: in the session's time zone, as results are read back (toJava) and as the body
         // form does (JsOracle.hostForm): an identity function returns its argument (independent
         // review C16); Oracle's rules for zero and impossible dates (Values.Temporal.jsMillis).
-        // Python has no form for a zero date: the call fails as MLE-Type (toJava).
-        default -> js ? (Object) t.jsMillis(zone) : t.toJava().toString();
+        // (Python's are made in invoke.)
+        default -> t.jsMillis(zone);
       };
-      // An instant: a JavaScript Date (invalid for the zero timestamp); for Python the local time
-      // in the session's zone (None for the zero timestamp).
-      case Values.Timestamp t -> js ? (Object) (t.zero() ? Double.NaN : (double) t.millis())
-          : t.zero() ? null : t.local().toString();
+      // An instant: a JavaScript Date (invalid for the zero timestamp). (Python's are made in invoke.)
+      case Values.Timestamp t -> t.zero() ? Double.NaN : (double) t.millis();
       default -> v;  // Double, Float, String
     };
   }
@@ -1428,20 +1533,28 @@ final class Polyglot {
       }
       case Wire.T_DATE -> {
         if (v.isDate() && !v.isTime()) return v.asDate();
-        if (v.isInstant()) return LocalDate.ofInstant(v.asInstant(), options.zone);
+        if (v.isInstant()) {
+          java.time.Instant i = v.asInstant();
+          return options.times.localDateTime(i.getEpochSecond(), i.getNano()).toLocalDate();
+        }
         if (v.isDate()) return v.asDate();
         throw new Values.ConversionException("cannot convert " + v + " to DATE");
       }
       case Wire.T_DATETIME -> {
         if (v.isDate() && v.isTime() && !v.isTimeZone()) return LocalDateTime.of(v.asDate(), v.asTime());
-        // An aware datetime: in the session's time zone (as JavaScript Dates).
-        if (v.isInstant()) return LocalDateTime.ofInstant(v.asInstant(), options.zone);
+        // Python's aware datetime is an instant: it goes as TIMESTAMP (§7.2, Appendix B.4). A
+        // JavaScript Date for DATETIME is its local time in the zone of OPTIONS (Oracle's table, as
+        // JsOracle converts it).
+        if (v.isInstant()) {
+          java.time.Instant i = v.asInstant();
+          return h == js ? options.times.localDateTime(i.getEpochSecond(), i.getNano()) : i;
+        }
         if (v.isDate()) return v.asDate();
         throw new Values.ConversionException("cannot convert " + v + " to " + t.sqlName());
       }
       case Wire.T_TIMESTAMP -> {
-        // An instant as it is (a JavaScript Date, an aware datetime); a naive datetime is the
-        // local time in the session's time zone (Values.writeAs).
+        // An instant as it is (a JavaScript Date, an aware datetime); a naive datetime goes as
+        // DATETIME (Values.writeAs).
         if (v.isInstant()) return v.asInstant();
         if (v.isDate() && v.isTime()) return LocalDateTime.of(v.asDate(), v.asTime());
         if (v.isDate()) return v.asDate();

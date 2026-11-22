@@ -279,7 +279,8 @@ final class JavaRoutines {
       case Wire.T_DECIMAL -> "java.math.BigDecimal";
       case Wire.T_BYTES -> "byte[]";
       case Wire.T_DATE -> "java.time.LocalDate";
-      case Wire.T_DATETIME, Wire.T_TIMESTAMP -> "java.time.LocalDateTime";
+      case Wire.T_DATETIME -> "java.time.LocalDateTime";
+      case Wire.T_TIMESTAMP -> "java.time.Instant";  // an instant (Appendix B.4)
       case Wire.T_TIME -> "java.time.Duration";
       case Wire.T_VECTOR -> "float[]";
       default -> "String";  // strings, ENUM, SET, JSON

@@ -43,15 +43,34 @@ final class Options {
   static final int DECIMAL_STRING = 0;
   static final int DECIMAL_NUMBER = 1;
 
+  /** Without options in force the worker serves with +00:00 and the defaults (§1). */
+  static final String DEFAULT_ZONE = "+00:00";
+
   int integerType = INT_UNSAFE_STRING;
   int decimalType = DECIMAL_STRING;
   ZoneId zone = ZoneOffset.UTC;
+  /** The zone as OPTIONS named it (an IANA name or +hh:mm): Python's tzinfo is made from it. */
+  String zoneName = DEFAULT_ZONE;
+  /** Conversions between instants and local times in zone (Appendix A). */
+  ZoneCache times = new ZoneCache(ZoneOffset.UTC);
 
   /** Back to the defaults (RESET ends the options in force). */
   void reset() {
     integerType = INT_UNSAFE_STRING;
     decimalType = DECIMAL_STRING;
-    zone = ZoneOffset.UTC;
+    zone(DEFAULT_ZONE, ZoneOffset.UTC);
+  }
+
+  /** The zone of OPTIONS: name as sent, zone as parsed (parseZone). */
+  void zone(String name, ZoneId zone) {
+    if (!zone.equals(this.zone)) times = new ZoneCache(zone);
+    this.zone = zone;
+    this.zoneName = name;
+  }
+
+  /** Whether name is an offset (+hh:mm, -hh:mm), not an IANA name. */
+  static boolean isOffset(String name) {
+    return !name.isEmpty() && (name.charAt(0) == '+' || name.charAt(0) == '-');
   }
 
   /** Parses an IANA name or an offset (+hh:mm); null if unknown. */

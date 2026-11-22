@@ -46,10 +46,11 @@ import org.graalvm.polyglot.proxy.ProxyObject;
  * the globals session, mysql and SqlError in every Python routine.
  *
  * <p>Values: int (all integers, exact), float, decimal.Decimal (float with decimalType NUMBER),
- * str, bytes, JSON parsed (dict, list ...), datetime.date, datetime.datetime (naive; a TIMESTAMP in the
- * session's zone), datetime.timedelta (TIME), numpy.float32 arrays for VECTOR (array.array('f') without
+ * str, bytes, JSON parsed (dict, list ...), datetime.date, datetime.datetime (DATETIME naive; TIMESTAMP
+ * aware, in the zone of OPTIONS: Appendix B.4), datetime.timedelta (TIME), numpy.float32 arrays for VECTOR (array.array('f') without
  * numpy); NULL and a zero date are None (a Java null: "is None" holds, its type shows as
- * ForeignNone). Parameters: the same types, plus bool, set (text), list/tuple/dict
+ * ForeignNone). Parameters: the same types (an aware datetime is a TIMESTAMP, a naive one a
+ * DATETIME), plus bool, set (text), list/tuple/dict
  * (JSON; not for VECTOR columns), numpy arrays and array.array (VECTOR), bytearray/memoryview (bytes).
  */
 final class PySql implements GuestSql.Lang {
@@ -62,6 +63,8 @@ final class PySql implements GuestSql.Lang {
   private final Value json;
   private final Value date;
   private final Value datetime;
+  private final Value timestamp;
+  private final Value setZone;
   private final Value timedelta;
   private final Value kind;
   private final Value throwSql;
@@ -95,6 +98,8 @@ final class PySql implements GuestSql.Lang {
     json = h.getHashValue("json");
     date = h.getHashValue("date");
     datetime = h.getHashValue("datetime");
+    timestamp = h.getHashValue("timestamp");
+    setZone = h.getHashValue("set_zone");
     timedelta = h.getHashValue("timedelta");
     kind = h.getHashValue("kind");
     throwSql = h.getHashValue("throw_sql");
@@ -211,9 +216,42 @@ final class PySql implements GuestSql.Lang {
               except ImportError:
                   return _mle_array.array('f', v).tobytes().decode('latin-1')
 
+          # TIMESTAMP (Appendix B.4): an aware datetime in the zone of OPTIONS, made when first
+          # needed (zoneinfo reads the zone data): an offset is a fixed timezone, +00:00 is
+          # timezone(timedelta(0)), a name is zoneinfo.ZoneInfo. The CPython worker makes the same
+          # objects, so both print alike.
+          zone = {'name': '+00:00', 'tz': None}
+          epoch = _mle_dt.datetime(1970, 1, 1, tzinfo=_mle_dt.timezone.utc)
+          one_us = _mle_dt.timedelta(microseconds=1)
+
+          def set_zone(name):
+              if zone['name'] != name:
+                  zone['name'], zone['tz'] = name, None
+
+          def tz():
+              t = zone['tz']
+              if t is None:
+                  name = zone['name']
+                  if name[:1] in ('+', '-'):
+                      h, m = name[1:].split(':')
+                      d = _mle_dt.timedelta(hours=int(h), minutes=int(m))
+                      t = _mle_dt.timezone(-d if name[0] == '-' else d)
+                  else:
+                      import zoneinfo
+                      t = zoneinfo.ZoneInfo(name)
+                  zone['tz'] = t
+              return t
+
+          def timestamp(y, mo, d, h, mi, s, us, fold):
+              # An instant as an aware datetime: its local fields (Java computes them in the zone of
+              # OPTIONS) and fold, as datetime.fromtimestamp(t, tz) makes it. Built directly: an ISO
+              # text to parse cost GraalPy more than the rest of a row (protocol-review.md §17).
+              return _mle_dt.datetime(y, mo, d, h, mi, s, us, zone['tz'] or tz(), fold=fold)
+
           # A parameter as Java sees it: (kind, value). 0 None, 1 bool, 2 str, 3 int (64 bits),
           # 4 float, 5 big int (text), 7 VECTOR (float32 bytes as latin-1 text), 8 bytes (latin-1
-          # text), 9 JSON text, 10 Decimal (text), 11 datetime, 12 date, 13 timedelta (us), 14 time.
+          # text), 9 JSON text, 10 Decimal (text), 11 naive datetime, 12 date, 13 timedelta (us),
+          # 14 time, 15 aware datetime (microseconds since the epoch: a TIMESTAMP).
           def kind(v):
               if v is None: return (0, None)
               if isinstance(v, bool): return (1, v)
@@ -226,7 +264,7 @@ final class PySql implements GuestSql.Lang {
                   if not v.is_finite(): raise TypeError('cannot bind ' + str(v))
                   return (10, str(v))
               if isinstance(v, _mle_dt.datetime):
-                  # An aware datetime keeps its offset: Java converts it to the session's zone.
+                  if v.utcoffset() is not None: return (15, (v - epoch) // one_us)
                   return (11, v.isoformat())
               if isinstance(v, _mle_dt.date): return (12, v.isoformat())
               if isinstance(v, _mle_dt.timedelta): return (13, (v.days * 86400 + v.seconds) * 1000000 + v.microseconds)
@@ -246,8 +284,8 @@ final class PySql implements GuestSql.Lang {
           return {
               'list': lambda a: list(a), 'bigint': lambda s: int(s), 'decimal': _mle_decimal.Decimal,
               'bytes': lambda s: s.encode('latin-1'), 'vector': vector, 'json': _mle_json.loads,
-              'date': _mle_dt.date.fromisoformat, 'datetime': _mle_dt.datetime.fromisoformat,
-              'timedelta': timedelta, 'kind': kind, 'throw_sql': throw_sql, 'throw_error': throw_error,
+              'date': _mle_dt.date, 'datetime': _mle_dt.datetime,
+              'timestamp': timestamp, 'set_zone': set_zone, 'timedelta': timedelta, 'kind': kind, 'throw_sql': throw_sql, 'throw_error': throw_error,
               'load_library': load_library, 'bind': bind,
           }
 
@@ -508,8 +546,8 @@ final class PySql implements GuestSql.Lang {
       case MleJson j -> json.execute(j.text());
       case float[] f -> vectorValue(f);
       case Values.Temporal t -> temporal(t);
-      // The local time in the session's zone (a naive datetime); None for the zero timestamp.
-      case Values.Timestamp t -> t.zero() ? null : datetime.execute(t.local().toString());
+      // An aware datetime in the zone of OPTIONS; None for the zero timestamp.
+      case Values.Timestamp t -> t.zero() ? null : timestamp(t);
       default -> raw;
     };
   }
@@ -555,15 +593,44 @@ final class PySql implements GuestSql.Lang {
       long us = ((t.hour() * 60 + t.minute()) * 60 + t.second()) * 1_000_000L + t.micro();
       return timedelta.execute(t.negative() ? -us : us);
     }
-    Object j;
+    // A zero date, a date with a zero month or day, an impossible date, and years before 1
+    // (Python's dates start with year 1) are None.
+    return civil(t, false);
+  }
+
+  /**
+   * A DATE or DATETIME as a Python date or naive datetime, built from its fields. One Python has no
+   * form for: None for a value of a result, a conversion error (MLE-Type) for an argument.
+   */
+  Object civil(Values.Temporal t, boolean argument) {
     try {
-      j = t.toJava();
-    } catch (Values.ConversionException e) {
-      return null;  // a zero date
+      if (t.year() >= 1) {
+        if (t.tag() == Wire.T_DATE) {
+          LocalDate.of(t.year(), t.month(), t.day());  // a date Python can make (no exception there)
+          return date.execute(t.year(), t.month(), t.day());
+        }
+        java.time.LocalDateTime.of(t.year(), t.month(), t.day(), (int) t.hour(), t.minute(), t.second(), t.micro() * 1000);
+        return datetime.execute(t.year(), t.month(), t.day(), (int) t.hour(), t.minute(), t.second(), t.micro());
+      }
+    } catch (java.time.DateTimeException e) {
+      // below
     }
-    // Python's dates start with year 1: None, as for a zero date.
-    if (t.year() < 1) return null;
-    return j instanceof LocalDate d ? date.execute(d.toString()) : datetime.execute(j.toString());
+    if (!argument) return null;
+    throw new Values.ConversionException("the " + Wire.TAG_NAMES[t.tag()] + " value " + t + " has no Python equivalent");
+  }
+
+  /** A TIMESTAMP (not the zero one) as an aware datetime in the zone of OPTIONS. */
+  Object timestamp(Values.Timestamp t) {
+    long micros = t.micros();
+    long second = Math.floorDiv(micros, 1_000_000L);
+    java.time.LocalDateTime l = options.times.localDateTime(second, 0);
+    return timestamp.execute(l.getYear(), l.getMonthValue(), l.getDayOfMonth(), l.getHour(), l.getMinute(),
+        l.getSecond(), (int) Math.floorMod(micros, 1_000_000L), options.times.fold(second) ? 1 : 0);
+  }
+
+  /** The zone of OPTIONS for TIMESTAMPs (its tzinfo is made when first needed). */
+  void zone(String name) {
+    setZone.execute(name);
   }
 
   @Override
@@ -591,12 +658,11 @@ final class PySql implements GuestSql.Lang {
       case 8 -> p.asString().getBytes(StandardCharsets.ISO_8859_1);
       case 9 -> new MleJson(p.asString());
       case 10 -> new BigDecimal(p.asString());
-      case 11 -> {
-        String text = p.asString();
-        java.time.temporal.TemporalAccessor parsed = java.time.format.DateTimeFormatter.ISO_DATE_TIME.parse(text);
-        yield parsed.isSupported(java.time.temporal.ChronoField.OFFSET_SECONDS)
-            ? java.time.OffsetDateTime.from(parsed).atZoneSameInstant(options.zone).toLocalDateTime()
-            : LocalDateTime.parse(text);
+      case 11 -> LocalDateTime.parse(p.asString());
+      // An aware datetime is an instant: a TIMESTAMP (out of its range: an error, Values).
+      case 15 -> {
+        long us = p.asLong();
+        yield java.time.Instant.ofEpochSecond(Math.floorDiv(us, 1_000_000L), Math.floorMod(us, 1_000_000L) * 1000L);
       }
       case 12 -> LocalDate.parse(p.asString());
       case 13 -> Duration.ofNanos(Math.multiplyExact(p.asLong(), 1000L));

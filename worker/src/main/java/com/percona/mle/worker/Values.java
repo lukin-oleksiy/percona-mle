@@ -30,7 +30,6 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
-import java.time.ZoneId;
 import java.time.ZonedDateTime;
 
 /**
@@ -60,10 +59,6 @@ final class Values {
   /** The session's options: their zone is where a language's local time stands for a TIMESTAMP. */
   static Options options = new Options();
 
-  static ZoneId zone() {
-    return options.zone;
-  }
-
   /** Type of §7.4; typeName is INT, VARCHAR, SET, YEAR, BIT ... (NULL for a column without a type). */
   record ParamType(int tag, boolean unsigned, long length, long precision, long scale, String typeName) {
     ParamType(int tag, boolean unsigned, long length, long precision, long scale) {
@@ -89,12 +84,13 @@ final class Values {
      * constructor makes of its fields in local time, so an impossible day (April 31) runs on into
      * the next month.
      */
-    double jsMillis(ZoneId zone) {
+    double jsMillis(ZoneCache zone) {
       if (month == 0 || day == 0) return Double.NaN;
       try {
-        return LocalDate.of(year, 1, 1).atStartOfDay().plusMonths(month - 1).plusDays(day - 1).plusHours(hour)
-            .plusMinutes(minute).plusSeconds(second).plusNanos(micro * 1000L).atZone(zone).toInstant()
-            .toEpochMilli();
+        // Years 0 to 99 are those years (not 1900 to 1999); the day runs on past the month's end.
+        long local = (LocalDate.of(year, month, 1).toEpochDay() + day - 1) * 86_400L + hour * 3600L + minute * 60L
+            + second;
+        return zone.instant(local) * 1000.0 + micro / 1000;
       } catch (java.time.DateTimeException | ArithmeticException e) {
         return Double.NaN;  // a value outside every calendar (the host does not send one)
       }
@@ -142,7 +138,8 @@ final class Values {
 
     /** The local time in the session's zone. */
     LocalDateTime local() {
-      return LocalDateTime.ofInstant(instant(), zone());
+      if (zero()) throw new ConversionException("the zero TIMESTAMP has no Java equivalent");
+      return options.times.localDateTime(Math.floorDiv(micros, 1_000_000L), (int) Math.floorMod(micros, 1_000_000L) * 1000);
     }
   }
 
@@ -204,15 +201,13 @@ final class Values {
   }
 
   /**
-   * A value of the host whose declared type has the tag declared: it is NULL or has that tag
-   * (§7.3); with tag 0 (a column without a type) it is NULL. The tag is checked, the value's
-   * domain is not (§1): a value outside it gives guest code what it gives, and one the worker
+   * A value of the host, decoded by its own tag (§1 item 2): it is not compared with its Column's or
+   * Param's type, and the language gets a value of the tag's type. The value's domain is not
+   * checked either (§1): a value outside it gives guest code what it gives, and one the worker
    * cannot represent at all ends the worker.
    */
-  static Object read(MessageReader r, int declared) {
+  static Object read(MessageReader r) {
     int tag = r.u8();
-    if (tag != Wire.T_NULL && tag != declared)
-      throw ProtocolFailure.exit("a value with tag " + tag + " where the declared type has " + declared);
     return switch (tag) {
       case Wire.T_NULL -> null;
       case Wire.T_I64 -> r.u64();
@@ -246,10 +241,13 @@ final class Values {
     };
   }
 
-  /** The plain Java form of a neutral value (for SQL results and Object parameters). */
+  /**
+   * The plain Java form of a neutral value (for SQL results and Object parameters; Appendix B.4):
+   * DATE LocalDate, TIME Duration, DATETIME LocalDateTime, TIMESTAMP Instant, DECIMAL BigDecimal.
+   */
   static Object toJava(Object v) {
     if (v instanceof Temporal t) return t.toJava();
-    if (v instanceof Timestamp t) return t.local();
+    if (v instanceof Timestamp t) return t.instant();
     if (v instanceof VectorRef ref) return ref.toArray();
     return v;
   }
@@ -512,22 +510,15 @@ final class Values {
         if (!(v instanceof LocalDate d)) throw cannot(v, t);
         writeDate(w, Wire.T_DATE, d);
       }
-      case Wire.T_DATETIME -> {
+      // An instant goes as TIMESTAMP and a value without a zone as DATETIME (§7.2), whichever of
+      // the two is declared: the host converts it to the declared type as the server assigns it.
+      case Wire.T_DATETIME, Wire.T_TIMESTAMP -> {
         switch (v) {
           case LocalDateTime d -> writeDateTime(w, Wire.T_DATETIME, d);
           case LocalDate d -> writeDateTime(w, Wire.T_DATETIME, d.atStartOfDay());
-          case Instant i -> writeDateTime(w, Wire.T_DATETIME, LocalDateTime.ofInstant(i, zone()));
-          default -> throw cannot(v, t);
-        }
-      }
-      case Wire.T_TIMESTAMP -> {
-        // A local time is the time in the session's zone (in the hour a zone repeats: the earlier).
-        switch (v) {
           case Instant i -> writeTimestamp(w, i);
           case OffsetDateTime d -> writeTimestamp(w, d.toInstant());
           case ZonedDateTime d -> writeTimestamp(w, d.toInstant());
-          case LocalDateTime d -> writeTimestamp(w, d.atZone(zone()).toInstant());
-          case LocalDate d -> writeTimestamp(w, d.atStartOfDay(zone()).toInstant());
           default -> throw cannot(v, t);
         }
       }
