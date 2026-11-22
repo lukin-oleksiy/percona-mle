@@ -2259,7 +2259,7 @@ a reading was needed:
 
 * I64 and U64 by `integer_type`, DECIMAL by `decimal_type`, in every
   conversion of a value to JavaScript (arguments and SQL results); TIME as a
-  string; VECTOR as `Float32Array`; JSON as Oracle's Table 27.5
+  string; VECTOR as `Float32Array`; JSON as Oracle's JSON conversion table
   (numbers rounded with `Math.round` where an integer is needed).
 * DATE, DATETIME and TIMESTAMP as `Date`. A zero date, a date with a
   zero month or day, and the zero timestamp are an Invalid Date; any
