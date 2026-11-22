@@ -293,7 +293,8 @@ WorkerStats Worker::stats() const {
   memcpy(&s, &m_process->header()->stats, sizeof s);
   WorkerStats r;
   r.heap_max = s.heap_max;
-  r.heap_used = std::min(s.heap_used, s.heap_max);
+  // heap_max 0: the runtime knows no limit (§3.1).
+  r.heap_used = s.heap_max == 0 ? s.heap_used : std::min(s.heap_used, s.heap_max);
   r.memory_gcs = s.gc_count <= (uint64_t{1} << 32) ? s.gc_count : 0;
   r.state = s.state <= uint32_t(wire::WorkerState::kCompiling) ? s.state : 0;
   return r;
@@ -301,25 +302,29 @@ WorkerStats Worker::stats() const {
 
 const HeldError *Worker::held_error(uint64_t error_id) const {
   if (error_id == 0) return nullptr;
-  const size_t n = std::min<uint64_t>(m_held_count, m_held.size());
-  for (size_t i = 0; i < n; i++)
-    if (m_held[i].error_id == error_id) return &m_held[i];
+  // Entries of earlier top-level requests have another call_seq.
+  for (const HeldError &e : m_held)
+    if (e.error_id == error_id && e.call_seq == m_seq) return &e;
   return nullptr;
 }
 
 void Worker::hold_error(const SqlResultMsg &error) {
-  HeldError &e = m_held[m_held_count++ % m_held.size()];
+  HeldError &e = m_held[m_held_next++ % m_held.size()];
+  e.call_seq = m_seq;
   e.error_id = error.error_id;
   e.sql_errno = error.sql_errno;
-  e.sqlstate = error.sqlstate;
+  e.sqlstate = error.sqlstate;  // into the entry's own buffers: reused
   e.message = error.message;
 }
 
-void Worker::forget_record() {
-  if (m_depth != 0) return;
-  // No record is made between top-level requests (the word has no
-  // kRunning), so this cannot lose one.
-  m_interrupt.store(0, std::memory_order_release);
+std::string &Worker::buffer(
+    std::array<std::string, wire::kMaxDepth + 2> &buffers) {
+  // A request is refused beyond the deepest nesting, so m_depth fits.
+  std::string &b = buffers[std::min<size_t>(m_depth, buffers.size() - 1)];
+  // A rare large message does not stay held for the worker's life.
+  if (b.capacity() > (4U << 20)) std::string().swap(b);
+  b.clear();
+  return b;
 }
 
 // ---------------------------------------------------------------- mailbox
@@ -479,7 +484,8 @@ Worker::Wait Worker::wait_post(CallHooks *hooks, Transfer *transfer,
 }
 
 Worker::Wait Worker::receive(Message *m, CallHooks *hooks, const Expect &expect,
-                             int64_t deadline, std::string *error) {
+                             int64_t deadline, std::string *error,
+                             bool in_place) {
   const uint32_t arena = m_process->arena_size();
   Assembler a(arena, wire::kMaxWorkerMessage);
   Transfer transfer;
@@ -540,19 +546,30 @@ Worker::Wait Worker::receive(Message *m, CallHooks *hooks, const Expect &expect,
         return Wait::kProtocol;
       }
     }
-    const Assembler::Step step = a.add(h, m_process->arena());
+    // A message of one chunk is decoded where it is, each byte read once
+    // (§1); the chunks of a longer one are copied once as they come.
+    const bool leave = first && in_place && !more;
+    const Assembler::Step step = a.add(h, m_process->arena(), !leave);
     if (step == Assembler::Step::kError) {
       *error = a.error();
       return Wait::kProtocol;
     }
     if (first && h.op == static_cast<uint32_t>(Op::kSql)) {
       // The bound on request bytes is applied before the message is held
-      // (§5.3): only its action and statement id are looked at here.
+      // or checked (§5.3): only its action and statement id are looked at
+      // here, copied once; serve_sql() decodes the rest.
       if (h.total_len < wire::kSqlHeadSize) {
         *error = "bad SQL: message truncated";
         return Wait::kProtocol;
       }
-      const auto action = static_cast<uint8_t>(a.body()[0]);
+      unsigned char head[wire::kSqlHeadSize];
+      memcpy(head,
+             leave ? static_cast<const void *>(m_process->arena())
+                   : static_cast<const void *>(a.body().data()),
+             sizeof head);
+      const uint8_t action = head[0];
+      m->sql_action = static_cast<wire::SqlAction>(action);
+      memcpy(&m->sql_stmt_id, head + 1, sizeof m->sql_stmt_id);
       if (action > wire::kMaxSqlAction) {
         *error = "bad SQL: bad SQL action";
         return Wait::kProtocol;
@@ -565,7 +582,7 @@ Worker::Wait Worker::receive(Message *m, CallHooks *hooks, const Expect &expect,
       } else if (hooks->sql_bytes_reserve(h.total_len)) {
         m->reserved = h.total_len;
       } else {
-        a.discard_beyond(wire::kSqlHeadSize);
+        if (!leave) a.discard_beyond(wire::kSqlHeadSize);
         m->discarded = true;
       }
     }
@@ -584,7 +601,14 @@ Worker::Wait Worker::receive(Message *m, CallHooks *hooks, const Expect &expect,
     if (step == Assembler::Step::kDone) {
       if (!first && transfer.excepted) clock_start(m_noticed ? now_ns() : 0);
       m->h = a.header();
-      m->body = a.release_body();
+      m->in_region = leave;
+      if (leave) {
+        m->data = std::string_view(
+            reinterpret_cast<const char *>(m_process->arena()), h.len);
+      } else {
+        m->body = a.release_body();
+        m->data = m->body;
+      }
       return Wait::kMessage;
     }
     post(Op::kContinue, 0, nullptr, 0, 0);
@@ -655,8 +679,9 @@ Outcome Worker::wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error,
   std::string why;
   Expect expect;
   expect.ops = bit(Op::kReady);
+  // Copied: a READY's version is read before the rest is decoded.
   switch (receive(&m, hooks, expect,
-                  now_ns() + int64_t{timeout_ms} * 1000000, &why)) {
+                  now_ns() + int64_t{timeout_ms} * 1000000, &why, false)) {
     case Wait::kMessage:
       break;
     case Wait::kDied:
@@ -678,7 +703,7 @@ Outcome Worker::wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error,
   if (m.h.status != static_cast<uint32_t>(Status::kOk)) {
     // A failed READY: only version and info are decoded (§9.1).
     std::string info;
-    if (!decode_ready_head(m.body, &ready->version, &info, &why))
+    if (!decode_ready_head(m.data, &ready->version, &info, &why))
       return broke("bad READY: " + why);
     ready->info = info;
     if (wire::version_major(ready->version) != wire::kVersionMajor)
@@ -690,7 +715,7 @@ Outcome Worker::wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error,
                 error);
   }
   uint32_t version;
-  if (!decode_ready_version(m.body, &version, &why))
+  if (!decode_ready_version(m.data, &version, &why))
     return broke("bad READY: " + why);
   if (wire::version_major(version) != wire::kVersionMajor) {
     ready->version = version;
@@ -700,7 +725,7 @@ Outcome Worker::wait_ready(int timeout_ms, ReadyMsg *ready, std::string *error,
                     version_text(wire::kVersion),
                 error);
   }
-  if (!decode(m.body, ready, &why)) return broke("bad READY: " + why);
+  if (!decode(m.data, ready, &why)) return broke("bad READY: " + why);
   if (!language.empty() &&
       std::find(ready->languages.begin(), ready->languages.end(), language) ==
           ready->languages.end())
@@ -736,7 +761,8 @@ std::string Worker::check_result(const Request &q, uint32_t status,
     return r.ret ? "unexpected return value" : "missing return value";
   if (call && ok) {
     // One entry for every OUT and INOUT parameter, ascending.
-    const auto &outs = q.routine->outs;
+    static const std::vector<uint32_t> kNone;
+    const auto &outs = q.routine->outs ? *q.routine->outs : kNone;
     if (!std::equal(r.out_params.begin(), r.out_params.end(), outs.begin(),
                     outs.end(),
                     [](const auto &p, uint32_t index) {
@@ -818,8 +844,8 @@ Outcome Worker::request(const Request &q, CallHooks &hooks, ResultMsg *result,
     m_noticed = false;
     m_clock_running = false;
     m_clock_used = 0;
+    // The held errors of the last request are forgotten by its call_seq.
     m_error_ids = 0;
-    m_held_count = 0;
     m_retire_after_top = false;
   } else {
     // From the moment of notice no nested request is sent (§11.1 step 2).
@@ -884,7 +910,7 @@ Outcome Worker::request(const Request &q, CallHooks &hooks, ResultMsg *result,
     Message m;
     Reservation reservation(&hooks, &m.reserved);
     const int64_t t_wait = m_trace == &trace ? now_ns() : 0;
-    w = receive(&m, &hooks, expect, deadline, &why);
+    w = receive(&m, &hooks, expect, deadline, &why, true);
     if (m_trace == &trace) trace.worker += now_ns() - t_wait;
     if (w != Wait::kMessage) return lost(w, q.op, why, error);
 
@@ -903,7 +929,8 @@ Outcome Worker::request(const Request &q, CallHooks &hooks, ResultMsg *result,
             "the MLE worker was retired: it reported that it must not be "
             "used again";
       }
-      if (!decode(m.body, result, &why))
+      // From the region, each byte once; nothing was posted since.
+      if (!decode(m.data, result, &why))
         return lost(Wait::kProtocol, q.op, "bad RESULT: " + why, error);
       if (std::string bad = check_result(q, m.h.status, *result); !bad.empty())
         return lost(Wait::kProtocol, q.op, bad, error);
@@ -951,10 +978,13 @@ Worker::Wait Worker::serve_sql(const Request &q, Message &m, CallHooks &hooks,
                                int64_t deadline, std::string *error) {
   using wire::SqlAction;
   SqlMsg sql;
-  if (m.discarded) {
-    sql.action = static_cast<SqlAction>(m.body[0]);
-    memcpy(&sql.stmt_id, m.body.data() + 1, sizeof sql.stmt_id);
-  } else if (std::string why; !decode(m.body, &sql, &why)) {
+  sql.action = m.sql_action;
+  sql.stmt_id = m.sql_stmt_id;
+  // The head was read by receive(); a discarded message has nothing more
+  // (§5.3).
+  if (std::string why;
+      !m.discarded &&
+      !decode_sql_rest(m.data.substr(wire::kSqlHeadSize), &sql, &why)) {
     *error = "bad SQL: " + why;
     return Wait::kProtocol;
   }
@@ -1061,7 +1091,7 @@ Worker::Wait Worker::serve_sql(const Request &q, Message &m, CallHooks &hooks,
     repair_utf8(&r.message);
     r.error_id = error_id;
   };
-  std::string reply;
+  std::string &reply = buffer(m_reply_bodies);
   if (r.kind == SqlResultKind::kError) complete_error();
   encode(r, &reply);
   if (reply.size() > wire::kMaxHostMessage) {
@@ -1088,7 +1118,7 @@ Worker::Wait Worker::serve_sql(const Request &q, Message &m, CallHooks &hooks,
 Worker::Wait Worker::serve_library(Message &m, CallHooks &hooks,
                                    int64_t deadline, std::string *error) {
   LibraryMsg library;
-  if (std::string why; !decode(m.body, &library, &why)) {
+  if (std::string why; !decode(m.data, &library, &why)) {
     *error = "bad LIBRARY: " + why;
     return Wait::kProtocol;
   }
@@ -1128,6 +1158,13 @@ Worker::Wait Worker::serve_library(Message &m, CallHooks &hooks,
 
 Outcome Worker::parse_library(const ParseLibraryMsg &library, CallHooks &hooks,
                               ResultMsg *result, std::string *error) {
+  // The host sends no language the worker did not announce (§1 item 4).
+  if (m_ready && std::find(m_languages.begin(), m_languages.end(),
+                           library.language) == m_languages.end()) {
+    forget_record();
+    *error = "the MLE worker does not run the language '" + library.language + "'";
+    return Outcome::kRefused;
+  }
   std::string body;
   encode(library, &body);
   return request(Request{Op::kParseLibrary, body}, hooks, result, error);
@@ -1141,6 +1178,13 @@ Outcome Worker::prepare(const PrepareMsg &routine, CallHooks &hooks,
     *error = "the routine has more parameters or imports than MLE allows";
     return Outcome::kRefused;
   }
+  // The host sends no language the worker did not announce (§1 item 4).
+  if (m_ready && std::find(m_languages.begin(), m_languages.end(),
+                           routine.language) == m_languages.end()) {
+    forget_record();
+    *error = "the MLE worker does not run the language '" + routine.language + "'";
+    return Outcome::kRefused;
+  }
   std::string body;
   encode(routine, &body);
   Request q{Op::kPrepare, body};
@@ -1152,8 +1196,11 @@ Outcome Worker::prepare(const PrepareMsg &routine, CallHooks &hooks,
     // before.
     m_unsent_drops.erase(routine.routine_id);
     RoutineInfo info{routine.params.size(), routine.returns.has_value(), {}};
+    std::vector<uint32_t> outs;
     for (uint32_t i = 0; i < routine.params.size(); i++)
-      if (routine.params[i].mode != wire::ParamMode::kIn) info.outs.push_back(i);
+      if (routine.params[i].mode != wire::ParamMode::kIn) outs.push_back(i);
+    if (!outs.empty())
+      info.outs = std::make_shared<const std::vector<uint32_t>>(std::move(outs));
     m_routines[routine.routine_id] = std::move(info);
   } else if (o != Outcome::kRefused) {
     // A PREPARE that was sent and did not answer OK leaves the id not
@@ -1175,13 +1222,11 @@ Outcome Worker::call(uint64_t routine_id, uint64_t library_epoch,
     return Outcome::kRefused;
   }
   // The RESULT is checked against the parameters in force now: a nested
-  // PREPARE or DROP may change the entry meanwhile.
+  // PREPARE or DROP may change the entry meanwhile (a copy without
+  // allocation: the list of OUT parameters is shared).
   const RoutineInfo info = it->second;
-  // The top-level call reuses one buffer; a nested call, made while the
-  // outer one waits, gets its own.
-  std::string nested;
-  std::string &body = m_depth == 0 ? m_call_body : nested;
-  body.clear();
+  // One buffer per depth: a nested call is made while the outer one waits.
+  std::string &body = buffer(m_call_bodies);
   Writer w(&body);
   w.u64(routine_id);
   w.u64(library_epoch);
@@ -1211,6 +1256,21 @@ Outcome Worker::drop(uint64_t routine_id, std::string *error) {
   const Outcome o = request(q, hooks, &result, error);
   if (o != Outcome::kRefused) m_routines.erase(routine_id);
   return o;
+}
+
+Outcome Worker::send_pending_drops(std::string *error) {
+  if (m_unsent_drops.empty()) return Outcome::kOk;
+  if (!m_usable) return died(error);
+  if (m_depth != 0) {
+    *error = "DROP is sent at top level only here";
+    return Outcome::kRefused;
+  }
+  const std::vector<uint64_t> ids(m_unsent_drops.begin(), m_unsent_drops.end());
+  m_unsent_drops.clear();
+  for (const uint64_t id : ids)
+    if (const Outcome o = drop(id, error); o != Outcome::kOk)
+      return m_usable ? o : died(error);
+  return Outcome::kOk;
 }
 
 Outcome Worker::options(const OptionsMsg &options, Error *guest_error,

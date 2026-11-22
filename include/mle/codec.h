@@ -27,7 +27,9 @@
 
   Decoding treats its input as hostile: every length and count is checked
   against the bytes that are left and against the limits of §12, every value
-  against its domain, and a body must be consumed exactly. A decoder returns
+  against its domain, and a body must be consumed exactly. A decoder reads
+  each byte of its input once, front to back, and copies a field before it
+  checks it, so it may decode a message in the region itself (§1). A decoder returns
   false and sets an error text on the first problem; it never reads outside
   its input. What a decoder refuses is malformed: from a worker, a violation.
   One thing a decoder accepts although the host must not use it: a float of
@@ -127,11 +129,15 @@ class Writer {
     once anything failed; the first failure is kept in error(). */
 class Reader {
  public:
-  Reader(const void *data, size_t len, Sender from = Sender::kWorker)
+  /** origin: the offset of data in the message body (offsets count from
+      the body's start: VECTOR padding, error texts). */
+  Reader(const void *data, size_t len, Sender from = Sender::kWorker,
+         size_t origin = 0)
       : m_begin(static_cast<const unsigned char *>(data)),
         m_pos(m_begin),
         m_end(m_begin + len),
-        m_from(from) {}
+        m_from(from),
+        m_origin(origin) {}
   explicit Reader(std::string_view s, Sender from = Sender::kWorker)
       : Reader(s.data(), s.size(), from) {}
 
@@ -162,7 +168,9 @@ class Reader {
   bool fail(std::string what);
   bool ok() const { return m_error.empty(); }
   const std::string &error() const { return m_error; }
-  size_t offset() const { return static_cast<size_t>(m_pos - m_begin); }
+  size_t offset() const {
+    return m_origin + static_cast<size_t>(m_pos - m_begin);
+  }
   size_t remaining() const { return static_cast<size_t>(m_end - m_pos); }
 
  private:
@@ -173,6 +181,7 @@ class Reader {
 
   const unsigned char *m_begin, *m_pos, *m_end;
   Sender m_from;
+  size_t m_origin;
   std::string m_error;
 };
 
@@ -454,6 +463,10 @@ bool decode_ready_head(std::string_view body, uint32_t *version,
                        std::string *info, std::string *error);
 bool decode(std::string_view body, ResultMsg *m, std::string *error);
 bool decode(std::string_view body, SqlMsg *m, std::string *error);
+/** An SQL message after its action and statement id (the first
+    wire::kSqlHeadSize bytes, read by the caller into m->action and
+    m->stmt_id): rest is the body from that offset. */
+bool decode_sql_rest(std::string_view rest, SqlMsg *m, std::string *error);
 bool decode(std::string_view body, LibraryMsg *m, std::string *error);
 /** Messages of the host. A later batch of a result set carries no columns:
     set_columns is the set's column count then. */
@@ -471,7 +484,8 @@ bool decode(std::string_view body, LibraryResultMsg *m, std::string *error);
 /** Reassembles a message that may arrive in several chunks (§5.2). The
     caller copies each MessageHeader out of the region first and passes the
     copy; add() copies the chunk's bytes once, so the arena may change
-    afterwards. Every chunk is checked against the arena size, the message
+    afterwards (or, for a message of one chunk, leaves them for a decoder
+    that reads each byte once). Every chunk is checked against the arena size, the message
     size limit and the first chunk (its op, status, depth, call_seq,
     total_len and TAINTED flag). What only the receiver knows (the ops
     allowed, the expected depth and call_seq, the limit of this op) it
@@ -483,7 +497,9 @@ class Assembler {
   Assembler(uint32_t arena_size, uint64_t max_message)
       : m_arena_size(arena_size), m_max_message(max_message) {}
 
-  Step add(const wire::MessageHeader &h, const void *chunk);
+  /** keep false: the chunk is checked and counted, not copied (a message of
+      one chunk that the caller decodes where it is). */
+  Step add(const wire::MessageHeader &h, const void *chunk, bool keep = true);
   /** After the first chunk: the body keeps only its first keep bytes; the
       chunks that follow are checked and counted, not stored (§5.3). */
   void discard_beyond(size_t keep);

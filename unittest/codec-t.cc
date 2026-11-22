@@ -22,10 +22,12 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "mle/codec.h"
@@ -1581,6 +1583,102 @@ TEST(MleAssembler, WorkerHeaderCheck) {
   EXPECT_TRUE(bad([](MessageHeader &h) {
     h.len = 0, h.total_len = 0, h.flags = 1;
   }, go));
+}
+
+// §1 region rules: a decoder reads each byte once and checks a field only
+// after it copied it, so a worker that changes the region while the host
+// decodes cannot make the host accept what it checked as something else.
+// A byte of a string flips between a valid and an invalid UTF-8 lead byte
+// on another thread: a decoder that validated the region and then copied it
+// would now and then keep an invalid string.
+TEST(MleRegionRules, FieldsAreCopiedBeforeTheyAreChecked) {
+  ResultMsg m;
+  m.ret = Value::string(std::string(64, 'a'));
+  m.error = Error{"", std::string(64, 'b'), {}, 0, "", 0};
+  m.console_out = "out";
+  std::string body;
+  encode(m, &body);
+  // The region: decoded where it is, as the host does with a RESULT.
+  std::vector<char> region(body.begin(), body.end());
+  const size_t ret_at = 1 + 1 + 4 + 32;  // a byte inside the returned string
+  const size_t message_at = body.rfind(std::string(64, 'b')) + 32;
+  std::atomic<bool> stop{false};
+  std::thread flipper([&] {
+    auto *r = reinterpret_cast<volatile char *>(region.data());
+    while (!stop.load(std::memory_order_relaxed)) {
+      r[ret_at] = '\xff';
+      r[message_at] = '\xff';
+      r[ret_at] = 'a';
+      r[message_at] = 'b';
+    }
+  });
+  int accepted = 0;
+  for (int i = 0; i < 200000; i++) {
+    ResultMsg got;
+    std::string error;
+    if (!decode(std::string_view(region.data(), region.size()), &got, &error))
+      continue;
+    ++accepted;
+    ASSERT_TRUE(got.ret && is_valid_utf8(got.ret->as_text()));
+    ASSERT_TRUE(got.error && is_valid_utf8(got.error->message));
+  }
+  stop = true;
+  flipper.join();
+  EXPECT_GT(accepted, 0);
+}
+
+// The SQL message decoded in two parts (head read by the receiver, the rest
+// where it is) is the message decoded whole; offsets count from the body.
+TEST(MleRegionRules, SqlRestIsTheWholeMessage) {
+  SqlMsg m;
+  m.action = wire::SqlAction::kExecute;
+  m.stmt_id = 77;
+  m.statement = "SELECT ?, ?";
+  m.params = {Value::vector({1.0f, 2.0f}), Value::string("x")};
+  m.max_rows = 5;
+  std::string body;
+  encode(m, &body);
+  SqlMsg rest;
+  rest.action = m.action;
+  rest.stmt_id = m.stmt_id;
+  std::string error;
+  ASSERT_TRUE(decode_sql_rest(std::string_view(body).substr(wire::kSqlHeadSize),
+                              &rest, &error))
+      << error;
+  EXPECT_EQ(rest, m);
+  // A bad byte is reported at its offset in the body.
+  std::string bad = body;
+  const size_t text_at = wire::kSqlHeadSize + 4;
+  bad[text_at] = '\xff';
+  EXPECT_FALSE(decode_sql_rest(std::string_view(bad).substr(wire::kSqlHeadSize),
+                               &rest, &error));
+  SqlMsg whole;
+  std::string whole_error;
+  EXPECT_FALSE(decode(bad, &whole, &whole_error));
+  EXPECT_EQ(error, whole_error);
+  // A field the action does not use.
+  rest.action = wire::SqlAction::kFetch;
+  EXPECT_FALSE(decode_sql_rest(std::string_view(body).substr(wire::kSqlHeadSize),
+                               &rest, &error));
+  EXPECT_NE(error.find("does not use"), std::string::npos) << error;
+}
+
+// A message of one chunk can be checked without being copied.
+TEST(MleAssembler, LeftInPlace) {
+  Assembler a(1024, 4096);
+  MessageHeader h{};
+  h.op = uint32_t(wire::Op::kResult);
+  h.len = 10;
+  h.total_len = 10;
+  const char chunk[10] = {};
+  EXPECT_EQ(a.add(h, chunk, false), Assembler::Step::kDone);
+  EXPECT_TRUE(a.body().empty());
+  Assembler b(1024, 4096);
+  h.flags = wire::kMore;
+  h.len = 1024;
+  h.total_len = 2000;
+  std::vector<char> big(1024);
+  EXPECT_EQ(b.add(h, big.data(), false), Assembler::Step::kError);
 }
 
 }  // namespace mle_codec_unittest

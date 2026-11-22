@@ -560,9 +560,10 @@ bool Reader::text(std::string *s, bool utf8, size_t max) {
   if (!u32(&n)) return false;
   if (remaining() < n) return fail("string length beyond the message");
   if (n > max) return fail("string longer than its limit");
-  std::string_view v(reinterpret_cast<const char *>(m_pos), n);
-  if (utf8 && !is_valid_utf8(v)) return fail("invalid UTF-8");
-  s->assign(v);
+  // Copied before it is checked: the input may be the region, which the
+  // worker can change at any time (§1: each byte is read once).
+  s->assign(reinterpret_cast<const char *>(m_pos), n);
+  if (utf8 && !is_valid_utf8(*s)) return fail("invalid UTF-8");
   m_pos += n;
   return true;
 }
@@ -944,14 +945,11 @@ void encode(const SqlMsg &m, std::string *out) {
   w.u32(m.row_width);
 }
 
-bool decode(std::string_view body, SqlMsg *m, std::string *error) {
-  return decode_with(body, Sender::kWorker, m, error, [](Reader &r, SqlMsg *x) {
+namespace {
+/** An SQL message after its action and statement id. */
+bool get_sql_rest(Reader &r, SqlMsg *x) {
     using wire::SqlAction;
-    uint8_t action;
-    if (!r.u8(&action)) return false;
-    if (action > wire::kMaxSqlAction) return r.fail("bad SQL action");
-    x->action = static_cast<SqlAction>(action);
-    if (!r.u64(&x->stmt_id) || !r.str(&x->statement) ||
+    if (!r.str(&x->statement) ||
         !get_values(r, &x->params) || !r.u8(&x->flags) ||
         !r.u32(&x->max_rows) || !r.u32(&x->row_width))
       return false;
@@ -971,7 +969,29 @@ bool decode(std::string_view body, SqlMsg *m, std::string *error) {
         (a != SqlAction::kExecuteMany && x->row_width != 0))
       return r.fail("a field the SQL action does not use is set");
     return true;
+}
+}  // namespace
+
+bool decode(std::string_view body, SqlMsg *m, std::string *error) {
+  return decode_with(body, Sender::kWorker, m, error, [](Reader &r, SqlMsg *x) {
+    uint8_t action;
+    if (!r.u8(&action)) return false;
+    if (action > wire::kMaxSqlAction) return r.fail("bad SQL action");
+    x->action = static_cast<wire::SqlAction>(action);
+    return r.u64(&x->stmt_id) && get_sql_rest(r, x);
   });
+}
+
+bool decode_sql_rest(std::string_view rest, SqlMsg *m, std::string *error) {
+  Reader r(rest.data(), rest.size(), Sender::kWorker, wire::kSqlHeadSize);
+  m->statement.clear();
+  m->params.clear();
+  m->flags = 0;
+  m->max_rows = 0;
+  m->row_width = 0;
+  if (get_sql_rest(r, m) && r.finish()) return true;
+  if (error != nullptr) *error = r.error();
+  return false;
 }
 
 void encode(const SqlResultMsg &m, std::string *out) {
@@ -1187,7 +1207,7 @@ void Assembler::discard_beyond(size_t keep) {
 }
 
 Assembler::Step Assembler::add(const wire::MessageHeader &h,
-                               const void *chunk) {
+                               const void *chunk, bool keep) {
   if (!m_error.empty()) return Step::kError;
   if (h.len > m_arena_size) return fail("chunk larger than the arena");
   const bool more = (h.flags & wire::kMore) != 0;
@@ -1213,7 +1233,9 @@ Assembler::Step Assembler::add(const wire::MessageHeader &h,
     return fail("more chunks announced after the last byte");
   if (!more && m_received + h.len != m_first.total_len)
     return fail("message truncated");
-  if (!m_discard) {
+  if (!keep && (more || m_received != 0))
+    return fail("only a message of one chunk can be left in place");
+  if (!m_discard && keep) {
     // The second chunk shows that the first was accepted: now the whole
     // body is allocated at once.
     if (m_received != 0 && m_body.capacity() < m_first.total_len)

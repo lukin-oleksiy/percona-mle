@@ -28,10 +28,13 @@
   interruption with its grace clock, deadlines, and the validation of
   everything the worker sends.
 
-  The worker is untrusted. All protocol state is private to this object; a
-  message header is copied out of the region once, a chunk's bytes are
-  copied once, and nothing the host wrote is read back. A violation ends
-  the worker. A worker that died, was ended or retired is never used again:
+  The worker is untrusted. All protocol state is private to this object;
+  each byte of a message is read from the region at most once (§1): a
+  header is copied out before it is checked, a message of one chunk is
+  decoded where it is, field by field, each field copied before it is
+  checked or used, and a message of several chunks is copied once as it is
+  reassembled. Nothing the host wrote is read back. A violation ends the
+  worker. A worker that died, was ended or retired is never used again:
   every later request returns Outcome::kDied with failure() as the reason.
 
   Threads: one thread at a time uses a Worker (the session's thread);
@@ -212,6 +215,9 @@ struct WorkerStats {
 /** An SQL_RESULT ERROR the host sent during the current top-level request
     and still holds (§10.8). */
 struct HeldError {
+  /** call_seq of the top-level request it was sent in: an entry of an
+      earlier request is not held (forgotten by this number, not cleared). */
+  uint64_t call_seq = 0;
   uint64_t error_id = 0;
   uint32_t sql_errno = 0;
   std::string sqlstate;
@@ -296,6 +302,14 @@ class Worker {
   bool is_prepared(uint64_t routine_id) const {
     return m_routines.contains(routine_id);
   }
+  /** True while any id is prepared in the worker, or a DROP of one still
+      waits to be sent. */
+  bool has_prepared() const {
+    return !m_routines.empty() || !m_unsent_drops.empty();
+  }
+  /** Sends the DROPs that wait to be sent (the worker was busy when the
+      ids were dropped), at top level only; kOk when none waits. */
+  Outcome send_pending_drops(std::string *error);
   /** The READY languages. */
   const std::vector<std::string> &languages() const { return m_languages; }
   /** The minor version in use with this worker (§14). */
@@ -316,9 +330,17 @@ class Worker {
   struct SqlTrace;
   struct Message {
     wire::MessageHeader h{};
+    /** The body: in the region (a message of one chunk, decoded where it
+        is, each byte read at most once) or in body (reassembled). Valid
+        until the host posts again. */
+    std::string_view data;
+    bool in_region = false;
     std::string body;
-    /** An SQL message over the bound on request bytes: body holds only its
-        action and statement id. */
+    /** An SQL message: its action and statement id, read by receive(). */
+    wire::SqlAction sql_action = wire::SqlAction::kExecute;
+    uint64_t sql_stmt_id = 0;
+    /** An SQL message over the bound on request bytes: only its action and
+        statement id are known. */
     bool discarded = false;
     /** Bytes reserved with CallHooks::sql_bytes_reserve. */
     uint64_t reserved = 0;
@@ -328,8 +350,10 @@ class Worker {
   struct RoutineInfo {
     size_t params = 0;
     bool has_return = false;
-    /** Indexes of the OUT and INOUT parameters, ascending. */
-    std::vector<uint32_t> outs;
+    /** Indexes of the OUT and INOUT parameters, ascending; nullptr for
+        none. Shared: a CALL holds the entry it was sent for without a copy
+        of the list. */
+    std::shared_ptr<const std::vector<uint32_t>> outs;
   };
 
   /** A message in chunks, as the grace clock sees it (§11.1 step 3 (b)). */
@@ -377,9 +401,11 @@ class Worker {
   Wait send(wire::Op op, std::string_view body, CallHooks *hooks,
             bool begins_top, bool interruptible, int64_t deadline,
             std::string *error);
-  /** Waits for and reassembles the next message. */
+  /** Waits for the next message; reassembles it if it has several chunks.
+      in_place: a message of one chunk is left in the region (m->data), for
+      a decoder that reads each byte once; else it is copied. */
   Wait receive(Message *m, CallHooks *hooks, const Expect &expect,
-               int64_t deadline, std::string *error);
+               int64_t deadline, std::string *error, bool in_place);
   /** Waits for the worker's post. transfer: the transfer this turn of the
       worker belongs to, or nullptr; turn_len: the chunk the worker reads
       or posts in this turn, 0 if the turn has no bound of its own. */
@@ -410,7 +436,14 @@ class Worker {
   void hold_error(const SqlResultMsg &error);
   /** A request is asked for: at top level, the record of the last
       top-level request is not this one's. */
-  void forget_record();
+  void forget_record() {
+    // No record is made between top-level requests (the word has no
+    // kRunning), so this cannot lose one.
+    if (m_depth == 0) m_interrupt.store(0, std::memory_order_release);
+  }
+  /** A buffer of this depth, kept for the worker's life (no allocation per
+      request): the body of a CALL, an SQL_RESULT. */
+  std::string &buffer(std::array<std::string, wire::kMaxDepth + 2> &buffers);
   /** The top-level request is complete: no interrupt is recorded for it
       from now on; a record that was made stays readable. */
   void end_running() {
@@ -482,16 +515,18 @@ class Worker {
   /** total_len of the host message posted last. */
   uint64_t m_last_host_total = 0;
 
-  // ERRORs held for §10.8: the most recent ones of the top-level request,
-  // m_held_count of them so far (the ring keeps the last kHeldErrors).
+  // ERRORs held for §10.8: the most recent ones (a ring of kHeldErrors);
+  // an entry is held while its call_seq is that of the last top-level
+  // request.
   std::array<HeldError, wire::kHeldErrors> m_held;
-  uint64_t m_held_count = 0;
+  uint64_t m_held_next = 0;
   /** The last error_id taken in the top-level request. */
   uint64_t m_error_ids = 0;
 
   SqlTrace *m_trace = nullptr;
-  /** Body of the top-level CALL, reused. */
-  std::string m_call_body;
+  /** Bodies of CALLs and of SQL_RESULTs, one per depth, reused. */
+  std::array<std::string, wire::kMaxDepth + 2> m_call_bodies;
+  std::array<std::string, wire::kMaxDepth + 2> m_reply_bodies;
 };
 
 }  // namespace mle
