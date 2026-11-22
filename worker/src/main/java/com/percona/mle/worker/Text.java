@@ -69,41 +69,78 @@ final class Text {
   }
 
   /**
-   * s as well-formed UTF-8, repaired (§7.1), in one pass where nothing needs repair: the JDK's
-   * encoder (vectorized for Latin-1 strings) writes '?' for an unpaired surrogate, so only output
-   * with more '?' than s has is encoded again, repairing. (A scan for unpaired surrogates before
-   * getBytes cost ~0.7 ns per character after a large fetch, protocol-review.md §17.) The output
-   * is searched for a '?' 8 bytes at a time; only where there is one are the '?' counted.
+   * s as well-formed UTF-8, repaired (§7.1). A string the JDK keeps as Latin-1 has no surrogate:
+   * its encoder's output (a copy for ASCII) is the answer. Another one is encoded here, repairing
+   * as it goes, in place of the JDK's encoder, which writes '?' for an unpaired surrogate. (Any
+   * scan of a large string or of its output, on top of the encoding, cost up to 0.36 ns per byte
+   * where it was compiled into its caller: echo of 64 KiB +4..+6 %.) A short string is checked
+   * for unpaired surrogates first.
    */
   static byte[] utf8(String s) {
-    byte[] b = s.getBytes(StandardCharsets.UTF_8);
-    int first = indexOfMark(b);
-    if (first < 0) return b;
-    int marks = 0;
-    for (int i = first; i < b.length; i++) marks += b[i] == '?' ? 1 : 0;
-    int own = 0;  // String.indexOf is vectorized, for either coder of a String
-    for (int i = s.indexOf('?'); i >= 0 && own <= marks; i = s.indexOf('?', i + 1)) own++;
-    return own == marks ? b : utf8Repairing(s);
+    int n = s.length();
+    if (n <= SHORT ? firstUnpaired(s) < 0 : latin1(s)) return s.getBytes(StandardCharsets.UTF_8);
+    return utf8Repairing(s);
   }
 
-  private static final java.lang.invoke.VarHandle LONGS =
-      java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
-  private static final long MARKS = 0x3F3F3F3F3F3F3F3FL, ONES = 0x0101010101010101L, HIGHS = 0x8080808080808080L;
+  private static final int SHORT = 32;
 
-  /** The index of the first '?' (0x3F) in b, or -1; 8 bytes at a time (a zero byte of b ^ '?'). */
-  static int indexOfMark(byte[] b) {
-    int n = b.length, i = 0;
-    for (; i <= n - 8; i += 8) {
-      long v = (long) LONGS.get(b, i) ^ MARKS;
-      if (((v - ONES) & ~v & HIGHS) != 0) break;  // exact for "some byte is zero"
-    }
-    for (; i < n; i++)
-      if (b[i] == '?') return i;
-    return -1;
+  /**
+   * The class of String.chars()'s spliterator for a string kept as Latin-1 (the JDK makes one of
+   * its own for each of its two forms), or null where it cannot be told (compact strings off).
+   */
+  private static final Class<?> LATIN1_CHARS = latin1Chars();
+
+  private static Class<?> latin1Chars() {
+    Class<?> c = "\u00e9".chars().spliterator().getClass();
+    Class<?> other = "\u0100".chars().spliterator().getClass();
+    return c != other && c.getName().equals("java.lang.StringLatin1$CharsSpliterator") ? c : null;
+  }
+
+  /** Whether the JDK keeps s as Latin-1 (it then has no surrogate); false when not known. */
+  static boolean latin1(String s) {
+    return LATIN1_CHARS != null && s.chars().spliterator().getClass() == LATIN1_CHARS;
   }
 
   /** s as UTF-8, each unpaired surrogate as U+FFFD (EF BF BD); longer than a message may be: TooLarge. */
   private static byte[] utf8Repairing(String s) {
+    int n = s.length();
+    if (n > ONE_PASS) return utf8Exact(s);
+    // One pass into room for the longest form (3 bytes per char; a pair takes 4 of its 6), then
+    // the bytes written, as the JDK's encoder does.
+    byte[] out = new byte[n * 3];
+    int p = 0;
+    for (int i = 0; i < n; i++) {
+      char c = s.charAt(i);
+      if (c < 0x80) {
+        out[p++] = (byte) c;
+      } else if (c < 0x800) {
+        out[p++] = (byte) (0xC0 | c >> 6);
+        out[p++] = (byte) (0x80 | (c & 0x3F));
+      } else if (!Character.isSurrogate(c)) {
+        out[p++] = (byte) (0xE0 | c >> 12);
+        out[p++] = (byte) (0x80 | (c >> 6 & 0x3F));
+        out[p++] = (byte) (0x80 | (c & 0x3F));
+      } else if (Character.isHighSurrogate(c) && i + 1 < n && Character.isLowSurrogate(s.charAt(i + 1))) {
+        int cp = Character.toCodePoint(c, s.charAt(++i));
+        out[p++] = (byte) (0xF0 | cp >> 18);
+        out[p++] = (byte) (0x80 | (cp >> 12 & 0x3F));
+        out[p++] = (byte) (0x80 | (cp >> 6 & 0x3F));
+        out[p++] = (byte) (0x80 | (cp & 0x3F));
+      } else {
+        out[p++] = (byte) 0xEF;
+        out[p++] = (byte) 0xBF;
+        out[p++] = (byte) 0xBD;
+      }
+    }
+    if (p > Wire.MAX_WORKER_MESSAGE) throw new MessageWriter.TooLarge();
+    return p == out.length ? out : java.util.Arrays.copyOf(out, p);
+  }
+
+  /** Strings longer than this many chars are measured first (utf8Exact), not given 3 bytes per char. */
+  private static final int ONE_PASS = 1 << 20;
+
+  /** utf8Repairing for a long string: its length first, then the bytes. */
+  private static byte[] utf8Exact(String s) {
     int n = s.length();
     long length = 0;
     for (int i = 0; i < n; i++) {

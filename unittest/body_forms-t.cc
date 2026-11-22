@@ -390,6 +390,32 @@ TEST_F(MleBodyForms, JsDateStringsNameTheZoneAsV8) {
             Value::string("Mon Feb 10 1653 07:54:36 GMT+0141 (Eastern European Standard Time) | Invalid Date"));
 }
 
+// Text the worker sends is well-formed UTF-8 (§7.1): an unpaired surrogate
+// becomes U+FFFD, a '?' stays; short and long strings, ASCII, Latin-1 and
+// others (the JVM worker encodes each form its own way).
+TEST_F(MleBodyForms, JsStringsRepairedToUtf8) {
+  const std::string fffd = "\xEF\xBF\xBD", e = "\xC3\xA9", zh = "\xE4\xB8\xAD", pair = "\xF0\x9F\x98\x80";
+  auto rep = [](const std::string &x, int n) {
+    std::string r;
+    for (int i = 0; i < n; i++) r += x;
+    return r;
+  };
+  struct Case {
+    std::string expr, want;
+  };
+  for (const Case &c : std::vector<Case>{
+           {"'a?b'", "a?b"},
+           {"'a?\\uD800b'", "a?" + fffd + "b"},
+           {"'?'.repeat(40) + '\\uDC00'", rep("?", 40) + fffd},
+           {"'x?'.repeat(40)", rep("x?", 40)},
+           {"'\\u00e9?'.repeat(40)", rep(e + "?", 40)},
+           {"'\\u4e2d?'.repeat(40) + '\\uD83D\\uDE00'", rep(zh + "?", 40) + pair},
+           {"'\\u4e2d'.repeat(40) + '\\uDE00\\uD83D' + 'x'.repeat(40)", rep(zh, 40) + fffd + fffd + rep("x", 40)},
+           {"'a'.repeat(100) + '\\uD800'", rep("a", 100) + fffd}}) {
+    EXPECT_EQ(ret(js_expr(c.expr, kVarchar), {}), Value::string(c.want)) << c.expr;
+  }
+}
+
 TEST_F(MleBodyForms, JsIntegerResults) {
   struct Case {
     const char *expr;
