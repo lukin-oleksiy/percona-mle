@@ -183,8 +183,10 @@ account that was dropped or renamed (away from that name), and, once an
 account may have been created under a name or renamed to it, every
 worker whose principal names an account that did not exist when the
 worker started (an owner that does not exist, a session whose account was
-dropped while it stayed connected). It does so before the statement that
-changed the accounts reports success. So no worker serves two
+dropped while it stayed connected). It decides so before the statement
+that changed the accounts reports success: a worker so retired is used
+for no further top-level request (one already in progress runs to its
+end) and is never kept for another session. So no worker serves two
 incarnations of one account. The host MUST NOT send a worker a PREPARE, CALL or
 PARSE_LIBRARY of another principal, nor a library body that its
 principal's routine may not have (§9.10), and runs a worker's SQL only
@@ -1679,7 +1681,9 @@ retires a worker when:
 
 * it died, timed out, committed a violation, or was killed after the
   grace period;
-* an account of its principal was dropped or renamed (§1);
+* an account of its principal was dropped or renamed, or may have been
+  created after it started while it named an account that did not exist
+  (§1);
 * it answered INTERNAL to DROP, RESET or OPTIONS (for a nested DROP:
   after the top-level request, which keeps its own outcome);
 * its READY shows an incompatible worker (§9.1);
@@ -2107,7 +2111,9 @@ or its routines were dropped) may call `mle_set_session_state()`: that
 ends the fixed options as a reset does, and the next request fixes the
 new ones. Before it decides, the host DROPs the ids its session still has
 prepared for `mle_eval()` code and for routines that no longer exist
-(`mle_eval()` code is not a cached program). The host checks a setting's value in
+(`mle_eval()` code is not a cached program). A routine that another
+session dropped stays in this session's routine cache until the server
+evicts it, and counts as cached until then. The host checks a setting's value in
 `mle_set_session_state()`, so a worker's `MLE-Option` is not reached in
 practice.
 
@@ -2144,6 +2150,18 @@ stored function the server lets the host raise none, and it becomes a
 routine error. Wanted: a server service that raises a condition by
 number, SQLSTATE and text.
 
+**Temporal parameters in CAST.** The server formats a temporal
+parameter that is the whole argument of CAST or CONVERT to a character
+type with the decimals of the string type it infers (a debug server
+asserts). The host binds such a TIME or DATETIME as the text the server
+would produce. Wanted: a server fix.
+
+**Accounts' incarnations.** The server has no service that tells one
+incarnation of an account from another; the host takes an account as
+existing at a worker's start by the server's definer lookup, and not as
+existing if it was dropped since the session began (so a worker may be
+retired sooner than needed, never later).
+
 **Owners that trust each other.** An administrator may declare a set of
 accounts whose code may share workers; the host then treats them as one
 owner in a principal. Without it, invoker-rights routines of different
@@ -2166,7 +2184,9 @@ record (§11.1 step 1). Measured, the host's fixed cost per call is what
 an implementation adds around that exchange; so the host keeps per
 session (not per request) the fixed options and the zone's offset
 interval; it keeps the principal it computed keyed by the routine and
-the security context's account (an identity compare), forgotten when an
+the security context's account (comparing the account itself, not a key
+built from it, and not the context's address, which the server reuses),
+forgotten when an
 account is dropped or renamed; it forgets held errors (§10.8) by a
 generation number rather than by clearing; and it copies from the
 region only the fields it uses (§1). A worker encodes text
@@ -2320,3 +2340,4 @@ Both JavaScript workers make these choices alike:
 | A `Set` as a JSON result | `{}` (no `toJSON`) |
 | A plain `Array` for VECTOR; `ArrayBuffer` or `DataView` for BLOB | accepted |
 | Call stack exceeded | a `RangeError` in guest code (§9.4: GUEST_ERROR when uncaught) |
+| A BigInt returned for DOUBLE / for JSON | its nearest double / `MLE-Type` (as `JSON.stringify` refuses it) |

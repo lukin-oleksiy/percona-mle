@@ -403,6 +403,8 @@ TEST_F(MleBodyForms, JsOtherResults) {
   const ParamType dbl = ty(Tag::kF64, "DOUBLE");
   EXPECT_EQ(ret(js_expr("0.5", dbl), {}), Value::f64(0.5));
   EXPECT_EQ(ret(js_expr("'1e3'", dbl), {}), Value::f64(1000));
+  // A BigInt for DOUBLE is its nearest double, in both JavaScript workers (Appendix B.7).
+  EXPECT_EQ(ret(js_expr("10n", dbl), {}), Value::f64(10));
   const ParamType dec = ty(Tag::kDecimal, "DECIMAL");
   EXPECT_EQ(ret(js_expr("0.1", dec), {}), Value::decimal("0.1"));
   EXPECT_EQ(ret(js_expr("'12.345'", dec), {}), Value::decimal("12.345"));
@@ -420,7 +422,6 @@ TEST_F(MleBodyForms, JsOtherResults) {
            {"10n", json},
            {"'abc'", blob},
            {"NaN", dbl},
-           {"10n", dbl},
            {"'x'", dec},
            {"'now'", ty(Tag::kDate, "DATE")}}) {
     uint32_t s;
