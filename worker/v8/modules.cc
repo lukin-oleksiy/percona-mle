@@ -74,13 +74,6 @@ bool library_name(std::string_view s) {
   return !s.empty() && s.size() <= w::kMaxLibraryName && s.find('\0') == std::string_view::npos;
 }
 
-/** A language identifier: 1 to 32 characters of [a-z0-9_] (§9.1). */
-bool identifier(std::string_view s) {
-  return !s.empty() && s.size() <= w::kMaxIdentifier && std::all_of(s.begin(), s.end(), [](char c) {
-    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
-  });
-}
-
 }  // namespace
 
 const Worker::Library *Worker::lib_resolve(const LibraryName &lib, std::string *why) {
@@ -115,25 +108,23 @@ const Worker::Library *Worker::lib_resolve(const LibraryName &lib, std::string *
   const std::string_view language = r.str(), body = r.str();
   const auto version = r.get<uint64_t>();
   const std::string_view message = r.str();
-  r.finish();
+  uint64_t held = version;
   switch (status) {
     case uint8_t(w::LibraryStatus::kRefused):
-      if (!language.empty() || !body.empty() || version != 0) protocol_failure("a LIBRARY_RESULT REFUSED with a body");
       *why = message.empty() ? "the library " + lib.schema + "." + lib.name + " is not available" : std::string(message);
       return nullptr;
     case uint8_t(w::LibraryStatus::kUnchanged):
-      if (known_version == 0 || version != known_version || !identifier(language) || !body.empty() || !message.empty())
-        protocol_failure("a LIBRARY_RESULT UNCHANGED outside its domain");
+      // The body the worker holds, under the version it named (§1: UNCHANGED against a body it holds).
+      if (known_version == 0) protocol_failure("a LIBRARY_RESULT UNCHANGED for a library the worker does not hold");
+      held = known_version;
       break;
     case uint8_t(w::LibraryStatus::kBody):
-      if (version == 0 || !identifier(language) || !message.empty())
-        protocol_failure("a LIBRARY_RESULT BODY outside its domain");
       m_libraries[key] = Library{version, std::string(language), std::string(body)};
       break;
     default:
       protocol_failure("an unknown LIBRARY_RESULT status");
   }
-  answers[key] = Answer{q.library_epoch, version};
+  answers[key] = Answer{q.library_epoch, held};
   return &m_libraries[key];
 }
 

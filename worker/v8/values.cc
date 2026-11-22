@@ -314,7 +314,6 @@ Temporal read_temporal(Reader &r, w::Tag tag) {
   t.second = r.get<uint8_t>();
   t.micro = r.get<uint32_t>();
   t.negative = r.boolean();
-  if (!valid_temporal(t)) protocol_failure("a DATE, TIME or DATETIME outside its domain");
   return t;
 }
 
@@ -426,21 +425,16 @@ Local<Value> Values::integer(int64_t v, bool is_unsigned, const ParamType *t) {
   }
 }
 
-Local<Value> Values::temporal(const Temporal &t, bool argument) {
+Local<Value> Values::temporal(const Temporal &t) {
   if (t.tag == w::Tag::kTime) return v8_string(m_iso, time_text(t));
   using namespace std::chrono;
   const year_month_day ymd{year(t.year), month(t.month), day(t.day)};
-  if (!ymd.ok() || t.year == 0) {
-    if (argument) {
-      char b[64];
-      std::snprintf(b, sizeof b, "%04u-%02u-%02u %s%u:%02u:%02u.%06u", unsigned{t.year}, unsigned{t.month},
-                    unsigned{t.day}, t.negative ? "-" : "", t.hour, unsigned{t.minute}, unsigned{t.second},
-                    t.micro);
-      throw ConversionError{std::string("the ") + kTagNames[static_cast<uint8_t>(t.tag)] + " value " + b +
-                            " has no JavaScript equivalent (zero date?)"};
-    }
-    return v8::Date::New(context(), std::nan("")).ToLocalChecked();  // a zero date in a row: an invalid Date
-  }
+  // Oracle's rule: a zero date (and MySQL's partial dates and impossible days, which no Date can
+  // be) is an Invalid Date, as an argument and in a row. Year 0 with a month and a day is a date.
+  // So is a clock time no DATETIME has: the host sends none.
+  if (!ymd.ok() ||
+      (t.tag == w::Tag::kDatetime && (t.hour > 23 || t.minute > 59 || t.second > 59 || t.micro > 999999)))
+    return v8::Date::New(context(), std::nan("")).ToLocalChecked();
   const double ms = t.tag == w::Tag::kDate ? m_opt->epoch_ms(t.year, t.month, t.day, 0, 0, 0, 0)
                                            : m_opt->epoch_ms(t.year, t.month, t.day, t.hour, t.minute,
                                                              t.second, t.micro);
@@ -459,7 +453,6 @@ Local<v8::ArrayBuffer> buffer_of(v8::Isolate *iso, std::span<const std::byte> da
     the arena would be valid only until the worker's next write there (§7.2). */
 Local<Value> vector_of(v8::Isolate *iso, Reader &r) {
   const auto dims = r.get<uint32_t>();
-  if (dims < 1 || dims > w::kMaxVectorDimensions) protocol_failure("a VECTOR with an illegal number of dimensions");
   r.align();
   const auto data = r.take(size_t{dims} * 4);
   return v8::Float32Array::New(buffer_of(iso, data), 0, dims);
@@ -469,17 +462,13 @@ Local<Value> vector_of(v8::Isolate *iso, Reader &r) {
 
 Local<Value> Values::argument(Reader &r, const ParamType &t) { return value(r, t, true); }
 
-Local<Value> Values::column(Reader &r, const ParamType &t, const Options *rules) {
-  struct Use {
-    const Options *&slot, *saved;
-    ~Use() { slot = saved; }
-  } use{m_rules, m_rules};
-  if (rules != nullptr) m_rules = rules;
-  return value(r, t, false);
-}
+Local<Value> Values::column(Reader &r, const ParamType &t) { return value(r, t, false); }
 
 Local<Value> Values::value(Reader &r, const ParamType &t, bool argument) {
   const auto tag = r.get<uint8_t>();
+  // The value is decoded by its own tag, which is its type's unless it is NULL (§1, §7.3).
+  if (tag != static_cast<uint8_t>(t.tag) && tag != static_cast<uint8_t>(w::Tag::kNull))
+    protocol_failure("a value whose tag is not its type's");
   switch (static_cast<w::Tag>(tag)) {
     case w::Tag::kNull:
       return v8::Null(m_iso);
@@ -493,7 +482,6 @@ Local<Value> Values::value(Reader &r, const ParamType &t, bool argument) {
       return v8::Number::New(m_iso, r.get<float>());
     case w::Tag::kDecimal: {
       const std::string_view s = r.str();
-      if (!valid_decimal(s)) protocol_failure("a DECIMAL outside its domain");
       if (rules()->decimal_type == DecimalType::kNumber)
         return v8::Number::New(m_iso, std::strtod(std::string(s).c_str(), nullptr));
       return v8_string(m_iso, s);
@@ -524,15 +512,12 @@ Local<Value> Values::value(Reader &r, const ParamType &t, bool argument) {
     case w::Tag::kDate:
     case w::Tag::kTime:
     case w::Tag::kDatetime:
-      return temporal(read_temporal(r, static_cast<w::Tag>(tag)), argument);
+      return temporal(read_temporal(r, static_cast<w::Tag>(tag)));
     case w::Tag::kTimestamp: {
-      // An instant: a Date, whatever the session's zone. Date counts milliseconds.
+      // An instant: a Date, whatever the session's zone. Date counts milliseconds. MySQL's zero
+      // timestamp is an Invalid Date (Oracle's rule).
       const auto us = r.get<int64_t>();
-      if (us == w::kZeroTimestamp) {
-        if (argument) throw ConversionError{"the zero TIMESTAMP has no JavaScript equivalent"};
-        return v8::Date::New(context(), std::nan("")).ToLocalChecked();  // in a row: an invalid Date
-      }
-      if (us < 0 || us > w::kMaxTimestamp) protocol_failure("a TIMESTAMP outside its domain");
+      if (us == w::kZeroTimestamp) return v8::Date::New(context(), std::nan("")).ToLocalChecked();
       return v8::Date::New(context(), static_cast<double>(us / 1000)).ToLocalChecked();
     }
     case w::Tag::kJson: {
@@ -647,8 +632,9 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
       }
       const auto [lo, hi] = int_range(t);
       if (b < lo || b > hi) cannot(v, t);
-      const bool is_unsigned = t.is_unsigned || t.tag == w::Tag::kU64;
-      need(put_tag(wr, is_unsigned ? w::Tag::kU64 : w::Tag::kI64) &&
+      // The tag of the declared type (§7.3: an unsigned type below BIGINT is I64).
+      const bool as_u64 = t.tag == w::Tag::kU64 || b > INT64_MAX;
+      need(put_tag(wr, as_u64 ? w::Tag::kU64 : w::Tag::kI64) &&
            wr.put(static_cast<uint64_t>(static_cast<unsigned __int128>(b))));
       return;
     }

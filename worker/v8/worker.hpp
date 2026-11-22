@@ -23,6 +23,11 @@
   routines in Oracle's form; errors and the console; SQL (§10) with the statement states; database
   libraries (§9.10, modules.cc); interruption through Isolate::TerminateExecution; the heap limit
   as EXHAUSTED, which retires the worker.
+
+  Of the host's messages the worker checks what §1 lists: lengths and counts against the bytes,
+  every tag and kind it switches on, the numbers it finds its own state by, and that the message
+  is one its state can take (the mailbox does that for the header). Domains, reserved fields and
+  trailing bytes are the host's to get right.
 */
 
 #ifndef MLE_V8_WORKER_HPP
@@ -31,11 +36,13 @@
 #include <libplatform/libplatform.h>
 #include <v8.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -57,6 +64,9 @@ struct Config {
   /** The largest host message the worker holds, in bytes; a larger one is discarded and failed
       where it belongs (§5.3). 0: whatever memory can be allocated. */
   uint64_t message_max = 0;
+  /** The most kept statements per routine (§10.1): a statement a routine prepares stays prepared
+      for its later calls. 0: none is kept. */
+  uint32_t kept_statements = 32;
 };
 
 /** An Error of a RESULT (§7.4). */
@@ -144,12 +154,24 @@ class Worker {
     bool prepared = false;
     /** PASS_RESULT_TO_CLIENT, given when the id was opened. */
     bool to_client = false;
-    /** The current result set: its columns' types and its total_rows. */
+    /** A prepared statement's number of parameter markers. */
+    uint32_t param_count = 0;
+    /** The types of the columns of the current result set; of a prepared statement, of the columns
+        last received, which the first batch of a later set may leave out (§10.3). */
     std::vector<ParamType> columns;
-    uint64_t total_rows = 0;
+    /** Of a prepared statement: those columns as sql.js takes them (the labels; the columns). */
+    v8::Global<v8::Value> labels, described;
+    /** A kept statement (§10.1): the scope of the request that uses it now, or 0; when it was used
+        last; and what it was prepared from (the flag and the text), by which a later PREPARE of
+        the routine finds it. */
+    uint64_t lease = 0;
+    uint64_t used = 0;
+    std::string key;
   };
+  using Statements = std::unordered_map<uint64_t, Statement>;
 
-  /** A request being served, at its depth. */
+  /** A request being served, at its depth: a frame of m_frames, used again by the next request
+      at that depth. */
   struct Request {
     uint32_t op = 0;
     uint32_t depth = 0;
@@ -159,28 +181,28 @@ class Worker {
     bool guest = false;
     uint64_t routine_id = 0;
     uint64_t library_epoch = 0;
-    std::string schema;
-    /** CALL: the code this activation started with. */
+    /** CALL: the code this activation started with. PREPARE: the routine being loaded. */
     std::shared_ptr<Routine> routine;
-    /** The statement ids of this request: the worker counts them from 1. */
-    uint64_t statement_ids = 0;
-    std::unordered_map<uint64_t, Statement> statements;
-    Request *outer = nullptr;
+    /** The statements of this request that are not kept. */
+    Statements statements;
+    /** The request uses kept statements of its routine (their lease is its scope). */
+    bool leased = false;
   };
 
   /** What a request ends with: the RESULT's status, Error and values. */
   struct Reply {
     wire::Status status = wire::Status::kOk;
     ErrorInfo error;
-    /** The start of the RESULT's body: has_return, the return value, out_params. Empty: none. */
-    std::vector<std::byte> values;
+    /** The start of the RESULT's body: has_return, the return value, out_params (in
+        m_values_buf). Empty: none. */
+    std::span<const std::byte> values;
     /** V8 terminated the guest code: the status comes from the reason (handle()). */
     bool terminated = false;
 
     void fail(wire::Status s, std::string language, std::string message) {
       status = s;
       error = ErrorInfo{std::move(language), std::move(message), {}, 0, "", 0};
-      values.clear();
+      values = {};
     }
   };
 
@@ -189,9 +211,11 @@ class Worker {
   void prepare(const common::Message &m, Request &q, Reply *reply);
   void call(const common::Message &m, Request &q, Reply *reply);
   void drop(const common::Message &m);
-  void reset(const common::Message &m);
+  void reset();
   void options(const common::Message &m, Reply *reply);
   void parse_library(const common::Message &m, Reply *reply);
+  /** The id is not prepared any more (§8.3): its code (a running activation keeps its own), its
+      library answers (§9.10) and its kept statements, which the host has closed (§10.1). */
   void drop_routine(uint64_t id);
   /** The buffer for a host message in chunks; nullptr if the worker cannot hold it. */
   std::byte *allocate(std::vector<std::byte> &buffer, size_t total);
@@ -208,25 +232,50 @@ class Worker {
   bool failed(v8::TryCatch &tc, Reply *reply);
   ErrorInfo error_of(v8::Local<v8::Value> exception, v8::Local<v8::Message> message);
   std::string compile_error(v8::Local<v8::Message> message, const std::string &name, int prefix);
-  /** True if a termination was requested and V8 has not acted on it yet; it is consumed. */
-  bool termination_pending();
   /** Drops the microtasks that a failed request left: they would run in a later request. */
   void discard_microtasks();
 
   /** Posts the RESULT of q. */
   void post_result(const Request &q, Reply &reply);
-  void stats(uint32_t state);
+  /** Writes the statistics (§3.1): the worker is idle, with the heap's figures of now. */
+  void write_stats();
 
   // SQL (§10).
   /** The reply to the SQL message just sent, nested requests served before it. */
   common::Message sql_reply(std::vector<std::byte> &assembled);
-  /** Checks the SQL_RESULT m that answers action for statement id against §10.1 to §10.3, moves
-      the id to its next state, and returns the reply for sql.js. rows_sent: the rows of an
-      EXECUTE_MANY. Empty and a TypeError thrown if a value has no JavaScript form. */
-  v8::MaybeLocal<v8::Value> sql_result(Request &q, wire::SqlAction action, uint64_t id, uint8_t flags,
-                                       uint32_t rows_sent, const common::Message &m, const Options &rules);
-  /** Sends CLOSE for a statement whose SQL_RESULT the worker could not hold (§5.3). */
+  /** What an SQL message of the worker was, for the check of its reply. */
+  struct Sent {
+    wire::SqlAction action = wire::SqlAction::kExecute;
+    uint64_t id = 0;
+    bool to_client = false;
+    /** PREPARE with KEEP, and what the kept statement is found by. */
+    bool keep = false;
+    std::string key;
+    /** EXECUTE_MANY: the rows sent. */
+    uint32_t rows = 0;
+  };
+  /** Where a statement id is, if it is one the request q may use: its own, or a kept statement of
+      its routine that it uses now. st is nullptr for an id that is CLOSED. */
+  struct Found {
+    Statement *st = nullptr;
+    Statements *in = nullptr;
+  };
+  Found find_statement(Request &q, uint64_t id);
+  /** Checks of the SQL_RESULT m that answers the message `sent` what §1 lists (the reply kind for
+      the action, counts against the bytes, the numbers the worker finds its state by), moves the
+      id to its next state (§10.1), and returns the reply for sql.js. Empty and a TypeError thrown
+      if a value has no JavaScript form. */
+  v8::MaybeLocal<v8::Value> sql_result(Request &q, const Sent &sent, const common::Message &m, const Options &rules);
+  /** Sends CLOSE for id and takes its OK (§10.1 rule 1): the id is CLOSED. */
   void sql_close(Request &q, uint64_t id);
+  /** A free kept statement of q's routine that was prepared from key; {0, nullptr} if none. */
+  std::pair<uint64_t, Statement *> free_kept(Request &q, const std::string &key);
+  /** Room for one more kept statement of q's routine: true if there is, after closing the free
+      one used longest ago when the routine has as many as it may. */
+  bool kept_room(Request &q);
+  /** The request ends: the kept statements it used are IDLE again and free for a later request
+      of the routine (§10.1). */
+  void release_statements(Request &q);
   /** Why guest code may not send SQL or LIBRARY now; nullptr if it may (§10.1, §10.6). */
   const char *host_unavailable() const;
 
@@ -278,6 +327,7 @@ class Worker {
 
   static inline Worker *s_current = nullptr;
   static size_t near_heap_limit(void *data, size_t current, size_t initial);
+  static void after_gc(v8::Isolate *isolate, v8::GCType type, v8::GCCallbackFlags flags, void *data);
 
   Config m_config;
   std::chrono::steady_clock::time_point m_started = std::chrono::steady_clock::now();
@@ -287,29 +337,37 @@ class Worker {
   v8::Global<v8::Context> m_context;
   v8::Global<v8::Object> m_api;      // api.js's helpers
   v8::Global<v8::Function> m_show;   // <eval>: the text of a value
-  v8::Global<v8::Function> m_probe;  // an empty function (termination_pending)
   /** On a SqlError made from an SQL_RESULT ERROR: [error_id, call_seq, errno, sqlstate, message].
       Guest code cannot read or forge it. */
   v8::Global<v8::Private> m_handed;
   Options m_options;
-  bool m_options_in_force = false;
   std::unique_ptr<Values> m_values;
   std::unordered_map<uint64_t, std::shared_ptr<Routine>> m_routines;
   std::unordered_map<int, Script> m_scripts;
   /** Console output no RESULT has carried yet (§9.4). */
   std::string m_out, m_err;
   bool m_cleared = false;
-  bool m_tainted = false;
   /** The heap limit was reached (near_heap_limit): the request ends EXHAUSTED. */
   bool m_exhausted = false;
   /** call_seq of the top-level request being served or served last. */
   uint64_t m_seq = 0;
+  /** The requests being served, by depth (at most 32, §8.2): a request costs no allocation. */
+  std::array<Request, wire::kMaxDepth + 1> m_frames;
   /** The innermost request being served; nullptr between requests. */
   Request *m_request = nullptr;
   uint64_t m_scopes = 0;
+  /** Statement ids are never used twice in a worker: unique among every request's and every
+      routine's (§10.1). */
+  uint64_t m_statement_ids = 0;
+  /** The kept statements of each routine id. */
+  std::unordered_map<uint64_t, Statements> m_kept;
+  uint64_t m_kept_tick = 0;
   std::vector<std::byte> m_sql_buf;
+  std::vector<std::byte> m_values_buf;
   std::vector<std::byte> m_result_buf;
-  uint32_t m_calls = 0;
+  /** A full collection ran since the statistics were written: the heap's figures have changed
+      enough to matter (§3.1). */
+  bool m_heap_changed = false;
   /** C++ is writing values into a message: a value's toString or toJSON runs guest code, which
       then may not send to the host (SQL, a library): no message may be posted between the moment
       one is being composed and its post (§4.1). */

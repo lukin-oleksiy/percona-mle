@@ -20,9 +20,10 @@
 
   MySQL values and JavaScript values in the V8 worker, by Oracle's rules as the JVM worker's GraalJS
   has them (JsOracle.java): wire values (docs/protocol.md §7.2) of arguments, SQL rows and
-  parameters to V8 values, and V8 results to wire values of the declared SQL type. What the host
-  sends outside the wire's domains is a protocol failure (common::protocol_failure); what guest
-  code gives outside them is a ConversionError, so that no value of guest code breaks the protocol.
+  parameters to V8 values, and V8 results to wire values of the declared SQL type. Of the host's
+  values the tags and the lengths are checked (§1): a value outside its domain gives guest code
+  an unspecified value (an Invalid Date, a number). What guest code gives outside the wire's
+  domains is a ConversionError, so that no value of guest code breaks the protocol.
 */
 
 #ifndef MLE_V8_VALUES_HPP
@@ -66,16 +67,16 @@ struct ParamType {
   bool is(std::string_view name) const { return type_name == name; }
 };
 
-/** The setting js.integer_type (Appendix B.2): how JavaScript receives I64 and U64. The values are
-    also sql.js's codes of a statement's integerType. */
+/** The session option integer_type (Appendix B.2): how JavaScript receives I64 and U64. The values
+    are also sql.js's codes of a statement's integerType. */
 enum class IntegerType : uint8_t { kUnsafeString = 0, kUnsafeBigint = 1, kString = 2, kBigint = 3 };
 constexpr int kMaxIntegerType = 3;
-/** The setting js.decimal_type: how JavaScript receives DECIMAL. */
+/** The session option decimal_type: how JavaScript receives DECIMAL. */
 enum class DecimalType : uint8_t { kString = 0, kNumber = 1 };
 constexpr int kMaxDecimalType = 1;
 
-/** The options in force (OPTIONS, §9.8): the settings of JavaScript and the session's time zone,
-    in which DATE and DATETIME values are Dates. */
+/** The options in force (OPTIONS, §9.8): the session options JavaScript uses and the session's
+    time zone, in which DATE and DATETIME values are Dates. */
 struct Options {
   IntegerType integer_type = IntegerType::kUnsafeString;
   DecimalType decimal_type = DecimalType::kString;
@@ -112,16 +113,31 @@ class Values {
       : m_iso(isolate), m_ctx(isolate, context), m_opt(options) {}
 
   /** A routine argument of type t from the wire (Oracle's conversions, as JsOracle.hostForm and
-      its converters do them). */
+      its converters do them): DATE, DATETIME and TIMESTAMP as a Date, a zero or partial date and
+      the zero TIMESTAMP as an Invalid Date; TIME as a string; a SET as a Set. */
   v8::Local<v8::Value> argument(Reader &r, const ParamType &t);
 
-  /** A value of an SQL row under its column's type t (Oracle's SQL API rules: a SET stays a
-      string, a zero date is an invalid Date). rules: the statement's integerType and decimalType
-      (nullptr: the session's).
+  /** A value of an SQL row under its column's type t (Oracle's SQL API rules: as an argument,
+      but a SET stays a string).
 
-      argument() and column() throw ConversionError for a value JavaScript cannot hold, and only
-      after they have read the value completely: the caller can go on reading the message. */
-  v8::Local<v8::Value> column(Reader &r, const ParamType &t, const Options *rules = nullptr);
+      argument() and column() decode the value by its own tag; a value that is not NULL and whose
+      tag is not t's is a protocol failure (§1). They throw ConversionError for a value JavaScript
+      cannot hold, and only after they have read the value completely: the caller can go on
+      reading the message. */
+  v8::Local<v8::Value> column(Reader &r, const ParamType &t);
+
+  /** While it lives, column() uses a statement's integerType and decimalType, not the session's. */
+  class Rules {
+   public:
+    Rules(Values &values, const Options *rules) : m_slot(values.m_rules), m_saved(values.m_rules) { m_slot = rules; }
+    ~Rules() { m_slot = m_saved; }
+    Rules(const Rules &) = delete;
+    Rules &operator=(const Rules &) = delete;
+
+   private:
+    const Options *&m_slot;
+    const Options *m_saved;
+  };
 
   /** Writes result v as type t (JsOracle.toJava, then Values.writeAs); ConversionError if it
       cannot be one, TooLarge if the message would exceed its limit. */
@@ -139,7 +155,7 @@ class Values {
  private:
   v8::Local<v8::Value> integer(int64_t v, bool is_unsigned, const ParamType *t);
   v8::Local<v8::Value> value(Reader &r, const ParamType &t, bool argument);
-  v8::Local<v8::Value> temporal(const Temporal &t, bool argument);
+  v8::Local<v8::Value> temporal(const Temporal &t);
   [[noreturn]] void cannot(v8::Local<v8::Value> v, const ParamType &t);
 
   const Options *rules() const { return m_rules != nullptr ? m_rules : m_opt; }
@@ -164,7 +180,7 @@ v8::Local<v8::String> v8_string(v8::Isolate *iso, std::string_view s);
 bool valid_temporal(const Temporal &t);
 /** The domain of a DECIMAL's text (§7.2). */
 bool valid_decimal(std::string_view s);
-/** Reads a Civil (after its tag); outside its domain it is a protocol failure. */
+/** Reads a Civil (after its tag) as it is: its domain is the host's to keep (§1). */
 Temporal read_temporal(Reader &r, wire::Tag tag);
 void write_temporal(Writer &w, const Temporal &t);
 /** "[-]hh:mm:ss[.ffffff]" of a TIME. */

@@ -17,8 +17,9 @@
 
 // The V8 worker's values (worker/v8/values.cc): DECIMAL text within MySQL's limits, TIME text,
 // time zones, arguments to JavaScript and results back by Oracle's rules (as the JVM worker's
-// JsOracle), the domains of docs/protocol.md §7.2 in both directions, text that is not well-formed,
-// and malformed messages, which are protocol failures. In an isolate of the distribution's V8.
+// JsOracle), the domains of docs/protocol.md §7.2 of what guest code gives, text that is not
+// well-formed, the checks of §1 on the host's values (lengths and tags: protocol failures; domains:
+// not checked) and Oracle's Invalid Date for zero dates. In an isolate of the distribution's V8.
 
 #include <gtest/gtest.h>
 #include <libplatform/libplatform.h>
@@ -230,14 +231,24 @@ TEST_F(V8Values, Dates) {
   EXPECT_EQ(str(js("(d) => d.toISOString()").As<v8::Function>()->Call(m_ctx, v8::Undefined(m_iso), 1, &d)
                     .ToLocalChecked()),
             "2026-01-14T22:00:00.000Z");
-  // a zero date is an error as an argument, an invalid Date in a row
-  std::array<std::byte, 64> zero{};
-  Writer zw(zero);
-  mle::v8w::write_temporal(zw, mle::v8w::Temporal{w::Tag::kDate, 0, 0, 0, 0, 0, 0, 0, false});
-  Reader zr(std::span<const std::byte>(zero.data(), zw.size()), 0);
-  EXPECT_THROW(m_values->argument(zr, type(w::Tag::kDate, "DATE")), ConversionError);
-  Reader zr2(std::span<const std::byte>(zero.data(), zw.size()), 0);
-  EXPECT_TRUE(std::isnan(m_values->column(zr2, type(w::Tag::kDate, "DATE")).As<v8::Date>()->ValueOf()));
+  // Oracle's rule: a zero date is an Invalid Date, as an argument and in a row; so is a partial
+  // date, and a zero DATETIME
+  const auto invalid = [this](const mle::v8w::Temporal &value, const char *name) {
+    std::array<std::byte, 64> buf{};
+    Writer wr(buf);
+    mle::v8w::write_temporal(wr, value);
+    const ParamType t = type(value.tag, name);
+    Reader a(std::span<const std::byte>(buf.data(), wr.size()), 0), c(std::span<const std::byte>(buf.data(), wr.size()), 0);
+    const v8::Local<v8::Value> as_argument = m_values->argument(a, t), in_row = m_values->column(c, t);
+    return as_argument->IsDate() && std::isnan(as_argument.As<v8::Date>()->ValueOf()) && in_row->IsDate() &&
+           std::isnan(in_row.As<v8::Date>()->ValueOf()) && a.left() == 0;
+  };
+  EXPECT_TRUE(invalid(mle::v8w::Temporal{w::Tag::kDate, 0, 0, 0, 0, 0, 0, 0, false}, "DATE"));
+  EXPECT_TRUE(invalid(mle::v8w::Temporal{w::Tag::kDate, 2024, 0, 15, 0, 0, 0, 0, false}, "DATE"));
+  EXPECT_TRUE(invalid(mle::v8w::Temporal{w::Tag::kDatetime, 0, 0, 0, 0, 0, 0, 0, false}, "DATETIME"));
+  EXPECT_TRUE(invalid(mle::v8w::Temporal{w::Tag::kDate, 2024, 4, 31, 0, 0, 0, 0, false}, "DATE"));
+  // year 0 with a month and a day is a date (as Java's LocalDate)
+  EXPECT_FALSE(invalid(mle::v8w::Temporal{w::Tag::kDate, 0, 1, 1, 0, 0, 0, 0, false}, "DATE"));
   // results back: the session's local date-time (00:00 on 2 July in Kyiv), the same instant again
   std::array<std::byte, 64> back{};
   Writer bw(back);
@@ -263,17 +274,20 @@ TEST_F(V8Values, Timestamps) {
   EXPECT_THROW(written("new Date(Date.UTC(10000, 0, 1))", ts), ConversionError);
   EXPECT_THROW(written("new Date(NaN)", ts), ConversionError);
   EXPECT_THROW(written("'2024-01-01'", ts), ConversionError);
-  // the zero timestamp: an error as an argument, an invalid Date in a row
+  // Oracle's rule: the zero timestamp (the spec's vector) is an Invalid Date, as an argument and
+  // in a row
   const std::vector<std::byte> zero = bytes(0x0B, 0, 0, 0, 0, 0, 0, 0, 0x80);
   Reader z(zero);
-  EXPECT_THROW(m_values->argument(z, ts), ConversionError);
-  EXPECT_EQ(z.left(), 0u);  // read completely before the error
+  const v8::Local<v8::Value> as_argument = m_values->argument(z, ts);
+  ASSERT_TRUE(as_argument->IsDate());
+  EXPECT_TRUE(std::isnan(as_argument.As<v8::Date>()->ValueOf()));
+  EXPECT_EQ(z.left(), 0u);
   Reader z2(zero);
   EXPECT_TRUE(std::isnan(m_values->column(z2, ts).As<v8::Date>()->ValueOf()));
-  // outside the wire's range
+  // The host keeps the domain (§1): a value outside it is some Date, not a failure.
   const std::vector<std::byte> negative = bytes(0x0B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
   Reader n(negative);
-  EXPECT_THROW(m_values->argument(n, ts), ProtocolFailure);
+  EXPECT_TRUE(m_values->argument(n, ts)->IsDate());
 }
 
 TEST_F(V8Values, Text) {
@@ -345,16 +359,32 @@ TEST_F(V8Values, Malformed) {
   EXPECT_TRUE(fails(bytes(99)));                          // an unknown tag
   EXPECT_TRUE(fails(bytes(0, 0)));                        // a trailing byte
   EXPECT_FALSE(fails(bytes(0)));
-  EXPECT_TRUE(fails(text_value(w::Tag::kDecimal, "1e5"), w::Tag::kDecimal));
-  EXPECT_TRUE(fails(bytes(13, 0, 0, 0, 0), w::Tag::kVector));                 // no dimensions
-  // a VECTOR whose padding is not zero
+  // a value that is not NULL under a type of another tag (§1 item 2)
+  EXPECT_TRUE(fails(bytes(1, 5, 0, 0, 0, 0, 0, 0, 0), w::Tag::kString));
+  EXPECT_FALSE(fails(bytes(1, 5, 0, 0, 0, 0, 0, 0, 0), w::Tag::kI64));
+  EXPECT_TRUE(fails(text_value(w::Tag::kString, "x"), w::Tag::kJson));
+  // a VECTOR longer than the message; its padding cut
+  EXPECT_TRUE(fails(bytes(13, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x3F), w::Tag::kVector));
+  EXPECT_TRUE(fails(bytes(13, 1, 0, 0, 0, 0, 0), w::Tag::kVector));
+  // What the host guarantees is not checked (§1): domains, padding bytes and the value of a bool.
+  // Such a value is read to its end and gives some JavaScript value.
+  EXPECT_FALSE(fails(text_value(w::Tag::kDecimal, "1e5"), w::Tag::kDecimal));
+  EXPECT_FALSE(fails(bytes(13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), w::Tag::kVector));  // no dimensions
   std::vector<std::byte> v = bytes(13, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x3F);
   EXPECT_FALSE(fails(v, w::Tag::kVector));
-  v[7] = std::byte{1};
-  EXPECT_TRUE(fails(v, w::Tag::kVector));
-  // a DATE with a time, a bool that is 2
-  EXPECT_TRUE(fails(bytes(8, 0xE8, 0x07, 2, 29, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), w::Tag::kDate));
-  EXPECT_TRUE(fails(bytes(8, 0xE8, 0x07, 2, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2), w::Tag::kDate));
+  v[7] = std::byte{1};  // a padding byte that is not zero
+  EXPECT_FALSE(fails(v, w::Tag::kVector));
+  Reader padded(v);
+  const v8::Local<v8::Value> one = m_values->argument(padded, type(w::Tag::kVector));
+  ASSERT_TRUE(one->IsFloat32Array());
+  EXPECT_EQ(str(one), "1");
+  // a DATE with a time (the time is not a DATE's), a bool that is 2
+  EXPECT_FALSE(fails(bytes(8, 0xE8, 0x07, 2, 29, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), w::Tag::kDate));
+  EXPECT_FALSE(fails(bytes(8, 0xE8, 0x07, 2, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2), w::Tag::kDate));
+  // a DATETIME with a clock time outside its domain: an Invalid Date
+  const std::vector<std::byte> late_value = bytes(10, 0xE8, 0x07, 2, 29, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0);
+  Reader late(late_value);
+  EXPECT_TRUE(std::isnan(m_values->argument(late, type(w::Tag::kDatetime)).As<v8::Date>()->ValueOf()));
   // a count beyond the bytes left
   const std::vector<std::byte> list = bytes(5, 0, 0, 0, 1);
   Reader r(list);
