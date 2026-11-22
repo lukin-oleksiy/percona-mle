@@ -91,15 +91,22 @@ bool set_attribute(my_h_statement h, const char *name, const T &value) {
   return mysql_service_mysql_stmt_attributes->set(h, cstr(name), &value);
 }
 
-/** A text of the result set's metadata, for a str field: repaired. */
-std::string text_info(my_h_field f, const char *key) {
+/** A text of the result set's metadata, for a str field, into *out:
+    repaired. */
+void text_info(my_h_field f, const char *key, std::string *out) {
   const char *v = nullptr;
   if (mysql_service_mysql_stmt_resultset_metadata->field_info(f, key, &v) ||
-      v == nullptr)
-    return "";
-  std::string text = v;
-  repair_utf8(&text);
-  return text;
+      v == nullptr) {
+    out->clear();
+    return;
+  }
+  const std::string_view text(v);
+  out->assign(text);
+  // Names are ASCII as a rule: checked here, the full check only for others.
+  if (!std::all_of(text.begin(), text.end(),
+                   [](char c) { return static_cast<unsigned char>(c) < 0x80; }) &&
+      !mle::is_valid_utf8(text))
+    repair_utf8(out);
 }
 
 template <typename T>
@@ -176,8 +183,8 @@ struct SqlRunner::Statement {
   /** The current result set. */
   std::vector<mle::Column> columns;
   std::vector<Reader> readers;
-  /** What the server said of each column when `columns` was made: compared
-      with what it says at the next execution. */
+  /** A prepared id: what the server said of each column when `columns` was
+      made, compared with what it says at the next execution. */
   struct Raw {
     uint64_t type = 0;
     unsigned long length = 0;
@@ -1134,24 +1141,26 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
     s.columns.clear();
     s.readers.clear();
     s.raw.clear();
+    s.columns.reserve(fields);
+    s.readers.reserve(fields);
   }
   for (uint32_t i = 0; i < fields; i++) {
     my_h_field f = nullptr;
     (void)mysql_service_mysql_stmt_resultset_metadata->fetch_field(s.h, i, &f);
-    mle::Column c;
-    c.name = text_info(f, "col_name");
-    c.org_name = text_info(f, "org_col_name");
-    c.schema = text_info(f, "db_name");
-    c.table = text_info(f, "table_name");
-    c.org_table = text_info(f, "org_table_name");
-    c.charset = text_info(f, "charset_name");
-    c.collation = text_info(f, "collation_name");
+    mle::Column &c = s.columns.emplace_back();
+    text_info(f, "col_name", &c.name);
+    text_info(f, "org_col_name", &c.org_name);
+    text_info(f, "db_name", &c.schema);
+    text_info(f, "table_name", &c.table);
+    text_info(f, "org_table_name", &c.org_table);
+    text_info(f, "charset_name", &c.charset);
+    text_info(f, "collation_name", &c.collation);
     c.flags = number_info<uint>(f, "flags");
     const uint64_t type = number_info<uint64_t>(f, "type");
     const bool is_unsigned = number_info<bool>(f, "is_unsigned");
     const bool binary = c.charset == "binary";
-    const auto length =
-        static_cast<uint32_t>(number_info<unsigned long>(f, "length"));
+    const auto raw_length = number_info<unsigned long>(f, "length");
+    const auto length = static_cast<uint32_t>(raw_length);
     const uint32_t decimals = number_info<uint>(f, "decimals");
     c.type.is_unsigned = is_unsigned;
     c.type.type_name = sql_type_name(type);
@@ -1247,10 +1256,10 @@ void SqlRunner::reply(uint64_t id, Statement &s, uint32_t max_rows,
         break;
       }
     }
-    s.columns.push_back(std::move(c));
     s.readers.push_back(r);
-    s.raw.push_back({type, number_info<unsigned long>(f, "length"), decimals,
-                     number_info<uint>(f, "flags"), is_unsigned});
+    // Only a prepared id compares its next result's columns (same_columns).
+    if (s.prepared)
+      s.raw.push_back({type, raw_length, decimals, c.flags, is_unsigned});
   }
   s.state = Statement::State::kRows;
   s.columns_sent = false;

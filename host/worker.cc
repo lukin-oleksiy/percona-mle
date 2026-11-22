@@ -985,14 +985,28 @@ Outcome Worker::request(const Request &q, CallHooks &hooks, ResultMsg *result,
 Worker::Wait Worker::serve_sql(const Request &q, Message &m, CallHooks &hooks,
                                int64_t deadline, std::string *error) {
   using wire::SqlAction;
-  SqlMsg sql;
+  // This depth's message, reused; what a large one held is not kept.
+  SqlMsg &sql = m_sql_msgs[std::min<size_t>(m_depth, m_sql_msgs.size() - 1)];
+  struct Release {
+    SqlMsg &sql;
+    ~Release() {
+      sql.params.clear();
+      if (sql.statement.capacity() > (1U << 20)) std::string().swap(sql.statement);
+      if (sql.params.capacity() > 4096) std::vector<Value>().swap(sql.params);
+    }
+  } release{sql};
   sql.action = m.sql_action;
   sql.stmt_id = m.sql_stmt_id;
   // The head was read by receive(); a discarded message has nothing more
   // (§5.3).
-  if (std::string why;
-      !m.discarded &&
-      !decode_sql_rest(m.data.substr(wire::kSqlHeadSize), &sql, &why)) {
+  if (m.discarded) {
+    sql.statement.clear();
+    sql.params.clear();
+    sql.flags = 0;
+    sql.max_rows = 0;
+    sql.row_width = 0;
+  } else if (std::string why;
+             !decode_sql_rest(m.data.substr(wire::kSqlHeadSize), &sql, &why)) {
     *error = "bad SQL: " + why;
     return Wait::kProtocol;
   }

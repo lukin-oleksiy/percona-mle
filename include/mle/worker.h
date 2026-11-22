@@ -534,6 +534,9 @@ class Worker {
   /** Bodies of CALLs and of SQL_RESULTs, one per depth, reused. */
   std::array<std::string, wire::kMaxDepth + 2> m_call_bodies;
   std::array<std::string, wire::kMaxDepth + 2> m_reply_bodies;
+  /** SQL messages being served, one per depth, reused: a statement's text
+      and parameters need no allocation of their own. */
+  std::array<SqlMsg, wire::kMaxDepth + 2> m_sql_msgs;
 };
 
 }  // namespace mle
