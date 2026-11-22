@@ -1183,19 +1183,6 @@ when a request's RESULT arrives the host closes every id it left open. A
 worker MUST fail, in guest code, the use of a statement of another
 request (an earlier one, or the caller's), without sending anything.
 
-**Kept statements.** A statement prepared with the KEEP flag (§10.2)
-belongs not to the request but to the **routine** the request serves (its
-routine id), in this worker. It is not closed at the RESULT: the host
-discards its pending results and it is IDLE again. Any later request for
-the same routine id may use it, so a routine called many times prepares
-its statements once. It is closed by CLOSE, by DROP or a new PREPARE of
-its routine id, by RESET, and with the worker. Its id is unique among the
-kept ids of its routine and the worker's other open ids at that depth. A
-kept statement counts in the bounds of §10.7 for as long as it is open.
-Two activations of one routine (a recursion) share its kept statements: a
-worker MUST NOT execute a kept statement in one activation while another
-activation has results to read on it; it prepares another instead.
-
 SQL and LIBRARY come only from the guest code of the request (CALL or
 PREPARE) that the worker is serving at the innermost depth, on the
 serving thread. A worker MUST fail, in guest
@@ -1282,8 +1269,6 @@ MUST NOT pass these fields from guest code unchecked.
 
 * `flags` bit 0, PASS_RESULT_TO_CLIENT (§10.5). Given at EXECUTE or
   PREPARE, it holds for the life of that id.
-* `flags` bit 1, KEEP: only with PREPARE while serving a CALL: the
-  statement is a kept statement (§10.1).
 * `max_rows`: the most rows the worker wants in one batch (§10.3); 0
   leaves it to the host. The host MUST NOT send more rows than a non-zero
   `max_rows`.
@@ -2061,6 +2046,13 @@ These are choices of the current host, not rules of the protocol.
 | Request bytes in progress per session (§10.7) | 256 MiB |
 | Console output kept | 64 KiB per session |
 | Routine error message when raised as SQL error | cut to 128 characters |
+
+**Statements across calls.** A prepared statement cannot outlive the
+stored-program call that prepared it: the server's statement service keeps
+a pointer to that call's diagnostics area. A routine called many times
+therefore prepares its statements on every call. Wanted: a statement
+service whose prepared statements outlive the call (then a KEEP flag can
+be added in a minor version).
 
 **Reading results.** The host need not buffer a whole result set before
 it sends the first batch: `total_rows` may be unknown. `exec_us` costs

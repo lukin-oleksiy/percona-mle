@@ -512,3 +512,17 @@ the rights account may use, in any schema); a failure guest code brings about in
 GUEST_ERROR (with TAINTED if the worker cannot go on), INTERNAL only for what guest code did not
 cause; an argument with no form in the language fails the CALL as `MLE-Type`; GEOMETRY
 parameters are refused (Oracle lists no such type).
+
+**Kept statements withdrawn (22 Nov).** The host-side implementation tried them first: the
+server's statement service stores, in a prepared statement, a pointer to the diagnostics area of
+the stored-program call in which it was prepared (`m_diagnostics_area(thd->get_stmt_da())`,
+sql/statement/statement.cc:478; inside a stored program that is a stack object of
+`sp_head::execute_external_routine_core`). Reusing the statement in a later call through an SQL
+procedure crashed mysqld in `Statement_handle::copy_warnings`. The rule cannot be implemented with
+this server, so it is removed from the specification (flag bit 1 of SQL is unassigned again) and
+recorded in Appendix A as a wanted server service; the workers stop sending KEEP.
+
+Also from that pass: Oracle's documentation says an impossible date (31 February) goes to the
+JavaScript Date constructor with its fields (it rolls over), so only zero dates and dates with a
+zero month or day are an Invalid Date; and the JVM worker shows a JavaScript Date's local time in
+the host's zone instead of the zone of OPTIONS (a defect).
