@@ -319,6 +319,10 @@ class Worker {
       Guest code cannot read or forge it. */
   v8::Global<v8::Private> m_handed;
   Options m_options;
+  /** Local time of guest code's Dates (Appendix B.4): ICU's default zone as the zone of OPTIONS
+      (+00:00 without options). The zone text set last; empty: not set yet. */
+  void set_local_zone(std::string_view zone);
+  std::string m_local_zone;
   std::unique_ptr<Values> m_values;
   std::unordered_map<uint64_t, std::shared_ptr<Routine>> m_routines;
   std::unordered_map<int, Script> m_scripts;

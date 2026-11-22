@@ -230,7 +230,47 @@ void setup_icu(const std::vector<std::string> &dirs) {
 #endif
 }
 
+/** ICU's ucal_setDefaultTimeZone(const UChar *id, UErrorCode *status) in the ICU that V8 uses
+    (the system's, or libnode's own: its symbols carry the ICU version); nullptr if there is none. */
+using SetDefaultZone = void (*)(const char16_t *, int *);
+SetDefaultZone icu_set_default_zone() {
+  for (int v = 99; v >= 60; v--)
+    if (void *f = dlsym(RTLD_DEFAULT, ("ucal_setDefaultTimeZone_" + std::to_string(v)).c_str()); f != nullptr)
+      return reinterpret_cast<SetDefaultZone>(f);
+  return reinterpret_cast<SetDefaultZone>(dlsym(RTLD_DEFAULT, "ucal_setDefaultTimeZone"));
+}
+
+/** ICU's id of a zone of OPTIONS, named as the launcher's TZ named it before (Date.toString()
+    unchanged): +00:00 is UTC, a whole hour Etc/GMT with IANA's sign (west positive), another
+    offset ICU's custom id GMT+05:30; an IANA name as it is. */
+std::u16string icu_zone_id(std::string_view zone) {
+  std::string id(zone);
+  if (zone.size() == 6 && (zone[0] == '+' || zone[0] == '-')) {
+    const int hours = (zone[1] - '0') * 10 + (zone[2] - '0');
+    if (zone.substr(1) == "00:00")
+      id = "UTC";
+    else if (zone.substr(3) == ":00")
+      id = std::string("Etc/GMT") + (zone[0] == '+' ? "-" : "+") + std::to_string(hours);
+    else
+      id = "GMT" + id;
+  }
+  return {id.begin(), id.end()};  // IANA names and offsets are ASCII
+}
+
 }  // namespace
+
+void Worker::set_local_zone(std::string_view zone) {
+  if (zone == m_local_zone) return;
+  static const SetDefaultZone set_default = icu_set_default_zone();
+  if (set_default == nullptr) return;  // V8 without ICU: the process's zone
+  const std::u16string id = icu_zone_id(zone);
+  int status = 0;
+  set_default(id.c_str(), &status);
+  if (status > 0) return;  // U_FAILURE: the zone stays as it was
+  m_local_zone = zone;
+  // V8 drops its cached zone and dates and asks ICU's default again (no redetection of the host's).
+  m_isolate->DateTimeConfigurationChangeNotification(v8::Isolate::TimeZoneDetection::kSkip);
+}
 
 Worker::Worker(const Config &config) : m_config(config) {
   s_current = this;
@@ -324,6 +364,7 @@ void Worker::run() {
           std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_started).count()) +
       " ms";
   const std::string_view languages[] = {kJs};
+  set_local_zone("+00:00");  // without options in force (§1)
   write_stats();
   Mailbox::ready(info, "v8", languages, runtime);
   std::vector<std::byte> assembled;
@@ -482,6 +523,7 @@ void Worker::reset() {
   // RESET ends the options (§9.8) and discards the console output that waits (§9.4). globalThis
   // and the loaded libraries stay (Appendix B.6).
   m_options = Options();
+  set_local_zone("+00:00");
   m_out.clear();
   m_err.clear();
   m_cleared = false;
@@ -518,6 +560,7 @@ void Worker::options(const Message &m, Reply *reply) {
     reply->fail(w::Status::kGuestError, w::kLanguageOption, refused);
   } else {
     m_options = o;
+    set_local_zone(zone);  // options change only while nothing is prepared (§9.8)
   }
 }
 
