@@ -19,6 +19,7 @@ package com.percona.mle.worker;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.List;
 
 /**
@@ -68,7 +69,9 @@ public final class Train {
     }
 
     // JS and Python routines, numpy when the venv is there.
-    Polyglot polyglot = new Polyglot(new Console(), new Options());
+    Console console = new Console();
+    Options options = new Options();
+    Polyglot polyglot = new Polyglot(console, options);
     polyglot.prepare(2, "js", "", "f", "function f(a, b, c) { return a + b.length + c; }", threeArgs, i64, List.of());
     // The body forms (CREATE ... AS $$ body $$).
     polyglot.prepare(6, "js", "jf", "", "return a + b.length + c;", threeArgs, i64, List.of());
@@ -82,6 +85,51 @@ public final class Train {
       for (int id : Polyglot.PYTHON ? new int[] {2, 3, 6, 7} : new int[] {2, 6})
         polyglot.invoke(polyglot.get(id), new Object[] {1L, "hello", 2.0}, outs);
     }
+    // The request path of a worker's first session (Dispatcher, Mailbox): OPTIONS, then a
+    // JavaScript and a Java routine prepared and called, through a mailbox in memory. A few
+    // requests: their classes are loaded and call sites linked; the routines are trained above.
+    Values.options = options;
+    Mailbox mb = Mailbox.inMemory((int) Wire.MIN_ARENA_SIZE);
+    Dispatcher d = new Dispatcher(mb, java, polyglot, console, new Control(Thread.currentThread(), polyglot), options);
+    MessageWriter w = new MessageWriter(mb.arena);
+    w.reset();
+    w.str("Europe/Vilnius");
+    w.u32(1);
+    w.str(Options.INTEGER_TYPE);
+    w.str("unsafe_string");
+    request(mb, d, Wire.OPTIONS, w);
+    for (int i = 0; i < 3; i++) {
+      for (String[] r : new String[][] {{"js", "return a + b.length + c;"}, {"java", "return a + b.length() + c.longValue();"}}) {
+        long id = 100 + r[0].length();
+        w.reset();
+        w.u64(id);
+        w.str(r[0]);
+        w.str("t" + r[0]);
+        w.str("");  // the body form
+        w.str(r[1]);
+        w.u32(threeArgs.size());
+        for (JavaRoutines.Param p : threeArgs) {
+          w.str(p.name());
+          w.u8(p.mode());
+          type(w, p.type().tag());
+        }
+        w.bool(true);
+        type(w, Wire.T_I64);
+        w.u32(0);  // no imports
+        w.str("");
+        w.bool(false);
+        w.u64(0);
+        request(mb, d, Wire.PREPARE, w);
+        w.reset();
+        w.u64(id);
+        w.u64(0);
+        w.u32(3);
+        Values.writeParam(w, 1L);
+        Values.writeParam(w, "hello");
+        Values.writeParam(w, 2.0);
+        request(mb, d, Wire.CALL, w);
+      }
+    }
     if (Polyglot.PYTHON && !System.getProperty("mle.python.venv", "").isEmpty()) {
       polyglot.prepare(4, "python", "", "f", "import numpy as np\ndef f(v):\n    return float(np.dot(v, v))\n",
           List.of(new JavaRoutines.Param("v", 0, vec)), f64, List.of());
@@ -92,5 +140,39 @@ public final class Train {
     VectorWarmup.run(() -> false);
     System.out.println("mle training done");
     System.exit(0);  // GraalPy leaves non-daemon threads; exit writes the AOT configuration
+  }
+
+  private static long seq;
+
+  /**
+   * As the host: the request in the arena (w's body) goes to the dispatcher, which serves it and
+   * posts its RESULT, which must be OK. A request that is wrong ends the run (ProtocolFailure).
+   */
+  private static void request(Mailbox mb, Dispatcher d, int op, MessageWriter w) {
+    MemorySegment r = mb.region;
+    r.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_OP, op);
+    r.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_STATUS, 0);
+    r.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_FLAGS, 0);
+    r.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_DEPTH, 0);
+    r.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_LEN, (int) w.size());
+    r.set(ValueLayout.JAVA_LONG, Wire.OFF_MSG + Wire.MSG_TOTAL_LEN, w.size());
+    r.set(ValueLayout.JAVA_LONG, Wire.OFF_MSG + Wire.MSG_CALL_SEQ, ++seq);
+    r.set(ValueLayout.JAVA_INT, Wire.OFF_TO_W, r.get(ValueLayout.JAVA_INT, Wire.OFF_TO_W) + 1);
+    d.serveNext();
+    // The training covers the path of requests that succeed.
+    if (r.get(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_OP) != Wire.RESULT
+        || r.get(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_STATUS) != Wire.OK)
+      throw new IllegalStateException("training request of op " + op + " failed: status "
+          + r.get(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_STATUS));
+  }
+
+  /** A Type (§7.1) of the tag, without a SQL type name. */
+  private static void type(MessageWriter w, int tag) {
+    w.u8(tag);
+    w.bool(false);
+    w.u32(0);
+    w.u32(0);
+    w.u32(0);
+    w.str("");
   }
 }

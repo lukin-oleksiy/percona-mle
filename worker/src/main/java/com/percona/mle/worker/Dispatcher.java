@@ -268,10 +268,15 @@ final class Dispatcher {
         // Idle after a RESET (§3.1): the host's memory figures, after the GC if there was one.
         mb.stats(Wire.STATE_IDLE);
       }
-      Mailbox.Message m = mb.receive(topLevel);
-      lastSeq = m.callSeq();
-      handle(m);
+      serveNext();
     }
+  }
+
+  /** Receives the next top-level request and serves it (also the training run's, Train). */
+  void serveNext() {
+    Mailbox.Message m = mb.receive(topLevel);
+    lastSeq = m.callSeq();
+    handle(m);
   }
 
   /**

@@ -129,6 +129,14 @@ final class Mailbox {
     return new Mailbox(Native.mapShared(Wire.MAILBOX_FD, size), (int) arenaSize, version, spin);
   }
 
+  /**
+   * A mailbox in memory that no host reads, for the AOT training run (Train): what is posted to it
+   * stays there, and a request is put in by hand (Train.request).
+   */
+  static Mailbox inMemory(int arenaSize) {
+    return new Mailbox(Arena.global().allocate(Wire.HEADER_SIZE + arenaSize, 4096), arenaSize, Wire.VERSION, 0);
+  }
+
   // ------------------------------------------------------------ raw hand-off
 
   /** Waits until the host's word differs from the value seen: spin, then sleep on the futex (§4.3). */
