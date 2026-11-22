@@ -38,8 +38,6 @@ struct Config {
   /** The largest host message the worker holds, in bytes; a larger one is discarded and failed
       where it belongs (§5.3). 0: whatever memory can be allocated. */
   uint64_t message_max = 0;
-  /** Kept statements (§10.1) per routine, at most; 0: statements are never kept. */
-  uint32_t kept_statements = 32;
   /** The arena's size (Mailbox::open). */
   uint32_t arena_size = 0;
 };

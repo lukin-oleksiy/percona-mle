@@ -38,10 +38,6 @@ Config &config() {
 
 namespace {
 
-/** SQL flags bit 1, KEEP (§10.2): only with PREPARE while serving a CALL; the statement is a kept
-    statement (§10.1). Belongs beside wire::kPassResultToClient in include/mle/protocol.h. */
-constexpr uint8_t kKeep = 1U << 1;
-
 // ------------------------------------------------------------------------------ requests
 
 /** An SQL statement id that is not CLOSED (§10.1). */
@@ -57,11 +53,6 @@ struct Statement {
       which a later set's first batch may leave out (§10.3): (block, labels, tags). */
   Ref columns;
   uint32_t ncols = 0;
-  /** A kept statement: the request (its scope) that uses it now, or 0; when it was used last;
-      and what it was prepared from (the flag and the text), by which a later PREPARE finds it. */
-  uint64_t lease = 0;
-  uint64_t used = 0;
-  std::string key;
 };
 
 using Statements = std::unordered_map<uint64_t, Statement>;
@@ -77,7 +68,7 @@ struct Request {
   /** PREPARE, CALL, DROP: the routine. */
   uint64_t routine_id = 0;
   uint64_t library_epoch = 0;
-  /** The statements of this request that are not kept. */
+  /** The statements of this request. */
   Statements statements;
   Request *outer = nullptr;
 };
@@ -87,12 +78,8 @@ Request *g_request = nullptr;
 /** call_seq of the top-level request being served or served last. */
 uint64_t g_seq = 0;
 uint64_t g_scopes = 0;
-/** Statement ids are never used twice in a worker: unique among every request's and every
-    routine's (§10.1). */
+/** Statement ids are never used twice in a worker: unique among every request's (§10.1). */
 uint64_t g_statement_ids = 0;
-/** The kept statements of each routine id. */
-std::unordered_map<uint64_t, Statements> g_kept;
-uint64_t g_kept_tick = 0;
 
 /** The request loop's Python side (serve()). */
 struct Loop {
@@ -183,19 +170,6 @@ std::string python_error() {
   return text;
 }
 
-/** The request ends: the host closes the statements it left open; the kept statements it used
-    are IDLE again and free for a later request of the routine (§10.1). */
-void release_statements(Request &q) {
-  if (q.op != uint32_t(w::Op::kCall)) return;
-  const auto kept = g_kept.find(q.routine_id);
-  if (kept == g_kept.end()) return;
-  for (auto &[id, st] : kept->second) {
-    if (st.lease != q.scope) continue;
-    st.lease = 0;
-    st.state = Statement::State::kIdle;
-  }
-}
-
 /** Posts the RESULT of q, which Python makes from what the request ended with. From here on no
     guest code of the request runs and the status is fixed (§11.1). */
 void finish_request(Request &q, PyObject *ctx, PyObject *outcome, PyObject *failure, bool delivered) {
@@ -203,7 +177,6 @@ void finish_request(Request &q, PyObject *ctx, PyObject *outcome, PyObject *fail
   if (guest_op) g_console = false;  // this RESULT carries the console output
   PyObject *r = PyObject_CallFunction(g_loop.finish, "IOOOO", q.op, ctx, outcome != nullptr ? outcome : Py_None,
                                       failure != nullptr ? failure : Py_None, delivered ? Py_True : Py_False);
-  release_statements(q);
   // The statistics change when the worker becomes idle after a RESET, not on every request (§3.1).
   if (q.op == uint32_t(w::Op::kReset)) Mailbox::stats(uint32_t(w::WorkerState::kIdle));
   unsigned status = 0;
@@ -406,10 +379,9 @@ bool fast_call(Request &q, const Message &m, Ref &assembled) {
 }
 
 /** The routine id is not prepared any more, or is prepared anew (§8.3): later CALLs do not find
-    its fast routine, and the host has closed its kept statements (§10.1). */
+    its fast routine. */
 void forget_routine(uint64_t id) {
   g_fast.erase(id);
-  g_kept.erase(id);
 }
 
 /** Serves the request m: from its complete receipt to the post of its RESULT. Nested requests
@@ -429,7 +401,6 @@ void dispatch(const Message &m, Ref &assembled) {
   if (op == w::Op::kPrepare || op == w::Op::kDrop) forget_routine(q.routine_id);
   if (op == w::Op::kReset) {
     g_fast.clear();
-    g_kept.clear();
   }
   if (top) {
     // The worker begins to serve the request: it has received it completely (§11.1).
@@ -626,30 +597,11 @@ Ref columns(Reader &r, uint32_t count) {
                                   labels.get(), tags.get()));
 }
 
-/** Where the statement id is, if it is one the request q may use: its own, or a kept statement
-    of its routine that it uses now. */
-struct Found {
-  Statement *st = nullptr;
-  Statements *in = nullptr;
-};
-Found find_statement(Request &q, uint64_t id) {
-  if (const auto own = q.statements.find(id); own != q.statements.end()) return {&own->second, &q.statements};
-  if (q.op == uint32_t(w::Op::kCall)) {
-    if (const auto kept = g_kept.find(q.routine_id); kept != g_kept.end())
-      if (const auto st = kept->second.find(id); st != kept->second.end() && st->second.lease == q.scope)
-        return {&st->second, &kept->second};
-  }
-  return {};
-}
-
 /** What an SQL message of the worker was, for the check of its reply. */
 struct Sent {
   w::SqlAction action = w::SqlAction::kExecute;
   uint64_t id = 0;
   bool to_client = false;
-  /** PREPARE with KEEP, and what the kept statement is found by. */
-  bool keep = false;
-  std::string key;
   /** EXECUTE_MANY: the rows sent. */
   uint32_t rows = 0;
 };
@@ -685,9 +637,8 @@ Ref sql_result(Request &q, const Sent &sent, const Message &m, Ref &assembled) {
   Reader r(m.body);
   const auto kind = r.get<uint8_t>();
   if (kind > w::kMaxSqlResultKind) protocol_failure("an unknown SQL_RESULT kind");
-  // Looked up now: a nested PREPARE or DROP may have taken the routine's kept statements.
-  Found found = find_statement(q, sent.id);
-  Statement *st = found.st;  // nullptr: CLOSED
+  const auto known = q.statements.find(sent.id);
+  Statement *st = known != q.statements.end() ? &known->second : nullptr;  // nullptr: CLOSED
   const bool to_client = st != nullptr ? st->to_client : sent.to_client;
   const bool nothing_next = action == w::SqlAction::kNextResult && (st == nullptr || st->state == State::kIdle);
   bool legal = false;
@@ -713,13 +664,12 @@ Ref sql_result(Request &q, const Sent &sent, const Message &m, Ref &assembled) {
     if (st->prepared)
       st->state = State::kIdle;
     else
-      found.in->erase(sent.id);
+      q.statements.erase(sent.id);
     st = nullptr;
   };
   // The id has a result to read: a direct statement gets its entry now.
   const auto open = [&]() -> Statement & {
     if (st == nullptr) {
-      found.in = &q.statements;
       st = &q.statements[sent.id];
       st->to_client = to_client;
     }
@@ -749,17 +699,12 @@ Ref sql_result(Request &q, const Sent &sent, const Message &m, Ref &assembled) {
       const uint32_t params = r.get<uint32_t>();
       const uint64_t exec_us = r.get<uint64_t>();
       if (action == w::SqlAction::kClose) {
-        if (st != nullptr) found.in->erase(sent.id);
+        if (st != nullptr) q.statements.erase(sent.id);
       } else if (action == w::SqlAction::kPrepare) {
-        Statement &s = sent.keep ? g_kept[q.routine_id][sent.id] : q.statements[sent.id];
+        Statement &s = q.statements[sent.id];
         s.prepared = true;
         s.to_client = sent.to_client;
         s.param_count = params;
-        if (sent.keep) {
-          s.lease = q.scope;
-          s.used = ++g_kept_tick;
-          s.key = sent.key;
-        }
       } else if (more_results) {
         open().state = State::kNext;
       } else {
@@ -829,33 +774,7 @@ void sql_close(Request &q, uint64_t id) {
   const Message m = sql_reply(assembled);
   if (m.discarded || m.body.empty() || m.body[0] != std::byte{uint8_t(w::SqlResultKind::kOk)})
     protocol_failure("a reply to CLOSE that is not OK");
-  if (const Found f = find_statement(q, id); f.st != nullptr) f.in->erase(id);
-}
-
-/** A free kept statement of q's routine that was prepared from key, or nullptr. */
-std::pair<uint64_t, Statement *> free_kept(Request &q, const std::string &key) {
-  const auto kept = g_kept.find(q.routine_id);
-  if (kept != g_kept.end())
-    for (auto &[id, st] : kept->second)
-      if (st.lease == 0 && st.key == key) return {id, &st};
-  return {0, nullptr};
-}
-
-/** Room for one more kept statement of q's routine: true if there is, after closing the free one
-    used longest ago if the routine has as many as it may. */
-bool kept_room(Request &q) {
-  const auto kept = g_kept.find(q.routine_id);
-  if (kept == g_kept.end() || kept->second.size() < config().kept_statements) return true;
-  uint64_t oldest = 0, tick = UINT64_MAX;
-  for (const auto &[id, st] : kept->second)
-    if (st.lease == 0 && st.used < tick) {
-      oldest = id;
-      tick = st.used;
-    }
-  if (oldest == 0) return false;  // every one is in use (a recursion): this statement is not kept
-  kept->second.erase(oldest);
-  sql_close(q, oldest);
-  return true;
+  q.statements.erase(id);
 }
 
 /** sql(action, scope, id, message, count, flags, width) -> the reply tuple (sql_result), or None
@@ -866,8 +785,7 @@ bool kept_room(Request &q) {
     the values), which this function completes; else None. scope and id: the statement's handle
     as an earlier reply gave it (the reply's id, the scope of the request that got it); not used
     by EXECUTE and PREPARE, which open a new id. flags: PASS_RESULT_TO_CLIENT, with EXECUTE and
-    PREPARE. A PREPARE while serving a CALL is a kept statement of the routine (§10.1): the same
-    text prepared again, by this or a later call, gets a free one without a message.
+    PREPARE.
 
     What does not need the host is answered here: an id that is CLOSED (CLOSE: OK; NEXT_RESULT:
     END; others: an ERROR), FETCH without rows to fetch. The handle of another request fails. */
@@ -906,7 +824,7 @@ Ref py_sql(PyObject *args) {
 
   Statement *st = nullptr;
   if (!opens) {
-    // A statement belongs to the request that opened it (a kept one: that uses it): the handle of
+    // A statement belongs to the request that opened it: the handle of
     // another request, an earlier one or the caller's, fails here and nothing is sent.
     if (scope != q.scope) {
       PyErr_SetString(PyExc_RuntimeError,
@@ -914,14 +832,10 @@ Ref py_sql(PyObject *args) {
       throw PyErrorSet{};
     }
     sent.id = handle;
-    const Found found = find_statement(q, sent.id);
-    st = found.st;
+    const auto known = q.statements.find(sent.id);
+    st = known != q.statements.end() ? &known->second : nullptr;
     if (action == w::SqlAction::kClose) {
       if (st == nullptr) return ok_tuple(q, 0, 0, Ref::borrow(Py_None), false, 0, 0, sent.id);
-      if (st->lease != 0 && st->state == State::kIdle) {
-        st->lease = 0;  // a kept statement with nothing to read stays prepared for the routine
-        return ok_tuple(q, 0, 0, Ref::borrow(Py_None), false, 0, 0, sent.id);
-      }
     } else if (action == w::SqlAction::kNextResult) {
       if (st == nullptr || st->state == State::kIdle) return Ref::steal(Py_BuildValue("(i)", 3));
     } else if (action == w::SqlAction::kFetch) {
@@ -951,23 +865,10 @@ Ref py_sql(PyObject *args) {
       sent.to_client = (flags & w::kPassResultToClient) != 0;
       wire_flags = sent.to_client ? uint8_t{w::kPassResultToClient} : uint8_t{0};
     }
-    if (action == w::SqlAction::kPrepare && q.op == uint32_t(w::Op::kCall) && config().kept_statements != 0) {
-      sent.key.assign(1, sent.to_client ? '1' : '0');
-      sent.key.append(reinterpret_cast<const char *>(head) + 13, text_len);
-      if (const auto [id, free] = free_kept(q, sent.key); free != nullptr) {
-        free->lease = q.scope;
-        free->used = ++g_kept_tick;
-        return ok_tuple(q, 0, 0, Ref::borrow(Py_None), false, free->param_count, 0, id);
-      }
-    }
   }
   if (action == w::SqlAction::kExecuteMany) sent.rows = width != 0 ? count / width : 0;
 
   const HostCall waiting;
-  if (!sent.key.empty()) {
-    sent.keep = kept_room(q);
-    if (sent.keep) wire_flags |= kKeep;
-  }
   if (opens) sent.id = ++g_statement_ids;
   if (with_message) {
     const Py_ssize_t size = PyByteArray_GET_SIZE(message);

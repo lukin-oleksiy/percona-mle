@@ -22,7 +22,7 @@
   class cpython, language python).
 
     mle_cpython_worker --code=<dir> [--site=<dir>]... [--pycache=<dir>] [--class=<name>] [--spin=<n>]
-                       [--message-mb=<n>] [--kept-statements=<n>] [--dumpable]
+                       [--message-mb=<n>] [--dumpable]
 
   Started by mle_launcher like mle_worker: Landlock, the cgroup and the descriptors (3 = mailbox,
   4 = control socket) are in place. Here:
@@ -39,8 +39,7 @@
 
   --class is the launcher's name of the worker class, for READY's info. --message-mb: a host
   message of more MiB than this is not held but failed where it belongs (§5.3); 0, the default: as
-  large as memory allows. --kept-statements: the statements a routine keeps prepared between its
-  calls (§10.1), at most; 0: none.
+  large as memory allows.
 
   Exit codes: 0 normal (the host closed the control socket); 1 a protocol failure, or the worker
   cannot serve (after a failed READY); 2 fd 3 is not an MLE region; 20 bad arguments; 21 dumpable;
@@ -96,8 +95,6 @@ bool parse(int argc, char **argv, Args *a) {
       a->spin = std::atoi(v.c_str());
     } else if (value("--message-mb=", &v)) {
       mle::cpython::config().message_max = std::strtoull(v.c_str(), nullptr, 10) << 20;
-    } else if (value("--kept-statements=", &v)) {
-      mle::cpython::config().kept_statements = static_cast<uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     } else {
       fprintf(stderr, "mle_cpython_worker: unknown argument %s\n", argv[i]);
       return false;
@@ -158,7 +155,7 @@ int main(int argc, char **argv) {
   if (!parse(argc, argv, &args)) {
     fprintf(stderr,
             "usage: mle_cpython_worker --code=<dir> [--site=<dir>]... [--pycache=<dir>] [--class=<name>] [--spin=<n>] "
-            "[--message-mb=<n>] [--kept-statements=<n>] [--dumpable]\n");
+            "[--message-mb=<n>] [--dumpable]\n");
     return 20;
   }
   if (!args.dumpable && prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0) return 21;
