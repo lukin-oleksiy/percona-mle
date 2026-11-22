@@ -69,15 +69,26 @@ final class JsOracle {
       is not counted against the frame limit (the arrow is the routine's). */
   static final String WRAPPER = "$mle$routine";
 
-  /** Converters used by the wrappers, written in JavaScript; $o holds the session options. */
+  /**
+   * Converters used by the wrappers, written in JavaScript; $o holds the session options. Also
+   * puts in Date.prototype.toString() and toTimeString() that stand in for Polyglot.DATE_STRINGS'
+   * until one of them is first called (datesBridge makes those then, from GraalJS's methods as
+   * they are here, before guest code runs).
+   */
   static Value helpers(Context c) {
     return c.eval(Source.create("js", """
         (() => {
-          const $mle$dates = DATES;
+          const P = Date.prototype, dates = [P, P.toString, P.toTimeString, P.getTime];
+          const standIn = {
+            toString() { return h.datesBridge(dates, standIn).toString.call(this); },
+            toTimeString() { return h.datesBridge(dates, standIn).toTimeString.call(this); },
+          };
+          // (Assignment keeps the properties' attributes: writable, configurable, not enumerable.)
+          P.toString = standIn.toString;
+          P.toTimeString = standIn.toTimeString;
           const $o = { int: 0, dec: 0 };
           const big = (a) => typeof a === 'string' || typeof a === 'number' ? BigInt(a) : a;
-          return {
-            $mle$dates,  // Polyglot.DATE_STRINGS (one source: parsed with the rest)
+          const h = {
             $o,
             // Integers come as numbers when safe, else as strings (decided in Java).
             int: (a) => a === null ? null
@@ -128,8 +139,9 @@ final class JsOracle {
               return f === undefined ? undefined : f.buffer.slice(f.byteOffset, f.byteOffset + f.byteLength);
             },
           };
+          return h;
         })()
-        """.replace("DATES", Polyglot.DATE_STRINGS)));
+        """));
   }
 
   /** The JavaScript converter of an argument of type t, or null if none is needed. */

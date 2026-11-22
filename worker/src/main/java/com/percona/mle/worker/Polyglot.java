@@ -408,11 +408,14 @@ final class Polyglot {
    * Date.prototype.toString() and toTimeString() as V8 (and Oracle's MLE) show them: GraalJS names
    * the zone in short ("GMT+3", "EET") unless in its V8 compatibility mode, which changes much else;
    * V8 gives ICU's long name (ZoneNames). The rest is GraalJS's own (its date, time and offset are
-   * V8's): its text with the long name in place of the short one.
+   * V8's): its text with the long name in place of the short one. Made when guest code first calls
+   * one of them (JsOracle.helpers' stand-ins, through dateMethods), from GraalJS's methods as they
+   * were before guest code ran (d: Date.prototype and those); they replace the stand-ins in
+   * Date.prototype unless guest code replaced those.
    */
-  static final String DATE_STRINGS = """
-      ((zones) => {
-        const P = Date.prototype, toString = P.toString, toTimeString = P.toTimeString, getTime = P.getTime;
+  private static final String DATE_STRINGS = """
+      ((zones, d, standIn) => {
+        const P = d[0], toString = d[1], toTimeString = d[2], getTime = d[3];
         let from = Infinity, until = -Infinity, name = '';  // numbers as ZoneNames gives them (doubles)
         const named = (s, t) => {
           if (!(t >= from && t < until)) {
@@ -431,12 +434,26 @@ final class Polyglot {
             const t = getTime.call(this), s = toTimeString.call(this);
             return t === t ? named(s, t) : s;
           },
+          changed: () => { from = Infinity; until = -Infinity; },
         };
-        Object.defineProperty(P, 'toString', { value: methods.toString, writable: true, enumerable: false, configurable: true });
-        Object.defineProperty(P, 'toTimeString', { value: methods.toTimeString, writable: true, enumerable: false, configurable: true });
-        return () => { from = Infinity; until = -Infinity; };
+        if (P.toString === standIn.toString) P.toString = methods.toString;
+        if (P.toTimeString === standIn.toTimeString) P.toTimeString = methods.toTimeString;
+        return methods;
       })
       """;
+
+  /** The Date methods of DATE_STRINGS, once made. */
+  private Value dateMethods;
+
+  /** JsOracle's datesBridge(d, standIn): the Date methods of DATE_STRINGS, made on the first call. */
+  private Value dateMethods(Context c, Value[] a) {
+    if (dateMethods == null) {
+      Value m = c.eval(Source.create("js", DATE_STRINGS)).execute(zoneNames, a[0], a[1]);
+      jsZoneChanged = m.getMember("changed");
+      dateMethods = m;
+    }
+    return dateMethods;
+  }
 
   static boolean isGuest(String language) {
     return LANGUAGES.contains(language);
@@ -483,7 +500,7 @@ final class Polyglot {
       if (JS) {
         js = jsHelpers(c);
         jsOracle = JsOracle.helpers(c);
-        jsZoneChanged = jsOracle.getMember("$mle$dates").execute(zoneNames);
+        jsOracle.putMember("datesBridge", (org.graalvm.polyglot.proxy.ProxyExecutable) a -> dateMethods(c, a));
         // USING in JavaScript routines (Phase 6): $c.lib(...) gets every library's module.
         jsOracle.putMember("libBridge",
             (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString(), true));
