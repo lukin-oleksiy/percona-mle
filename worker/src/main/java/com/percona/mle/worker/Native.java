@@ -63,13 +63,19 @@ final class Native {
               ValueLayout.ADDRESS,
               ValueLayout.JAVA_INT),
           Linker.Option.firstVariadicArg(1));
-  private static final MethodHandle READ =
-      fn("read", FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+  /**
+   * read(2) and lseek(2) share one descriptor, long f(int, long, long): read's buffer goes as its
+   * address and lseek's whence as a long (LP64, arguments in registers: the callee reads an int's
+   * low 32 bits). The Linker keeps one downcall stub per descriptor; each new one costs a stub and
+   * some twenty LambdaForm classes made at run time, ~3.5 ms of every worker's start.
+   */
+  private static final FunctionDescriptor INT_LONG_LONG =
+      FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG);
 
-  private static final MethodHandle LSEEK =
-      fn("lseek", FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT));
+  private static final MethodHandle READ = fn("read", INT_LONG_LONG);
+  private static final MethodHandle LSEEK = fn("lseek", INT_LONG_LONG);
 
-  static final int SEEK_END = 2;
+  static final long SEEK_END = 2;
   static final int PROT_READ = 1;
   static final int PROT_WRITE = 2;
   static final int MAP_SHARED = 1;
@@ -130,10 +136,10 @@ final class Native {
     }
   }
 
-  /** read(2); -1 on error, 0 on EOF. */
+  /** read(2) into a native segment; -1 on error, 0 on EOF. */
   static long read(int fd, MemorySegment buf) {
     try {
-      return (long) READ.invokeExact(fd, buf, buf.byteSize());
+      return (long) READ.invokeExact(fd, buf.address(), buf.byteSize());
     } catch (Throwable t) {
       throw rethrow(t);
     }
