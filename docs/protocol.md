@@ -126,16 +126,20 @@ host as the host validates a worker. It MUST check only what keeps a
    elements can be empty against the limits of §12 (a first batch of a
    result set has at least one column);
 2. every tag, kind, status, mode, action and operation it reads; it
-   decodes each value by the value's own tag (a value that is not NULL
-   and whose tag differs from its Column's or Param's is a protocol
-   failure);
+   decodes each value by the value's own tag and need not compare that
+   tag with its Column's or Param's type (a host that sends another tag
+   gives guest code a value of that tag's type, nothing worse);
 3. every number it uses to find its own state: the argument count of a
    CALL against the routine's Params, a routine id against what is
    prepared, the values of a row against the set's column count,
    `failed_row` against the rows it sent, UNCHANGED against a body it
    holds;
 4. that the message is one its state can take: the operation, `depth`,
-   `call_seq`, and the reply kind for the action (§10.1).
+   `call_seq`, the reply kind for the action (§10.1), and that the
+   language of a PREPARE or PARSE_LIBRARY is one it announced in READY.
+
+It need not check that options are in force (§9.8), nor the value of a
+setting it does not use.
 
 It need not check the domains of §7.2, the well-formedness of the host's
 str, reserved or unused fields, or what the host guarantees about order
@@ -171,7 +175,11 @@ view or trigger that is their definer, not the session's user. The host
 never substitutes rights: it only refuses a worker whose principal
 differs. An account here is one
 incarnation of it: the host retires every worker whose principal names an
-account that was dropped, renamed, or created after the worker started. The host MUST NOT send a worker a PREPARE, CALL or
+account that was dropped or renamed (away from that name). An account
+created under a name, or renamed to it, needs no retirement: the server
+already gives it the routines defined under that name, and every worker
+of an earlier account of that name was retired when that account was
+dropped or renamed. The host MUST NOT send a worker a PREPARE, CALL or
 PARSE_LIBRARY of another principal, nor a library body that its
 principal's routine may not have (§9.10), and runs a worker's SQL only
 with the rights of its principal's second account. So code that took over
@@ -278,16 +286,19 @@ Line 0 exists for the worker; the host does not read it.
 | 0 | 8 | `heap_used`: bytes of the runtime's heap in use |
 | 8 | 8 | `heap_max`: the heap's limit |
 | 16 | 8 | `gc_count`: collections the worker forced since the last RESET |
-| 24 | 4 | `state`: 0 starting, 1 idle, 2 running, 3 compiling |
+| 24 | 4 | `state`: 0 starting, 1 ready, 2 running, 3 compiling |
 | 28 | 4 | reserved |
 
 The worker writes the statistics whenever it likes, without
 synchronization. They are for reporting only: the host copies them in one
-read, replaces impossible values (`heap_used > heap_max`, an unknown
-`state`) and MUST NOT base any decision on them. A worker SHOULD NOT
-write them on every request: each write costs both sides a cache line.
-It writes them when they have changed enough to matter, and when it
-becomes idle after a RESET.
+read, replaces impossible values (`heap_used > heap_max` when `heap_max`
+is not 0, an unknown `state`) and MUST NOT base any decision on them. A
+worker SHOULD NOT write them on every request: each write costs both
+sides a cache line. It writes them when they have changed enough to
+matter (for example after a full collection), and when it becomes ready
+after start and after a RESET. `state` 2 and 3 are optional: a worker
+that does not write per request shows 1 while it serves. A figure the
+runtime does not have is 0 (`heap_max` 0: no known limit).
 
 ## 4. Turns and synchronization
 
@@ -455,7 +466,8 @@ bytes still due) and, on the first, what §1 lists and whether it can hold
   sends CLOSE for that id (it cannot know the id's state) and raises an
   error in guest code. A LIBRARY_RESULT: as for REFUSED (§9.10): the
   import fails; no answer is held, and a held one is unchanged. It MUST
-  NOT exit.
+  NOT exit. OPTIONS, DROP and RESET are at most 64 KiB; a worker that
+  cannot hold even these answers INTERNAL with `TAINTED`.
 * An SQL message whose `total_len` would put the host over its bound on
   request bytes (§10.7) is treated alike: the host completes the transfer
   and keeps
@@ -652,7 +664,8 @@ vector gets a copy.)
 
 * **From the host**, a value whose declared type is known (an argument, a
   row value under its Column) is NULL or has exactly the tag of this table.
-  A worker MAY rely on it: another tag is a protocol failure. A column
+  A worker MAY rely on it; it need not check it (§1, item 2), and if it
+  does, another tag is a protocol failure. A column
   without a type (`SELECT NULL`) has `Type.tag` 0 and only NULL values.
 * **From a worker**, a value (a return value, an OUT parameter, an SQL
   parameter) may have any tag: the host converts it to the target type
@@ -931,7 +944,7 @@ bool has_error [, Error]
 | 0 | OK | done | absent |
 | 1 | GUEST_ERROR | guest code failed or did not compile, or a value did not convert | present |
 | 2 | INTERRUPTED | stopped by INTERRUPT (§11.1) | present |
-| 3 | EXHAUSTED | the runtime's heap or stack is exhausted, or the worker cannot hold a host message (§5.3) | present |
+| 3 | EXHAUSTED | the runtime's heap or stack is exhausted (not a limit guest code can catch, below), or the worker cannot hold a host message (§5.3) | present |
 | 4 | INTERNAL | the worker itself failed | present |
 
 Any other status is a violation. Rules (each a violation if broken):
@@ -995,6 +1008,12 @@ A worker MUST set `TAINTED` when it answers EXHAUSTED because its
 runtime's heap or stack was exhausted, and when it answers INTERNAL
 because its own state may be damaged.
 
+EXHAUSTED is for exhaustion that may leave the runtime unsound. A limit
+of the language that guest code can catch and that leaves the runtime
+sound (Python's `RecursionError`, JavaScript's `RangeError` for the call
+stack size) is an ordinary error of guest code: uncaught, the request
+ends GUEST_ERROR, without `TAINTED`.
+
 ### 9.5 SQL (5), SQL_RESULT (6)
 
 ```
@@ -1052,9 +1071,11 @@ What a worker needs to know of the session.
   64 characters of `[a-z0-9_.]`, sorted ascending by bytes, no
   duplicates; a value is at most 1024 bytes. The whole message is one
   chunk (§12). A setting that is absent has its default; the host may
-  leave out those that have it. A worker ignores names it does not know,
-  and answers GUEST_ERROR with language `MLE-Option` for a value it does
-  not accept for a name it knows.
+  leave out those that have it. A worker ignores names it does not know
+  and settings it does not use, and answers GUEST_ERROR with language
+  `MLE-Option` for a value it does not accept for a setting it uses. (The
+  host checks values when they are set; the worker's check is a
+  backstop.)
 
 A worker has **options in force** from an OPTIONS it answered OK until
 RESET. The host MUST NOT send PREPARE, CALL or PARSE_LIBRARY to a worker
@@ -1064,8 +1085,9 @@ apply to every request served under them.
 A session has one set of **fixed options** at a time. The host fixes
 them before the session's first PREPARE, CALL or PARSE_LIBRARY (for
 MySQL: the zone and settings then in effect) and keeps them until the
-session's state is reset (Appendix A); an OPTIONS that failed fixes
-nothing. Every worker the session uses gets the same fixed options: the
+session's state is reset, or until they are replaced at a time when no
+id is prepared in any worker of the session (Appendix A); an OPTIONS
+that failed fixes nothing. Every worker the session uses gets the same fixed options: the
 host MUST NOT send PREPARE, CALL or PARSE_LIBRARY to a worker whose
 options in force differ from them. It sends OPTIONS only to a worker in
 which no id is prepared (after READY or RESET), so options never change
@@ -1591,7 +1613,10 @@ depth. The requirements:
   worker stops the outer code as well. What a language runs while it
   unwinds (cleanup handlers) may run; it gets ERROR for all SQL except
   CLOSE, and for imports — from the host, or from the worker itself
-  without a message — and the worker bounds it.
+  without a message — and the worker bounds it. (Where the interrupt is
+  an exception guest code can catch, the worker raises it again until
+  the code stops; how long cleanup may run is the worker's choice, and
+  the host's grace clock bounds the whole.)
 * INTERRUPTED is only for a delivered interrupt (§10.6).
 
 DROP, RESET and OPTIONS are not interruptible; they have a deadline
@@ -2064,7 +2089,12 @@ are fixed when it first runs a stored program and hold until
 session has stored programs cached. OPTIONS is therefore sent once per
 worker and session. `mle_session_reset()` releases the session's workers
 (a kept one gets RESET, and OPTIONS with the new values when a session
-takes it).
+takes it). A session with no program cached (it ran only `mle_eval()`,
+or its routines were dropped) may call `mle_set_session_state()`: that
+ends the fixed options as a reset does, and the next request fixes the
+new ones. The host checks a setting's value in
+`mle_set_session_state()`, so a worker's `MLE-Option` is not reached in
+practice.
 
 **Declared character sets (Oracle's rule).** A routine's string
 parameters and return type must be declared utf8mb4 or binary; values in
@@ -2074,7 +2104,14 @@ BYTES).
 
 **TIMESTAMP.** The server gives and takes a TIMESTAMP only as local time
 in the session's current zone; the host converts with the system's zone
-data. Wanted: a server service that exposes the stored instant.
+data. Wanted: a server service that exposes the stored instant. The
+host keeps the interval of the session zone's current offset (from one
+transition to the next), so that a value inside it costs a compare and
+an add; only a value outside it looks the zone up. A worker that maps
+instants to local time does the same with its zone. For `SYSTEM` without
+an IANA name the host derives the intervals from the C library's local
+time and caches them alike; repeated and skipped hours then follow the C
+library, which can differ from the server.
 
 **A handed-back SQL error.** While it is still the session's current
 error it reaches the client unchanged. An older one is raised anew with
@@ -2090,6 +2127,25 @@ definers run in different workers for the same invoker.
 
 **A killed session** still waits, for each worker it keeps, up to the
 deadline of the DROP or RESET it sends.
+
+**Accounts that change.** The server tells the host which account was
+dropped, but not which was renamed: after a RENAME USER the host checks
+the accounts of every worker's principal and retires the workers that
+name an account that no longer exists. CREATE USER and CREATE ROLE retire
+nothing (§1).
+
+**Cost per request.** Nothing in the protocol needs per-request work
+that grows with the session: a top-level CALL of a prepared routine is
+one message each way with no other exchange. Measured on the JVM path
+(22 Nov), the host's fixed cost is what an implementation adds around
+that exchange; so the host keeps per session (not per request) the
+fixed options, the zone's offset interval, and per routine and
+statement the principal it computed; it forgets held errors (§10.8) by
+a generation number rather than by clearing; and it copies a RESULT's
+fields out of the region only when it needs them. A worker encodes text
+in one pass, repairing (§7.1) only where its encoder found something to
+repair, and allocates nothing per call that it can reuse. The measured
+regressions and their causes are in `docs/protocol-review.md` §17–18.
 
 **Workers and sessions.** A kept worker is given to any session that
 needs its principal; a stricter host gives it to sessions of one account
@@ -2158,21 +2214,37 @@ A setting of one language only would be named with its prefix
 
 | Language | Body form (`entry` empty) | Entry form |
 |---|---|---|
-| JavaScript | the body of a function whose parameters are the routine's | an exported function of a module |
+| JavaScript | the body of a function whose parameters are the routine's | a function declared at the top level of a script (not a module: `export` is a SyntaxError) |
 | Python | the body of a `def` whose parameters are the routine's | a function of a module |
 | Java | the body of a static method | `Class.method` in the source |
 
-Loading runs guest code in JavaScript (module top level) and Python
+Loading runs guest code in JavaScript (script top level) and Python
 (module level), not in Java.
 
 ### B.4 Types
 
-A worker documents how each tag appears in its languages (for
-JavaScript: I64 and U64 by `integer_type`, DECIMAL by
-`decimal_type`; DATE, DATETIME and TIMESTAMP as `Date`, a zero date or
-zero timestamp as an Invalid Date; TIME as a string; VECTOR as
-`Float32Array`; and so on per language). The mapping is not part of the
-protocol; the MySQL test suite fixes it per language.
+The mapping of tags to language values is not part of the protocol; the
+MySQL test suite fixes it per language. For JavaScript it is Oracle's
+(Tables 27.2–27.5 of its documentation); both JavaScript workers follow
+it alike. The points where a reading was needed:
+
+* I64 and U64 by `integer_type`, DECIMAL by `decimal_type`; TIME as a
+  string; VECTOR as `Float32Array`; JSON as Oracle's Table 27.5
+  (numbers rounded with `Math.round` where an integer is needed).
+* DATE, DATETIME and TIMESTAMP as `Date`. A zero date, a date with a
+  zero month or day, and the zero timestamp are an Invalid Date; any
+  other date goes to the `Date` constructor with its fields, so an
+  impossible date (31 February) rolls over. Years 0–99 keep their value
+  (they are not taken as 1900–1999).
+* A `Date` given for DATE is rounded to the nearest second, then its
+  local date is taken (Table 27.3).
+* Local time is that of the zone in OPTIONS, not the zone of the worker's
+  process.
+
+Python: TIMESTAMP is a naive `datetime` in the zone of OPTIONS (as guest
+code saw it before 1.0; an aware `datetime` would be the instant).
+`decimal_type` applies to SQL results; routine arguments are always
+`Decimal`. Java: `java.time` types, `BigDecimal`.
 
 ### B.5 Errors a worker raises itself
 
@@ -2187,3 +2259,18 @@ for SQL parameters, and GUEST_ERROR / `MLE-Type` for results.
 |---|---|
 | `jvm`, `v8` | JavaScript `globalThis`; loaded libraries |
 | `jvm`, `cpython` | Python modules already imported |
+
+### B.7 JavaScript: choices where Oracle's documentation is silent
+
+Both JavaScript workers make these choices alike:
+
+| Question | Choice |
+|---|---|
+| A BigInt as a statement parameter | I64 if it fits, else U64, else DECIMAL |
+| A string given for a DOUBLE | parsed as `Number()` parses decimal notation; hexadecimal, octal and binary forms are refused |
+| Successive `setOptions()` | an option not given keeps the value an earlier call set |
+| Session variables (`session.x = v`) | bound as an ordinary parameter; an object as JSON text |
+| `getOption()` default for `integer_type` | `UNSAFE_STRING` (the session state page) |
+| A `Set` as a JSON result | `{}` (no `toJSON`) |
+| A plain `Array` for VECTOR; `ArrayBuffer` or `DataView` for BLOB | accepted |
+| Call stack exceeded | a `RangeError` in guest code (§9.4: GUEST_ERROR when uncaught) |
