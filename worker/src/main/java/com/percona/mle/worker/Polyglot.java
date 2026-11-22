@@ -197,27 +197,35 @@ final class Polyglot {
   private String jsZone;
 
   /**
-   * GraalJS takes the zone of local time from the context (the process's zone, or the builder's
-   * timeZone()), fixed when the context is made; the context lives as long as the worker and
-   * serves sessions of any zone. So the JavaScript realm's zone is set directly (JSRealm is in this
-   * class loader, as the FrameLimit instrument is); the main thread is entered. Options change
-   * only while nothing is prepared (§9.8).
+   * The ICU id the V8 worker gives the zone of the options (Date.prototype.toString() shows its
+   * name): +00:00 is UTC, a whole hour Etc/GMT with IANA's sign (west positive), another offset
+   * GMT+05:30; an IANA name as it is. java.time knows them all.
    */
-  private void jsZone() {
-    // The ICU id the V8 worker gives the zone (Date.prototype.toString() shows its name): +00:00
-    // is UTC, a whole hour Etc/GMT with IANA's sign (west positive), another offset GMT+05:30; an
-    // IANA name as it is. java.time knows them all.
+  private String jsZoneName() {
     String name = options.zoneName;
     if (Options.isOffset(name) && name.length() == 6) {
       int hours = Integer.parseInt(name.substring(1, 3));
-      if (name.substring(1).equals("00:00")) name = "UTC";
+      if (name.substring(1).equals("00:00")) return "UTC";
       // (IANA has Etc/GMT-14 to Etc/GMT+12: -13:00 is GMT-13:00.)
-      else if (name.endsWith(":00") && (name.charAt(0) == '+' || hours <= 12))
-        name = "Etc/GMT" + (name.charAt(0) == '+' ? "-" : "+") + hours;
-      else name = "GMT" + name;
-    } else if (!Options.isOffset(name)) {
-      name = options.zone instanceof java.time.ZoneOffset ? "UTC" : options.zone.getId();  // "UTC", "Z"
+      if (name.endsWith(":00") && (name.charAt(0) == '+' || hours <= 12))
+        return "Etc/GMT" + (name.charAt(0) == '+' ? "-" : "+") + hours;
+      return "GMT" + name;
     }
+    if (!Options.isOffset(name))
+      return options.zone instanceof java.time.ZoneOffset ? "UTC" : options.zone.getId();  // "UTC", "Z"
+    return name;
+  }
+
+  /**
+   * GraalJS takes the zone of local time from the context (the process's zone, or the builder's
+   * timeZone()), fixed when the context is made; the context lives as long as the worker and
+   * serves sessions of any zone. So the JavaScript realm's zone is set directly (JSRealm is in this
+   * class loader, as the FrameLimit instrument is), also when the context is made, so that a
+   * worker of the pool has done it once; the main thread is entered. Options change only while
+   * nothing is prepared (§9.8).
+   */
+  private void jsZone() {
+    String name = jsZoneName();
     if (name.equals(jsZone)) return;
     try {
       if (getMainRealm == null) {
@@ -386,7 +394,7 @@ final class Polyglot {
    * V8 gives ICU's long name (ZoneNames). The rest is GraalJS's own (its date, time and offset are
    * V8's): its text with the long name in place of the short one.
    */
-  private static final String DATE_STRINGS = """
+  static final String DATE_STRINGS = """
       ((zones) => {
         const P = Date.prototype, toString = P.toString, toTimeString = P.toTimeString, getTime = P.getTime;
         let from = Infinity, until = -Infinity, name = '';  // numbers as ZoneNames gives them (doubles)
@@ -408,8 +416,8 @@ final class Polyglot {
             return t === t ? named(s, t) : s;
           },
         };
-        for (const n of ['toString', 'toTimeString'])
-          Object.defineProperty(P, n, { value: methods[n], writable: true, enumerable: false, configurable: true });
+        Object.defineProperty(P, 'toString', { value: methods.toString, writable: true, enumerable: false, configurable: true });
+        Object.defineProperty(P, 'toTimeString', { value: methods.toTimeString, writable: true, enumerable: false, configurable: true });
         return () => { from = Infinity; until = -Infinity; };
       })
       """;
@@ -459,7 +467,7 @@ final class Polyglot {
       if (JS) {
         js = jsHelpers(c);
         jsOracle = JsOracle.helpers(c);
-        jsZoneChanged = c.eval(Source.create("js", DATE_STRINGS)).execute(zoneNames);
+        jsZoneChanged = jsOracle.getMember("$mle$dates").execute(zoneNames);
         // USING in JavaScript routines (Phase 6): $c.lib(...) gets every library's module.
         jsOracle.putMember("libBridge",
             (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString(), true));

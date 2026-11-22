@@ -73,9 +73,11 @@ final class JsOracle {
   static Value helpers(Context c) {
     return c.eval(Source.create("js", """
         (() => {
+          const $mle$dates = DATES;
           const $o = { int: 0, dec: 0 };
           const big = (a) => typeof a === 'string' || typeof a === 'number' ? BigInt(a) : a;
           return {
+            $mle$dates,  // Polyglot.DATE_STRINGS (one source: parsed with the rest)
             $o,
             // Integers come as numbers when safe, else as strings (decided in Java).
             int: (a) => a === null ? null
@@ -127,7 +129,7 @@ final class JsOracle {
             },
           };
         })()
-        """));
+        """.replace("DATES", Polyglot.DATE_STRINGS)));
   }
 
   /** The JavaScript converter of an argument of type t, or null if none is needed. */
