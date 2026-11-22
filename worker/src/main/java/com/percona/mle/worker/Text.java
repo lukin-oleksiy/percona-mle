@@ -72,16 +72,34 @@ final class Text {
    * s as well-formed UTF-8, repaired (§7.1), in one pass where nothing needs repair: the JDK's
    * encoder (vectorized for Latin-1 strings) writes '?' for an unpaired surrogate, so only output
    * with more '?' than s has is encoded again, repairing. (A scan for unpaired surrogates before
-   * getBytes cost ~0.7 ns per character after a large fetch, protocol-review.md §17.)
+   * getBytes cost ~0.7 ns per character after a large fetch, protocol-review.md §17.) The output
+   * is searched for a '?' 8 bytes at a time; only where there is one are the '?' counted.
    */
   static byte[] utf8(String s) {
     byte[] b = s.getBytes(StandardCharsets.UTF_8);
+    int first = indexOfMark(b);
+    if (first < 0) return b;
     int marks = 0;
-    for (byte x : b) marks += x == '?' ? 1 : 0;
-    if (marks == 0) return b;
+    for (int i = first; i < b.length; i++) marks += b[i] == '?' ? 1 : 0;
     int own = 0;  // String.indexOf is vectorized, for either coder of a String
     for (int i = s.indexOf('?'); i >= 0 && own <= marks; i = s.indexOf('?', i + 1)) own++;
     return own == marks ? b : utf8Repairing(s);
+  }
+
+  private static final java.lang.invoke.VarHandle LONGS =
+      java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
+  private static final long MARKS = 0x3F3F3F3F3F3F3F3FL, ONES = 0x0101010101010101L, HIGHS = 0x8080808080808080L;
+
+  /** The index of the first '?' (0x3F) in b, or -1; 8 bytes at a time (a zero byte of b ^ '?'). */
+  static int indexOfMark(byte[] b) {
+    int n = b.length, i = 0;
+    for (; i <= n - 8; i += 8) {
+      long v = (long) LONGS.get(b, i) ^ MARKS;
+      if (((v - ONES) & ~v & HIGHS) != 0) break;  // exact for "some byte is zero"
+    }
+    for (; i < n; i++)
+      if (b[i] == '?') return i;
+    return -1;
   }
 
   /** s as UTF-8, each unpaired surrogate as U+FFFD (EF BF BD); longer than a message may be: TooLarge. */
