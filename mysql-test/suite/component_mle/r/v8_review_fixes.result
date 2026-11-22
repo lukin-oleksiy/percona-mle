@@ -80,13 +80,14 @@ CALL js_outer(@r);
 SELECT @r AS nested;
 nested
 9
-# C5: an import allowed for one routine is not thereby allowed for another.
+# C5 under Oracle's library rule (protocol Appendix A): a routine without
+# USING may import at run time any library its rights account may use.
 SELECT js_peek_using() AS with_using;
 with_using
 secret
 SELECT js_peek() AS without_using;
 without_using
-refused
+secret
 # C4: internal statements of the SQL API never go to the client.
 SET @foo = 42;
 CALL js_opts(@r);

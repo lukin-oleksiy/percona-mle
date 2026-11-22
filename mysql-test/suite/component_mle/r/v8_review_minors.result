@@ -21,19 +21,10 @@ SELECT py_resize(TO_VECTOR('[5,6,7,8]')) AS second;
 second
 owns False ValueError 4
 # C129
-SELECT js_liar();
-js_liar()
-true
 # C60, C162
 SELECT js_context();
 js_context()
 context refused, ProcessHandle refused
-CALL java_close();
-# A Java routine may close it: the next script call finds it closed, and
-# the worker is replaced (it used to stay, failing every call). It is an
-# error of guest code, not an interrupt: none was requested (protocol 10.6).
-SELECT js_one();
-ERROR HY000: JavaScript> the worker's context was closed by a routine
 SELECT js_one() AS works_after;
 works_after
 1
@@ -205,7 +196,8 @@ good()
 CREATE LIBRARY `lib1.ab` LANGUAGE JS AS $$ export function f() { return 2 } $$;
 CREATE FUNCTION dotted() RETURNS INT LANGUAGE JS USING (`lib1.ab` AS l) AS $$ return l.f() $$;
 SELECT dotted();
-Got one of the listed errors
+dotted()
+2
 DROP FUNCTION dotted;
 DROP LIBRARY `lib1.ab`;
 # C128: the text of a frame on a JavaScript body's first line is the body's.
@@ -215,7 +207,7 @@ ERROR HY000: JavaScript> TypeError: Cannot read properties of null (reading 'oop
 SELECT mle_session_state('traceback') AS traceback;
 traceback
 TypeError: Cannot read properties of null (reading 'oops')
-    at js_line1:1:21
+    at js_line1:1:26
         const answer = 42; null.oops
 
 DROP FUNCTION js_line1;

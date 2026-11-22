@@ -1443,9 +1443,10 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
     params = info[4].As<v8::Array>();
     nparams = params->Length();
   }
-  if (nparams > w::kMaxValues)
-    return type_error("Incorrect arguments: " + std::to_string(nparams) + " values in one statement (at most " +
-                      std::to_string(w::kMaxValues) + ")");
+  if (nparams > w::kMaxValues)  // an error of the statement, as on the other workers (MySQL's 1210)
+    return error_reply(iso, 1210, "HY000",
+                       "Incorrect arguments: " + std::to_string(nparams) + " values in one statement (at most " +
+                           std::to_string(w::kMaxValues) + ")");
   if (action == w::SqlAction::kExecuteMany) sent.rows = width != 0 ? nparams / width : 0;
   // The statement's integerType and decimalType; anything else: the session's.
   Options rules = m_options;

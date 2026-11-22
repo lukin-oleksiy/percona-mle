@@ -25,9 +25,6 @@ our @KNOWN = (
   ['oracle_examples', qr/<date> GMT\+0300 \(GMT\+3\)/, '<date> GMT+0300 (GMT+03:00)'],
   ['oracle_examples', qr/TypeError: \(intermediate value\)\.lob is not a function/, 'TypeError: console.lob is not a function'],
   ['oracle_examples', qr/<js> pc2:3:1-47/, '<js> pc2:3:9'],
-  # The V8 worker strips only ASCII white space from a numeric string (the JVM worker: what
-  # JavaScript's Number() strips), and keeps a Date's local date for DATE (the JVM worker rounds
-  # the time part off to the closest second, as Oracle's Table 27.3 says).
   # Libraries created with LANGUAGE JS show it in information_schema.LIBRARIES.
   ['libraries', qr/(?<=jslib\tlib\d\t)JAVASCRIPT$/m, 'JS'],
   ['libraries', qr/SyntaxError: lib3:3:10 Expected an operand but found \*/, "SyntaxError: lib3:3:11 Unexpected token '*'"],
@@ -39,11 +36,19 @@ our @KNOWN = (
   ['debugging', qr/at helper \(js_div:2:31\)/, 'at helper (js_div:2:41)'],
   ['session_state', qr/<js> pc2:4:1-6/, '<js> pc2:4:3'],
   ['review_isolation', qr/at helper \(js_secret:2:29\)/, 'at helper (js_secret:2:39)'],
+  ['review_minors', qr/at js_line1:1:21/, 'at js_line1:1:26'],
   ['review_isolation', qr/at js_lib_secret:2:8/, 'at js_lib_secret:2:10'],
   ['review_isolation', qr/at author_fails:2:8/, 'at author_fails:2:18'],
   # A session that runs JavaScript and Python holds a V8 and a JVM worker: one more kept.
   ['review_isolation', qr/SELECT VARIABLE_VALUE = 3 FROM performance_schema\.global_status WHERE VARIABLE_NAME = 'mle_workers_cached'/,
    "SELECT VARIABLE_VALUE = 4 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached'"],
+  # review_minors: what needs the JVM worker's polyglot context is not JavaScript on V8: numpy
+  # through importPython (C129), and a Java routine that closes the context JavaScript runs in (C60).
+  ['review_minors', qr/SELECT js_liar\(\);\n(?:js_liar\(\)\ntrue\n)?/, ''],
+  ['review_minors', qr/CALL java_close\(\);\n(?:[^\n]*\n)*?(?:--error ER_LANGUAGE_COMPONENT_RUNTIME\n)?SELECT js_one\(\);\n(?:ERROR HY000: [^\n]*\n)?/, ''],
+  # C47: V8 imports the library `lib1.ab` itself (GraalJS fails the import; neither takes lib1).
+  ['review_minors', qr/--error ER_LANGUAGE_COMPONENT_RUNTIME,ER_LANGUAGE_COMPONENT\nSELECT dotted\(\);\n/, "SELECT dotted();\n"],
+  ['review_minors', qr/SELECT dotted\(\);\nGot one of the listed errors\n/, "SELECT dotted();\ndotted()\n2\n"],
   # GraalJS prefixes a failed import: "Error reading module '/other/secret' imported from peek: ".
   # The session holds a V8 worker (JavaScript) and a JVM worker (its Python).
   ['packages', qr/cannot refresh: 1 session workers are in use/, 'cannot refresh: 2 session workers are in use'],

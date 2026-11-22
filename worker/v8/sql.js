@@ -275,6 +275,19 @@
   // [depth, scope, routine schema, integer type, decimal type] of the request being served.
   const state = () => N.state();
 
+  // A result of a direct statement (run from text) that mysqld buffered whole (it said how many rows)
+  // and that the routine read in part is drained into the worker before the routine runs another
+  // statement, so that mysqld holds at most one such result per call, as on the JVM worker
+  // (independent review C14). depth -> [scope, SqlResult].
+  const partial = new Map();
+  const drainPartial = () => {
+    const st = state();
+    const e = partial.get(st[0]);
+    if (e === undefined) return;
+    partial.delete(st[0]);
+    if (e[0] === st[1]) e[1].$drain();
+  };
+
   // One SQL message and its reply. A statement is known by the scope of the request that opened
   // it and its id there; EXECUTE and PREPARE open one, and the reply says which. The reply:
   // [0, code, state, message, row, errorId] (thrown as a SqlError) |
@@ -284,6 +297,8 @@
   //    are made with the labels given here); total null if the host does not know it |
   // [3]: no further result (NEXT_RESULT).
   const send = (action, scope, id, text, params, options, flags = 0, width = 0, labels = null) => {
+    if (partial.size !== 0 && (action === EXECUTE || action === PREPARE || action === EXECUTE_PREPARED || action === EXECUTE_MANY))
+      drainPartial();
     const o = options || NO_OPTIONS;
     // -1: the session's integerType / decimalType (OPTIONS).
     const t = N.sql(action, scope, id, text, params, flags, width, o.intCode, o.decCode);
@@ -353,6 +368,15 @@
       s.replaced = true; s.rows = []; s.at = 0; s.more = false; s.moreResults = false;
     }
     $live() { if (this.$s.replaced) throw new Error(REPLACED); }
+    // The rest of the result set into the worker (partial, above).
+    $drain() {
+      const s = this.$s;
+      if (s.replaced || !s.more) return;
+      const rows = s.at === 0 ? s.rows : rowsFrom(s.rows, s.at);
+      s.at = 0;
+      while (s.more) appendRows(rows, this.$fetch());
+      s.rows = rows;
+    }
 
     *[Symbol.iterator]() {
       for (let r = this.fetchOne(); r !== null; r = this.fetchOne()) yield r;
@@ -771,7 +795,10 @@
   const run = (sql, params, o) => {
     if (params) checkArgs(params);
     const t = send(EXECUTE, 0, 0, sql, params, o, o.toClient ? TO_CLIENT : 0);
-    return o.toClient ? null : new SqlResult(scopeOf(t), idOf(t), true, o, t);
+    if (o.toClient) return null;
+    const r = new SqlResult(scopeOf(t), idOf(t), true, o, t);
+    if (t[0] === 2 && t[5] && t[3] !== null) partial.set(state()[0], [scopeOf(t), r]);
+    return r;
   };
   const exec = (sql, params = null) => {
     const t = send(EXECUTE, 0, 0, sql, params, internal());

@@ -1347,13 +1347,14 @@ ERROR HY000: too many open statements (mle.sql_statements_max)
 SET GLOBAL mle.sql_statements_max = DEFAULT;
 # statements do not outlive their call
 CREATE PROCEDURE keep(INOUT id BIGINT) LANGUAGE JAVA AS $$
-if (id[0] == null) { id[0] = 1000000L; MleSql.prepare(id[0], "SELECT 1", false); }
+if (id[0] == null) { id[0] = MleSql.newStatementId(); MleSql.prepare(id[0], "SELECT 1", false); }
 else MleSql.executePrepared(id[0], null, 0);
 $$;
 SET @id = NULL;
 CALL keep(@id);
+# The worker fails the use of another call's statement itself (protocol 10.1).
 CALL keep(@id);
-ERROR HY000: no prepared statement with this id
+ERROR HY000: the statement or result belongs to another routine call (or its id was not made by this one)
 #
 # 8. Privileges: inner SQL runs as the routine's security context.
 #

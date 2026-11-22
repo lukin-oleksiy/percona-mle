@@ -97,7 +97,9 @@ $$;
 ERROR HY000: JavaScript> SyntaxError: lib3:3:11 Unexpected token '*'
 #
 # 5. Ours: a changed library is used at the next call; a dropped one
-#    fails the call; libraries of other schemas need USING.
+#    fails the call. Oracle's rule: a dynamic import may name any
+#    library, in any schema, that the account whose rights apply may use
+#    (USING is not needed); one that account may not use is refused.
 #
 SELECT foo(2);
 foo(2)
@@ -113,12 +115,27 @@ Got one of the listed errors
 CREATE LIBRARY other.secret LANGUAGE JS AS $$ export const value = 'from other' $$;
 CREATE FUNCTION peek() RETURNS TEXT LANGUAGE JS AS $$ return (await import('/other/secret')).value $$;
 SELECT peek();
-ERROR HY000: JavaScript> Error: library other.secret is not importable from test.peek (import it with USING, or use a library of the routine's schema) (peek, line 1)
+peek()
+from other
 CREATE FUNCTION peek_using() RETURNS TEXT LANGUAGE JS USING (other.secret)
 AS $$ return secret.value + ' / ' + (await import('/other/secret')).value $$;
 SELECT peek_using();
 peek_using()
 from other / from other
+CREATE FUNCTION peek_invoker() RETURNS TEXT SQL SECURITY INVOKER LANGUAGE JS
+AS $$ return (await import('/other/secret')).value $$;
+CREATE USER lib_reader@localhost;
+GRANT EXECUTE ON FUNCTION test.peek_invoker TO lib_reader@localhost;
+GRANT EXECUTE ON FUNCTION test.peek TO lib_reader@localhost;
+# The invoker may not use other.secret: refused. The definer may: peek()
+# runs with root's rights.
+SELECT test.peek_invoker();
+ERROR HY000: JavaScript> Error: library other.secret is not available to test.peek_invoker (peek_invoker, line 1)
+SELECT test.peek();
+test.peek()
+from other
+DROP USER lib_reader@localhost;
+DROP FUNCTION peek_invoker;
 DROP DATABASE jslib;
 DROP DATABASE db1;
 DROP DATABASE other;
