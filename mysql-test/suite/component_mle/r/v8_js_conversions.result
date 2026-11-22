@@ -1,0 +1,293 @@
+#
+# component_mle: JavaScript values as Oracle's documentation of
+# JavaScript stored programs defines them (MySQL manual, "JavaScript
+# Stored Program Data Types and Argument Handling"): zero and impossible
+# dates, BigInt statement parameters, MySQL JSON from JavaScript.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE ON *.* TO root@localhost;
+SET time_zone = '+00:00';
+SET sql_mode = 'ALLOW_INVALID_DATES';
+#
+# 1. A zero date or a date with a zero month or day is an invalid Date;
+#    an impossible day is what Date's constructor makes of the fields
+#    (April 31 is May 1); the zero TIMESTAMP is an invalid Date. As
+#    arguments and as values of rows.
+#
+CREATE FUNCTION js_when(d DATE, dt DATETIME, ts TIMESTAMP) RETURNS TEXT LANGUAGE JS AS $$
+const show = (v) => v === null ? 'null' : !(v instanceof Date) ? typeof v
+: isNaN(v) ? 'Invalid Date' : v.toISOString()
+return [d, dt, ts].map(show).join(' | ')
+$$;
+SELECT js_when('2024-02-29', '2024-02-29 10:11:12', '2024-02-29 10:11:12') AS ordinary;
+ordinary
+2024-02-29T00:00:00.000Z | 2024-02-29T10:11:12.000Z | 2024-02-29T10:11:12.000Z
+SELECT js_when('0000-00-00', '0000-00-00 00:00:00', '0000-00-00 00:00:00') AS zero;
+zero
+Invalid Date | Invalid Date | Invalid Date
+SELECT js_when('2024-00-10', '2024-04-00 01:02:03', NULL) AS zero_in_date;
+zero_in_date
+Invalid Date | Invalid Date | null
+SELECT js_when('2024-04-31', '2023-02-30 23:00:00', NULL) AS impossible_day;
+impossible_day
+2024-05-01T00:00:00.000Z | 2023-03-02T23:00:00.000Z | null
+CREATE TABLE td (k INT PRIMARY KEY, d DATE, dt DATETIME);
+INSERT INTO td VALUES (1, '0000-00-00', '0000-00-00 00:00:00'), (2, '2024-00-10', '2024-04-00 01:02:03'),
+(3, '2024-04-31', '2023-02-30 23:00:00'), (4, '2024-02-29', '2024-02-29 10:11:12');
+CREATE PROCEDURE js_rows(OUT r TEXT) LANGUAGE JS AS $$
+const show = (v) => v === null ? 'null' : !(v instanceof Date) ? typeof v
+: isNaN(v) ? 'Invalid Date' : v.toISOString()
+r = session.runSql('SELECT d, dt FROM td ORDER BY k').fetchAll()
+.map((row) => row.toArray().map(show).join(' | ')).join('\n')
+$$;
+CALL js_rows(@r);
+SELECT @r;
+@r
+Invalid Date | Invalid Date
+Invalid Date | Invalid Date
+2024-05-01T00:00:00.000Z | 2023-03-02T23:00:00.000Z
+2024-02-29T00:00:00.000Z | 2024-02-29T10:11:12.000Z
+#
+# 2. A BigInt statement parameter is BIGINT if it fits, else BIGINT
+#    UNSIGNED, else DECIMAL.
+#
+CREATE PROCEDURE js_bigints(OUT r TEXT) LANGUAGE JS AS $$
+const res = session.runSql('SELECT ? AS a, ? AS b, ? AS c, ? AS d',
+[5n, -5n, 2n ** 64n - 1n, -(2n ** 70n)], { integerType: 'STRING' })
+const row = res.fetchOne().toArray()
+r = res.getColumns().map((c, i) => c.getType() + ' ' + row[i]).join(', ')
+$$;
+CALL js_bigints(@r);
+SELECT @r;
+@r
+BIGINT 5, BIGINT -5, BIGINT 18446744073709551615, DECIMAL -1180591620717411303424
+#
+# 3. MySQL JSON from JavaScript: null and undefined are NULL; a string is
+#    JSON text (else an error); other scalars are errors; an object whose
+#    toJSON() gives a string is that text (a Date's is no JSON: an error);
+#    other objects and arrays are stringified. What guest code throws on
+#    the way passes through.
+#
+CREATE FUNCTION js_json(which TEXT) RETURNS JSON LANGUAGE JS AS $$
+switch (which) {
+case 'undefined': return undefined
+case 'text': return '{"a": [1, 2]}'
+    case 'null text': return 'null'
+    case 'bad text': return '{a'
+    case 'number': return 5
+case 'boolean': return true
+case 'bigint': return 5n
+case 'symbol': return Symbol('s')
+case 'object': return { a: 1, s: Symbol('s'), u: undefined }
+case 'array': return [1, Symbol('s'), 'x']
+case 'toJSON text': return { toJSON() { return '[3, 4]' } }
+case 'toJSON object': return { toJSON() { return { b: 2 } } }
+case 'toJSON undefined': return { toJSON() { return undefined } }
+case 'date': return new Date(0)
+case 'bigint inside': return { a: 1n }
+case 'toJSON throws': return { toJSON() { throw new RangeError('toJSON says no') } }
+}
+$$;
+SELECT js_json('undefined') AS v, js_json('text') AS t, js_json('null text') AS n;
+v	t	n
+NULL	{"a": [1, 2]}	null
+SELECT js_json('object') AS o, js_json('array') AS a;
+o	a
+{"a": 1}	[1, null, "x"]
+SELECT js_json('toJSON text') AS tt, js_json('toJSON object') AS tobj;
+tt	tobj
+[3, 4]	{"b": 2}
+SELECT js_json('bad text');
+ERROR HY000: MLE-Type> Cannot convert value '{a' to JSON from MLE in 'js_json('bad text')'
+SELECT js_json('number');
+ERROR HY000: MLE-Type> Cannot convert value '5' to JSON from MLE in 'js_json('number')'
+SELECT js_json('boolean');
+ERROR HY000: MLE-Type> Cannot convert value 'true' to JSON from MLE in 'js_json('boolean')'
+SELECT js_json('bigint');
+ERROR HY000: MLE-Type> Cannot convert value '5' to JSON from MLE in 'js_json('bigint')'
+SELECT js_json('symbol');
+ERROR HY000: MLE-Type> Cannot convert value 'Symbol(s)' to JSON from MLE in 'js_json('symbol')'
+SELECT js_json('toJSON undefined');
+ERROR HY000: MLE-Type> Cannot convert value '[object Object]' to JSON from MLE in 'js_json('toJSON undefined')'
+SELECT js_json('date');
+ERROR HY000: MLE-Type> Cannot convert value '<the Date>' to JSON from MLE in 'js_json('date')'
+SELECT js_json('bigint inside');
+ERROR HY000: JavaScript> TypeError: Do not know how to serialize a BigInt
+SELECT js_json('toJSON throws');
+ERROR HY000: JavaScript> RangeError: toJSON says no (js_json, line 18, in toJSON)
+# The same rules for an object as a statement parameter.
+CREATE PROCEDURE js_json_params(OUT r TEXT) LANGUAGE JS AS $$
+const out = []
+for (const v of [{ toJSON() { return '[3, 4]' } }, { a: 1 }, [1, 'x'], { toJSON() { return 'x{' } },
+{ toJSON() {} }, { toJSON() { throw new RangeError('toJSON says no') } }]) {
+try { out.push(session.runSql('SELECT CAST(? AS JSON) AS v', [v]).fetchOne().toArray()[0]) }
+catch (e) { out.push(e.name + ': ' + e.message) }
+}
+r = out.map((x) => typeof x === 'object' ? JSON.stringify(x) : String(x)).join('\n')
+$$;
+CALL js_json_params(@r);
+SELECT @r;
+@r
+[3,4]
+{"a":1}
+[1,"x"]
+TypeError: cannot bind [object Object]
+TypeError: cannot bind [object Object]
+RangeError: toJSON says no
+#
+# 4. A Number or a numeric string as an SQL integer is rounded as
+#    Math.round rounds (a half towards +Infinity), then checked against
+#    the type's range; values up to 2**64 reach the BIGINT UNSIGNED check.
+#    The functions below return what a JavaScript expression gives, as
+#    each SQL type; js_probe shows, for each expression, the value MySQL gets or 'error'.
+#
+CREATE FUNCTION js_i(src TEXT) RETURNS BIGINT LANGUAGE JS AS $$ return (0, eval)(src) $$;
+CREATE FUNCTION js_u(src TEXT) RETURNS BIGINT UNSIGNED LANGUAGE JS AS $$ return (0, eval)(src) $$;
+CREATE FUNCTION js_d(src TEXT) RETURNS DOUBLE LANGUAGE JS AS $$ return (0, eval)(src) $$;
+CREATE FUNCTION js_v(src TEXT) RETURNS VECTOR(2) LANGUAGE JS AS $$ return (0, eval)(src) $$;
+CREATE FUNCTION js_date(src TEXT) RETURNS DATE LANGUAGE JS AS $$ return (0, eval)(src) $$;
+CREATE PROCEDURE js_probe(fn TEXT, srcs TEXT, OUT r TEXT) LANGUAGE JS AS $$
+r = srcs.split(' ;; ').map((src) => {
+try {
+const v = session.runSql('SELECT ' + fn + '(?) AS v', [src]).fetchOne().toArray()[0]
+return src + ' => ' + (v instanceof Float32Array ? 'vector ' + v.length : v instanceof Date ? v.toISOString() : String(v))
+} catch (e) { return src + ' => error' }
+}).join('\n')
+$$;
+CALL js_probe('js_i', '0.49999999999999994 ;; -0.5 ;; 2.5 ;; -2.5 ;; -3.5', @r);
+SELECT @r;
+@r
+0.49999999999999994 => 0
+-0.5 => 0
+2.5 => 3
+-2.5 => -2
+-3.5 => -3
+CALL js_probe('js_i', '"2.5" ;; "-2.5" ;; " -3.5 " ;; "1e2" ;; "0.49999999999999994"', @r);
+SELECT @r;
+@r
+"2.5" => 3
+"-2.5" => -2
+" -3.5 " => -3
+"1e2" => 100
+"0.49999999999999994" => 0
+CALL js_probe('js_i', '2 ** 63 ;; -(2 ** 63) ;; 1e300 ;; "1e999999999" ;; "0x10" ;; "abc" ;; ""', @r);
+SELECT @r;
+@r
+2 ** 63 => error
+-(2 ** 63) => -9223372036854775808
+1e300 => error
+"1e999999999" => error
+"0x10" => error
+"abc" => error
+"" => error
+CALL js_probe('js_u', '1.8446744073709550e19 ;; 2 ** 64 ;; -0.4 ;; -0.6 ;; "18446744073709549568.4"', @r);
+SELECT @r;
+@r
+1.8446744073709550e19 => 18446744073709549568
+2 ** 64 => error
+-0.4 => 0
+-0.6 => error
+"18446744073709549568.4" => 18446744073709549568
+#
+# 5. A string as FLOAT or DOUBLE is in decimal notation only.
+#
+CALL js_probe('js_d', '"1.5" ;; " -2.5e2 " ;; ".5" ;; "5."', @r);
+SELECT @r;
+@r
+"1.5" => 1.5
+" -2.5e2 " => -250
+".5" => 0.5
+"5." => 5
+CALL js_probe('js_d', '"1.5f" ;; "2d" ;; "0x1p3" ;; "0x10" ;; "" ;; "Infinity" ;; "NaN" ;; "1e999"', @r);
+SELECT @r;
+@r
+"1.5f" => error
+"2d" => error
+"0x1p3" => error
+"0x10" => error
+"" => error
+"Infinity" => error
+"NaN" => error
+"1e999" => error
+#
+# 6. A BigInt as FLOAT or DOUBLE is the nearest double; beyond DOUBLE's
+#    range it is an error.
+#
+CALL js_probe('js_d', '10n ** 20n ;; 2n ** 53n + 1n ;; -(2n ** 70n) ;; 5n ;; 2n ** 1024n ;; 2n ** 1024n - 1n', @r);
+SELECT @r;
+@r
+10n ** 20n => 100000000000000000000
+2n ** 53n + 1n => 9007199254740992
+-(2n ** 70n) => -1.1805916207174113e+21
+5n => 5
+2n ** 1024n => error
+2n ** 1024n - 1n => error
+#
+# 7. White space around a numeric string is what JavaScript's Number()
+#    strips (including U+00A0 and the line terminators), not every
+#    character up to U+0020. A DataView is no VECTOR.
+#
+CALL js_probe('js_d', '"\\u00a0\\u2003 7.5\\u2028\\ufeff"', @r);
+SELECT @r;
+@r
+"\u00a0\u2003 7.5\u2028\ufeff" => error
+CALL js_probe('js_i', '"\\n\\t 7\\r"', @r);
+SELECT @r;
+@r
+"\n\t 7\r" => 7
+CALL js_probe('js_d', 'String.fromCharCode(1) + "7.5"', @r);
+SELECT @r;
+@r
+String.fromCharCode(1) + "7.5" => error
+CALL js_probe('js_v', 'new Float32Array([1, 2]) ;; [1, 2] ;; new Uint8Array([1, 2]) ;; new DataView(new ArrayBuffer(8))', @r);
+SELECT @r;
+@r
+new Float32Array([1, 2]) => vector 2
+[1, 2] => vector 2
+new Uint8Array([1, 2]) => vector 2
+new DataView(new ArrayBuffer(8)) => error
+#
+# 8. A Date as DATE keeps its value with the time part rounded off to the
+#    closest second (Table 27.3); as DATETIME it is kept as it is.
+#
+CALL js_probe('js_date', 'new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 400)) ;; new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 500)) ;; new Date(Date.UTC(2024, 0, 1, 0, 0, 0, 0))', @r);
+SELECT @r;
+@r
+new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 400)) => 2024-01-01T00:00:00.000Z
+new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 500)) => 2024-01-01T00:00:00.000Z
+new Date(Date.UTC(2024, 0, 1, 0, 0, 0, 0)) => 2024-01-01T00:00:00.000Z
+#
+# 9. getOption always gives a value: a statement's own options over the
+#    call's setOptions over the session's defaults, also when setOptions
+#    set only one option.
+#
+CREATE PROCEDURE js_options(OUT r TEXT) LANGUAGE JS AS $$
+const show = (o) => o.getOption('integerType') + '/' + o.getOption('decimalType')
+const out = [show(session)]
+session.setOptions({ decimalType: 'NUMBER' })
+out.push(show(session))
+session.setOptions({ integerType: 'BIGINT' })
+out.push(show(session))
+out.push(show(session.sql('SELECT 1', { integerType: 'STRING' })))
+out.push(show(session.prepare('SELECT 1', { decimalType: 'STRING' })))
+r = out.join(' | ')
+$$;
+CALL js_options(@r);
+SELECT @r;
+@r
+UNSAFE_STRING/STRING | UNSAFE_STRING/NUMBER | BIGINT/NUMBER | STRING/NUMBER | BIGINT/STRING
+DROP FUNCTION js_when;
+DROP PROCEDURE js_rows;
+DROP PROCEDURE js_bigints;
+DROP FUNCTION js_json;
+DROP PROCEDURE js_json_params;
+DROP TABLE td;
+DROP FUNCTION js_i;
+DROP FUNCTION js_u;
+DROP FUNCTION js_d;
+DROP FUNCTION js_v;
+DROP FUNCTION js_date;
+DROP PROCEDURE js_probe;
+DROP PROCEDURE js_options;
+REVOKE CREATE_JS_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

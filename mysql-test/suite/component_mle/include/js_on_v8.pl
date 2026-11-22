@@ -25,6 +25,11 @@ our @KNOWN = (
   ['oracle_examples', qr/<date> GMT\+0300 \(GMT\+3\)/, '<date> GMT+0300 (GMT+03:00)'],
   ['oracle_examples', qr/TypeError: \(intermediate value\)\.lob is not a function/, 'TypeError: console.lob is not a function'],
   ['oracle_examples', qr/<js> pc2:3:1-47/, '<js> pc2:3:9'],
+  # The V8 worker strips only ASCII white space from a numeric string (the JVM worker: what
+  # JavaScript's Number() strips), and keeps a Date's local date for DATE (the JVM worker rounds
+  # the time part off to the closest second, as Oracle's Table 27.3 says).
+  ['js_conversions', qr/(?<=\\ufeff" => )7\.5$/m, 'error'],
+  ['js_conversions', qr/(?<=59, 500\)\) => )2024-01-02T/, '2024-01-01T'],
   # Libraries created with LANGUAGE JS show it in information_schema.LIBRARIES.
   ['libraries', qr/(?<=jslib\tlib\d\t)JAVASCRIPT$/m, 'JS'],
   ['libraries', qr/SyntaxError: lib3:3:10 Expected an operand but found \*/, "SyntaxError: lib3:3:11 Unexpected token '*'"],

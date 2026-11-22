@@ -167,7 +167,7 @@ CREATE PROCEDURE js_reenter_out(OUT r TEXT) LANGUAGE JS AS $$
 $$;
 CALL js_reenter_param(@r);
 SELECT @r;
---echo # (a toString that throws gives '?', as before)
+--error ER_LANGUAGE_COMPONENT_RUNTIME
 CALL js_reenter_out(@r);
 SELECT @r;
 SELECT js_double(6) AS after_reenter;

@@ -84,7 +84,7 @@ SET GLOBAL mle.sql_chunk_rows = DEFAULT, mle.sql_statements_max = DEFAULT;
 CALL js_outer(@r);
 SELECT @r;
 @r
-BIGINT/null | null/NUMBER | UNSAFE_STRING/STRING | BIGINT/null
+BIGINT/STRING | UNSAFE_STRING/NUMBER | UNSAFE_STRING/STRING | BIGINT/STRING
 # C5 (C24, C62): a failed multi-row chunk of executeMany is run again
 # row by row only when that repeats nothing: not when the table has
 # triggers (their writes to non-transactional tables stay), is hidden

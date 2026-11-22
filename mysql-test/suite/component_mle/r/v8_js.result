@@ -156,12 +156,12 @@ $$;
 CALL js_reenter_param(@r);
 SELECT @r;
 @r
-TypeError: cannot bind [object Object]
-# (a toString that throws gives '?', as before)
+Error: SQL and library imports are not available in toString or toJSON while MLE converts a value
 CALL js_reenter_out(@r);
+ERROR HY000: JavaScript> Error: SQL and library imports are not available in toString or toJSON while MLE converts a value (js_reenter_out, line 2, in toString)
 SELECT @r;
 @r
-?
+Error: SQL and library imports are not available in toString or toJSON while MLE converts a value
 SELECT js_double(6) AS after_reenter;
 after_reenter
 12
@@ -170,7 +170,7 @@ CREATE FUNCTION js_huge_dec() RETURNS DECIMAL(10, 2) LANGUAGE JS AS $$ return '1
 SELECT js_huge_int();
 ERROR HY000: MLE-Type> Cannot convert value '1e999999999' to BIGINT from MLE in 'js_huge_int()'
 SELECT js_huge_dec();
-ERROR HY000: MLE-Type> value of 1000000000 digits is out of range for DECIMAL in 'js_huge_dec()'
+ERROR HY000: MLE-Type> value 1E+999999999 is out of range for DECIMAL in 'js_huge_dec()'
 CREATE FUNCTION js_surrogate() RETURNS TEXT LANGUAGE JS AS $$ return 'a\uD800b' $$;
 SELECT HEX(js_surrogate()) AS replaced;
 replaced

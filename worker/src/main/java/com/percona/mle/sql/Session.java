@@ -77,8 +77,8 @@ public final class Session {
   /** The options of a statement: o over this call's session options over the defaults. */
   SqlOptions effective(SqlOptions o) {
     SqlOptions base = callOptions();
-    SqlOptions merged = base == null ? mapper instanceof Defaults d ? d.defaults() : new SqlOptions()
-        : base;
+    SqlOptions defaults = mapper instanceof Defaults d ? d.defaults() : new SqlOptions();
+    SqlOptions merged = base == null ? defaults : base.over(defaults);
     return o == null ? merged.over(null) : o.over(merged);
   }
 

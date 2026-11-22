@@ -122,7 +122,7 @@ final class JsOracle {
                 : ArrayBuffer.isView(v) ? v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength) : undefined,
             floats: (v) => {
               const f = v instanceof Float32Array ? v
-                  : Array.isArray(v) || ArrayBuffer.isView(v) ? Float32Array.from(v) : undefined;
+                  : Array.isArray(v) || (ArrayBuffer.isView(v) && !(v instanceof DataView)) ? Float32Array.from(v) : undefined;
               return f === undefined ? undefined : f.buffer.slice(f.byteOffset, f.byteOffset + f.byteLength);
             },
           };
@@ -276,6 +276,42 @@ final class JsOracle {
         BigInteger.ONE.shiftLeft(bits - 1).subtract(BigInteger.ONE)};
   }
 
+  private static final BigDecimal HALF = new BigDecimal("0.5");
+
+  /** Decimal notation as JavaScript's Number() reads it: no hex, Infinity, NaN or suffixes. */
+  private static final Pattern DECIMAL_LITERAL = Pattern.compile("[+-]?([0-9]+\\.?[0-9]*|\\.[0-9]+)([eE][+-]?[0-9]+)?");
+
+  /** JavaScript's Math.round of a finite number: the nearest integer, a half towards +Infinity. */
+  static BigInteger mathRound(double d) {
+    double floor = Math.floor(d);
+    BigInteger b = new BigDecimal(floor).toBigInteger();
+    return d - floor >= 0.5 ? b.add(BigInteger.ONE) : b;  // d - floor is exact
+  }
+
+  private static boolean isJsSpace(char c) {
+    return c == 0x20 || (c >= 0x09 && c <= 0x0d) || c == 0xa0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200a)
+        || c == 0x2028 || c == 0x2029 || c == 0x202f || c == 0x205f || c == 0x3000 || c == 0xfeff;
+  }
+
+  /** s without the white space and line terminators that JavaScript's Number() strips. */
+  static String jsTrim(String s) {
+    int a = 0, b = s.length();
+    while (a < b && isJsSpace(s.charAt(a))) a++;
+    while (b > a && isJsSpace(s.charAt(b - 1))) b--;
+    return s.substring(a, b);
+  }
+
+  /** The number a string holds in decimal notation (JavaScript white space around it allowed), or null. */
+  private static BigDecimal decimalLiteral(String s) {
+    String text = jsTrim(s);
+    if (!DECIMAL_LITERAL.matcher(text).matches()) return null;
+    try {
+      return new BigDecimal(text);
+    } catch (NumberFormatException e) {
+      return null;  // an exponent beyond int
+    }
+  }
+
   private static boolean isBigInt(Value v) {
     Value meta = v.getMetaObject();
     return meta != null && "bigint".equals(meta.getMetaSimpleName());
@@ -325,13 +361,15 @@ final class JsOracle {
         } else if (v.isNumber() && v.fitsInDouble()) {
           double d = v.asDouble();
           if (!Double.isFinite(d)) throw cannot(v, t, h);
-          b = new BigDecimal(Math.floor(d + 0.5)).toBigInteger();  // Math.round
+          b = mathRound(d);
         } else if (v.isString()) {
-          try {
-            b = new BigDecimal(v.asString().trim()).setScale(0, RoundingMode.HALF_UP).toBigInteger();
-          } catch (NumberFormatException e) {
-            throw cannot(v, t, h);
-          }
+          // "Parse as number and round to Integer": rounded as Math.round rounds.
+          BigDecimal d = decimalLiteral(v.asString());
+          // A value far outside every range is not expanded (1e999999999 would be a billion digits).
+          if (d == null || d.precision() - d.scale() > 40) throw cannot(v, t, h);
+          BigDecimal floor = d.setScale(0, RoundingMode.FLOOR);
+          b = floor.toBigInteger();
+          if (d.subtract(floor).compareTo(HALF) >= 0) b = b.add(BigInteger.ONE);
         } else {
           throw cannot(v, t, h);
         }
@@ -342,13 +380,12 @@ final class JsOracle {
       case Wire.T_F64, Wire.T_F32 -> {
         double d;
         if (v.isBoolean()) d = v.asBoolean() ? 1 : 0;
-        else if (v.isNumber() && !isBigInt(v) && v.fitsInDouble()) d = v.asDouble();
+        else if (v.isNumber() && isBigInt(v)) d = v.asBigInteger().doubleValue();  // nearest; Infinity is out of range
+        else if (v.isNumber() && v.fitsInDouble()) d = v.asDouble();
         else if (v.isString()) {
-          try {
-            d = Double.parseDouble(v.asString().trim());
-          } catch (NumberFormatException e) {
-            throw cannot(v, t, h);
-          }
+          String text = jsTrim(v.asString());
+          if (!DECIMAL_LITERAL.matcher(text).matches()) throw cannot(v, t, h);
+          d = Double.parseDouble(text);
         } else throw cannot(v, t, h);
         if (!Double.isFinite(d)) throw cannot(v, t, h);
         return d;
@@ -359,7 +396,7 @@ final class JsOracle {
           if (v.isNumber() && isBigInt(v)) return new BigDecimal(v.asBigInteger());
           if (v.isNumber() || v.isString()) {
             if (v.isNumber() && v.fitsInDouble() && !Double.isFinite(v.asDouble())) throw cannot(v, t, h);
-            String s = v.isString() ? v.asString().trim() : h.getMember("str").execute(v).asString();
+            String s = v.isString() ? jsTrim(v.asString()) : h.getMember("str").execute(v).asString();
             return new BigDecimal(s);
           }
         } catch (NumberFormatException e) {
@@ -398,7 +435,11 @@ final class JsOracle {
         Value ms = h.getMember("date_ms").execute(v);
         if (ms.isNull() || !Double.isFinite(ms.asDouble())) throw cannot(v, t, h);
         if (t.tag() == Wire.T_TIMESTAMP) return Instant.ofEpochMilli((long) ms.asDouble());
-        LocalDateTime dt = LocalDateTime.ofInstant(Instant.ofEpochMilli((long) ms.asDouble()), o.zone);
+        long millis = (long) ms.asDouble();
+        // A DATE keeps the Date's value with the time part rounded off to the closest second
+        // (Oracle's Table 27.3), so 23:59:59.5 is the next day.
+        if (t.tag() == Wire.T_DATE) millis = Math.floorDiv(millis + 500, 1000L) * 1000L;
+        LocalDateTime dt = LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), o.zone);
         return t.tag() == Wire.T_DATE ? dt.toLocalDate() : dt;
       }
       case Wire.T_TIME -> {

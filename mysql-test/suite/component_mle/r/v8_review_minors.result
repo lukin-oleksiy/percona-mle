@@ -1,0 +1,314 @@
+#
+# component_mle: regressions for the minor findings of the independent
+# multi-model review (exp notes 60 and 61).
+#
+call mtr.add_suppression("Component mle reported: 'The worker of .* was retired");
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(20));
+CREATE TABLE parent (id INT PRIMARY KEY);
+CREATE TABLE child (id INT PRIMARY KEY, a_rather_long_column_name_for_the_parent_reference INT,
+CONSTRAINT a_foreign_key_constraint_with_quite_a_long_name_for_a_message
+FOREIGN KEY (a_rather_long_column_name_for_the_parent_reference) REFERENCES parent (id));
+CREATE TABLE kinds (d DATE, tm TIME, dt DATETIME, ts TIMESTAMP NULL, de DECIMAL(10,2), tx TEXT, vb VARBINARY(10),
+b BINARY(4), bl BLOB, c CHAR(3));
+# C126: twice with the same worker.
+SET @pid = mle_debug_worker_pid();
+SELECT py_resize(TO_VECTOR('[1,2,3,4]')) AS first;
+first
+owns False ValueError 4
+SELECT py_resize(TO_VECTOR('[5,6,7,8]')) AS second;
+second
+owns False ValueError 4
+# C129
+SELECT js_liar();
+js_liar()
+true
+# C60, C162
+SELECT js_context();
+js_context()
+context refused, ProcessHandle refused
+CALL java_close();
+# A Java routine may close it: the next script call finds it closed, and
+# the worker is replaced (it used to stay, failing every call). It is an
+# error of guest code, not an interrupt: none was requested (protocol 10.6).
+SELECT js_one();
+ERROR HY000: JavaScript> the worker's context was closed by a routine
+SELECT js_one() AS works_after;
+works_after
+1
+SET @pid = mle_debug_worker_pid();
+# C68
+CALL js_markers(@r);
+SELECT @r;
+@r
+1210 fewer values than parameter markers | 1210 more values than parameter markers | 3
+CALL py_markers(@r);
+SELECT @r;
+@r
+1210 fewer values than parameter markers | 1210 more values than parameter markers | 3.0
+# C67
+CALL js_rethrow_long();
+ERROR 23000: Cannot add or update a child row: a foreign key constraint fails (`test`.`child`, CONSTRAINT `a_foreign_key_constraint_with_quit
+# C98
+CALL js_own_text();
+ERROR 42S02: my own text
+CALL js_same_error();
+ERROR 42S02: Table 'test.no_such_table' doesn't exist
+# C56
+CALL js_create_library(@r);
+SELECT @r;
+@r
+MLE> CREATE LIBRARY cannot run from the SQL of an MLE routine
+SELECT js_one() AS works_after;
+works_after
+1
+# C146
+CALL js_column_types(@r);
+SELECT @r;
+@r
+d:DATE tm:TIME dt:DATETIME ts:TIMESTAMP de:DECIMAL tx:STRING vb:BYTES b:BYTES bl:BYTES c:STRING
+# C40, C41
+INSERT INTO t VALUES (1, 'a'), (2, 'b');
+CALL js_api(@r);
+sent_to_the_client
+5
+SELECT @r;
+@r
+next false, then null, to client true
+# C42
+SELECT js_bad_state();
+ERROR HY000: JavaScript> the text (SqlError with the invalid SQLSTATE 'oops') (js_bad_state, line 1)
+SELECT js_one() AS works_after;
+works_after
+1
+# C161, C121, C105
+CALL js_binds(@r);
+SELECT @r;
+@r
+TypeError: cannot bind [object Object], minus zero 1
+CALL java_binds(@r);
+SELECT @r;
+@r
+IllegalArgumentException: cannot bind NaN; IllegalArgumentException: cannot bind Infinity; IllegalArgumentException: cannot bind NaN; 1.5 
+# C28, C92, C36, C93
+TRUNCATE t;
+CALL js_batches(@r);
+SELECT @r;
+@r
+1210, 1210, 1210, rows 0, 1210 Incorrect arguments to executeMany: the statement has no parameter markers, none 0, 1210 row 3 written 3, 1210 row 400 written 400, warnings 1, warnings 0
+# C23
+CALL java_load(@r);
+SELECT @r;
+@r
+rows 3
+# C22: years MySQL does not have
+SELECT js_year(2026) AS y;
+y
+2026-01-02 03:00:00
+SELECT js_year(10000);
+ERROR HY000: MLE-Type> the year 10000 is out of range (0 to 9999) in 'js_year(10000)'
+SELECT js_year(-5);
+ERROR HY000: MLE-Type> the year -5 is out of range (0 to 9999) in 'js_year(-5)'
+SELECT js_year(70000);
+ERROR HY000: MLE-Type> the year 70000 is out of range (0 to 9999) in 'js_year(70000)'
+# C37: not normalised
+SELECT js_time_text('00:59:59') AS js, py_time_text('-01:02:03.5') AS py;
+js	py
+00:59:59	-01:02:04
+SELECT js_time_text('00:60:00');
+ERROR HY000: MLE-Type> Cannot convert value '00:60:00' to TIME from MLE in 'js_time_text('00:60:00')'
+SELECT py_time_text('00:00:60');
+ERROR HY000: MLE-Type> Cannot convert value '00:00:60' to TIME from MLE in 'py_time_text('00:00:60')'
+SELECT js_time_text('00:99:99');
+ERROR HY000: MLE-Type> Cannot convert value '00:99:99' to TIME from MLE in 'js_time_text('00:99:99')'
+SELECT py_time_text('12345678901234567890:00:00');
+ERROR HY000: MLE-Type> Cannot convert value '12345678901234567890:00:00' to TIME from MLE in 'py_time_text('12345678901234567890:00:00')'
+# C45
+SELECT java_long_time();
+ERROR HY000: MLE-Type> TIME value out of range: PT-2562047788015215H-30M-8S in 'java_long_time()'
+# C48: exact
+SELECT py_big(64) AS p64, py_big(70) AS p70, py_big(3) AS p3;
+p64	p70	p3
+18446744073709551616	1180591620717411303424	8
+# C122
+CALL py_year_zero(@r);
+SELECT @r;
+@r
+None None 0001-01-01
+# C57
+SELECT py_print_much();
+py_print_much()
+1
+SELECT LENGTH(mle_session_state('stdout')) AS bytes, CHAR_LENGTH(mle_session_state('stdout')) AS chars,
+LEFT(mle_session_state('stdout'), 2) AS start;
+bytes	chars	start
+65535	32768	éé
+# The worker lived through all of it since the closed Context.
+SELECT mle_debug_worker_pid() = @pid AS same_worker;
+same_worker
+1
+# C94, C106, C107: mle_set_session_state() takes a JSON object of its options; NULL arguments.
+SELECT mle_set_session_state('');
+ERROR HY000: mle_set_session_state<int> UDF failed; the argument must be a JSON object of options, such as {"integer_type": "BIGINT"}
+SELECT mle_set_session_state('not json');
+ERROR HY000: mle_set_session_state<int> UDF failed; the argument must be a JSON object of options, such as {"integer_type": "BIGINT"}
+SELECT mle_set_session_state('[]');
+ERROR HY000: mle_set_session_state<int> UDF failed; the argument must be a JSON object of options, such as {"integer_type": "BIGINT"}
+SELECT mle_set_session_state('null');
+ERROR HY000: mle_set_session_state<int> UDF failed; the argument must be a JSON object of options, such as {"integer_type": "BIGINT"}
+SELECT mle_set_session_state('{"integer_type": 1}');
+ERROR HY000: mle_set_session_state<int> UDF failed; the value of integer_type must be a string
+SELECT mle_set_session_state('{"integer_type": "BIGINT"} trailing');
+ERROR HY000: mle_set_session_state<int> UDF failed; the argument must be a JSON object of options, such as {"integer_type": "BIGINT"}
+SELECT mle_set_session_state(NULL);
+ERROR HY000: mle_set_session_state<int> UDF failed; argument 1 cannot be null
+SELECT mle_set_session_state('{"integer_type": "BIGINT"}') AS first, mle_set_session_state('{"decimal_type": "NUMBER"}') AS second,
+mle_set_session_state('{}') AS nothing;
+first	second	nothing
+1	1	1
+CREATE FUNCTION js_kinds(i BIGINT, d DECIMAL(10,2)) RETURNS TEXT LANGUAGE JS AS $$ return typeof i + ' ' + typeof d $$;
+SELECT js_kinds(1, 1.5) AS both_kept;
+both_kept
+bigint number
+# NULL is refused for every argument (by the UDF framework).
+SELECT mle_eval('js', NULL);
+ERROR HY000: mle_eval<string> UDF failed; argument 2 cannot be null
+SELECT mle_eval(NULL, '1');
+ERROR HY000: mle_eval<string> UDF failed; argument 1 cannot be null
+SELECT mle_session_state(NULL);
+ERROR HY000: mle_session_state<string> UDF failed; argument 1 cannot be null
+SELECT mle_session_reset(NULL);
+ERROR HY000: mle_session_reset<string> UDF failed; argument 1 cannot be null
+SET NAMES latin1;
+SELECT mle_eval('js', CONCAT('"', _latin1 0xE9, '".charCodeAt(0)')) AS e_acute_is_233;
+e_acute_is_233
+233
+SET NAMES utf8mb4;
+# C39: the names libraries get in a routine are identifiers.
+CREATE LIBRARY lib1 LANGUAGE JS AS $$ export function f() { return 1 } $$;
+CREATE FUNCTION bad1() RETURNS INT LANGUAGE JS USING (lib1 AS `x=1;evil()`) AS $$ return 1 $$;
+ERROR HY000: JavaScript> The identifier 'x=1;evil()' is not valid.
+CREATE FUNCTION bad2() RETURNS INT LANGUAGE JS USING (lib1 AS `$c`) AS $$ return 1 $$;
+ERROR HY000: JavaScript> The identifier '$c' is not valid.
+CREATE FUNCTION bad3(a INT) RETURNS INT LANGUAGE JS USING (lib1 AS a) AS $$ return 1 $$;
+ERROR HY000: JavaScript> The identifier 'a' is not valid.
+CREATE FUNCTION bad4() RETURNS INT LANGUAGE JS USING (lib1 AS l, lib1 AS l) AS $$ return 1 $$;
+ERROR HY000: JavaScript> The identifier 'l' is not valid.
+CREATE FUNCTION bad5() RETURNS INT LANGUAGE JS USING (lib1 AS class) AS $$ return 1 $$;
+ERROR HY000: JavaScript> The identifier 'class' is not valid.
+CREATE FUNCTION good() RETURNS INT LANGUAGE JS USING (lib1 AS l) AS $$ return l.f() $$;
+SELECT good();
+good()
+1
+# C47: a JavaScript library with a '.' in its name is not taken for another one.
+CREATE LIBRARY `lib1.ab` LANGUAGE JS AS $$ export function f() { return 2 } $$;
+CREATE FUNCTION dotted() RETURNS INT LANGUAGE JS USING (`lib1.ab` AS l) AS $$ return l.f() $$;
+SELECT dotted();
+Got one of the listed errors
+DROP FUNCTION dotted;
+DROP LIBRARY `lib1.ab`;
+# C128: the text of a frame on a JavaScript body's first line is the body's.
+CREATE FUNCTION js_line1() RETURNS INT LANGUAGE JS AS $$ const answer = 42; null.oops $$;
+SELECT js_line1();
+ERROR HY000: JavaScript> TypeError: Cannot read properties of null (reading 'oops') (js_line1, line 1)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+TypeError: Cannot read properties of null (reading 'oops')
+    at js_line1:1:21
+        const answer = 42; null.oops
+
+DROP FUNCTION js_line1;
+# C86: SET ... = DEFAULT of a setting that shapes workers, while a session holds one.
+SET GLOBAL mle.heap_max = 268435456;
+SELECT js_one();
+js_one()
+1
+# Not checked by the server before the update: refused there, with a warning.
+SET GLOBAL mle.heap_max = DEFAULT;
+Warnings:
+Warning	6000	MLE: mle.heap_max is not changed: a session holds a worker
+SET GLOBAL mle.heap_max = 300000000;
+ERROR HY000: Language component: System variable 'mle.heap_max' cannot be configured when component is active.
+SELECT @@GLOBAL.mle.heap_max AS unchanged;
+unchanged
+268435456
+SET GLOBAL mle.heap_max = DEFAULT;
+SELECT @@GLOBAL.mle.heap_max = 536870912 AS the_default;
+the_default
+1
+# C124: fetchColumns() with names, a NULL and a column that is not there.
+CREATE PROCEDURE js_columns(OUT r TEXT) LANGUAGE JS AS $$
+const q = "SELECT 1 AS a, NULL AS b, 'x' AS c UNION ALL SELECT 2, 5, 'y'"
+  const out = []
+const one = session.runSql(q).fetchColumns('c', 'a')
+out.push(Object.keys(one).join('') + ' ' + one.c + ' ' + one.a)
+out.push('b ' + session.runSql(q).fetchColumns(['b']).b)
+try { session.runSql(q).fetchColumns('nope'); out.push('found') } catch (e) { out.push(e.message) }
+r = out.join(', ')
+$$;
+CALL js_columns(@r);
+SELECT @r;
+@r
+ca x,y 1,2, b ,5, no column 'nope' in the result
+DROP PROCEDURE js_columns;
+# C134: mle.max_workers. This session holds a worker: another gets none, new or kept.
+SET GLOBAL mle.max_workers = 1;
+SELECT js_one();
+ERROR HY000: Language component: Concurrency limit (mle.max_workers = 1) has been reached.
+SELECT js_one() AS the_holder_goes_on;
+the_holder_goes_on
+1
+SET GLOBAL mle.max_workers = DEFAULT;
+SELECT js_one() AS room_again;
+room_again
+1
+# C135: KILL of a connection inside a routine; an account renamed while a worker is kept for it.
+CREATE FUNCTION js_spin() RETURNS INT LANGUAGE JS AS $$ while (true) {} $$;
+SELECT js_spin();
+Got one of the listed errors
+SELECT js_one() AS others_go_on;
+others_go_on
+1
+DROP FUNCTION js_spin;
+CREATE USER renamed1@localhost;
+GRANT EXECUTE ON test.* TO renamed1@localhost;
+SELECT js_one();
+js_one()
+1
+RENAME USER renamed1@localhost TO renamed2@localhost;
+SELECT js_one() AS as_the_new_name, CURRENT_USER();
+as_the_new_name	CURRENT_USER()
+1	renamed2@localhost
+DROP USER renamed2@localhost;
+DROP TABLE child, parent, t, kinds;
+DROP FUNCTION py_resize;
+DROP FUNCTION js_liar;
+DROP FUNCTION js_context;
+DROP PROCEDURE java_close;
+DROP FUNCTION js_one;
+DROP PROCEDURE js_markers;
+DROP PROCEDURE py_markers;
+DROP PROCEDURE js_rethrow_long;
+DROP PROCEDURE js_own_text;
+DROP PROCEDURE js_same_error;
+DROP PROCEDURE js_create_library;
+DROP PROCEDURE js_column_types;
+DROP PROCEDURE js_api;
+DROP FUNCTION js_bad_state;
+DROP PROCEDURE js_binds;
+DROP PROCEDURE java_binds;
+DROP PROCEDURE js_batches;
+DROP PROCEDURE java_load;
+DROP FUNCTION js_year;
+DROP FUNCTION js_time_text;
+DROP FUNCTION py_time_text;
+DROP FUNCTION java_long_time;
+DROP FUNCTION py_big;
+DROP PROCEDURE py_year_zero;
+DROP FUNCTION py_print_much;
+DROP FUNCTION js_kinds;
+DROP FUNCTION good;
+DROP LIBRARY lib1;
+REVOKE CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

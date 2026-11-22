@@ -115,6 +115,90 @@ $$;
 CALL js_json_params(@r);
 SELECT @r;
 
+--echo #
+--echo # 4. A Number or a numeric string as an SQL integer is rounded as
+--echo #    Math.round rounds (a half towards +Infinity), then checked against
+--echo #    the type's range; values up to 2**64 reach the BIGINT UNSIGNED check.
+--echo #    The functions below return what a JavaScript expression gives, as
+--echo #    each SQL type; js_probe shows, for each expression, the value MySQL gets or 'error'.
+--echo #
+CREATE FUNCTION js_i(src TEXT) RETURNS BIGINT LANGUAGE JAVASCRIPT AS $$ return (0, eval)(src) $$;
+CREATE FUNCTION js_u(src TEXT) RETURNS BIGINT UNSIGNED LANGUAGE JAVASCRIPT AS $$ return (0, eval)(src) $$;
+CREATE FUNCTION js_d(src TEXT) RETURNS DOUBLE LANGUAGE JAVASCRIPT AS $$ return (0, eval)(src) $$;
+CREATE FUNCTION js_v(src TEXT) RETURNS VECTOR(2) LANGUAGE JAVASCRIPT AS $$ return (0, eval)(src) $$;
+CREATE FUNCTION js_date(src TEXT) RETURNS DATE LANGUAGE JAVASCRIPT AS $$ return (0, eval)(src) $$;
+CREATE PROCEDURE js_probe(fn TEXT, srcs TEXT, OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  r = srcs.split(' ;; ').map((src) => {
+    try {
+      const v = session.runSql('SELECT ' + fn + '(?) AS v', [src]).fetchOne().toArray()[0]
+      return src + ' => ' + (v instanceof Float32Array ? 'vector ' + v.length : v instanceof Date ? v.toISOString() : String(v))
+    } catch (e) { return src + ' => error' }
+  }).join('\n')
+$$;
+CALL js_probe('js_i', '0.49999999999999994 ;; -0.5 ;; 2.5 ;; -2.5 ;; -3.5', @r);
+SELECT @r;
+CALL js_probe('js_i', '"2.5" ;; "-2.5" ;; " -3.5 " ;; "1e2" ;; "0.49999999999999994"', @r);
+SELECT @r;
+CALL js_probe('js_i', '2 ** 63 ;; -(2 ** 63) ;; 1e300 ;; "1e999999999" ;; "0x10" ;; "abc" ;; ""', @r);
+SELECT @r;
+CALL js_probe('js_u', '1.8446744073709550e19 ;; 2 ** 64 ;; -0.4 ;; -0.6 ;; "18446744073709549568.4"', @r);
+SELECT @r;
+
+--echo #
+--echo # 5. A string as FLOAT or DOUBLE is in decimal notation only.
+--echo #
+CALL js_probe('js_d', '"1.5" ;; " -2.5e2 " ;; ".5" ;; "5."', @r);
+SELECT @r;
+CALL js_probe('js_d', '"1.5f" ;; "2d" ;; "0x1p3" ;; "0x10" ;; "" ;; "Infinity" ;; "NaN" ;; "1e999"', @r);
+SELECT @r;
+
+--echo #
+--echo # 6. A BigInt as FLOAT or DOUBLE is the nearest double; beyond DOUBLE's
+--echo #    range it is an error.
+--echo #
+CALL js_probe('js_d', '10n ** 20n ;; 2n ** 53n + 1n ;; -(2n ** 70n) ;; 5n ;; 2n ** 1024n ;; 2n ** 1024n - 1n', @r);
+SELECT @r;
+
+--echo #
+--echo # 7. White space around a numeric string is what JavaScript's Number()
+--echo #    strips (including U+00A0 and the line terminators), not every
+--echo #    character up to U+0020. A DataView is no VECTOR.
+--echo #
+CALL js_probe('js_d', '"\\u00a0\\u2003 7.5\\u2028\\ufeff"', @r);
+SELECT @r;
+CALL js_probe('js_i', '"\\n\\t 7\\r"', @r);
+SELECT @r;
+CALL js_probe('js_d', 'String.fromCharCode(1) + "7.5"', @r);
+SELECT @r;
+CALL js_probe('js_v', 'new Float32Array([1, 2]) ;; [1, 2] ;; new Uint8Array([1, 2]) ;; new DataView(new ArrayBuffer(8))', @r);
+SELECT @r;
+
+--echo #
+--echo # 8. A Date as DATE keeps its value with the time part rounded off to the
+--echo #    closest second (Table 27.3); as DATETIME it is kept as it is.
+--echo #
+CALL js_probe('js_date', 'new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 400)) ;; new Date(Date.UTC(2024, 0, 1, 23, 59, 59, 500)) ;; new Date(Date.UTC(2024, 0, 1, 0, 0, 0, 0))', @r);
+SELECT @r;
+
+--echo #
+--echo # 9. getOption always gives a value: a statement's own options over the
+--echo #    call's setOptions over the session's defaults, also when setOptions
+--echo #    set only one option.
+--echo #
+CREATE PROCEDURE js_options(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const show = (o) => o.getOption('integerType') + '/' + o.getOption('decimalType')
+  const out = [show(session)]
+  session.setOptions({ decimalType: 'NUMBER' })
+  out.push(show(session))
+  session.setOptions({ integerType: 'BIGINT' })
+  out.push(show(session))
+  out.push(show(session.sql('SELECT 1', { integerType: 'STRING' })))
+  out.push(show(session.prepare('SELECT 1', { decimalType: 'STRING' })))
+  r = out.join(' | ')
+$$;
+CALL js_options(@r);
+SELECT @r;
+
 --disconnect con1
 --connection default
 DROP FUNCTION js_when;
@@ -123,6 +207,13 @@ DROP PROCEDURE js_bigints;
 DROP FUNCTION js_json;
 DROP PROCEDURE js_json_params;
 DROP TABLE td;
+DROP FUNCTION js_i;
+DROP FUNCTION js_u;
+DROP FUNCTION js_d;
+DROP FUNCTION js_v;
+DROP FUNCTION js_date;
+DROP PROCEDURE js_probe;
+DROP PROCEDURE js_options;
 REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
 --source include/wait_until_count_sessions.inc
 UNINSTALL COMPONENT "file://component_mle";

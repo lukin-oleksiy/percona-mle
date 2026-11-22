@@ -1,0 +1,179 @@
+#
+# component_mle: regressions for the independent multi-model review
+# (exp note 60): the findings that have no better home.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+# C9: all of TIME's hour 838 passes (only 838:59:59 with a fraction is
+# beyond the range), as arguments, results and SQL parameters.
+CREATE FUNCTION js_time(t TIME(6)) RETURNS TIME(6) LANGUAGE JS AS $$ return t $$;
+CREATE FUNCTION py_time(t TIME(6)) RETURNS TIME(6) LANGUAGE PYTHON AS $$ return t $$;
+CREATE FUNCTION js_time_text() RETURNS TIME LANGUAGE JS AS $$ return '838:30:00' $$;
+SELECT js_time('838:00:00') AS a, js_time('-838:59:58.999999') AS b, js_time('838:59:59') AS c,
+py_time('838:30:00.5') AS d, py_time('-838:00:00') AS e, js_time_text() AS f;
+a	b	c	d	e	f
+838:00:00.000000	-838:59:58.999999	838:59:59.000000	838:30:00.500000	-838:00:00.000000	838:30:00
+CALL py_time_sql(@r);
+SELECT @r;
+@r
+34 days, 22:10:00 838:10:00.000000
+# C12: a negative TIME in a routine's SQL result keeps its sign.
+CALL js_neg_time(@r);
+SELECT @r;
+@r
+-12:34:56.500000 -00:00:02 01:02:03
+CALL py_neg_time(@r);
+SELECT @r;
+@r
+-1 day, 11:25:03.500000 | -1 day, 23:59:58
+CALL java_neg_time(@r);
+SELECT @r;
+@r
+PT-12H-34M-56.5S PT-2S
+# C13: DECIMAL text is bounded before it is sent: digits beyond the 30th
+# decimal place are rounded, more than 65 digits is an error of the
+# routine; the worker stays (same pid).
+CREATE FUNCTION js_tiny() RETURNS DECIMAL(20,10) LANGUAGE JS AS $$ return 1e-110 $$;
+CREATE FUNCTION js_huge() RETURNS DECIMAL(65,0) LANGUAGE JS AS $$ return 1e101 $$;
+CREATE FUNCTION js_exp() RETURNS DECIMAL(65,0) LANGUAGE JS AS $$ return '1e2000000000' $$;
+CREATE FUNCTION js_max() RETURNS DECIMAL(65,0) LANGUAGE JS AS $$ return '9e64' $$;
+SET @pid = mle_debug_worker_pid();
+SELECT js_tiny(), js_max();
+js_tiny()	js_max()
+0.0000000000	90000000000000000000000000000000000000000000000000000000000000000
+SELECT js_huge();
+ERROR HY000: MLE-Type> value 1E+101 is out of range for DECIMAL in 'js_huge()'
+SELECT js_exp();
+ERROR HY000: MLE-Type> value 1E+2000000000 is out of range for DECIMAL in 'js_exp()'
+CALL py_big_params(@r);
+SELECT @r;
+@r
+refused | 0 | refused | 10000000000000000000000000000000000000000000000000000000000000000 | 0.123456789012345678901234567891
+# C10: a batch of many small rows is split by the number of values too
+# (65,535 per message); C11: after a rewritten batch a partial bind does
+# not inherit the values bound before it.
+CREATE TABLE u (id INT PRIMARY KEY, a INT, b INT);
+INSERT INTO u VALUES (1, 1, 1), (2, 2, 2), (29999, 3, 3);
+CREATE TABLE t11 (id INT PRIMARY KEY, a VARCHAR(10)) ENGINE=InnoDB;
+CALL py_many_values(@r);
+SELECT @r;
+@r
+affected 3, left 0
+CALL js_too_many(@r);
+SELECT @r;
+@r
+1210 Incorrect arguments: 70000 values in one statement (at most 65535)
+CALL js_rebind(@r);
+SELECT @r;
+@r
+1000 | no bind: 1210 | partial bind: 1210 | 1:before,2:q before,3:after,4:after,5:tail
+# C14: a result of a statement with parameters that is read in part is
+# drained before the next statement, as one without parameters: mysqld
+# keeps one, not one per statement.
+CREATE TABLE big (n INT PRIMARY KEY);
+INSERT INTO big WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 50) SELECT n FROM c;
+SET GLOBAL mle.sql_chunk_rows = 10, mle.sql_statements_max = 8;
+CALL js_partial(@r);
+SELECT @r;
+@r
+496 49
+SET GLOBAL mle.sql_chunk_rows = DEFAULT, mle.sql_statements_max = DEFAULT;
+# C15: session options belong to one routine call: a nested call's
+# setOptions does not replace its caller's, and the next nested call
+# does not inherit them.
+CALL js_outer(@r);
+SELECT @r;
+@r
+BIGINT/STRING | UNSAFE_STRING/NUMBER | UNSAFE_STRING/STRING | BIGINT/STRING
+# C5 (C24, C62): a failed multi-row chunk of executeMany is run again
+# row by row only when that repeats nothing: not when the table has
+# triggers (their writes to non-transactional tables stay), is hidden
+# by a temporary table, or the error is not one of a row's values. The
+# error then names the chunk.
+# (The trigger's table would be a MyISAM one: the suite's server refuses
+# that with GTIDs. The check is for any trigger.)
+CREATE TABLE audit (id INT) ENGINE=InnoDB;
+CREATE TABLE tt (id INT PRIMARY KEY, a VARCHAR(10)) ENGINE=InnoDB;
+CREATE TABLE tt2 (id INT PRIMARY KEY, a VARCHAR(10)) ENGINE=InnoDB;
+CREATE TRIGGER tt_ai AFTER INSERT ON tt FOR EACH ROW INSERT INTO audit VALUES (NEW.id);
+CALL py_replay('tt', @r);
+SELECT @r;
+@r
+error 1062 row 0 (the table has triggers)
+SELECT (SELECT COUNT(*) FROM tt) AS rows_written, (SELECT COUNT(*) FROM audit) AS trigger_writes;
+rows_written	trigger_writes
+0	0
+DROP TRIGGER tt_ai;
+TRUNCATE audit;
+CALL py_replay('tt', @r);
+SELECT @r;
+@r
+error 1062 row 400
+SELECT COUNT(*) AS rows_written FROM tt;
+rows_written
+400
+CREATE TEMPORARY TABLE tt2 (id INT PRIMARY KEY, a VARCHAR(10)) ENGINE=MEMORY;
+CALL py_replay('tt2', @r);
+SELECT @r;
+@r
+error 1062 row 0 (the table is a temporary one)
+SELECT COUNT(*) AS rows_in_the_temporary_table FROM tt2;
+rows_in_the_temporary_table
+400
+DROP TEMPORARY TABLE tt2;
+SELECT COUNT(*) AS rows_in_the_table FROM tt2;
+rows_in_the_table
+0
+# C4: the results that a call's open statements hold in mysqld have a
+# budget (mle.sql_call_results_max; by default four times
+# mle.sql_result_max), also across nested calls.
+SET GLOBAL mle.sql_call_results_max = 1048576;
+CALL java_hold(2, @r);
+SELECT @r;
+@r
+all 2 opened: none
+CALL java_hold(50, @r);
+SELECT @r;
+@r
+refused before 50: the results of the open statements hold too much memory (mle.sql_call_results_max): read or close them first
+CALL js_nested_hold(@r);
+SELECT @r;
+@r
+refused before 2: the results of the open statements hold too much memory (mle.sql_call_results_max): read or close them first
+CALL js_many_small(@r);
+SELECT @r;
+@r
+100 small results open
+SET GLOBAL mle.sql_call_results_max = DEFAULT;
+CALL java_hold(50, @r);
+SELECT @r;
+@r
+all 50 opened: none
+SELECT mle_debug_worker_pid() = @pid AS same_worker;
+same_worker
+1
+DROP TABLE u, t11, big, audit, tt, tt2;
+DROP PROCEDURE py_replay;
+DROP PROCEDURE java_hold;
+DROP PROCEDURE js_nested_hold;
+DROP PROCEDURE js_many_small;
+DROP FUNCTION js_time;
+DROP FUNCTION py_time;
+DROP FUNCTION js_time_text;
+DROP FUNCTION js_tiny;
+DROP FUNCTION js_huge;
+DROP FUNCTION js_exp;
+DROP FUNCTION js_max;
+DROP PROCEDURE py_time_sql;
+DROP PROCEDURE js_neg_time;
+DROP PROCEDURE py_neg_time;
+DROP PROCEDURE java_neg_time;
+DROP PROCEDURE py_big_params;
+DROP PROCEDURE py_many_values;
+DROP PROCEDURE js_too_many;
+DROP PROCEDURE js_rebind;
+DROP PROCEDURE js_partial;
+DROP PROCEDURE js_inner;
+DROP PROCEDURE js_outer;
+REVOKE CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
