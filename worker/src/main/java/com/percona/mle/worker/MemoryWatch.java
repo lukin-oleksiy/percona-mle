@@ -48,6 +48,11 @@ import java.util.concurrent.locks.LockSupport;
  * Idle workers are left alone: RESET and the pool already trim them. The count goes to the host
  * with the worker's statistics (mle_worker_memory_gcs) and restarts at RESET. A check allocates
  * nothing: /proc/self/status is re-read through a file kept open, into a reused buffer.
+ *
+ * <p>The thread also writes the worker's statistics (§3.1), so that the thread that serves
+ * requests writes none on a request's path: at each of its periods while calls run, when the
+ * figures have changed enough to matter (the state, the count of forced GCs, or the heap in use by
+ * 1/64 of its limit), and once when the worker has been idle for a period.
  */
 final class MemoryWatch implements Runnable {
   /** 10 ms: a numpy loop can allocate several GB/s (reading the size costs microseconds). */
@@ -58,6 +63,14 @@ final class MemoryWatch implements Runnable {
 
   private final long limit;
   private final Thread thread;
+  private final Mailbox mailbox;
+  /** What the serving thread is doing (Wire.STATE_RUNNING or STATE_COMPILING): read here without
+      synchronization, for the statistics only. */
+  private static int phase = Wire.STATE_RUNNING;
+  /** The statistics written last. */
+  private int writtenState = -1;
+  private long writtenHeap;
+  private long writtenGcs = -1;
   /**
    * Calls begun plus calls ended (the main thread writes it): odd while a call runs. One volatile
    * write per begin and per end; the thread parks only after a whole period in which no call
@@ -77,19 +90,41 @@ final class MemoryWatch implements Runnable {
   /** Where the garbage of nudge() goes (a volatile store: it cannot be optimised away). */
   private static volatile Object sink;
 
-  private MemoryWatch(long limit) {
+  private MemoryWatch(long limit, Mailbox mailbox) {
     this.limit = limit;
+    this.mailbox = mailbox;
     this.thread = new Thread(this, "mle-memory");
     thread.setDaemon(true);
   }
 
-  /** Starts the watcher if the worker has a memory limit and can read its resident size. */
-  static void start() {
+  /**
+   * Starts the thread: it writes the statistics into mailbox, and watches the memory if the
+   * worker has a memory limit and can read its resident size.
+   */
+  static void start(Mailbox mailbox) {
     long limit = Long.getLong("mle.memoryMax", 0);
-    if (limit <= 0 || rss() < 0) return;
-    MemoryWatch w = new MemoryWatch(limit);
+    MemoryWatch w = new MemoryWatch(limit <= 0 || rss() < 0 ? 0 : limit, mailbox);
     w.thread.start();
     instance = w;
+  }
+
+  /** What the serving thread does from now on, for the statistics (no synchronization). */
+  static void phase(int state) {
+    phase = state;
+  }
+
+  /** The statistics, if they changed enough to matter (state: what the worker is doing now). */
+  private void statistics(int state) {
+    Runtime rt = Runtime.getRuntime();
+    long max = rt.maxMemory();
+    long used = rt.totalMemory() - rt.freeMemory();
+    long gcs = GCS.get();
+    if (state == writtenState && gcs == writtenGcs && Math.abs(used - writtenHeap) < Math.max(max >> 6, 1 << 20))
+      return;
+    writtenState = state;
+    writtenGcs = gcs;
+    writtenHeap = used;
+    mailbox.stats(state, used, max);
   }
 
   /** A top-level call starts (the main thread). */
@@ -123,6 +158,7 @@ final class MemoryWatch implements Runnable {
     while (true) {
       long s = state;
       if (s == seen && (s & 1) == 0) {  // idle, and no call began during the last period
+        statistics(Wire.STATE_IDLE);
         parked = true;
         if (state == s) LockSupport.park(this);
         parked = false;
@@ -135,7 +171,10 @@ final class MemoryWatch implements Runnable {
       } catch (InterruptedException e) {
         Thread.interrupted();  // nothing interrupts this thread on purpose; go on
       }
-      if ((state & 1) != 0) check();
+      if ((state & 1) != 0) {
+        if (limit > 0) check();
+        statistics(phase);
+      }
     }
   }
 

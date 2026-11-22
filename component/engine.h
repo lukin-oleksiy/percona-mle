@@ -162,13 +162,22 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal, W
 
 /** DROP USER / RENAME USER: kept workers of that account are destroyed (a
     new account of the same name must not get them), and the workers that
-    sessions hold for it are retired at their next use (protocol §1). */
+    sessions hold for it are retired before their next top-level request
+    (protocol §1). */
 void engine_forget_account(const std::string &principal);
+
+/** CREATE USER, CREATE ROLE or RENAME USER ran: an account was created.
+    The server does not say which, so every worker whose principal can name
+    an account that did not exist when the worker started is treated as
+    engine_forget_account() treats the workers of a dropped one (protocol
+    §1). Those are the workers of a principal of two accounts: an account
+    that owns code need not exist, one whose rights apply does. */
+void engine_account_created();
 
 /** How many accounts were forgotten so far; it only grows. Lock-free. */
 uint64_t engine_forgets();
-/** Whether an account of the principal was dropped or renamed after the
-    count of engine_forgets() was since. */
+/** Whether an account of the principal was dropped or renamed, or may have
+    been created, after the count of engine_forgets() was since. */
 bool engine_account_forgotten(const std::string &principal, uint64_t since);
 
 /** Heap in use over all session workers that report one (JVM: the Java

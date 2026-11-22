@@ -186,7 +186,7 @@ std::vector<std::string> seed_messages() {
   add(DropMsg{11});
   OptionsMsg options;
   options.time_zone = "Europe/Kyiv";
-  options.settings = {{"js.decimal_type", "number"}, {"js.integer_type", "bigint"}};
+  options.settings = {{"decimal_type", "number"}, {"integer_type", "bigint"}};
   add(options);
   return out;
 }

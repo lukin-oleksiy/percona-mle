@@ -72,22 +72,70 @@ namespace {
 
 std::atomic<uint64_t> g_library_epoch{1};
 
-/** The commands that change no library, no routine and no right to use
-    one, by the names the server's query events carry. */
-bool leaves_libraries(std::string_view command) {
-  static const std::unordered_set<std::string_view> kHarmless = {
-      "select", "update", "update_multi", "insert", "insert_select", "delete",
-      "delete_multi", "replace", "replace_select", "truncate", "load", "do",
-      "call", "set_option", "change_db", "begin", "commit", "rollback",
-      "rollback_to_savepoint", "savepoint", "release_savepoint", "prepare",
-      "execute", "deallocate_prepare", "empty_query", "lock_tables",
-      "unlock_tables", "ha_open", "ha_close", "ha_read", "signal", "resignal",
-      "get_diagnostics", "help", "kill", "analyze", "check", "checksum",
-      "optimize", "repair", "explain_other", "create_table", "create_index",
-      "alter_table", "drop_table", "drop_index", "rename_table", "create_view",
-      "drop_view", "create_trigger", "drop_trigger"};
-  return command.starts_with("show_") || command.starts_with("xa_") ||
-         kHarmless.contains(command);
+/** What the end of a statement of a command means here. */
+enum Command : uint8_t {
+  kNotLookedUp = 0,
+  kHarmless = 1,
+  /** It can change a library, a routine's USING clause or the right to use
+      a library (§9.10). */
+  kChangesLibraries = 2,
+  /** It can create an account (§1). */
+  kCreatesAccount = 4,
+};
+
+/** By the name the server's query events carry. A command the server does
+    not name (the event of something that is no statement) counts as one
+    that changes: it is rare and may be anything. */
+uint8_t classify(std::string_view command) {
+  // The server's names (sql/command_mapping.cc): "create_spfunction" is a
+  // stored function, "create_function" a loadable one; "drop_function" drops
+  // either.
+  static const std::unordered_set<std::string_view> kChanging = {
+      "create_library", "alter_library", "drop_library", "create_procedure",
+      "create_spfunction", "alter_procedure", "alter_function",
+      "drop_procedure", "drop_function", "drop_db", "grant", "revoke",
+      "revoke_all", "grant_role", "revoke_role", "create_user", "drop_user",
+      "rename_user", "alter_user", "alter_user_default_role", "create_role",
+      "drop_role", "set_role", "flush"};
+  if (command.empty() || command == "error") return kChangesLibraries;
+  uint8_t what = kChanging.contains(command) ? kChangesLibraries : kHarmless;
+  if (command == "create_user" || command == "create_role" ||
+      command == "rename_user")
+    what |= kCreatesAccount;
+  return what;
+}
+
+/** The commands seen so far, by the address of the server's name of each
+    (one static string per command): a statement costs a few loads. */
+struct KnownCommand {
+  std::atomic<const char *> name{nullptr};
+  std::atomic<uint8_t> what{kNotLookedUp};
+};
+constexpr size_t kKnownCommands = 1024;  // a power of two, above the commands
+std::array<KnownCommand, kKnownCommands> g_known_commands;
+
+uint8_t command_class(const char *name) {
+  if (name == nullptr) return kChangesLibraries;
+  size_t at = (reinterpret_cast<uintptr_t>(name) >> 3) % kKnownCommands;
+  for (size_t probes = 0; probes < kKnownCommands; probes++) {
+    KnownCommand &known = g_known_commands[at];
+    const char *have = known.name.load(std::memory_order_acquire);
+    if (have == name) {
+      const uint8_t what = known.what.load(std::memory_order_acquire);
+      // Another thread is just entering it: by the name, this once.
+      return what != kNotLookedUp ? what : classify(name);
+    }
+    if (have == nullptr) {
+      const uint8_t what = classify(name);
+      const char *expected = nullptr;
+      if (known.name.compare_exchange_strong(expected, name,
+                                             std::memory_order_acq_rel))
+        known.what.store(what, std::memory_order_release);
+      return what;
+    }
+    at = (at + 1) % kKnownCommands;
+  }
+  return classify(name);
 }
 
 /**
@@ -147,8 +195,10 @@ uint64_t library_epoch() { return g_library_epoch.load(); }
 
 void library_epoch_changed() { ++g_library_epoch; }
 
-void statement_ended(std::string_view sql_command) {
-  if (!leaves_libraries(sql_command)) library_epoch_changed();
+void statement_ended(const char *sql_command) {
+  const uint8_t what = command_class(sql_command);
+  if ((what & kChangesLibraries) != 0) library_epoch_changed();
+  if ((what & kCreatesAccount) != 0) engine_account_created();
 }
 
 namespace {
@@ -190,14 +240,13 @@ class Hooks : public mle::CallHooks {
 
   /**
     A database library the routine of this request imports (§9.10),
-    answered from the catalog as it is now. A routine may have the
-    libraries of its USING clause and the libraries those import. The host
-    does not read source code, so it cannot tell which libraries a library
-    imports: a routine with a USING clause may have every library that the
-    account whose rights it runs with may use (the server checks EXECUTE on
-    the library in the security context in force, which is that account's),
-    a routine without one has none. Every refusal says the same, whether the
-    library exists or not.
+    answered by the catalog and the rights as they are now (protocol
+    Appendix A, Oracle's rule): a routine may import the libraries of its
+    USING clause and, by an import at run time or an import inside a
+    library, any library in any schema that the account whose rights apply
+    may use. The server checks EXECUTE on the library in the security
+    context in force, which is that account's (at CREATE: the creator's).
+    Every refusal says the same, whether the library exists or not.
   */
   void library(const mle::LibraryMsg &m, mle::LibraryResultMsg *r) override {
     *r = mle::LibraryResultMsg();
@@ -210,16 +259,6 @@ class Hooks : public mle::CallHooks {
       repair_utf8(&r->message);
     };
     if (m_routine == nullptr) return refuse();
-    // SPEC QUESTION (integration, 20 Nov): Appendix A allows a routine its
-    // USING libraries and what those import, so one without USING could
-    // import nothing; Oracle's JavaScript imports libraries dynamically in
-    // routines without USING (the suite's libraries tests have such
-    // examples, for libraries of the routine's own schema). Until the
-    // specification settles it, a routine without USING may import the
-    // libraries of its own schema that the account whose rights apply may
-    // use, and nothing else.
-    if (m_routine->prepare.imports.empty() && m.schema != m_routine->schema)
-      return refuse();
     // A failed lookup may leave the server's error (a missing library, an
     // MDL timeout, KILL) in the diagnostics area: it is not the routine's,
     // the routine gets r->message. A statement's error kept there goes with
@@ -246,9 +285,9 @@ class Hooks : public mle::CallHooks {
     const std::string_view text(body.str == nullptr ? "" : body.str, body.length);
     const std::string_view id =
         worker_language(language_bit({language.str, language.length}));
-    // A body that is not UTF-8 text is not sent (§7.1), nor one in a
-    // language MLE does not run.
-    if (id.empty() || !mle::is_valid_utf8(text)) {
+    // A library in a language MLE does not run is not sent; nor is a body
+    // that is not UTF-8 text (§7.1): the Worker refuses that one.
+    if (id.empty()) {
       refuse();
     } else {
       r->language = id;
@@ -264,13 +303,13 @@ class Hooks : public mle::CallHooks {
   }
 
   void sql(const mle::SqlMsg &m, mle::SqlResultMsg *r) override {
-    sql_into(m, r, nullptr);
+    sql_into(m, r, nullptr, 0);
   }
   /** SQL from the routine (sql.cc); rows may go straight into the mailbox
       arena. */
   void sql_into(const mle::SqlMsg &m, mle::SqlResultMsg *r,
-                mle::DirectReply *direct) override {
-    if (m_sql != nullptr) return m_sql->handle(m, r, direct);
+                mle::DirectReply *direct, uint64_t error_id) override {
+    if (m_sql != nullptr) return m_sql->handle(m, r, direct, error_id);
     // No statement ids exist here: CLOSE closes nothing, every other action
     // is an ERROR and its id stays CLOSED.
     *r = mle::SqlResultMsg();
@@ -279,9 +318,11 @@ class Hooks : public mle::CallHooks {
     if (m.action == mle::wire::SqlAction::kExecuteMany) r->failed_row = 0;
   }
 
-  void sql_refused(mle::SqlRefusal why, mle::wire::SqlAction action,
-                   uint64_t stmt_id, mle::SqlResultMsg *error) override {
-    if (m_sql != nullptr) return m_sql->refused(why, action, stmt_id, error);
+  void sql_refused(mle::SqlRefusal why, bool ran, mle::wire::SqlAction action,
+                   uint64_t stmt_id, uint64_t,
+                   mle::SqlResultMsg *error) override {
+    if (m_sql != nullptr)
+      return m_sql->refused(why, ran, action, stmt_id, error);
     if (action != mle::wire::SqlAction::kClose)
       refusal_error(why, m_no_sql, error);
   }
@@ -634,15 +675,16 @@ Session::Slot *Session::worker_for(const std::string &key,
         return nullptr;
       }
     }
-    // A worker whose principal names an account that was dropped or renamed
-    // is retired: an account of that name is another one now (§1).
+    // A worker whose principal names an account that was dropped, renamed
+    // or created after the worker started is retired: an account of that
+    // name is another one now (§1).
     if (keep && slot.worker->depth() == 0) {
       const uint64_t forgets = engine_forgets();
       if (forgets != slot.forgets) {
         if (engine_account_forgotten(slot.principal, slot.forgets)) {
           log_info("The worker of " + display_key(key) +
-                   " was retired: an account of its principal was dropped or "
-                   "renamed.");
+                   " was retired: an account of its principal was dropped, "
+                   "renamed or created.");
           keep = false;
         } else {
           slot.forgets = forgets;
@@ -659,8 +701,10 @@ Session::Slot *Session::worker_for(const std::string &key,
   if (it != m_workers.end() && it->second.worker->depth() != 0)
     return &it->second;
 
-  // A top-level request follows. Nothing is sent for a session that is
-  // killed or whose statement is out of time (§11.1): the server reports it.
+  // A top-level PREPARE, CALL or PARSE_LIBRARY follows, with the OPTIONS
+  // before it. None of them is sent for a session that is killed or whose
+  // statement is out of time (§11.1): the server reports it. (DROP and
+  // RESET are sent all the same: forget() and the worker's release.)
   if (session_killed(m_thd)) return nullptr;
 
   if (it == m_workers.end()) {
@@ -711,15 +755,7 @@ Session::Slot *Session::worker_for(const std::string &key,
 
   Slot &slot = it->second;
   slot.worker->set_timing(spin_us(), interrupt_grace_ms());
-  // Routines that went away while their DROP could not be sent.
-  while (!slot.undropped.empty()) {
-    std::string error;
-    const Outcome o = slot.worker->drop(slot.undropped.back(), &error);
-    if (o == Outcome::kRefused) break;
-    slot.undropped.pop_back();
-    if (!slot.worker->usable()) break;
-  }
-  if (slot.worker->usable() && options_in(key, slot, routine)) return &slot;
+  if (options_in(key, slot, routine)) return &slot;
   // The worker was lost on the way (or retired for an INTERNAL answer).
   mle::Worker *const worker = slot.worker.get();
   if (!worker->usable()) {
@@ -734,38 +770,43 @@ Session::Slot *Session::worker_for(const std::string &key,
 bool Session::options_in(const std::string &key, Slot &slot,
                          const Routine &routine) {
   mle::Worker &worker = *slot.worker;
-  const std::string zone = session_time_zone(m_thd);
-  if (worker.options_in_force() && zone == slot.zone &&
-      m_settings_version == slot.settings_version)
-    return true;
-  mle::OptionsMsg options;
-  options.time_zone = options_time_zone(zone);
-  if (options.time_zone.empty()) {
-    // A zone the protocol cannot express: nothing is sent.
-    my_error(ER_LANGUAGE_COMPONENT_TIMEZONE, MYF(0), routine.display_language(),
-             zone.c_str());
-    return false;
+  // A worker comes to a session without options (new, or RESET when it was
+  // given back), and the session gives it only its fixed options: what is
+  // in force is right, and nothing is compared.
+  if (worker.options_in_force()) return true;
+  // The session's fixed options (§9.8), or, before its first request, what
+  // they will be once a worker has taken them: the zone and the settings
+  // now in effect.
+  mle::OptionsMsg first;
+  std::string zone = m_fixed_zone;
+  if (!m_fixed) {
+    zone = session_time_zone(m_thd);
+    first.time_zone = options_time_zone(zone);
+    if (first.time_zone.empty()) {
+      // A zone the protocol cannot express: nothing is sent.
+      my_error(ER_LANGUAGE_COMPONENT_TIMEZONE, MYF(0),
+               routine.display_language(), zone.c_str());
+      return false;
+    }
+    // A setting that is not listed has its default.
+    for (const auto &[name, value] : m_settings)
+      first.settings.push_back({name, value});
   }
-  // The complete set: a setting that is not listed has its default.
-  for (const auto &[name, value] : m_settings)
-    options.settings.push_back({name, value});
-  if (worker.options_in_force() && options == slot.options) {
-    slot.zone = zone;
-    slot.settings_version = m_settings_version;
-    return true;
-  }
+  const mle::OptionsMsg &options = m_fixed ? *m_fixed : first;
   mle::Error refused;
   std::string error;
   switch (worker.options(options, &refused, &error)) {
     case Outcome::kOk:
-      slot.options = std::move(options);
-      slot.zone = zone;
-      slot.settings_version = m_settings_version;
+      // Fixed from here until the session's state is reset.
+      if (!m_fixed) {
+        m_fixed = std::move(first);
+        m_fixed_zone = std::move(zone);
+      }
       return true;
     case Outcome::kGuestError:
-      // The options in force are unchanged (possibly none) and the worker
-      // lives on; the statement fails. Which setting it was is told by the
-      // Error's language, never by its text.
+      // The worker has no options in force and lives on; the statement
+      // fails, and an OPTIONS that failed fixes nothing. Which setting it
+      // was is told by the Error's language, never by its text.
       if (refused.language == mle::wire::kLanguageTimeZone) {
         my_error(ER_LANGUAGE_COMPONENT_TIMEZONE, MYF(0),
                  routine.display_language(), zone.c_str());
@@ -856,15 +897,23 @@ mle::Worker *Session::prepared_worker(const std::string &key,
 bool Session::parse(Routine &routine) {
   if (!check_create_privilege(m_thd, routine)) return false;
   const Request request(this);
-  const std::string key = slot_key(principal(&routine), routine.language);
+  enum_sql_command command = SQLCOM_END;
+  (void)mysql_service_mysql_thd_attributes->get(m_thd, "sql_command_id", &command);
+  const bool creating =
+      command == SQLCOM_CREATE_PROCEDURE || command == SQLCOM_CREATE_SPFUNCTION;
+  // Whose code it is (§1). A routine that enters the session's cache: its
+  // definer's. A routine being created: the creator's, and the creator is
+  // the account of the security context in force; created by the SQL of a
+  // routine, it is code that routine submits and has that routine's
+  // principal.
+  const Routine *owner =
+      creating && m_running_routine != nullptr ? m_running_routine : &routine;
+  const std::string key = slot_key(principal(owner), routine.language);
   Slot *slot = worker_for(key, routine);
   if (slot == nullptr) return false;
   // CREATE: the worker also checks the code; what it finds becomes the
   // statement's warnings.
-  enum_sql_command command = SQLCOM_END;
-  (void)mysql_service_mysql_thd_attributes->get(m_thd, "sql_command_id", &command);
-  routine.prepare.check =
-      command == SQLCOM_CREATE_PROCEDURE || command == SQLCOM_CREATE_SPFUNCTION;
+  routine.prepare.check = creating;
   const bool ok = prepare_in(key, *slot, routine);
   routine.prepare.check = false;
   return ok;
@@ -884,7 +933,7 @@ bool Session::execute(Routine &routine) {
   m_stack.clear();  // Oracle: the trace of the last call only
   m_trace.reset();
   std::vector<Value> args = std::move(m_args);  // reused; a nested call allocates
-  if (!routine.read_args(&args)) return false;
+  if (!routine.read_args(&args, &m_zones)) return false;
   const Request request(this);
   const std::string key =
       slot_key(principal(&routine), routine.language);  // a copy: nested calls change it
@@ -903,7 +952,7 @@ bool Session::execute(Routine &routine) {
   m_running_routine = &routine;
 
   // The call's statements; closed when it returns.
-  SqlRunner sql(m_thd, &m_budget);
+  SqlRunner sql(m_thd, &m_budget, &m_zones);
   Hooks hooks(m_thd, &m_budget, &sql, &routine);
   ResultMsg result;
   std::string error;
@@ -947,10 +996,9 @@ void Session::forget(const Routine &routine) {
         !slot.worker->is_prepared(routine.id))
       continue;
     std::string error;
-    // A DROP that cannot be sent now (the worker is busy where no nested
-    // request fits) goes before the worker's next top-level request.
-    if (slot.worker->drop(routine.id, &error) == Outcome::kRefused)
-      slot.undropped.push_back(routine.id);
+    // Where the DROP cannot be sent now (the worker is busy where no nested
+    // request fits), the Worker sends it before its next top-level request.
+    (void)slot.worker->drop(routine.id, &error);
     if (!slot.worker->usable()) lost.push_back(key);
   }
   for (const std::string &key : lost) {
@@ -1240,7 +1288,9 @@ void Session::clear_state(bool reuse) {
   m_last_out.clear();
   m_last_err.clear();
   m_settings.clear();
-  ++m_settings_version;
+  // The session's options are fixed anew at its next request.
+  m_fixed.reset();
+  m_fixed_zone.clear();
 }
 
 bool Session::reset() {
@@ -1263,15 +1313,28 @@ void Session::account_changed() {
 
 bool Session::set_settings(
     const std::vector<std::pair<std::string, std::string>> &settings) {
-  if (has_programs()) return false;
+  // Oracle's rule: not while the session has stored programs cached. And
+  // never while a request of the session is in progress: its options are
+  // fixed (§9.8).
+  if (has_programs() || m_calls > 0) return false;
   for (const auto &[name, value] : settings) {
     if (value.empty())
       m_settings.erase(name);
     else
       m_settings[name] = value;
   }
-  // The workers get them with OPTIONS before their next top-level request.
-  ++m_settings_version;
+  // Options that were fixed already (the session ran code and has no
+  // program cached any more) end here: the session's workers are released
+  // (a kept one gets RESET), and the next request fixes the new options in
+  // the workers it takes.
+  if (m_fixed) {
+    for (auto &[key, slot] : m_workers)
+      engine_release_worker(std::move(slot.worker), slot.kind, slot.principal,
+                            m_mark);
+    m_workers.clear();
+    m_fixed.reset();
+    m_fixed_zone.clear();
+  }
   return true;
 }
 
@@ -1436,14 +1499,13 @@ std::optional<std::string> Session::eval(unsigned language,
   m.name = routine.name;
   m.entry = "<eval>";  // the worker evaluates the code and returns its value as text
   m.source = code;
-  // The current schema while it runs; a session without one names a schema
-  // that holds no libraries.
+  // The session's current schema while it runs; empty for a session
+  // without one (§9.2).
   mysql_cstring_with_length schema{nullptr, 0};
   if (!mysql_service_mysql_thd_attributes->get(m_thd, "schema", &schema) &&
       schema.str != nullptr && schema.length > 0)
     m.schema.assign(schema.str, schema.length);
-  if (m.schema.empty() || !mle::is_valid_utf8(m.schema))
-    m.schema = "information_schema";
+  if (!mle::is_valid_utf8(m.schema)) m.schema.clear();
   routine.schema = m.schema;
   mle::ParamType text;
   text.tag = mle::Tag::kString;

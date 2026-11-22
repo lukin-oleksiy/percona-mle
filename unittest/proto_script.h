@@ -51,6 +51,7 @@ enum class Step : uint8_t {
   /** Blocks until the INTERRUPT for the request arrives. */
   kAwaitInterrupt,
   kExit,
+  /** From now on every RESULT sent as a message has the TAINTED flag. */
   kTainted,
   /** Writes impossible statistics. */
   kBadStats,
@@ -65,6 +66,9 @@ enum class Step : uint8_t {
   /** Appends the request (header and body) to the log, and from now on
       every reply the worker receives. */
   kLog,
+  /** Appends every datagram that waits on the control socket to the log,
+      each as an entry with op 0. */
+  kDrainControl,
 };
 
 /** In a kPost: the value the worker computes itself. */
@@ -141,6 +145,7 @@ class Script {
     return *this;
   }
   Script &log() { return step(Step::kLog); }
+  Script &drain_control() { return step(Step::kDrainControl); }
 
   const std::string &bytes() const { return m_bytes; }
   std::string hex() const {

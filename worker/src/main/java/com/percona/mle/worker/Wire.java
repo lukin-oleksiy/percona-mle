@@ -109,7 +109,7 @@ final class Wire {
   static final long STATS_HEAP_MAX = 8;
   static final long STATS_GC_COUNT = 16;
   static final long STATS_STATE = 24;
-  static final long STATS_TAINTED = 28;
+  static final long STATS_RESERVED = 28;
 
   // Operations (§9). 0, 7 and above 14 are not assigned.
   static final int READY = 1;
@@ -144,6 +144,8 @@ final class Wire {
   static final int INTERNAL = 4;
 
   static final int FLAG_MORE = 1;
+  /** Only in a RESULT, alike in all its chunks: the worker asks to be retired (§11.5). */
+  static final int FLAG_TAINTED = 2;
 
   // Value tags (§7.2).
   static final int T_NULL = 0;

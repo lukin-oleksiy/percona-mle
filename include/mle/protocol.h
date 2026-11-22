@@ -94,7 +94,8 @@ constexpr size_t kMaxDecimalChars = 100;
 constexpr uint32_t kMaxVectorDimensions = 16383;
 constexpr uint32_t kMaxTimeHour = 838;
 constexpr uint32_t kMaxSqlErrno = 65535;
-/** The ERRORs the host holds per top-level request, at least (§10.8). */
+/** The ERRORs the host holds per top-level request and worker, at least
+    (§10.8). */
 constexpr uint32_t kHeldErrors = 16;
 /** VECTOR elements start at this alignment, counted from the start of the
     message body (§7.2). */
@@ -152,11 +153,14 @@ inline constexpr char kLanguageType[] = "MLE-Type";
 inline constexpr char kLanguageTimeZone[] = "MLE-TimeZone";
 inline constexpr char kLanguageOption[] = "MLE-Option";
 
-/** MessageHeader::flags (§5.1). */
+/** MessageHeader::flags (§5.1). kTainted is legal only in a RESULT, where
+    all chunks of the message carry it alike: the worker asks to be retired
+    (§11.5). */
 enum MessageFlag : uint32_t {
   kMore = 1U << 0,
+  kTainted = 1U << 1,
 };
-constexpr uint32_t kKnownMessageFlags = kMore;
+constexpr uint32_t kKnownMessageFlags = kMore | kTainted;
 
 /** Value tags (§7.2). */
 enum class Tag : uint8_t {
@@ -205,9 +209,14 @@ constexpr size_t kSqlCloseSize = 26;
 /** SQL_RESULT ERROR failed_row when the error does not answer EXECUTE_MANY. */
 constexpr uint32_t kNoRow = 0xFFFFFFFF;
 
-/** SQL flags (§10.2). */
+/** SQL flags (§10.2). kKeep (a kept statement, §10.1) is not accepted by
+    this host: the server's statement service binds a prepared statement to
+    the stored program call that prepared it (a statement handle keeps that
+    call's diagnostics area), so no statement can outlive its request. A
+    worker that sends it commits a violation (an unknown flag). */
 enum SqlFlag : uint8_t {
   kPassResultToClient = 1U << 0,
+  kKeep = 1U << 1,
 };
 constexpr uint8_t kKnownSqlFlags = kPassResultToClient;
 
@@ -236,13 +245,15 @@ struct MessageHeader {
 };
 static_assert(sizeof(MessageHeader) == 40);
 
-/** Worker statistics (§3.1). */
+/** Worker statistics (§3.1): for reporting only. A worker writes them when
+    they changed enough to matter and when it becomes idle after a RESET,
+    not on every request; the host never decides anything by them. */
 struct WorkerStats {
   uint64_t heap_used;
   uint64_t heap_max;
   uint64_t gc_count;
   uint32_t state;
-  uint32_t tainted;
+  uint32_t reserved;
 };
 static_assert(sizeof(WorkerStats) == 32);
 

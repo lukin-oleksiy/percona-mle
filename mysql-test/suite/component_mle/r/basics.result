@@ -32,6 +32,7 @@ mle.pool_size	2
 mle.spin_us	50
 mle.sql_call_results_max	0
 mle.sql_chunk_rows	1000
+mle.sql_exec_time	OFF
 mle.sql_result_max	67108864
 mle.sql_row_max	16777216
 mle.sql_statements_max	1024

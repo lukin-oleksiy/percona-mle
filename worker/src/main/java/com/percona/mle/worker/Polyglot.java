@@ -1202,11 +1202,17 @@ final class Polyglot {
       throw new JavaRoutines.CompileException("the source does not define a function " + entry);
     Value[] converters = new Value[params.size()];
     if (jsRoutine == null)
-      for (int i = 0; i < converters.length; i++) converters[i] = converter(h, types[i].tag(), language);
+      for (int i = 0; i < converters.length; i++)
+        converters[i] = converter(h, types[i].tag(), language, options.decimalType);
     routines.put(id, new Routine(language, fn, converters, ret, types, outs, jsRoutine, imports));
   }
 
-  private static Value converter(Helpers h, int tag, String language) {
+  /**
+   * How a Python or JavaScript argument of the tag is made from its host form. decimalType: the
+   * session's decimal_type (Appendix B.2), fixed while the routine is prepared (§9.8): Python's
+   * DECIMAL is a Decimal, or a float with NUMBER.
+   */
+  private static Value converter(Helpers h, int tag, String language, int decimalType) {
     return switch (tag) {
       case Wire.T_BYTES -> h.bytes();
       case Wire.T_VECTOR -> h.vector();
@@ -1214,7 +1220,8 @@ final class Polyglot {
       case Wire.T_DATE -> h.date();
       case Wire.T_DATETIME, Wire.T_TIMESTAMP -> h.datetime();
       case Wire.T_TIME -> h.time();
-      case Wire.T_DECIMAL -> h.decimal();
+      case Wire.T_DECIMAL -> language.equals("python") && decimalType == Options.DECIMAL_NUMBER ? h.toNumber()
+          : h.decimal();
       // BIGINT UNSIGNED beyond 2^63 comes as a string (hostForm): Python makes it an int.
       case Wire.T_U64 -> language.equals("python") ? h.bigint() : null;
       case Wire.T_I64 -> null;
@@ -1349,14 +1356,11 @@ final class Polyglot {
           long us = ((t.hour() * 60 + t.minute()) * 60 + t.second()) * 1_000_000L + t.micro();
           yield js ? formatTime(t) : (Object) (t.negative() ? -us : us);
         }
-        case Wire.T_DATE -> js
-            // In the session's time zone, as results are read back (toJava) and as the body form
-            // does (JsOracle.hostForm): an identity function returns its argument (independent review C16).
-            ? (Object) (double) ((LocalDate) t.toJava()).atStartOfDay(zone).toInstant().toEpochMilli()
-            : t.toJava().toString();
-        default -> js
-            ? (Object) (double) ((LocalDateTime) t.toJava()).atZone(zone).toInstant().toEpochMilli()
-            : t.toJava().toString();
+        // JavaScript: in the session's time zone, as results are read back (toJava) and as the body
+        // form does (JsOracle.hostForm): an identity function returns its argument (independent
+        // review C16); Oracle's rules for zero and impossible dates (Values.Temporal.jsMillis).
+        // Python has no form for a zero date: the call fails as MLE-Type (toJava).
+        default -> js ? (Object) t.jsMillis(zone) : t.toJava().toString();
       };
       // An instant: a JavaScript Date (invalid for the zero timestamp); for Python the local time
       // in the session's zone (None for the zero timestamp).

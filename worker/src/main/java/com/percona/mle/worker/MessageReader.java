@@ -21,20 +21,36 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 /**
- * Reads a message body of the host in place (from the arena or the reassembly buffer). A body that
- * is not what §7 and §9 define is a protocol failure: the process ends (ProtocolFailure), nothing
- * is thrown.
+ * Reads a message body of the host in place (from the arena or the reassembly buffer). The host
+ * is trusted (§1): the reader checks every length and count against the bytes of the body, so
+ * that nothing outside the message is read, and nothing else. A length or count beyond the body
+ * is a protocol failure: the process ends (ProtocolFailure), nothing is thrown. Text is decoded
+ * as it comes (ill-formed UTF-8 becomes U+FFFD), a bool is true for any byte but 0, padding is
+ * skipped unread, and bytes after the last field are left alone.
  */
 final class MessageReader {
-  private final MemorySegment s;
+  private MemorySegment s;
   private long pos;
+  private long end;
+
+  MessageReader() {
+    this(MemorySegment.NULL);
+  }
 
   MessageReader(MemorySegment body) {
-    this.s = body;
+    reset(body, body.byteSize());
+  }
+
+  /** Reads the first length bytes of body from now on. */
+  MessageReader reset(MemorySegment body, long length) {
+    s = body;
+    pos = 0;
+    end = Math.min(length, body.byteSize());
+    return this;
   }
 
   private void need(long n) {
-    if (n < 0 || n > s.byteSize() - pos) throw ProtocolFailure.exit("message body truncated");
+    if (n < 0 || n > end - pos) throw ProtocolFailure.exit("message body truncated");
   }
 
   long position() {
@@ -42,12 +58,7 @@ final class MessageReader {
   }
 
   long remaining() {
-    return s.byteSize() - pos;
-  }
-
-  /** The body is consumed exactly (§5.1). */
-  void finish() {
-    if (pos != s.byteSize()) throw ProtocolFailure.exit("trailing bytes in a message body");
+    return end - pos;
   }
 
   int u8() {
@@ -56,9 +67,7 @@ final class MessageReader {
   }
 
   boolean bool() {
-    int v = u8();
-    if (v > 1) throw ProtocolFailure.exit("a bool of " + v);
-    return v == 1;
+    return u8() != 0;
   }
 
   int u16() {
@@ -78,11 +87,11 @@ final class MessageReader {
 
   /**
    * The count of a list whose elements take at least minSize bytes each: checked against the
-   * bytes left and against the list's limit before anything is allocated for it (§7.1).
+   * bytes left before anything is allocated for it (§1, §7.1).
    */
-  int count(long minSize, long limit) {
+  int count(long minSize) {
     long n = u32();
-    if (n > limit || n > remaining() / minSize) throw ProtocolFailure.exit("a list of " + n + " elements");
+    if (n > remaining() / minSize) throw ProtocolFailure.exit("a list of " + n + " elements");
     return (int) n;
   }
 
@@ -116,11 +125,9 @@ final class MessageReader {
     return b;
   }
 
-  /** A str: well-formed UTF-8, or the host broke the protocol. */
+  /** A str: the host sends well-formed UTF-8, and the worker does not check it (§1). */
   String str() {
-    String t = Text.decode(bytes());
-    if (t == null) throw ProtocolFailure.exit("a str that is not well-formed UTF-8");
-    return t;
+    return Text.decodeRepairing(bytes());
   }
 
   /** An lstr: the server's data, which may be ill-formed UTF-8 and is repaired here (§7.1). */
@@ -128,12 +135,10 @@ final class MessageReader {
     return Text.decodeRepairing(bytes());
   }
 
-  /** The zero bytes up to the next multiple of alignment, counted from the start of the body. */
+  /** The padding up to the next multiple of alignment, counted from the start of the body. */
   void skipPadding(int alignment) {
     long pad = (alignment - pos % alignment) % alignment;
     need(pad);
-    for (long i = 0; i < pad; i++)
-      if (s.get(ValueLayout.JAVA_BYTE, pos + i) != 0) throw ProtocolFailure.exit("VECTOR padding is not zero");
     pos += pad;
   }
 

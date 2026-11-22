@@ -215,7 +215,9 @@ $$;
 CREATE FUNCTION vec_long() RETURNS TEXT LANGUAGE JAVA AS $$
 Random r = new Random(1);
 float[][] m = new float[50000][768];
-for (float[] v : m) for (int i = 0; i < v.length; i++) v[i] = (float) r.nextGaussian();
+// Made quickly (nextFloat): the KILL is meant for related(), not for this
+// loop, which does not look for interrupts.
+for (float[] v : m) for (int i = 0; i < v.length; i++) v[i] = r.nextFloat() - 0.5f;
 return "finished: " + Vectors.related(m, 10, Vectors.Metric.COSINE).length;
 $$;
 CREATE FUNCTION vec_pool() RETURNS TEXT LANGUAGE JAVA AS $$

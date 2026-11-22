@@ -162,6 +162,8 @@ size_t sql_statements_max();
 /** mle.sql_call_results_max (0: four times mle.sql_result_max). */
 size_t sql_call_results_max();
 uint32_t sql_chunk_rows();
+/** mle.sql_exec_time: whether a statement's execution time is measured. */
+bool sql_exec_time();
 
 /* session.cc: the library epoch (protocol §9.10). A number that only grows;
    every PREPARE and CALL carries its value. It changes after a library, a
@@ -169,10 +171,13 @@ uint32_t sql_chunk_rows();
    before the statement that made the change reports success. */
 uint64_t library_epoch();
 void library_epoch_changed();
-/** A statement of a command (the server's name: "create_library") ended:
-    changes the epoch unless that command can change neither libraries nor
-    routines nor rights. */
-void statement_ended(std::string_view sql_command);
+/** A statement of a command ended (sql_command: the server's name of it, as
+    its query events carry it, e.g. "create_library"): changes the epoch if
+    that command can change a library, a routine or a right, and retires
+    workers that may name an account the command created. A command is
+    looked up by its name once; after that it is known by the address of
+    the server's name for it. */
+void statement_ended(const char *sql_command);
 
 /* status.cc: the mle_* status variables. */
 bool register_status();

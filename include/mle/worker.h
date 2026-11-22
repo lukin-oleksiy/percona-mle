@@ -43,7 +43,6 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -128,35 +127,50 @@ enum class SqlRefusal {
   kReplyTooLarge,
 };
 
-/** Implemented by the caller (mysqld in the component, tests here). */
+/** Implemented by the caller (mysqld in the component, tests here).
+
+    Text. The worker does not validate what the host sends (§1, §15 host
+    item 6), so every str a hook supplies must be well-formed UTF-8. The
+    Worker repairs the texts of the replies it encodes on paths that are
+    not hot: an ERROR's message and SQLSTATE, a LIBRARY_RESULT's message
+    (and it refuses a library whose language or body is not well-formed).
+    Column names and warning messages are the hook's to repair where it
+    takes them from the server (repair_utf8, codec.h): a batch of rows goes
+    straight into the arena, where the Worker does not look at it again. */
 class CallHooks {
  public:
   virtual ~CallHooks() = default;
   /** Runs an SQL message of the routine on the calling thread and fills
       *result (§10). May use the Worker again for nested requests (PREPARE,
-      CALL, DROP). The Worker sets error_id of an ERROR itself. The time
-      spent in this call is not counted on the grace clock (§11.1 step 3,
-      exception (a)), except while a nested request of this worker is in
-      progress. */
+      CALL, DROP). The time spent in this call is not counted on the grace
+      clock (§11.1 step 3, exception (a)), except while a nested request of
+      this worker is in progress. */
   virtual void sql(const SqlMsg &request, SqlResultMsg *result) = 0;
   /** sql(), but a ROWS result may instead be written into direct (its
-      length set). By default: sql(). */
+      length set). error_id: the error_id the reply carries if it is an
+      ERROR (§10.4); the Worker sets it in the reply itself. By default:
+      sql(). */
   virtual void sql_into(const SqlMsg &request, SqlResultMsg *result,
-                        DirectReply *direct) {
+                        DirectReply *direct, uint64_t error_id) {
     (void)direct;
+    (void)error_id;
     sql(request, result);
   }
-  /** The Worker answers an SQL message without running it, or replaces the
-      reply of one that ran (kReplyTooLarge, and kInterrupted when the
-      interrupt was noticed after sql() returned). The hook applies §10.1 to
-      the statement id: CLOSE closes it; any other action is answered ERROR
-      by rule 2 or 3 (an allowed action discards the id's results and sends
-      the id home). It fills the ERROR's number, SQLSTATE and message in
-      *error; the Worker has set kind and failed_row, and sets error_id. For
-      CLOSE the Worker answers OK and ignores *error. The hook executes
+  /** The Worker answers an SQL message itself. ran is false when the
+      message was not given to sql_into() at all, and true when the Worker
+      replaces the reply sql_into() just made for it (kReplyTooLarge, and
+      kInterrupted when the interrupt was noticed after sql_into()
+      returned): the action was executed then, whatever that reply was.
+      The hook applies §10.1 to the statement id: CLOSE closes it; any
+      other action is answered ERROR by rule 2 or 3 (an allowed action
+      discards the id's results and sends the id home). It fills the
+      ERROR's number, SQLSTATE and message in *error; the Worker has set
+      kind and failed_row, and sets error_id, which is the id given here.
+      For CLOSE the Worker answers OK and ignores *error. The hook executes
       nothing and does not use the Worker. By default: a generic error. */
-  virtual void sql_refused(SqlRefusal why, wire::SqlAction action,
-                           uint64_t stmt_id, SqlResultMsg *error);
+  virtual void sql_refused(SqlRefusal why, bool ran, wire::SqlAction action,
+                           uint64_t stmt_id, uint64_t error_id,
+                           SqlResultMsg *error);
   /** Asks to hold an SQL message of bytes bytes while its statement is in
       progress (§10.7). False: the session's bound would be exceeded; the
       Worker discards the message and answers ERROR (kRequestTooLarge).
@@ -185,13 +199,14 @@ class NoSql : public CallHooks {
   void sql(const SqlMsg &request, SqlResultMsg *result) override;
 };
 
-/** Worker statistics, with impossible values replaced (§3.1). */
+/** Worker statistics, with impossible values replaced (§3.1). A worker
+    writes them now and then, not with every request: they are for
+    reporting, and nothing is decided by them. */
 struct WorkerStats {
   uint64_t heap_used = 0;
   uint64_t heap_max = 0;
   uint64_t memory_gcs = 0;
   uint32_t state = 0;
-  bool tainted = false;
 };
 
 /** An SQL_RESULT ERROR the host sent during the current top-level request
@@ -239,11 +254,15 @@ class Worker {
                const std::vector<Value> &args, CallHooks &hooks,
                ResultMsg *result, std::string *error);
 
-  /** DROP (§9.6), top level or nested. */
+  /** DROP (§9.6), top level or nested. Where no request can be sent now
+      (the worker is busy and the caller is not inside CallHooks::sql of its
+      innermost request), the id counts as not prepared at once and the
+      DROP goes out at top level before the worker's next request: kOk. */
   Outcome drop(uint64_t routine_id, std::string *error);
-  /** OPTIONS (§9.8). With kGuestError *guest_error is the worker's Error:
-      its language (wire::kLanguageTimeZone or kLanguageOption) tells which
-      setting it refused. */
+  /** OPTIONS (§9.8): only for a worker in which no id is prepared (after
+      READY or RESET), else kRefused. With kGuestError *guest_error is the
+      worker's Error: its language (wire::kLanguageTimeZone or
+      kLanguageOption) tells which setting it refused. */
   Outcome options(const OptionsMsg &options, Error *guest_error,
                   std::string *error);
   /** RESET (§9.7). Ends the options in force. */
@@ -262,7 +281,9 @@ class Worker {
       told "interrupted" whatever the outcome (§11.1 step 4). A request that
       was not sent (kRefused, a worker that is gone, a session killed before
       it started) has no record: false after it. */
-  bool interrupted() const { return m_recorded.load(); }
+  bool interrupted() const {
+    return (m_interrupt.load(std::memory_order_acquire) & kRequested) != 0;
+  }
 
   /** The ERROR with this error_id, if it was sent during the top-level
       request in progress (or the last one) and is still held; else nullptr.
@@ -280,7 +301,8 @@ class Worker {
   /** The minor version in use with this worker (§14). */
   uint32_t minor_version() const { return m_minor; }
 
-  /** False once the worker is dead, ended or retired. */
+  /** False once the worker is dead, ended or retired (also: after a RESULT
+      of it had the TAINTED flag, once the top-level request is over). */
   bool usable() const { return m_usable; }
   /** Why the worker is no longer usable. */
   const std::string &failure() const { return m_failure; }
@@ -384,10 +406,16 @@ class Worker {
   Outcome fail(Outcome outcome, const std::string &why, std::string *error);
   Outcome died(std::string *error);
   Outcome lost(Wait w, wire::Op op, const std::string &why, std::string *error);
-  void hold_error(SqlResultMsg *error);
+  /** Keeps an ERROR the host sends, with its error_id (§10.8). */
+  void hold_error(const SqlResultMsg &error);
   /** A request is asked for: at top level, the record of the last
       top-level request is not this one's. */
   void forget_record();
+  /** The top-level request is complete: no interrupt is recorded for it
+      from now on; a record that was made stays readable. */
+  void end_running() {
+    m_interrupt.fetch_and(~kRunning, std::memory_order_acq_rel);
+  }
 
   std::unique_ptr<WorkerProcess> m_process;
   WorkerOptions m_options;
@@ -419,17 +447,22 @@ class Worker {
   /** Ids whose nested PREPARE or DROP was not sent after an interrupt: a
       top-level DROP goes out before the worker is used again (§11.1 step 2). */
   std::unordered_set<uint64_t> m_unsent_drops;
-  /** A nested DROP answered INTERNAL: retire after the top-level request. */
+  /** A nested DROP answered INTERNAL, or a RESULT had the TAINTED flag:
+      retire after the top-level request. */
   bool m_retire_after_top = false;
   std::string m_retire_why;
 
-  // Interruption (§11.1). The mutex serializes the record, the post of a
-  // top-level request's first chunk and the receipt of its RESULT.
-  mutable std::mutex m_interrupt_mutex;
-  /** call_seq of the interruptible top-level request in progress, or 0. */
-  uint64_t m_running = 0;
-  /** "Interrupt requested" for the top-level request in progress or last. */
-  std::atomic<bool> m_recorded{false};
+  // Interruption (§11.1 step 1). One atomic word orders the session's
+  // thread and the threads that call interrupt(): call_seq << 2 with two
+  // bits. kRunning is set from the post of the first chunk of an
+  // interruptible top-level request until the last chunk of its RESULT is
+  // received; a record (kRequested) is made by a compare-and-swap that
+  // succeeds only on a word with kRunning, so it is made only in that
+  // window and names only a request that was sent. After the request the
+  // word keeps its record until the next request is asked for.
+  static constexpr uint64_t kRequested = 1;
+  static constexpr uint64_t kRunning = 2;
+  std::atomic<uint64_t> m_interrupt{0};
 
   // The grace clock, on the session's thread.
   /** The hooks of the interruptible top-level request in progress: its
@@ -449,8 +482,11 @@ class Worker {
   /** total_len of the host message posted last. */
   uint64_t m_last_host_total = 0;
 
-  // ERRORs held for §10.8.
+  // ERRORs held for §10.8: the most recent ones of the top-level request,
+  // m_held_count of them so far (the ring keeps the last kHeldErrors).
   std::array<HeldError, wire::kHeldErrors> m_held;
+  uint64_t m_held_count = 0;
+  /** The last error_id taken in the top-level request. */
   uint64_t m_error_ids = 0;
 
   SqlTrace *m_trace = nullptr;

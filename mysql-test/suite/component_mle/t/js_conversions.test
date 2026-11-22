@@ -1,0 +1,128 @@
+--echo #
+--echo # component_mle: JavaScript values as Oracle's documentation of
+--echo # JavaScript stored programs defines them (MySQL manual, "JavaScript
+--echo # Stored Program Data Types and Argument Handling"): zero and impossible
+--echo # dates, BigInt statement parameters, MySQL JSON from JavaScript.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+SET time_zone = '+00:00';
+SET sql_mode = 'ALLOW_INVALID_DATES';
+
+--echo #
+--echo # 1. A zero date or a date with a zero month or day is an invalid Date;
+--echo #    an impossible day is what Date's constructor makes of the fields
+--echo #    (April 31 is May 1); the zero TIMESTAMP is an invalid Date. As
+--echo #    arguments and as values of rows.
+--echo #
+CREATE FUNCTION js_when(d DATE, dt DATETIME, ts TIMESTAMP) RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  const show = (v) => v === null ? 'null' : !(v instanceof Date) ? typeof v
+      : isNaN(v) ? 'Invalid Date' : v.toISOString()
+  return [d, dt, ts].map(show).join(' | ')
+$$;
+SELECT js_when('2024-02-29', '2024-02-29 10:11:12', '2024-02-29 10:11:12') AS ordinary;
+SELECT js_when('0000-00-00', '0000-00-00 00:00:00', '0000-00-00 00:00:00') AS zero;
+SELECT js_when('2024-00-10', '2024-04-00 01:02:03', NULL) AS zero_in_date;
+SELECT js_when('2024-04-31', '2023-02-30 23:00:00', NULL) AS impossible_day;
+CREATE TABLE td (k INT PRIMARY KEY, d DATE, dt DATETIME);
+INSERT INTO td VALUES (1, '0000-00-00', '0000-00-00 00:00:00'), (2, '2024-00-10', '2024-04-00 01:02:03'),
+  (3, '2024-04-31', '2023-02-30 23:00:00'), (4, '2024-02-29', '2024-02-29 10:11:12');
+CREATE PROCEDURE js_rows(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const show = (v) => v === null ? 'null' : !(v instanceof Date) ? typeof v
+      : isNaN(v) ? 'Invalid Date' : v.toISOString()
+  r = session.runSql('SELECT d, dt FROM td ORDER BY k').fetchAll()
+      .map((row) => row.toArray().map(show).join(' | ')).join('\n')
+$$;
+CALL js_rows(@r);
+SELECT @r;
+
+--echo #
+--echo # 2. A BigInt statement parameter is BIGINT if it fits, else BIGINT
+--echo #    UNSIGNED, else DECIMAL.
+--echo #
+CREATE PROCEDURE js_bigints(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const res = session.runSql('SELECT ? AS a, ? AS b, ? AS c, ? AS d',
+      [5n, -5n, 2n ** 64n - 1n, -(2n ** 70n)], { integerType: 'STRING' })
+  const row = res.fetchOne().toArray()
+  r = res.getColumns().map((c, i) => c.getType() + ' ' + row[i]).join(', ')
+$$;
+CALL js_bigints(@r);
+SELECT @r;
+
+--echo #
+--echo # 3. MySQL JSON from JavaScript: null and undefined are NULL; a string is
+--echo #    JSON text (else an error); other scalars are errors; an object whose
+--echo #    toJSON() gives a string is that text (a Date's is no JSON: an error);
+--echo #    other objects and arrays are stringified. What guest code throws on
+--echo #    the way passes through.
+--echo #
+CREATE FUNCTION js_json(which TEXT) RETURNS JSON LANGUAGE JAVASCRIPT AS $$
+  switch (which) {
+    case 'undefined': return undefined
+    case 'text': return '{"a": [1, 2]}'
+    case 'null text': return 'null'
+    case 'bad text': return '{a'
+    case 'number': return 5
+    case 'boolean': return true
+    case 'bigint': return 5n
+    case 'symbol': return Symbol('s')
+    case 'object': return { a: 1, s: Symbol('s'), u: undefined }
+    case 'array': return [1, Symbol('s'), 'x']
+    case 'toJSON text': return { toJSON() { return '[3, 4]' } }
+    case 'toJSON object': return { toJSON() { return { b: 2 } } }
+    case 'toJSON undefined': return { toJSON() { return undefined } }
+    case 'date': return new Date(0)
+    case 'bigint inside': return { a: 1n }
+    case 'toJSON throws': return { toJSON() { throw new RangeError('toJSON says no') } }
+  }
+$$;
+SELECT js_json('undefined') AS v, js_json('text') AS t, js_json('null text') AS n;
+SELECT js_json('object') AS o, js_json('array') AS a;
+SELECT js_json('toJSON text') AS tt, js_json('toJSON object') AS tobj;
+--error ER_LANGUAGE_COMPONENT
+SELECT js_json('bad text');
+--error ER_LANGUAGE_COMPONENT
+SELECT js_json('number');
+--error ER_LANGUAGE_COMPONENT
+SELECT js_json('boolean');
+--error ER_LANGUAGE_COMPONENT
+SELECT js_json('bigint');
+--error ER_LANGUAGE_COMPONENT
+SELECT js_json('symbol');
+--error ER_LANGUAGE_COMPONENT
+SELECT js_json('toJSON undefined');
+--replace_regex /'(Wed Dec 31 1969|Thu Jan 01 1970)[^']*'/'<the Date>'/
+--error ER_LANGUAGE_COMPONENT
+SELECT js_json('date');
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_json('bigint inside');
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT js_json('toJSON throws');
+--echo # The same rules for an object as a statement parameter.
+CREATE PROCEDURE js_json_params(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  for (const v of [{ toJSON() { return '[3, 4]' } }, { a: 1 }, [1, 'x'], { toJSON() { return 'x{' } },
+                   { toJSON() {} }, { toJSON() { throw new RangeError('toJSON says no') } }]) {
+    try { out.push(session.runSql('SELECT CAST(? AS JSON) AS v', [v]).fetchOne().toArray()[0]) }
+    catch (e) { out.push(e.name + ': ' + e.message) }
+  }
+  r = out.map((x) => typeof x === 'object' ? JSON.stringify(x) : String(x)).join('\n')
+$$;
+CALL js_json_params(@r);
+SELECT @r;
+
+--disconnect con1
+--connection default
+DROP FUNCTION js_when;
+DROP PROCEDURE js_rows;
+DROP PROCEDURE js_bigints;
+DROP FUNCTION js_json;
+DROP PROCEDURE js_json_params;
+DROP TABLE td;
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

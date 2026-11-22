@@ -90,7 +90,9 @@ $$;
 
 --echo #
 --echo # 5. Ours: a changed library is used at the next call; a dropped one
---echo #    fails the call; libraries of other schemas need USING.
+--echo #    fails the call. Oracle's rule: a dynamic import may name any
+--echo #    library, in any schema, that the account whose rights apply may use
+--echo #    (USING is not needed); one that account may not use is refused.
 --echo #
 SELECT foo(2);
 DROP LIBRARY jslib.lib2;
@@ -101,11 +103,25 @@ DROP LIBRARY jslib.lib1;
 SELECT foo(2);
 CREATE LIBRARY other.secret LANGUAGE JAVASCRIPT AS $$ export const value = 'from other' $$;
 CREATE FUNCTION peek() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$ return (await import('/other/secret')).value $$;
---error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT peek();
 CREATE FUNCTION peek_using() RETURNS TEXT LANGUAGE JAVASCRIPT USING (other.secret)
   AS $$ return secret.value + ' / ' + (await import('/other/secret')).value $$;
 SELECT peek_using();
+CREATE FUNCTION peek_invoker() RETURNS TEXT SQL SECURITY INVOKER LANGUAGE JAVASCRIPT
+  AS $$ return (await import('/other/secret')).value $$;
+CREATE USER lib_reader@localhost;
+GRANT EXECUTE ON FUNCTION test.peek_invoker TO lib_reader@localhost;
+GRANT EXECUTE ON FUNCTION test.peek TO lib_reader@localhost;
+--connect (reader, localhost, lib_reader,,*NO-ONE*)
+--echo # The invoker may not use other.secret: refused. The definer may: peek()
+--echo # runs with root's rights.
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT test.peek_invoker();
+SELECT test.peek();
+--disconnect reader
+--connection con1
+DROP USER lib_reader@localhost;
+DROP FUNCTION peek_invoker;
 
 --disconnect con1
 --connection default

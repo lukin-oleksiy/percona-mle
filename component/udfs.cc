@@ -27,8 +27,8 @@
                             for the whole session (workers, programs, stack
                             trace, settings)
     mle_set_session_state(json)  {"integer_type": ..., "decimal_type": ...}:
-                            the session's settings js.integer_type and
-                            js.decimal_type (protocol Appendix B.2); only
+                            the session's settings integer_type and
+                            decimal_type (protocol Appendix B.2); only
                             while no programs are cached, else 1123
                             "... Cannot set options of an active session.
                             Please reset the session first."
@@ -284,11 +284,11 @@ class mle_set_session_state_impl {
         if (v != "unsafe_string" && v != "unsafe_bigint" && v != "string" &&
             v != "bigint")
           throw std::invalid_argument("invalid integer_type '" + value + "'");
-        settings.emplace_back("js.integer_type", v == "unsafe_string" ? "" : v);
+        settings.emplace_back("integer_type", v == "unsafe_string" ? "" : v);
       } else if (key == "decimal_type") {
         if (v != "string" && v != "number")
           throw std::invalid_argument("invalid decimal_type '" + value + "'");
-        settings.emplace_back("js.decimal_type", v == "string" ? "" : v);
+        settings.emplace_back("decimal_type", v == "string" ? "" : v);
       } else {
         // An unknown key (e.g. integerType, the SQL API's spelling) would
         // otherwise be ignored without a word.

@@ -42,8 +42,14 @@ import org.graalvm.polyglot.PolyglotException;
  * ids and their states. Only the guest code of the innermost request, on this thread, may send
  * SQL and LIBRARY; anything else gets an error in guest code and nothing is posted.
  *
- * <p>A message of the host that is malformed or out of place ends the process (ProtocolFailure):
- * it is never an exception that guest code could see.
+ * <p>The host is trusted (§1). Of its messages the worker checks what keeps a mistaken host from
+ * making it unsafe: lengths and counts against the bytes of the message; every tag, kind, status,
+ * mode, action and operation; the numbers it finds its own state by (a routine id, an argument
+ * count, a row's values against the set's columns, failed_row, UNCHANGED against a body it
+ * holds); and that its state can take the message (operation, depth, call_seq, the reply kind for
+ * the action). Such a message ends the process (ProtocolFailure): it is never an exception that
+ * guest code could see. The domains of values, the form of text, reserved and unused fields and
+ * what the host guarantees about order and uniqueness are not checked.
  */
 final class Dispatcher {
   private final Mailbox mb;
@@ -64,6 +70,7 @@ final class Dispatcher {
   private long lastSeq;
   /** Options are in force from an OPTIONS answered OK until RESET (§9.8). */
   private boolean optionsInForce;
+  /** Once set, every RESULT carries the TAINTED flag: the host retires the worker (§11.5). */
   private boolean tainted;
   /** RESET asked for a GC (memory back before the worker waits); run when idle, not on the way. */
   private boolean gcWhenIdle;
@@ -71,6 +78,7 @@ final class Dispatcher {
   private static final long IDLE_GC_NS = 200_000_000L;
   private final ThreadWatch threads = new ThreadWatch();
   private static final byte[] NO_BYTES = new byte[0];
+  private static final Object[] NO_VALUES = new Object[0];
 
   /** text: the frame's source line (trimmed, at most 200 characters), for tracebacks. */
   record Frame(String function, String file, int line, int column, int endColumn, String text) {
@@ -91,10 +99,12 @@ final class Dispatcher {
    */
   private final class Request implements Mailbox.Admission {
     static final int ID_BITS = 24;
-    final int op;
+    int op;
     final int depth;
-    final long seq;
-    final long scope;
+    long seq;
+    long scope;
+    /** Reads the request's body, and later the replies to its SQL and LIBRARY messages. */
+    final MessageReader reader = new MessageReader();
     /** PREPARE and CALL: the routine, the library epoch of the request, the routine's schema. */
     long routine;
     long epoch;
@@ -110,14 +120,29 @@ final class Dispatcher {
     Runnable deferred;
     long deferredId;
 
-    Request(int op, int depth, long seq) {
-      this.op = op;
+    Request(int depth) {
       this.depth = depth;
-      this.seq = seq;
-      this.scope = ++serials;
-      this.idScope = scope;
     }
 
+    /** The object serves the next request at its depth: one per depth, none made per request. */
+    Request begin(int op, long seq) {
+      this.op = op;
+      this.seq = seq;
+      scope = ++serials;
+      idScope = scope;
+      ids = 0;
+      moreScopes = null;
+      routine = 0;
+      epoch = 0;
+      schema = null;
+      activation = false;
+      answered = false;
+      if (statements != null) statements.clear();
+      deferred = null;
+      return this;
+    }
+
+    /** A request starts with no statement ids (§10.1); the object is kept for the next one. */
     Statements statements() {
       if (statements == null) statements = new Statements();
       return statements;
@@ -152,6 +177,8 @@ final class Dispatcher {
             + " while request " + Long.toUnsignedString(seq) + " waits for SQL_RESULT at depth " + depth);
     }
 
+    final Mailbox.Admission libraryResult = this::checkLibraryResult;
+
     /** While this request waits for a LIBRARY_RESULT: nothing else. */
     void checkLibraryResult(int o, int d, long s) {
       if (o != Wire.LIBRARY_RESULT || d != depth || s != seq)
@@ -159,6 +186,10 @@ final class Dispatcher {
             + " waits for LIBRARY_RESULT at depth " + depth);
     }
   }
+
+  /** The request objects, by depth. */
+  private final Request[] requests = new Request[Wire.MAX_DEPTH + 1];
+  private final Mailbox.Admission topLevel = this::checkTopLevel;
 
   Dispatcher(Mailbox mb, JavaRoutines java, Polyglot polyglot, Console console, Control control, Options options) {
     this.mb = mb;
@@ -211,11 +242,8 @@ final class Dispatcher {
     return q;
   }
 
-  /** The worker_class of READY: the host's name for this kind of worker, if it has the form of one. */
-  private static String workerClass() {
-    String c = System.getProperty("mle.class", "jvm");
-    return Text.identifier(c) ? c : "jvm";
-  }
+  /** The worker_class of READY: this kind of worker, whatever the host calls its class (§9.1). */
+  private static final String WORKER_CLASS = "jvm";
 
   /** Posts READY (§9.1): one chunk; with a status other than OK, info is why the worker cannot serve. */
   void ready(int status, String info) {
@@ -223,12 +251,12 @@ final class Dispatcher {
     w.u32(Wire.VERSION);
     w.str(Text.cut(info, Wire.MAX_ERROR_MESSAGE));
     w.u64(0);  // features: version 1.0 defines none
-    w.str(workerClass());
+    w.str(WORKER_CLASS);
     w.u32(languages.size());
     for (String l : languages) w.str(l);
     w.str(Text.cut("Java " + Runtime.version() + " (" + System.getProperty("java.vm.name") + ")", Wire.MAX_FRAME_TEXT));
-    mb.stats(Wire.STATE_IDLE, false);
-    mb.send(Wire.READY, status, 0, 0, w);
+    mb.stats(Wire.STATE_IDLE);
+    mb.send(Wire.READY, status, 0, 0, 0, w);
   }
 
   void loop() {
@@ -238,12 +266,11 @@ final class Dispatcher {
       // (back to back, the same account) does not wait ~20 ms for it (exp note 38).
       if (gcWhenIdle) {
         gcWhenIdle = false;
-        if (!mb.awaitPending(IDLE_GC_NS)) {
-          System.gc();
-          mb.stats(Wire.STATE_IDLE, tainted);  // the host's memory figures: after the GC
-        }
+        if (!mb.awaitPending(IDLE_GC_NS)) System.gc();
+        // Idle after a RESET (§3.1): the host's memory figures, after the GC if there was one.
+        mb.stats(Wire.STATE_IDLE);
       }
-      Mailbox.Message m = mb.receive(this::checkTopLevel);
+      Mailbox.Message m = mb.receive(topLevel);
       lastSeq = m.callSeq();
       handle(m);
     }
@@ -274,7 +301,10 @@ final class Dispatcher {
   /** Serves one request and posts its RESULT. Nothing is thrown: guest code of an outer request runs above. */
   private void handle(Mailbox.Message m) {
     Request outer = current;
-    Request q = new Request(m.op(), m.depth(), m.callSeq());
+    // The admission checked the depth: 0, or one more than the request that waits.
+    Request q = requests[m.depth()];
+    if (q == null) q = requests[m.depth()] = new Request(m.depth());
+    q.begin(m.op(), m.callSeq());
     current = q;
     boolean top = q.depth == 0;
     if (top) {
@@ -317,9 +347,7 @@ final class Dispatcher {
   }
 
   private void drop(Request q, Mailbox.Message m) {
-    MessageReader r = new MessageReader(m.body());
-    long id = r.u64();
-    r.finish();
+    long id = q.reader.reset(m.body, m.length).u64();
     if (q.depth == 0) control.begin(q.seq, false, false);
     unprepare(id);
     LibraryFileSystem.discard(id);
@@ -327,7 +355,6 @@ final class Dispatcher {
   }
 
   private void reset(Request q, Mailbox.Message m) {
-    new MessageReader(m.body()).finish();
     control.begin(q.seq, false, false);
     java.reset();
     polyglot.reset();
@@ -347,37 +374,21 @@ final class Dispatcher {
     result(q, Wire.OK, null);
   }
 
-  private static boolean settingName(String s) {
-    if (s.isEmpty() || s.length() > Wire.MAX_SETTING_NAME) return false;
-    for (int i = 0; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (!(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '_' && c != '.') return false;
-    }
-    return true;
-  }
-
   /**
-   * OPTIONS (§9.8): the complete set, so a setting that is absent has its default. Names this
-   * worker does not know are ignored. A zone it does not know or a value it does not accept
-   * leaves the options in force as they were.
+   * OPTIONS (§9.8): a setting that is absent has its default. Names this worker does not know are
+   * ignored. A zone it does not know or a value it does not accept leaves the worker without
+   * options in force, as it was: OPTIONS comes only to a worker that has none.
    */
   private void options(Request q, Mailbox.Message m) {
-    MessageReader r = new MessageReader(m.body());
+    MessageReader r = q.reader.reset(m.body, m.length);
     String zoneText = r.str();
-    int zoneBytes = zoneText.getBytes(StandardCharsets.UTF_8).length;
-    if (zoneBytes < 1 || zoneBytes > Wire.MAX_TIME_ZONE) throw ProtocolFailure.exit("a time_zone of " + zoneBytes + " bytes");
-    int n = r.count(8, Wire.MAX_SETTINGS);
+    int n = r.count(8);
     int integerType = Options.INT_UNSAFE_STRING;
     int decimalType = Options.DECIMAL_STRING;
     String refused = null;
-    String previous = null;
     for (int i = 0; i < n; i++) {
       String name = r.str();
       String value = r.str();
-      if (!settingName(name) || (previous != null && previous.compareTo(name) >= 0)
-          || value.getBytes(StandardCharsets.UTF_8).length > Wire.MAX_SETTING_VALUE)
-        throw ProtocolFailure.exit("bad setting '" + name + "' in OPTIONS");
-      previous = name;
       int v;
       if (name.equals(Options.INTEGER_TYPE)) {
         if ((v = Options.integerType(value)) >= 0) integerType = v;
@@ -387,7 +398,6 @@ final class Dispatcher {
         else if (refused == null) refused = name;
       }
     }
-    r.finish();
     control.begin(q.seq, false, false);
     java.time.ZoneId zone = Options.parseZone(zoneText);
     if (zone == null) {
@@ -422,11 +432,10 @@ final class Dispatcher {
     String language = null, name = null, body = null;
     if (!m.discarded()) {
       try {
-        MessageReader r = new MessageReader(m.body());
+        MessageReader r = q.reader.reset(m.body, m.length);
         language = r.str();
         name = r.str();
         body = r.str();
-        r.finish();
       } catch (OutOfMemoryError e) {
         body = null;
       }
@@ -438,7 +447,7 @@ final class Dispatcher {
     }
     if (!languages.contains(language)) throw ProtocolFailure.exit("PARSE_LIBRARY in the language '" + language + "'");
     control.begin(q.seq, true, !language.equals("java"));
-    mb.stats(Wire.STATE_COMPILING, tainted);
+    MemoryWatch.phase(Wire.STATE_COMPILING);
     String error = null;
     Throwable failure = null;
     try {
@@ -462,10 +471,10 @@ final class Dispatcher {
     w.str(schema);
     w.str(name);
     w.u64(knownVersion);
-    mb.send(Wire.LIBRARY, Wire.OK, q.depth, q.seq, w);
+    mb.send(Wire.LIBRARY, Wire.OK, 0, q.depth, q.seq, w);
     Mailbox.Message m;
     try {
-      m = mb.receive(q::checkLibraryResult);
+      m = mb.receive(q.libraryResult);
     } catch (Throwable t) {
       throw fatal("waiting for LIBRARY_RESULT", t);
     }
@@ -473,21 +482,19 @@ final class Dispatcher {
     if (m.discarded())
       return new LibraryFileSystem.Reply(Wire.LIBRARY_REFUSED, "", "", 0, "the library is larger than this worker can hold");
     try {
-      MessageReader r = new MessageReader(m.body());
+      MessageReader r = q.reader.reset(m.body, m.length);
       int status = r.u8();
       String language = r.str();
       String body = r.str();
       long version = r.u64();
       String message = r.str();
-      r.finish();
+      // The status is one of the three, and UNCHANGED is for a body the worker holds (§1).
       boolean ok = switch (status) {
-        case Wire.LIBRARY_REFUSED -> language.isEmpty() && body.isEmpty() && version == 0;
-        case Wire.LIBRARY_UNCHANGED -> knownVersion != 0 && version == knownVersion && Text.identifier(language)
-            && body.isEmpty() && message.isEmpty();
-        case Wire.LIBRARY_BODY -> version != 0 && Text.identifier(language) && message.isEmpty();
+        case Wire.LIBRARY_REFUSED, Wire.LIBRARY_BODY -> true;
+        case Wire.LIBRARY_UNCHANGED -> knownVersion != 0 && version == knownVersion;
         default -> false;
       };
-      if (!ok) throw ProtocolFailure.exit("a LIBRARY_RESULT with status " + status + " and fields that do not fit it");
+      if (!ok) throw ProtocolFailure.exit("a LIBRARY_RESULT with status " + status + " that the worker cannot take");
       return new LibraryFileSystem.Reply(status, language, body, version, message);
     } catch (OutOfMemoryError e) {
       return new LibraryFileSystem.Reply(Wire.LIBRARY_REFUSED, "", "", 0, "the library is larger than this worker can hold");
@@ -508,7 +515,7 @@ final class Dispatcher {
       String name = r.str();
       String entry = r.str();
       String source = r.str();
-      int n = r.count(23, Wire.MAX_PARAMS);
+      int n = r.count(23);
       List<JavaRoutines.Param> params = new ArrayList<>(n);
       for (int i = 0; i < n; i++) {
         String param = r.str();
@@ -517,13 +524,12 @@ final class Dispatcher {
         params.add(new JavaRoutines.Param(param, mode, Values.readType(r)));
       }
       Values.ParamType ret = r.bool() ? Values.readType(r) : null;
-      int ni = r.count(12, Wire.MAX_IMPORTS);
+      int ni = r.count(12);
       List<LibraryFileSystem.Import> imports = new ArrayList<>(ni);
       for (int i = 0; i < ni; i++) imports.add(new LibraryFileSystem.Import(r.str(), r.str(), r.str()));
       String schema = r.str();
       boolean check = r.bool();
       long epoch = r.u64();
-      r.finish();
       return new Prepare(language, name, entry, source, params, ret, imports, schema, check, epoch);
     }
   }
@@ -531,7 +537,7 @@ final class Dispatcher {
   private void prepare(Request q, Mailbox.Message m) {
     boolean top = q.depth == 0;
     // Of a message the worker could not hold, the first bytes are kept: the routine_id.
-    MessageReader r = new MessageReader(m.body());
+    MessageReader r = q.reader.reset(m.body, m.length);
     long id = r.u64();
     q.routine = id;
     // The id is prepared only by a PREPARE that answers OK, whatever it was before (§8.3); the
@@ -555,8 +561,10 @@ final class Dispatcher {
     if (!languages.contains(language)) throw ProtocolFailure.exit("PREPARE in the language '" + language + "'");
     boolean javaRoutine = language.equals("java");
     q.epoch = p.epoch();
-    q.schema = p.schema();
-    schemas.put(id, p.schema());
+    // <eval> of a session without a current schema has none (§9.2).
+    String schema = p.schema().isEmpty() ? null : p.schema();
+    q.schema = schema;
+    schemas.put(id, schema);
     // Loading runs routine code too (Python module level, JS top level), so PREPARE can be
     // interrupted like a call. A nested request that arrives after the interrupt runs nothing.
     if (top) {
@@ -565,7 +573,7 @@ final class Dispatcher {
       result(q, Wire.INTERRUPTED, guest("", "interrupted"));
       return;
     }
-    mb.stats(Wire.STATE_COMPILING, tainted);
+    MemoryWatch.phase(Wire.STATE_COMPILING);
     String compileError = null;
     Throwable failure = null;
     q.activation = true;
@@ -604,12 +612,12 @@ final class Dispatcher {
     Polyglot.Routine guestRoutine = null;
     Object[] args = null;
     if (!m.discarded()) {
-      MessageReader r = new MessageReader(m.body());
+      MessageReader r = q.reader.reset(m.body, m.length);
       long id = r.u64();
       q.routine = id;
       q.epoch = r.u64();
       q.schema = schemas.get(id);
-      int n = r.count(1, Wire.MAX_VALUES);
+      int n = r.count(1);
       // The host sends CALL only for a prepared id, with one argument per Param (§9.3).
       routine = java.get(id);
       guestRoutine = routine == null ? polyglot.get(id) : null;
@@ -620,9 +628,8 @@ final class Dispatcher {
         throw ProtocolFailure.exit("CALL of routine " + Long.toUnsignedString(id) + " with " + n + " arguments for "
             + types.length + " parameters");
       try {
-        Object[] a = new Object[n];
+        Object[] a = n == 0 ? NO_VALUES : new Object[n];
         for (int i = 0; i < n; i++) a[i] = Values.read(r, types[i].tag());
-        r.finish();
         args = a;
       } catch (OutOfMemoryError e) {
         args = null;
@@ -639,11 +646,14 @@ final class Dispatcher {
       result(q, Wire.INTERRUPTED, guest("", "interrupted"));
       return;
     }
-    mb.stats(Wire.STATE_RUNNING, tainted);
-    // The call's arena owns MemorySegment arguments; closing it makes them unusable afterwards.
-    try (Arena callArena = Arena.ofConfined()) {
+    MemoryWatch.phase(Wire.STATE_RUNNING);
+    // The call's arena owns the MemorySegment arguments of a Java routine (its VECTOR
+    // parameters); closing it makes them unusable afterwards. Other calls make none.
+    try (Arena callArena = routine != null && hasVector(routine.types()) ? Arena.ofConfined() : null) {
       Object ret = null;
-      Object[] outs = new Object[args.length];
+      // Indexed by parameter: made only for a routine with OUT or INOUT parameters.
+      int outCount = routine != null ? routine.outs().length : guestRoutine.outs().length;
+      Object[] outs = outCount == 0 ? NO_VALUES : new Object[args.length];
       Throwable failure = null;
       q.activation = true;
       try {
@@ -657,7 +667,20 @@ final class Dispatcher {
       } catch (Throwable t) {
         failure = t;
       }
+      // From here on the routine's code gets an error for SQL and imports.
       q.activation = false;
+      // The RESULT is composed in one pass with its values (§4.1). JavaScript and Python values
+      // were converted to Java ones inside the call, where guest code may run. A Java routine's
+      // JDK values are read as they are written; one of the routine's own classes is converted
+      // here, while the request still counts for interrupts.
+      if (failure == null && routine != null) {
+        try {
+          if (routine.ret() != null) ret = Values.settle(ret, routine.ret());
+          for (int i : routine.outs()) outs[i] = Values.settle(outs[i], routine.types()[i]);
+        } catch (Throwable t) {
+          failure = t;
+        }
+      }
       boolean stopped = top ? control.end() : control.stopped();
       if (top) afterTopLevel();
       // The routine was stopped: also when its code went on and returned (§11.1).
@@ -666,6 +689,12 @@ final class Dispatcher {
       else if (routine != null) result(q, Wire.OK, ret, routine.ret(), null, routine.outs(), outs, routine.types(), List.of());
       else result(q, Wire.OK, ret, guestRoutine.ret(), null, guestRoutine.outs(), outs, guestRoutine.params(), List.of());
     }
+  }
+
+  private static boolean hasVector(Values.ParamType[] types) {
+    for (Values.ParamType t : types)
+      if (t.tag() == Wire.T_VECTOR) return true;
+    return false;
   }
 
   /**
@@ -717,6 +746,15 @@ final class Dispatcher {
       else if (e.isCancelled())
         result(q, Wire.GUEST_ERROR, new ErrorInfo(language, "the worker's context was closed by a routine", frames, 0, "", 0));
       else result(q, Wire.GUEST_ERROR, new ErrorInfo(language, "interrupted by the routine's own code", frames, 0, "", 0));
+      return;
+    }
+    // Guest code ended the interpreter (Python's sys.exit, a hard exit): a failure it brought
+    // about in the worker itself is an error of guest code, and the worker asks to be retired,
+    // for the runtime may not run anything again (§10.6).
+    if (e.isExit()) {
+      tainted = true;
+      result(q, Wire.GUEST_ERROR, new ErrorInfo(language, "the routine ended the interpreter (exit status "
+          + e.getExitStatus() + ")", frames, 0, "", 0));
       return;
     }
     // GraalPy turns an exhausted Java heap into a Python MemoryError; treat it as exhaustion (the
@@ -883,7 +921,7 @@ final class Dispatcher {
   private ErrorInfo fit(Request q, int status, ErrorInfo e) {
     String language = e.language() == null ? "" : e.language();
     boolean known = switch (language) {
-      case Wire.LANGUAGE_TYPE -> status == Wire.GUEST_ERROR && q.op == Wire.CALL;
+      case Wire.LANGUAGE_TYPE -> status == Wire.GUEST_ERROR && (q.op == Wire.CALL || q.op == Wire.PREPARE);
       case Wire.LANGUAGE_TIME_ZONE, Wire.LANGUAGE_OPTION -> status == Wire.GUEST_ERROR && q.op == Wire.OPTIONS;
       default -> languages.contains(language);
     };
@@ -979,9 +1017,8 @@ final class Dispatcher {
     // A PREPARE that does not answer OK leaves the id not prepared (§8.3).
     if (q.op == Wire.PREPARE && status != Wire.OK) unprepare(q.routine);
     q.answered = true;
-    // tainted is set before the RESULT that the host reads it after (§11.5).
-    mb.stats(q.depth == 0 ? Wire.STATE_IDLE : Wire.STATE_RUNNING, tainted);
-    mb.send(Wire.RESULT, status, q.depth, q.seq, w);
+    // A worker that must not be reused says so in this RESULT and in every later one (§11.5).
+    mb.send(Wire.RESULT, status, tainted ? Wire.FLAG_TAINTED : 0, q.depth, q.seq, w);
   }
 
   private void writeResult(Object ret, Values.ParamType retType, ErrorInfo error, int[] outIndexes, Object[] outs,
@@ -1116,11 +1153,12 @@ final class Dispatcher {
     Object[] lastRow = action == Wire.SQL_EXECUTE_MANY && rowWidth > 0 && params != null && params.length >= rowWidth
         ? Arrays.copyOfRange(params, params.length - rowWidth, params.length) : null;
     Statements.Exchange x = statements.begin(action, id, flags);
-    mb.send(Wire.SQL, Wire.OK, q.depth, q.seq, w);
+    int sent = params == null ? 0 : params.length;
+    mb.send(Wire.SQL, Wire.OK, 0, q.depth, q.seq, w);
     Mailbox.Message m = sqlResult(q);
     if (!m.discarded()) {
       try {
-        return sqlReply(x, action, id, maxRows, lastRow, m, form, sink);
+        return sqlReply(q, x, action, id, rowWidth > 0 ? sent / rowWidth : 0, lastRow, m, form, sink);
       } catch (OutOfMemoryError e) {
         // no memory for the rows: as for a reply that was discarded
       }
@@ -1135,8 +1173,8 @@ final class Dispatcher {
     w.u8(0);
     w.u32(0);
     w.u32(0);
-    mb.send(Wire.SQL, Wire.OK, q.depth, q.seq, w);
-    sqlReply(close, Wire.SQL_CLOSE, id, 0, null, sqlResult(q), RAW, null);
+    mb.send(Wire.SQL, Wire.OK, 0, q.depth, q.seq, w);
+    sqlReply(q, close, Wire.SQL_CLOSE, id, 0, null, sqlResult(q), RAW, null);
     throw new MleSqlException(ER_NET_PACKET_TOO_LARGE, "HY000",
         "the statement's result is larger than this worker can hold; the statement was closed");
   }
@@ -1207,18 +1245,18 @@ final class Dispatcher {
   /** A result set's columns as the decoder keeps them for the set's later batches. */
   private record Columns(List<MleSql.Column> columns, int[] tags) {}
 
-  private static void check(String violation) {
-    if (violation != null) throw ProtocolFailure.exit("SQL_RESULT: " + violation);
-  }
-
   /**
-   * Decodes the SQL_RESULT m of an exchange and moves the statement to its next state. The whole
-   * reply is checked and the state moved before anything is thrown that guest code can see: an
-   * MleSqlException for ERROR, a failure of the sink, a value Java cannot show.
+   * Decodes the SQL_RESULT m of an exchange and moves the statement to its next state. Checked
+   * are the reply's kind against the action and the statement's state, its counts against its
+   * bytes, the values' tags against their columns, failed_row against the rows sent (rowsSent, of
+   * an EXECUTE_MANY) and that a batch has columns: its own, its set's, or for a prepared id the
+   * ones the worker keeps for it (§10.3). The state is moved before anything is thrown that
+   * guest code can see: an MleSqlException for ERROR, a failure of the sink, a value Java cannot
+   * show.
    */
-  private MleSql.Reply sqlReply(Statements.Exchange x, int action, long id, int maxRows, Object[] lastRow,
-      Mailbox.Message m, int form, RowSink sink) {
-    MessageReader r = new MessageReader(m.body());
+  private MleSql.Reply sqlReply(Request q, Statements.Exchange x, int action, long id, long rowsSent,
+      Object[] lastRow, Mailbox.Message m, int form, RowSink sink) {
+    MessageReader r = q.reader.reset(m.body, m.length);
     int kind = r.u8();
     if (kind > Wire.SQL_END || !x.accepts(kind))
       throw ProtocolFailure.exit("SQL_RESULT of kind " + kind + " to action " + action
@@ -1230,10 +1268,8 @@ final class Dispatcher {
         String message = r.str();
         long row = r.u32();
         long errorId = r.u64();
-        r.finish();
-        if (errno < 1 || errno > Wire.MAX_SQL_ERRNO || !Text.sqlState(sqlState) || errorId == 0
-            || (action != Wire.SQL_EXECUTE_MANY && row != Wire.NO_ROW))
-          throw ProtocolFailure.exit("SQL_RESULT ERROR " + errno + " '" + sqlState + "' with fields outside §10.4");
+        if (action == Wire.SQL_EXECUTE_MANY && row > rowsSent)
+          throw ProtocolFailure.exit("SQL_RESULT ERROR at row " + row + " of " + rowsSent);
         x.error();
         MleSqlException e = new MleSqlException((int) errno, sqlState, message,
             action == Wire.SQL_EXECUTE_MANY ? row : -1, errorId);
@@ -1247,16 +1283,12 @@ final class Dispatcher {
         boolean moreResults = r.bool();
         long paramCount = r.u32();
         long execUs = r.u64();
-        r.finish();
-        check(x.ok(moreResults, paramCount, affected == 0 && insertId == 0 && warnings.isEmpty() && execUs == 0,
-            lastRow));
+        x.ok(moreResults, lastRow);
         return new MleSql.Reply(id, false, List.of(), List.of(), false, moreResults, affected, insertId, warnings,
             (int) paramCount, execUs, 0, false);
       }
       case Wire.SQL_ROWS -> {
-        int ncols = r.count(50, Wire.MAX_COLUMNS);
-        if (x.firstBatch() != ncols > 0)
-          check(ncols > 0 ? "columns in a later batch of a result set" : "no columns in the first batch of a result set");
+        int ncols = r.count(50);
         Columns set;
         if (ncols > 0) {
           List<MleSql.Column> columns = new ArrayList<>(ncols);
@@ -1271,16 +1303,17 @@ final class Dispatcher {
           }
           set = new Columns(List.copyOf(columns), tags);
         } else {
+          // A later batch of the set; or a set of a prepared id with the columns sent last for it.
           set = (Columns) x.columns();
-          if (set == null) check("a later batch of a result set whose columns were not sent");
+          if (set == null) throw ProtocolFailure.exit("SQL_RESULT: rows without columns");
         }
         int[] tags = set.tags();
         ncols = tags.length;
         long total = r.u64();
         long nrows = r.u32();
-        if (nrows > r.remaining() / ncols) check(nrows + " rows of " + ncols + " values in " + r.remaining() + " bytes");
-        if (maxRows != 0 && nrows > maxRows) check(nrows + " rows where max_rows is " + maxRows);
-        if (nrows > 1 && m.chunked()) check("a batch of " + nrows + " rows in more than one chunk");
+        // Every value takes at least its tag: the rows are checked against the bytes left.
+        if (nrows > r.remaining() / ncols)
+          throw ProtocolFailure.exit("SQL_RESULT: " + nrows + " rows of " + ncols + " values in " + r.remaining() + " bytes");
         List<Object[]> rows = sink != null ? List.of() : new ArrayList<>((int) nrows);
         Object[] row = sink != null ? new Object[ncols] : null;
         Throwable sinkFailure = null;
@@ -1309,8 +1342,7 @@ final class Dispatcher {
         boolean moreResults = r.bool();
         List<MleSql.Warning> warnings = warnings(r);
         long execUs = r.u64();
-        r.finish();
-        check(x.rows(x.firstBatch(), set, total, nrows, more, moreResults));
+        x.rows(set, more, moreResults);
         if (sinkFailure instanceof RuntimeException e) throw e;
         if (sinkFailure instanceof Error e) throw e;
         if (sinkFailure != null) throw new IllegalStateException(sinkFailure);
@@ -1321,7 +1353,6 @@ final class Dispatcher {
             total < 0 ? -1 : total, false);
       }
       default -> {
-        r.finish();
         x.end();
         return new MleSql.Reply(id, false, List.of(), List.of(), false, false, 0, 0, List.of(), 0, 0, 0, true);
       }
@@ -1338,14 +1369,10 @@ final class Dispatcher {
   }
 
   private static List<MleSql.Warning> warnings(MessageReader r) {
-    int n = r.count(12, Wire.MAX_WARNINGS);
+    int n = r.count(12);
     if (n == 0) return List.of();
     List<MleSql.Warning> list = new ArrayList<>(n);
-    for (int i = 0; i < n; i++) {
-      long level = r.u32();
-      if (level > 2) throw ProtocolFailure.exit("a Warning of level " + level);
-      list.add(new MleSql.Warning((int) level, (int) r.u32(), r.str()));
-    }
+    for (int i = 0; i < n; i++) list.add(new MleSql.Warning((int) r.u32(), (int) r.u32(), r.str()));
     return list;
   }
 }

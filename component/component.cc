@@ -88,9 +88,6 @@ REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_string_charse
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_null);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_timestamp);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_timestamp);
-REQUIRES_SERVICE_PLACEHOLDER(mysql_string_factory);
-REQUIRES_SERVICE_PLACEHOLDER(mysql_string_copy_converter);
-REQUIRES_SERVICE_PLACEHOLDER(mysql_string_get_data_in_charset);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_int);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_unsigned_int);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_float);
@@ -365,10 +362,13 @@ class Libraries {
 
 /* COM_CHANGE_USER: the session's MLE state belonged to the old account.
    DROP USER / RENAME USER: that account's kept workers go, and the workers
-   sessions hold for it are retired at their next use.
-   The end of a statement, before it reports success, and a change of a
-   global variable: the library epoch changes unless the statement can have
-   changed no library, routine or right (protocol §9.10). */
+   sessions hold for it are retired before their next top-level request.
+   The end of a statement, before it reports success: the library epoch
+   changes if the statement's command can change a library, a routine or a
+   right (protocol §9.10), and a command that creates an account retires
+   the workers that may name it (protocol §1; the server raises no event
+   that names a created account). A change of a global variable changes the
+   epoch too. */
 namespace Event_tracking_implementation {
 mysql_event_tracking_connection_subclass_t
     Event_tracking_connection_implementation::filtered_sub_events =
@@ -413,9 +413,7 @@ bool Event_tracking_query_implementation::callback(
     const mysql_event_tracking_query_data *data) {
   // Whether the statement failed or not: one that fails may have changed
   // something before.
-  mle_component::statement_ended(data->sql_command == nullptr
-                                     ? std::string_view()
-                                     : std::string_view(data->sql_command));
+  mle_component::statement_ended(data->sql_command);
   return false;
 }
 
@@ -489,9 +487,6 @@ BEGIN_COMPONENT_REQUIRES(mle)
   REQUIRES_SERVICE(mysql_stored_program_runtime_argument_null),
   REQUIRES_SERVICE(mysql_stored_program_runtime_argument_timestamp),
   REQUIRES_SERVICE(mysql_stored_program_return_value_timestamp),
-  REQUIRES_SERVICE(mysql_string_factory),
-  REQUIRES_SERVICE(mysql_string_copy_converter),
-  REQUIRES_SERVICE(mysql_string_get_data_in_charset),
   REQUIRES_SERVICE(mysql_stored_program_return_value_int),
   REQUIRES_SERVICE(mysql_stored_program_return_value_unsigned_int),
   REQUIRES_SERVICE(mysql_stored_program_return_value_float),

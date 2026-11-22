@@ -29,7 +29,12 @@ import java.util.concurrent.locks.LockSupport;
  *
  * <p>Messages are decoded in place from the arena when they fit in one chunk; larger messages
  * are reassembled in a native buffer. Messages are written in place by {@link MessageWriter}.
- * Every header of the host is checked in full; one that breaks §5 is a protocol failure.
+ *
+ * <p>The host is trusted (§1): of its headers the worker checks what its own safety needs, which
+ * is the operation, that its state can take the message (the receiver's Admission: op, depth,
+ * call_seq), and every chunk's len against the arena and the bytes still due. A header that
+ * fails one of these is a protocol failure; status, reserved fields, unknown flag bits and the
+ * exact fields of a CONTINUE are not looked at.
  */
 final class Mailbox {
   private static final VarHandle INT = ValueLayout.JAVA_INT.varHandle();
@@ -53,11 +58,37 @@ final class Mailbox {
   private boolean dropAssembly;
 
   /**
-   * A received message. body is valid until the worker posts its next message. discarded: the
-   * worker could not hold the message (§5.3); the transfer was completed, and body is only its
-   * first bytes (at most 8).
+   * The message received last: valid until the next receive (one object, reused). length bytes
+   * of body from offset 0, valid until the worker posts its next message. discarded: the worker
+   * could not hold the message (§5.3); the transfer was completed, and body is only its first
+   * bytes (at most 8).
    */
-  record Message(int op, int depth, long callSeq, MemorySegment body, boolean discarded, boolean chunked) {}
+  static final class Message {
+    int op;
+    int depth;
+    long callSeq;
+    MemorySegment body;
+    long length;
+    boolean discarded;
+
+    int op() {
+      return op;
+    }
+
+    int depth() {
+      return depth;
+    }
+
+    long callSeq() {
+      return callSeq;
+    }
+
+    boolean discarded() {
+      return discarded;
+    }
+  }
+
+  private final Message message = new Message();
 
   /**
    * What the receiver expects (§8): called with the first chunk's header before anything is
@@ -176,19 +207,30 @@ final class Mailbox {
 
   // ------------------------------------------------------------ messages
 
+  private Message message(int op, int depth, long seq, MemorySegment body, long length, boolean discarded) {
+    Message m = message;
+    m.op = op;
+    m.depth = depth;
+    m.callSeq = seq;
+    m.body = body;
+    m.length = length;
+    m.discarded = discarded;
+    return m;
+  }
+
   /**
-   * Waits for the next message of the host and reassembles it if it comes in chunks (§5.2). The
-   * first chunk's header is checked as a whole message's would be, admission included, before
-   * the first CONTINUE; every later chunk must repeat it.
+   * Waits for the next message of the host and reassembles it if it comes in chunks (§5.2). Of
+   * the first chunk the operation and the admission are checked before anything is answered, of
+   * every chunk its len: at most the arena and the bytes still due. A message of more bytes than
+   * a host message may have, or than the worker can allocate, is received to its end without its
+   * bytes (§5.3).
    */
   Message receive(Admission admission) {
     waitHost();
     int op = msgInt(Wire.MSG_OP);
-    int status = msgInt(Wire.MSG_STATUS);
     int flags = msgInt(Wire.MSG_FLAGS);
     int depth = msgInt(Wire.MSG_DEPTH);
     long len = Integer.toUnsignedLong(msgInt(Wire.MSG_LEN));
-    int reserved = msgInt(Wire.MSG_RESERVED);
     long total = msgLong(Wire.MSG_TOTAL_LEN);
     long seq = msgLong(Wire.MSG_CALL_SEQ);
     if (dropAssembly) {  // a large message's buffer is not kept for the worker's life
@@ -196,59 +238,53 @@ final class Mailbox {
       dropAssembly = false;
     }
     if (!hostOp(op)) throw ProtocolFailure.exit("op " + op + " from the host");
-    if (status != 0 || reserved != 0 || (flags & ~Wire.FLAG_MORE) != 0)
-      throw ProtocolFailure.exit("bad header of op " + op + ": status " + status + ", flags " + flags);
-    boolean more = flags == Wire.FLAG_MORE;
-    boolean small = op == Wire.OPTIONS || op == Wire.DROP || op == Wire.RESET;
-    if (total < 0 || total > (small ? Wire.MAX_SMALL_MESSAGE : Wire.MAX_HOST_MESSAGE))
-      throw ProtocolFailure.exit("op " + op + " of " + Long.toUnsignedString(total) + " bytes");
-    // One chunk is the whole message; of several, every one but the last is a whole arena.
-    if (more ? total <= arenaSize || len != arenaSize : len != total || total > arenaSize)
-      throw ProtocolFailure.exit("bad chunk of op " + op + ": len " + len + " of " + total);
+    boolean more = (flags & Wire.FLAG_MORE) != 0;
+    if (len > arenaSize) throw ProtocolFailure.exit("a chunk of op " + op + " of " + len + " bytes");
     admission.check(op, depth, seq);
-    if (!more) return new Message(op, depth, seq, arena.asSlice(0, len), false, false);
+    if (!more) return message(op, depth, seq, arena, len, false);
 
-    // A message the worker has no memory for is still received to its end, without its bytes (§5.3).
-    boolean discard = false;
-    MemorySegment head = MemorySegment.NULL;
-    if (assembly.byteSize() < total) {
+    boolean discard = total < 0 || total > Wire.MAX_HOST_MESSAGE;
+    if (!discard && assembly.byteSize() < total) {
       try {
         assembly = Arena.ofAuto().allocate(total, Wire.VECTOR_ALIGNMENT);
       } catch (OutOfMemoryError e) {
         discard = true;
-        head = MemorySegment.ofArray(arena.asSlice(0, HEAD).toArray(ValueLayout.JAVA_BYTE));
       }
     }
-    dropAssembly = assembly.byteSize() > 4L * arenaSize;
+    MemorySegment head = MemorySegment.NULL;
+    long headLength = Math.min(HEAD, len);
+    if (discard) head = MemorySegment.ofArray(arena.asSlice(0, headLength).toArray(ValueLayout.JAVA_BYTE));
+    else dropAssembly = assembly.byteSize() > 4L * arenaSize;
     long have = 0;
     while (true) {
-      if (!discard) MemorySegment.copy(arena, 0, assembly, have, len);
+      // The bytes still due bound a chunk; one that is discarded has nowhere to overflow.
+      if (!discard) {
+        if (len > total - have)
+          throw ProtocolFailure.exit("bad chunk of op " + op + ": len " + len + " after " + have + " of " + total);
+        MemorySegment.copy(arena, 0, assembly, have, len);
+      }
       have += len;
       if (!more) break;
       header(Wire.CONTINUE, 0, 0, depth, 0, 0, seq);
       post();
       waitHost();
-      flags = msgInt(Wire.MSG_FLAGS);
+      if (msgInt(Wire.MSG_OP) != op) throw ProtocolFailure.exit("op " + msgInt(Wire.MSG_OP) + " among the chunks of op " + op);
+      more = (msgInt(Wire.MSG_FLAGS) & Wire.FLAG_MORE) != 0;
       len = Integer.toUnsignedLong(msgInt(Wire.MSG_LEN));
-      if (msgInt(Wire.MSG_OP) != op || msgInt(Wire.MSG_STATUS) != 0 || msgInt(Wire.MSG_DEPTH) != depth
-          || msgInt(Wire.MSG_RESERVED) != 0 || msgLong(Wire.MSG_TOTAL_LEN) != total
-          || msgLong(Wire.MSG_CALL_SEQ) != seq || (flags & ~Wire.FLAG_MORE) != 0)
-        throw ProtocolFailure.exit("a chunk of op " + op + " that does not repeat the first chunk's header");
-      more = flags == Wire.FLAG_MORE;
-      if (more ? len != arenaSize || have + len >= total : len < 1 || len > arenaSize || have + len != total)
-        throw ProtocolFailure.exit("bad chunk of op " + op + ": len " + len + " after " + have + " of " + total);
+      if (len > arenaSize) throw ProtocolFailure.exit("a chunk of op " + op + " of " + len + " bytes");
     }
-    return new Message(op, depth, seq, discard ? head : assembly.asSlice(0, total), discard, true);
+    return discard ? message(op, depth, seq, head, headLength, true) : message(op, depth, seq, assembly, have, false);
   }
 
   /**
    * Posts the message in w (written in place, or spilled and sent in chunks). The writer keeps
-   * the size limits of §12; between the chunks the host posts CONTINUE and nothing else.
+   * the size limits of §12; between the chunks the host posts CONTINUE and nothing else. flags:
+   * FLAG_TAINTED or 0, the same in every chunk.
    */
-  void send(int op, int status, int depth, long seq, MessageWriter w) {
+  void send(int op, int status, int flags, int depth, long seq, MessageWriter w) {
     long total = w.size();
     if (!w.spilled()) {
-      header(op, status, 0, depth, total, total, seq);
+      header(op, status, flags, depth, total, total, seq);
       post();
       return;
     }
@@ -258,26 +294,30 @@ final class Mailbox {
       long len = Math.min(arenaSize, total - sent);
       MemorySegment.copy(body, sent, arena, 0, len);
       boolean more = sent + len < total;
-      header(op, status, more ? Wire.FLAG_MORE : 0, depth, len, total, seq);
+      header(op, status, more ? flags | Wire.FLAG_MORE : flags, depth, len, total, seq);
       post();
       sent += len;
       if (!more) return;
       waitHost();
-      if (msgInt(Wire.MSG_OP) != Wire.CONTINUE || msgInt(Wire.MSG_STATUS) != 0 || msgInt(Wire.MSG_FLAGS) != 0
-          || msgInt(Wire.MSG_DEPTH) != depth || msgInt(Wire.MSG_LEN) != 0 || msgInt(Wire.MSG_RESERVED) != 0
-          || msgLong(Wire.MSG_TOTAL_LEN) != 0 || msgLong(Wire.MSG_CALL_SEQ) != seq)
-        throw ProtocolFailure.exit("expected CONTINUE for op " + op);
+      if (msgInt(Wire.MSG_OP) != Wire.CONTINUE) throw ProtocolFailure.exit("expected CONTINUE for op " + op);
     }
   }
 
   // ------------------------------------------------------------ stats
 
-  void stats(int state, boolean tainted) {
-    Runtime rt = Runtime.getRuntime();
-    region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_HEAP_USED, rt.totalMemory() - rt.freeMemory());
-    region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_HEAP_MAX, rt.maxMemory());
+  /**
+   * Writes the statistics (§3.1): for reporting only, and not on every request. Any thread;
+   * nothing is synchronized.
+   */
+  void stats(int state, long heapUsed, long heapMax) {
+    region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_HEAP_USED, heapUsed);
+    region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_HEAP_MAX, heapMax);
     region.set(ValueLayout.JAVA_LONG, Wire.OFF_STATS + Wire.STATS_GC_COUNT, MemoryWatch.gcs());
     region.set(ValueLayout.JAVA_INT, Wire.OFF_STATS + Wire.STATS_STATE, state);
-    region.set(ValueLayout.JAVA_INT, Wire.OFF_STATS + Wire.STATS_TAINTED, tainted ? 1 : 0);
+  }
+
+  void stats(int state) {
+    Runtime rt = Runtime.getRuntime();
+    stats(state, rt.totalMemory() - rt.freeMemory(), rt.maxMemory());
   }
 }

@@ -322,10 +322,10 @@ final class PySql implements GuestSql.Lang {
     return o;
   }
 
-  /** No session setting concerns Python's values (js.decimal_type is JavaScript's): DECIMAL is Decimal. */
+  /** The session's decimal_type: DECIMAL as Decimal (string, the default) or as float (number). */
   @Override
   public SqlOptions defaults() {
-    return new SqlOptions();
+    return new SqlOptions().decimalType(SqlOptions.DECIMAL_TYPES.get(options.decimalType));
   }
 
   // ------------------------------------------------------------ columns (numpy)

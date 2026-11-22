@@ -160,7 +160,16 @@ final class JsSql implements GuestSql.Lang {
             if (v instanceof ArrayBuffer) return [8, v];
             if (ArrayBuffer.isView(v)) return [8, v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)];
             if (v instanceof Set) return [2, [...v].map(String).join(',')];
-            const json = JSON.stringify(v);
+            // Other objects as JSON, by the rule of a JSON value (JsOracle json_text): toJSON()
+            // that gives a string gives JSON text; what stringifies to nothing is an error.
+            let json;
+            if (typeof v.toJSON === 'function') {
+              const r = v.toJSON('');
+              if (typeof r !== 'string') json = JSON.stringify(r);
+              else try { json = JSON.stringify(JSON.parse(r)) } catch (e) { json = undefined }
+            } else {
+              json = JSON.stringify(v);
+            }
             if (json === undefined) throw new TypeError('cannot bind ' + Object.prototype.toString.call(v));
             return [9, json];
           },
@@ -276,15 +285,8 @@ final class JsSql implements GuestSql.Lang {
     if (t.tag() == Wire.T_TIME)
       return String.format("%s%02d:%02d:%02d%s", t.negative() ? "-" : "", t.hour(), t.minute(), t.second(),
           t.micro() == 0 ? "" : String.format(".%06d", t.micro()));
-    double ms;
-    try {
-      Object j = t.toJava();
-      ms = j instanceof LocalDate d ? d.atStartOfDay(options.zone).toInstant().toEpochMilli()
-          : ((LocalDateTime) j).atZone(options.zone).toInstant().toEpochMilli();
-    } catch (Values.ConversionException e) {
-      ms = Double.NaN;  // a zero date: an invalid Date
-    }
-    return date.execute(ms);
+    // As an argument is (Values.Temporal.jsMillis): a zero date is an invalid Date.
+    return date.execute(t.jsMillis(options.zone));
   }
 
   @Override
@@ -303,7 +305,11 @@ final class JsSql implements GuestSql.Lang {
       case 2 -> p.asString();
       case 3 -> p.fitsInLong() ? p.asLong() : (long) p.asDouble();  // -0 is a safe integer too
       case 4 -> p.asDouble();
-      case 5 -> new BigInteger(p.asString());
+      // A BigInt: BIGINT if it fits, else BIGINT UNSIGNED, else DECIMAL (Values.writeParam).
+      case 5 -> {
+        BigInteger b = new BigInteger(p.asString());
+        yield b.bitLength() <= 63 ? (Object) b.longValue() : b;
+      }
       case 6 -> LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli((long) p.asDouble()), options.zone);
       case 7 -> {
         byte[] b = buffer(p);

@@ -291,6 +291,52 @@ bool is_valid_utf8(std::string_view s) {
   return true;
 }
 
+void repair_utf8(std::string *text) {
+  if (is_valid_utf8(*text)) return;
+  constexpr std::string_view kReplacement = "\xEF\xBF\xBD";  // U+FFFD
+  std::string out;
+  out.reserve(text->size() + 8);
+  const auto *p = reinterpret_cast<const unsigned char *>(text->data());
+  const auto *const end = p + text->size();
+  while (p < end) {
+    const unsigned char c = *p;
+    if (c < 0x80) {
+      out += static_cast<char>(c);
+      p++;
+      continue;
+    }
+    // The bytes that may follow this lead byte: the first one has a
+    // narrower range where a wider one would give an overlong form, a
+    // surrogate or a code point above U+10FFFF.
+    size_t need = 0;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) {
+      need = 1;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+      need = 2;
+      if (c == 0xE0) lo = 0xA0;
+      if (c == 0xED) hi = 0x9F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+      need = 3;
+      if (c == 0xF0) lo = 0x90;
+      if (c == 0xF4) hi = 0x8F;
+    }
+    size_t got = 0;
+    while (got < need && p + 1 + got < end && p[1 + got] >= lo &&
+           p[1 + got] <= hi) {
+      lo = 0x80;
+      hi = 0xBF;
+      got++;
+    }
+    if (need != 0 && got == need)
+      out.append(reinterpret_cast<const char *>(p), need + 1);
+    else
+      out += kReplacement;  // one for the maximal subpart
+    p += 1 + got;
+  }
+  *text = std::move(out);
+}
+
 bool is_valid_decimal(std::string_view s) {
   if (s.empty() || s.size() > wire::kMaxDecimalChars) return false;
   size_t i = 0;
@@ -1103,6 +1149,8 @@ bool check_worker_header(const wire::MessageHeader &h, uint32_t arena_size,
     why = "bad status";
   else if ((h.flags & ~wire::kKnownMessageFlags) != 0)
     why = "unknown flags";
+  else if ((h.flags & wire::kTainted) != 0 && !result)
+    why = "TAINTED in a message that is not a RESULT";
   else if (h.reserved != 0)
     why = "reserved header field is not 0";
   else if (h.len > arena_size)
@@ -1151,7 +1199,8 @@ Assembler::Step Assembler::add(const wire::MessageHeader &h,
     m_body.clear();
   } else if (h.op != m_first.op || h.status != m_first.status ||
              h.depth != m_first.depth || h.call_seq != m_first.call_seq ||
-             h.total_len != m_first.total_len) {
+             h.total_len != m_first.total_len ||
+             ((h.flags ^ m_first.flags) & wire::kTainted) != 0) {
     return fail("chunk does not continue the message");
   }
   if (h.len > m_first.total_len - m_received)

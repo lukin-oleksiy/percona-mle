@@ -39,7 +39,6 @@ public final class Main {
       Polyglot polyglot = new Polyglot(console, options);
       Control control = new Control(Thread.currentThread(), polyglot);
       control.start();
-      MemoryWatch.start();
       JavaRoutines java = new JavaRoutines();
       Dispatcher d = new Dispatcher(mb, java, polyglot, console, control, options);
       SqlBridge.dispatcher = d;
@@ -71,6 +70,8 @@ public final class Main {
         info = why.toString();
         t.printStackTrace();
       }
+      // The statistics are this thread's from here on (and the memory, while calls run).
+      if (status == Wire.OK) MemoryWatch.start(mb);
       d.ready(status, info);
       // A worker that cannot serve exits after its failed READY (§2 step 5).
       if (status != Wire.OK) Runtime.getRuntime().halt(1);

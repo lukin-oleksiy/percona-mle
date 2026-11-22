@@ -82,6 +82,24 @@ final class Values {
 
   /** A DATE, TIME or DATETIME as on the wire (Civil, §7.2). */
   record Temporal(int tag, int year, int month, int day, long hour, int minute, int second, int micro, boolean negative) {
+    /**
+     * A DATE or DATETIME as a JavaScript Date (milliseconds since the epoch) in zone, by Oracle's
+     * rules (MySQL manual, JavaScript stored program data types): MySQL's zero date and a date
+     * with a zero month or day are an invalid Date (NaN); any other date is what JavaScript's Date
+     * constructor makes of its fields in local time, so an impossible day (April 31) runs on into
+     * the next month.
+     */
+    double jsMillis(ZoneId zone) {
+      if (month == 0 || day == 0) return Double.NaN;
+      try {
+        return LocalDate.of(year, 1, 1).atStartOfDay().plusMonths(month - 1).plusDays(day - 1).plusHours(hour)
+            .plusMinutes(minute).plusSeconds(second).plusNanos(micro * 1000L).atZone(zone).toInstant()
+            .toEpochMilli();
+      } catch (java.time.DateTimeException | ArithmeticException e) {
+        return Double.NaN;  // a value outside every calendar (the host does not send one)
+      }
+    }
+
     Object toJava() {
       try {
         return switch (tag) {
@@ -154,14 +172,12 @@ final class Values {
 
   // ------------------------------------------------------------ decoding
 
-  /** A Type of a Param or return value: its tag is one of a declared type (§7.4). */
+  /** A Type of a Param or return value (§7.4). */
   static ParamType readType(MessageReader r) {
-    ParamType t = readColumnType(r);
-    if (t.tag() == Wire.T_NULL) throw ProtocolFailure.exit("a parameter type with tag 0");
-    return t;
+    return readColumnType(r);
   }
 
-  /** A Type of a Column: tag 0 for a column without a type. */
+  /** A Type of a Column: tag 0 for a column without a type. Its tag is one the worker knows. */
   static ParamType readColumnType(MessageReader r) {
     int tag = r.u8();
     if (tag > Wire.MAX_TAG) throw ProtocolFailure.exit("a type with tag " + tag);
@@ -182,25 +198,16 @@ final class Values {
     return i > digits && i == n;
   }
 
+  /** The host keeps the domains of §7.2; a value outside them is not looked for here (§1). */
   private static Temporal readCivil(MessageReader r, int tag) {
-    Temporal t = new Temporal(tag, r.u16(), r.u8(), r.u8(), r.u32(), r.u8(), r.u8(), (int) r.u32(), r.bool());
-    boolean date = t.year() <= 9999 && t.month() <= 12 && t.day() <= 31;
-    boolean ok = switch (tag) {
-      case Wire.T_DATE -> date && t.hour() == 0 && t.minute() == 0 && t.second() == 0 && t.micro() == 0
-          && !t.negative();
-      case Wire.T_TIME -> t.year() == 0 && t.month() == 0 && t.day() == 0 && t.hour() <= Wire.MAX_TIME_HOUR
-          && t.minute() <= 59 && t.second() <= 59 && t.micro() >= 0 && t.micro() <= 999999
-          && !(t.hour() == Wire.MAX_TIME_HOUR && t.minute() == 59 && t.second() == 59 && t.micro() != 0);
-      default -> date && t.hour() <= 23 && t.minute() <= 59 && t.second() <= 59 && t.micro() >= 0
-          && t.micro() <= 999999 && !t.negative();
-    };
-    if (!ok) throw ProtocolFailure.exit("a " + Wire.TAG_NAMES[tag] + " outside its domain: " + t);
-    return t;
+    return new Temporal(tag, r.u16(), r.u8(), r.u8(), r.u32(), r.u8(), r.u8(), (int) r.u32(), r.bool());
   }
 
   /**
    * A value of the host whose declared type has the tag declared: it is NULL or has that tag
-   * (§7.3); with tag 0 (a column without a type) it is NULL.
+   * (§7.3); with tag 0 (a column without a type) it is NULL. The tag is checked, the value's
+   * domain is not (§1): a value outside it gives guest code what it gives, and one the worker
+   * cannot represent at all ends the worker.
    */
   static Object read(MessageReader r, int declared) {
     int tag = r.u8();
@@ -218,23 +225,21 @@ final class Values {
       case Wire.T_F32 -> r.f32();
       case Wire.T_DECIMAL -> {
         String d = r.str();
-        if (!decimal(d)) throw ProtocolFailure.exit("a DECIMAL that is not digits[.digits]");
-        yield new BigDecimal(d);
+        try {
+          yield new BigDecimal(d);
+        } catch (NumberFormatException e) {
+          throw ProtocolFailure.exit("a DECIMAL that is no number");
+        }
       }
       case Wire.T_STRING -> r.lstr();
       case Wire.T_BYTES -> r.bytes();
       case Wire.T_JSON -> new MleJson(r.lstr());
       case Wire.T_DATE, Wire.T_TIME, Wire.T_DATETIME -> readCivil(r, tag);
-      case Wire.T_TIMESTAMP -> {
-        long micros = r.u64();
-        if (micros != Wire.ZERO_TIMESTAMP && (micros < 0 || micros > Wire.MAX_TIMESTAMP))
-          throw ProtocolFailure.exit("a TIMESTAMP of " + micros);
-        yield new Timestamp(micros);
-      }
+      case Wire.T_TIMESTAMP -> new Timestamp(r.u64());
       case Wire.T_VECTOR -> {
         long dims = r.u32();
-        if (dims < 1 || dims > Wire.MAX_VECTOR_DIMENSIONS) throw ProtocolFailure.exit("a VECTOR of " + dims);
         r.skipPadding(Wire.VECTOR_ALIGNMENT);
+        // The slice is checked against the body, which is far below 2^31 elements.
         yield new VectorRef(r.slice(dims * 4L), (int) dims);
       }
       default -> throw ProtocolFailure.exit("unknown value tag " + tag);
@@ -330,8 +335,11 @@ final class Values {
       case Short s -> i64(w, s);
       case Byte b -> i64(w, b);
       case Boolean b -> i64(w, b ? 1 : 0);
+      // BIGINT if it fits, else BIGINT UNSIGNED, else DECIMAL.
       case BigInteger b -> {
-        if (b.signum() >= 0 && b.bitLength() <= 64) {
+        if (b.bitLength() <= 63) {
+          i64(w, b.longValue());
+        } else if (b.signum() >= 0 && b.bitLength() <= 64) {
           w.u8(Wire.T_U64);
           w.u64(b.longValue());
         } else {
@@ -399,6 +407,37 @@ final class Values {
   private static void i64(MessageWriter w, long v) {
     w.u8(Wire.T_I64);
     w.u64(v);
+  }
+
+  /**
+   * v as writeAs takes it without running routine code. A value of a class of the JDK or of this
+   * worker is returned as it is: writeAs reads it in the same pass as it writes it. A value of a
+   * class of the routine (a Java routine's own Number or object) is converted here, with the
+   * routine's methods (toString, doubleValue), so that writeAs runs none of them while it composes
+   * the RESULT (§4.1). The caller runs this while the request still counts for interrupts and its
+   * SQL and imports are refused. A failure of the routine's method is a conversion error.
+   */
+  static Object settle(Object v, ParamType t) {
+    if (v == null) return null;
+    ClassLoader l = v.getClass().getClassLoader();
+    // A polyglot value (a Java routine may return one it got from JavaScript or Python) shows
+    // itself with guest code.
+    if ((l == null || l == Values.class.getClassLoader() || l == ClassLoader.getPlatformClassLoader())
+        && !(v instanceof org.graalvm.polyglot.Value))
+      return v;
+    try {
+      return switch (t.tag()) {
+        case Wire.T_STRING -> v instanceof float[] ? v : String.valueOf(v);
+        case Wire.T_JSON -> v instanceof CharSequence c ? c.toString() : v;
+        case Wire.T_F64, Wire.T_F32 -> v instanceof Number n ? (Object) n.doubleValue() : v;
+        default -> v;  // writeAs takes no other value of a routine's class: it refuses it by its class name
+      };
+    } catch (RuntimeException e) {
+      ConversionException c = new ConversionException("cannot convert the routine's " + v.getClass().getName()
+          + " to " + t.sqlName() + ": " + e);
+      c.initCause(e);
+      throw c;
+    }
   }
 
   /** A routine result as the declared SQL type t. */

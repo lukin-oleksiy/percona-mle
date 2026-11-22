@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -118,7 +119,8 @@ TEST_F(MleJavaWorker, Ready) {
   ReadyMsg ready;
   TestHost *h = new_host("jvm_cold", &ready);
   ASSERT_NE(h, nullptr);
-  EXPECT_EQ(ready.worker_class, "jvm_cold");
+  // The worker's own kind, not the name of the host's class (§9.1).
+  EXPECT_EQ(ready.worker_class, "jvm");
   EXPECT_EQ(ready.languages,
             (std::vector<std::string>{"java", "js", "python"}));
   EXPECT_NE(ready.runtime.find("Java 25"), std::string::npos) << ready.runtime;
@@ -414,6 +416,159 @@ TEST_F(MleJavaWorker, SqlCallback) {
   EXPECT_EQ(held->message, "Unknown table 'test.x'");
 }
 
+// §10.3: a prepared statement's columns come once. A later result set of the
+// id that has exactly those columns carries none in its first batch, and the
+// worker uses the ones it received last for the id.
+TEST_F(MleJavaWorker, ColumnsOncePerPreparedStatement) {
+  ResultMsg res;
+  ASSERT_EQ(prepare(*s_host, 510, "C.f",
+                    "import com.percona.mle.api.*;\n"
+                    "import com.percona.mle.sql.*;\n"
+                    "public class C { public static String f() {\n"
+                    "  PreparedStatement p = Mle.session().prepare(\"SELECT n, s "
+                    "FROM t WHERE id = ?\");\n"
+                    "  StringBuilder b = new StringBuilder();\n"
+                    "  for (long k = 1; k <= 3; k++) {\n"
+                    "    SqlResult r = p.bind(k).execute();\n"
+                    "    b.append(r.getColumnNames()).append(r.fetchOne().get(1))"
+                    ".append(';');\n"
+                    "  }\n"
+                    "  return b.toString();\n"
+                    "} }",
+                    {}, type(Tag::kString), &res),
+            0u)
+      << error_of(res);
+  int executions = 0;
+  auto sql = [&](const SqlMsg &m, SqlResultMsg *r) {
+    if (m.action == wire::SqlAction::kPrepare) {
+      *r = SqlResultMsg();
+      r->param_count = 1;
+      return;
+    }
+    ASSERT_EQ(m.action, wire::SqlAction::kExecutePrepared);
+    const std::string text = "row" + std::to_string(m.params.at(0).as_i64());
+    if (executions++ == 0) {
+      sql_rows(r, {{"n", "t", type(Tag::kI64)}, {"s", "t", type(Tag::kString)}},
+               {Value::i64(1), Value::string(text)});
+    } else {
+      // The same columns: none are sent.
+      sql_rows(r, {}, {Value::i64(2), Value::string(text)});
+      r->ncolumns = 2;
+      r->total_rows = 1;
+    }
+  };
+  ASSERT_EQ(s_host->call(510, {}, &res, sql), 0u) << error_of(res);
+  EXPECT_EQ(*res.ret, Value::string("[n, s]row1;[n, s]row2;[n, s]row3;"));
+  EXPECT_EQ(executions, 3);
+}
+
+// A first batch without columns for an id that has none: the worker cannot
+// tell where a row ends, and exits (§1, item 1).
+TEST_F(MleJavaWorker, RowsWithoutColumnsEndTheWorker) {
+  TestHost *h = new_host("jvm");
+  ASSERT_NE(h, nullptr);
+  ResultMsg res;
+  ASSERT_EQ(prepare(*h, 1, "C.f",
+                    "public class C { public static long f() {\n"
+                    "  com.percona.mle.api.Mle.session().runSql(\"SELECT 1\");\n"
+                    "  return 1; } }",
+                    {}, type(Tag::kI64), &res),
+            0u)
+      << error_of(res);
+  auto sql = [](const SqlMsg &, SqlResultMsg *r) {
+    sql_rows(r, {}, {Value::i64(1)});
+    r->ncolumns = 1;
+    r->total_rows = 1;
+  };
+  EXPECT_EQ(h->call(1, {}, &res, sql), u(Outcome::kDied)) << error_of(res);
+  EXPECT_FALSE(h->worker.usable());
+  delete h;
+}
+
+// §1: the worker does not validate a trusted host, but a mistaken one cannot
+// make it unsafe. Values outside their domains and ill-formed text give the
+// routine some value or an error, or end the worker; a tag that is not the
+// column's ends it. Nothing hangs, and the host sees no violation: the
+// worker's own messages stay correct.
+TEST_F(MleJavaWorker, AMistakenHostDoesNotMakeTheWorkerUnsafe) {
+  struct Case {
+    const char *what;
+    Column column;
+    Value value;
+    /** The worker must live on (else it may also end itself). */
+    bool lives;
+  };
+  Temporal month13;
+  month13.year = 2024;
+  month13.month = 13;
+  month13.day = 40;
+  Temporal late;
+  late.hour = 900;
+  late.minute = 77;
+  const std::vector<Case> cases = {
+      {"a DECIMAL that is no number", {"c", "t", type(Tag::kDecimal)},
+       Value::decimal("12a.5"), false},
+      {"a DECIMAL longer than its limit", {"c", "t", type(Tag::kDecimal)},
+       Value::decimal(std::string(300, '7')), true},
+      {"a DATE outside its domain", {"c", "t", type(Tag::kDate)},
+       Value::temporal(Tag::kDate, month13), true},
+      {"a TIME outside its domain", {"c", "t", type(Tag::kTime)},
+       Value::temporal(Tag::kTime, late), true},
+      {"a TIMESTAMP outside its domain", {"c", "t", type(Tag::kTimestamp)},
+       Value::timestamp(wire::kMaxTimestamp + 12345), true},
+      {"a column name that is not UTF-8", {"c\xff\xfe", "t", type(Tag::kI64)},
+       Value::i64(7), true},
+      {"a tag that is not the column's", {"c", "t", type(Tag::kI64)},
+       Value::string("seven"), false},
+  };
+  for (const Case &c : cases) {
+    SCOPED_TRACE(c.what);
+    TestHost *h = new_host("jvm");
+    ASSERT_NE(h, nullptr);
+    ResultMsg res;
+    ASSERT_EQ(prepare(*h, 1, "M.f",
+                      "import com.percona.mle.api.*;\n"
+                      "import com.percona.mle.sql.*;\n"
+                      "public class M { public static String f() {\n"
+                      "  SqlResult r = Mle.session().runSql(\"SELECT c FROM t\");\n"
+                      "  try { return r.getColumnNames() + \" \" + r.fetchOne().get(0); }\n"
+                      "  catch (RuntimeException e) { return \"error: \" + e; }\n"
+                      "} }",
+                      {}, type(Tag::kString), &res),
+              0u)
+        << error_of(res);
+    auto sql = [&c](const SqlMsg &, SqlResultMsg *r) {
+      sql_rows(r, {c.column}, {c.value});
+      // More that a conforming host would not send.
+      r->warnings = {{7, 1, "level 7"}};
+    };
+    const uint32_t outcome = h->call(1, {}, &res, sql);
+    if (c.lives) {
+      EXPECT_TRUE(outcome == u(Outcome::kOk) ||
+                  outcome == u(Outcome::kGuestError))
+          << outcome_name(static_cast<Outcome>(outcome)) << " " << error_of(res);
+      EXPECT_TRUE(h->worker.usable()) << h->worker.failure();
+      if (res.ret) std::cout << "[ INFO     ] " << c.what << ": "
+                             << res.ret->as_text() << "\n";
+      // The worker serves on.
+      EXPECT_EQ(h->call(1, {}, &res,
+                        [](const SqlMsg &, SqlResultMsg *r) {
+                          sql_rows(r, {{"c", "t", type(Tag::kI64)}},
+                                   {Value::i64(5)});
+                        }),
+                0u)
+          << error_of(res);
+      EXPECT_EQ(*res.ret, Value::string("[c] 5"));
+    } else {
+      // The worker ended itself: it died, the host found no violation.
+      EXPECT_EQ(outcome, u(Outcome::kDied))
+          << outcome_name(static_cast<Outcome>(outcome)) << " " << error_of(res);
+      EXPECT_FALSE(h->worker.usable());
+    }
+    delete h;
+  }
+}
+
 // routine -> SQL -> another routine of the same worker -> SQL.
 TEST_F(MleJavaWorker, NestedCalls) {
   ResultMsg res;
@@ -706,8 +861,8 @@ TEST_F(MleJavaWorker, ExhaustedTaintsTheWorker) {
       0u);
   EXPECT_EQ(h->call(1, {}, &res), u(Outcome::kExhausted));
   EXPECT_NE(error_of(res).find("StackOverflowError"), std::string::npos);
-  EXPECT_TRUE(h->stats().tainted);
-  // Retired: ended once the call was over (§11.5).
+  // Its RESULT had the TAINTED flag: retired, ended once the call was over
+  // (§11.5).
   EXPECT_FALSE(h->worker.usable());
   EXPECT_TRUE(h->worker.process().wait_exit(2000));
   delete h;
@@ -773,6 +928,101 @@ TEST_F(MleJavaWorker, InterruptFromAnotherThread) {
   EXPECT_LT(Clock::now() - t0, std::chrono::seconds(6));
   EXPECT_TRUE(h->worker.usable());
   delete h;
+}
+
+// §11.1, the worker's side without a lock on a request's path: a thread that
+// asks for interrupts all the time while short calls of Java and JavaScript
+// come and go. Every call ends OK or INTERRUPTED (the host ends a worker
+// that answers INTERRUPTED without an interrupt), an interrupt never reaches
+// a later request, and the worker serves on.
+TEST_F(MleJavaWorker, InterruptStateUnderAKillerThread) {
+  TestHost *h = new_host("jvm");
+  ASSERT_NE(h, nullptr);
+  ResultMsg res;
+  ASSERT_EQ(prepare(*h, 1, "Q.f",
+                    "public class Q { public static long f(long n) { long s = "
+                    "0; for (long i = 0; i < n; i++) s += i; return s; } }",
+                    {type(Tag::kI64)}, type(Tag::kI64), &res),
+            0u)
+      << error_of(res);
+  PrepareMsg js;
+  js.routine_id = 2;
+  js.language = "js";
+  js.name = "jsq";
+  js.source = "let s = 0; for (let i = 0; i < n; i++) s += i; return s;";
+  js.params.push_back({"n", wire::ParamMode::kIn, type(Tag::kI64)});
+  js.returns = type(Tag::kI64);
+  ASSERT_EQ(h->prepare(js, &res), 0u) << error_of(res);
+
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> asked{0};
+  std::thread killer([&] {
+    while (!stop.load()) {
+      h->worker.interrupt();
+      asked++;
+      if (asked % 64 == 0) std::this_thread::yield();
+    }
+  });
+  int ok = 0, interrupted = 0;
+  for (int i = 0; i < 1500 && h->worker.usable(); i++) {
+    const uint64_t id = i % 5 == 0 ? 2 : 1;
+    const uint32_t o = h->call(id, {Value::i64(i % 3 == 0 ? 2000 : 10)}, &res);
+    if (o == 0) {
+      ok++;
+    } else {
+      ASSERT_EQ(o, u(Outcome::kInterrupted)) << error_of(res);
+      EXPECT_TRUE(h->worker.interrupted());
+      interrupted++;
+    }
+  }
+  stop = true;
+  killer.join();
+  ASSERT_TRUE(h->worker.usable()) << h->worker.failure();
+  std::cout << "[ INFO     ] " << ok << " calls OK, " << interrupted
+            << " interrupted, " << asked.load() << " interrupt() calls\n";
+  // Nothing of the storm reaches the calls after it.
+  for (int i = 0; i < 50; i++) {
+    ASSERT_EQ(h->call(i % 2 == 0 ? 1 : 2, {Value::i64(100)}, &res), 0u)
+        << error_of(res);
+    EXPECT_EQ(*res.ret, Value::i64(4950));
+    EXPECT_FALSE(h->worker.interrupted());
+  }
+  delete h;
+}
+
+// §4.1: a Java routine's own class in a result is converted with its own
+// methods before the RESULT is composed; while that runs, SQL is refused, and
+// a failure there is a conversion error (MLE-Type), not the worker's.
+TEST_F(MleJavaWorker, RoutineClassesInResults) {
+  ResultMsg res;
+  ASSERT_EQ(prepare(*s_host, 520, "Own.f",
+                    "import com.percona.mle.api.*;\n"
+                    "public class Own {\n"
+                    "  static class Text { public String toString() {\n"
+                    "    try { Mle.session().runSql(\"SELECT 1\"); return \"ran SQL\"; }\n"
+                    "    catch (RuntimeException e) { return \"no SQL here\"; } } }\n"
+                    "  static class Bad { public String toString() {\n"
+                    "    throw new IllegalStateException(\"toString failed\"); } }\n"
+                    "  public static Object f(long k) { return k == 0 ? new Text() : new Bad(); }\n"
+                    "}",
+                    {type(Tag::kI64)}, type(Tag::kString), &res),
+            0u)
+      << error_of(res);
+  int statements = 0;
+  auto sql = [&](const SqlMsg &, SqlResultMsg *r) {
+    statements++;
+    r->kind = SqlResultKind::kOk;
+  };
+  ASSERT_EQ(s_host->call(520, {Value::i64(0)}, &res, sql), 0u) << error_of(res);
+  EXPECT_EQ(*res.ret, Value::string("no SQL here"));
+  EXPECT_EQ(statements, 0);
+  EXPECT_EQ(s_host->call(520, {Value::i64(1)}, &res, sql),
+            u(Outcome::kGuestError));
+  ASSERT_TRUE(res.error.has_value());
+  EXPECT_EQ(res.error->language, wire::kLanguageType);
+  EXPECT_NE(res.error->message.find("toString failed"), std::string::npos)
+      << res.error->message;
+  EXPECT_TRUE(s_host->worker.usable());
 }
 
 TEST_F(MleJavaWorker, WorkerExitsDuringACall) {

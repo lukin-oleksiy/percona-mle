@@ -248,7 +248,7 @@ TEST(MleLauncher, WorkerEnvironment) {
   EXPECT_EQ(r["seal"], "EPERM") << "the worker could resize the mailbox";
   EXPECT_EQ(r["stdin"], "/dev/null");
   EXPECT_EQ(r["ppid"], std::to_string(l->info().pid));
-  EXPECT_EQ(w->header()->stats.tainted, 0u);
+  EXPECT_EQ(w->header()->stats.reserved, 0u);
 }
 
 TEST(MleLauncher, ReleaseKillsTheWorker) {

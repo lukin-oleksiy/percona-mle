@@ -21,6 +21,7 @@
 #include <cctype>
 #include <cinttypes>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <ctime>
 #include <set>
@@ -52,9 +53,6 @@ extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_runtime_argument_null);
 extern REQUIRES_SERVICE_PLACEHOLDER(
     mysql_stored_program_runtime_argument_timestamp);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_timestamp);
-extern REQUIRES_SERVICE_PLACEHOLDER(mysql_string_factory);
-extern REQUIRES_SERVICE_PLACEHOLDER(mysql_string_copy_converter);
-extern REQUIRES_SERVICE_PLACEHOLDER(mysql_string_get_data_in_charset);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stored_program_return_value_int);
 extern REQUIRES_SERVICE_PLACEHOLDER(
@@ -87,62 +85,18 @@ const char *worker_language(unsigned bit) {
   }
 }
 
-// ------------------------------------------------------------- text
-
-void repair_utf8(std::string *text) {
-  if (mle::is_valid_utf8(*text)) return;
-  constexpr std::string_view kReplacement = "\xEF\xBF\xBD";  // U+FFFD
-  std::string out;
-  out.reserve(text->size() + 8);
-  const auto *p = reinterpret_cast<const unsigned char *>(text->data());
-  const auto *const end = p + text->size();
-  while (p < end) {
-    const unsigned char c = *p;
-    if (c < 0x80) {
-      out += static_cast<char>(c);
-      p++;
-      continue;
-    }
-    // The bytes that may follow this lead byte: the first one has a
-    // narrower range where a wider one would give an overlong form, a
-    // surrogate or a code point above U+10FFFF.
-    size_t need = 0;
-    unsigned char lo = 0x80, hi = 0xBF;
-    if (c >= 0xC2 && c <= 0xDF) {
-      need = 1;
-    } else if (c >= 0xE0 && c <= 0xEF) {
-      need = 2;
-      if (c == 0xE0) lo = 0xA0;
-      if (c == 0xED) hi = 0x9F;
-    } else if (c >= 0xF0 && c <= 0xF4) {
-      need = 3;
-      if (c == 0xF0) lo = 0x90;
-      if (c == 0xF4) hi = 0x8F;
-    }
-    size_t got = 0;
-    while (got < need && p + 1 + got < end && p[1 + got] >= lo &&
-           p[1 + got] <= hi) {
-      lo = 0x80;
-      hi = 0xBF;
-      got++;
-    }
-    if (need != 0 && got == need)
-      out.append(reinterpret_cast<const char *>(p), need + 1);
-    else
-      out += kReplacement;  // one for the maximal subpart
-    p += 1 + got;
-  }
-  *text = std::move(out);
-}
-
 // ------------------------------------------------------------- time zones
 
-std::string session_time_zone(MYSQL_THD thd) {
+std::string_view session_time_zone_name(MYSQL_THD thd) {
   MYSQL_LEX_CSTRING name{nullptr, 0};
   if (mysql_service_mysql_thd_attributes->get(thd, "time_zone_name", &name) ||
       name.str == nullptr)
-    return "";
-  return std::string(name.str, name.length);
+    return {};
+  return {name.str, name.length};
+}
+
+std::string session_time_zone(MYSQL_THD thd) {
+  return std::string(session_time_zone_name(thd));
 }
 
 namespace {
@@ -178,26 +132,95 @@ std::string offset_name(int32_t seconds) {
 
 }  // namespace
 
+namespace {
+
+std::atomic<uint64_t> g_zone_ids{0};
+
+/** Around a change of offset local times repeat or are skipped: the
+    interval a TimeZone remembers ends this far from each change (no zone
+    moves its clock by more). */
+constexpr int64_t kChangeMargin = 26 * 3600;
+
+}  // namespace
+
 bool TimeZone::set(std::string_view name) {
+  m_id = ++g_zone_ids;
   m_zone = nullptr;
+  m_from = m_to = 0;
+  m_offset = 0;
+  if (int32_t offset = 0; parse_offset(name, &offset)) {
+    // One offset for all time.
+    m_from = INT64_MIN;
+    m_to = INT64_MAX;
+    m_offset = offset;
+    return true;
+  }
+  // SYSTEM is mysqld's own zone: by its name in the zone data if it has
+  // one, else by the C library (m_zone stays nullptr).
+  const std::string system = name == "SYSTEM" ? system_time_zone() : "";
   if (name == "SYSTEM") {
-    m_kind = Kind::kSystem;
-    return true;
+    int32_t offset = 0;
+    if (system.empty() || parse_offset(system, &offset)) return true;
+    name = system;
   }
-  if (parse_offset(name, &m_offset)) {
-    m_kind = Kind::kOffset;
-    return true;
-  }
-  m_kind = Kind::kNamed;
   try {
     m_zone = std::chrono::locate_zone(name);
   } catch (const std::runtime_error &) {
-    return false;  // no such zone, or no zone data on this host
+    // No such zone, or no zone data on this host: for SYSTEM the C library
+    // still converts.
+    return !system.empty();
   }
   return true;
 }
 
-bool TimeZone::instant(const mle::Temporal &t, int64_t *microseconds) const {
+bool TimeZone::lookup(int64_t local, const mle::Temporal &t, int64_t *seconds) {
+  namespace ch = std::chrono;
+  if (m_zone == nullptr) {
+    // mysqld's own zone, by the C library's rules.
+    struct tm tm {};
+    tm.tm_year = t.year - 1900;
+    tm.tm_mon = t.month - 1;
+    tm.tm_mday = t.day;
+    tm.tm_hour = static_cast<int>(t.hour);
+    tm.tm_min = t.minute;
+    tm.tm_sec = t.second;
+    tm.tm_isdst = -1;
+    errno = 0;
+    const time_t at = mktime(&tm);
+    if (at == static_cast<time_t>(-1) && errno != 0) return false;
+    *seconds = at;
+    return true;
+  }
+  const ch::local_info info = m_zone->get_info(ch::local_seconds{ch::seconds{local}});
+  switch (info.result) {
+    case ch::local_info::unique: {
+      const int64_t offset = info.first.offset.count();
+      *seconds = local - offset;
+      // The offset holds from first.begin to first.end; near either end a
+      // local time may belong to the neighbour too.
+      const int64_t begin = info.first.begin.time_since_epoch().count();
+      const int64_t end = info.first.end.time_since_epoch().count();
+      constexpr int64_t kFar = INT64_MAX / 4;
+      m_from = begin < -kFar ? INT64_MIN : begin + offset + kChangeMargin;
+      m_to = end > kFar ? INT64_MAX : end + offset - kChangeMargin;
+      m_offset = offset;
+      return true;
+    }
+    case ch::local_info::ambiguous:
+      // The zone repeats this local time: its first occurrence (as the
+      // server takes it).
+      *seconds = local - info.first.offset.count();
+      return true;
+    case ch::local_info::nonexistent:
+      // The zone skips this local time: the instant of the change (as the
+      // server takes it).
+      *seconds = info.first.end.time_since_epoch().count();
+      return true;
+  }
+  return false;
+}
+
+bool TimeZone::instant(const mle::Temporal &t, int64_t *microseconds) {
   if (t.year == 0 && t.month == 0 && t.day == 0 && t.hour == 0 &&
       t.minute == 0 && t.second == 0 && t.microsecond == 0) {
     *microseconds = mle::wire::kZeroTimestamp;
@@ -208,36 +231,25 @@ bool TimeZone::instant(const mle::Temporal &t, int64_t *microseconds) const {
   if (!date.ok() || t.hour > 23 || t.minute > 59 || t.second > 59 ||
       t.microsecond > 999999)
     return false;
-  const ch::local_seconds local = ch::local_days{date} + ch::hours{t.hour} +
-                                  ch::minutes{t.minute} + ch::seconds{t.second};
-  int64_t seconds = 0;
-  switch (m_kind) {
-    case Kind::kOffset:
-      seconds = local.time_since_epoch().count() - m_offset;
-      break;
-    case Kind::kNamed:
-      if (m_zone == nullptr) return false;
-      // A local time in the hour the zone repeats names two instants: the
-      // first one is taken.
-      seconds = m_zone->to_sys(local, ch::choose::earliest).time_since_epoch().count();
-      break;
-    case Kind::kSystem: {
-      // mysqld's own zone, by the C library's rules, as the server converts.
-      struct tm tm {};
-      tm.tm_year = t.year - 1900;
-      tm.tm_mon = t.month - 1;
-      tm.tm_mday = t.day;
-      tm.tm_hour = static_cast<int>(t.hour);
-      tm.tm_min = t.minute;
-      tm.tm_sec = t.second;
-      tm.tm_isdst = -1;
-      seconds = mktime(&tm);
-      break;
-    }
-  }
+  const int64_t local = ch::local_days{date}.time_since_epoch().count() * int64_t{86400} +
+                        t.hour * 3600 + t.minute * 60 + t.second;
+  int64_t seconds = local - m_offset;
+  if ((local < m_from || local >= m_to) && !lookup(local, t, &seconds))
+    return false;
   *microseconds = seconds * 1000000 + t.microsecond;
   return mle::is_valid_timestamp(*microseconds) &&
          *microseconds != mle::wire::kZeroTimestamp;
+}
+
+TimeZone *ZoneCache::current(MYSQL_THD thd, std::string *name) {
+  const std::string_view now = session_time_zone_name(thd);
+  if (!m_known || now != m_name) {
+    m_name.assign(now);
+    m_known = m_zone.set(now);
+  }
+  if (m_known) return &m_zone;
+  if (name != nullptr) *name = m_name;
+  return nullptr;
 }
 
 std::string options_time_zone(std::string_view zone) {
@@ -520,10 +532,6 @@ bool describe(const TypeQuery &q, const std::string &what, ParamInfo *info) {
       p.scale = fraction_digits(q);
       info->kind = Kind::kTimestamp;
       return true;
-    case MYSQL_SP_ARG_TYPE_GEOMETRY:
-      p.tag = Tag::kBytes;
-      info->kind = Kind::kBytes;
-      return true;
     case MYSQL_SP_ARG_TYPE_JSON:
       p.tag = Tag::kJson;
       info->kind = Kind::kJson;
@@ -558,19 +566,16 @@ bool describe(const TypeQuery &q, const std::string &what, ParamInfo *info) {
         if (p.type_name == "CHAR") p.type_name = "BINARY";
         return true;
       }
+      // A string parameter or return type is declared utf8mb4 or binary
+      // (protocol Appendix A, Oracle's rule): the server converts values of
+      // other character sets when it passes and stores them. Binary ENUM
+      // and SET members go as they are.
+      if (cs != "utf8mb4" && cs != "binary")
+        return unsupported("The character set " + cs +
+                           " is not supported; use utf8mb4 or binary");
       p.tag = Tag::kString;
       info->kind = Kind::kString;
       if (p.type_name == "BLOB") p.type_name = "TEXT";
-      // The wire knows only UTF-8: text in another character set is
-      // converted when it is read (the server converts what is stored).
-      // utf8mb3 and ascii text is UTF-8 as it is; binary ENUM and SET
-      // members go as they are.
-      if (cs != "utf8mb4" && cs != "utf8mb3" && cs != "utf8" && cs != "ascii" &&
-          cs != "binary") {
-        info->charset = mysql_service_mysql_charset->get(cs.c_str());
-        if (info->charset == nullptr)
-          return unsupported("The character set " + cs + " is not known");
-      }
       return true;
     }
     default:
@@ -642,28 +647,6 @@ std::string format_temporal(Tag tag, const mle::Temporal &t) {
 CHARSET_INFO_h binary_charset() {
   static CHARSET_INFO_h cs = mysql_service_mysql_charset->get("binary");
   return cs;
-}
-
-/** Text of character set from as utf8mb4; false if the server cannot. */
-bool to_utf8mb4(const char *text, size_t length, CHARSET_INFO_h from,
-                std::string *out) {
-  my_h_string converted = nullptr;
-  if (mysql_service_mysql_string_factory->create(&converted) ||
-      converted == nullptr)
-    return false;
-  uint errors = 0;
-  const char *data = nullptr;
-  size_t size = 0;
-  CHARSET_INFO_h charset = nullptr;
-  const bool failed =
-      mysql_service_mysql_string_copy_converter->copy_convert(
-          converted, text, length, from,
-          mysql_service_mysql_charset->get_utf8mb4(), &errors) ||
-      mysql_service_mysql_string_get_data_in_charset->get_data(
-          converted, &data, &size, &charset);
-  if (!failed) out->assign(data == nullptr ? "" : data, size);
-  mysql_service_mysql_string_factory->destroy(converted);
-  return !failed;
 }
 
 // ------------------------------------------------------------- storing
@@ -927,11 +910,11 @@ Routine *Routine::create(stored_program_handle sp) {
   return r.release();
 }
 
-bool Routine::read_args(std::vector<Value> *args) const {
+bool Routine::read_args(std::vector<Value> *args, ZoneCache *zones) const {
   args->clear();
   args->reserve(params.size());
-  // The session's zone, looked up at the first TIMESTAMP argument.
-  std::optional<TimeZone> zone;
+  // The session's zone, asked for at the first TIMESTAMP argument.
+  TimeZone *zone = nullptr;
   for (uint16_t i = 0; i < params.size(); i++) {
     const ParamInfo &p = params[i];
     if (p.mode == ParamMode::kOut) {
@@ -984,15 +967,9 @@ bool Routine::read_args(std::vector<Value> *args) const {
           case Kind::kDecimal:
             args->push_back(Value::decimal(std::string(s, n)));
             break;
-          case Kind::kString: {
-            std::string text;
-            if (p.charset == nullptr)
-              text.assign(s, n);
-            else if (!to_utf8mb4(s, n, p.charset, &text))
-              return report_read_failure(p), false;
-            args->push_back(Value::string(std::move(text)));
+          case Kind::kString:
+            args->push_back(Value::string(std::string(s, n)));
             break;
-          }
           case Kind::kBytes:
             args->push_back(Value::bytes(std::string(s, n)));
             break;
@@ -1010,10 +987,10 @@ bool Routine::read_args(std::vector<Value> *args) const {
             mle::Temporal local;
             if (!parse_temporal(p.kind, s, n, &local))
               return report_read_failure(p), false;
-            if (!zone) {
-              zone.emplace();
-              const std::string name = session_time_zone();
-              if (!zone->set(name)) {
+            if (zone == nullptr) {
+              std::string name;
+              zone = zones->current(nullptr, &name);
+              if (zone == nullptr) {
                 my_error(ER_LANGUAGE_COMPONENT, MYF(0),
                          ("MLE-Type> Cannot convert the TIMESTAMP parameter '" +
                           p.name + "': the session's time zone '" + name +

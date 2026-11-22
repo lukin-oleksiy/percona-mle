@@ -149,7 +149,8 @@ CREATE LIBRARY nolib LANGUAGE JAVASCRIPT AS $$ export const x = 1 $$;
 SELECT js_using(4) AS top_level;
 CALL js_outer(@r);
 SELECT @r AS nested;
---echo # C5: an import allowed for one routine is not thereby allowed for another.
+--echo # C5 under Oracle's library rule (protocol Appendix A): a routine without
+--echo # USING may import at run time any library its rights account may use.
 SELECT js_peek_using() AS with_using;
 --error 0,ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT js_peek() AS without_using;

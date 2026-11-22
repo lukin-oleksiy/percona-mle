@@ -43,7 +43,10 @@
   the mailbox arena from the server's rows, so a batch of several rows is
   always one chunk, its columns and warnings included; a row that does not
   fit the arena goes alone, as Values in a message of several chunks. A
-  result set's columns go with its first batch only. With
+  result set's columns go with its first batch only, and for a prepared id
+  not even then when they are exactly the columns last sent for that id
+  (the worker keeps them): a statement executed many times sends its
+  columns once. With
   PASS_RESULT_TO_CLIENT the server sends the results to the consumer of the
   statement that invoked the routine, and the reply is one OK (§10.5).
 
@@ -53,6 +56,9 @@
   routine ends with an error it hands back by id, that error reaches the
   client: unchanged if it is still the one in the diagnostics area, else
   raised again with its number and SQLSTATE.
+
+  The server's execution time (exec_us) is measured only when
+  mle.sql_exec_time is ON: it costs two clock reads per statement.
 
   The session's bounds (§10.7) are counted in one SqlBudget over all
   requests in progress, at every depth and in every worker.
@@ -68,6 +74,7 @@
 
 #include "mle/codec.h"
 #include "mle/worker.h"
+#include "routine.h"
 
 namespace mle_component {
 
@@ -87,20 +94,22 @@ constexpr uint64_t kSqlRequestBytesMax = 256ULL << 20;
 
 class SqlRunner {
  public:
-  SqlRunner(MYSQL_THD thd, SqlBudget *budget);
+  /** zones: the session's time zone, for TIMESTAMP values of results. */
+  SqlRunner(MYSQL_THD thd, SqlBudget *budget, ZoneCache *zones);
   ~SqlRunner();
   SqlRunner(const SqlRunner &) = delete;
   SqlRunner &operator=(const SqlRunner &) = delete;
 
   /** Serves one SQL message of the worker (CallHooks::sql_into): a batch of
-      rows may be written into the mailbox arena instead of result. */
+      rows may be written into the mailbox arena instead of result.
+      error_id: the id of the reply if it is an ERROR. */
   void handle(const mle::SqlMsg &request, mle::SqlResultMsg *result,
-              mle::DirectReply *direct);
+              mle::DirectReply *direct, uint64_t error_id);
 
-  /** The Worker answers an SQL message itself, or replaces the reply of the
-      one handle() just served (CallHooks::sql_refused): the id's state by
-      §10.1, and the ERROR's number, SQLSTATE and message. */
-  void refused(mle::SqlRefusal why, mle::wire::SqlAction action,
+  /** The Worker answers an SQL message itself, or (ran) replaces the reply
+      of the one handle() just served (CallHooks::sql_refused): the id's
+      state by §10.1, and the ERROR's number, SQLSTATE and message. */
+  void refused(mle::SqlRefusal why, bool ran, mle::wire::SqlAction action,
                uint64_t stmt_id, mle::SqlResultMsg *error);
 
   /** The routine returned: a statement error it caught must not stay in the
@@ -109,8 +118,9 @@ class SqlRunner {
   /**
     The routine ended with an error it hands back (§10.8 rule 1): held is
     that ERROR as the host sent it. True if it is the error in the
-    diagnostics area now: the caller reports nothing more and the client
-    gets it unchanged. Otherwise the area is cleared and false is returned.
+    diagnostics area now (the ERROR with that id was made from it): the
+    caller reports nothing more and the client gets it unchanged. Otherwise
+    the area is cleared and false is returned.
   */
   bool propagates(const mle::HeldError &held);
 
@@ -176,20 +186,19 @@ class SqlRunner {
 
   MYSQL_THD m_thd;
   SqlBudget *m_budget;
+  ZoneCache *m_zones;
   /** The arena for the message being served (handle), or nullptr. */
   mle::DirectReply *m_direct = nullptr;
   std::map<uint64_t, std::unique_ptr<Statement>> m_statements;
   bool m_context_checked = false;
   bool m_refused = false;
-  /** handle() just ran an allowed action of this id and its reply is not an
-      ERROR: if the Worker replaces the reply by one, the id goes home. */
-  bool m_ran = false;
-  uint64_t m_ran_id = 0;
-  /** The statement error now in the diagnostics area, if any. */
+  /** The error_id of the reply to the message being served, if it is an
+      ERROR. */
+  uint64_t m_error_id = 0;
+  /** The statement error now in the diagnostics area, if any, and the
+      error_id of the ERROR made from it. */
   bool m_pending = false;
-  uint32_t m_pending_errno = 0;
-  std::string m_pending_sqlstate;
-  std::string m_pending_message;
+  uint64_t m_pending_id = 0;
 };
 
 /** An ERROR the host makes itself (a wrong state, a limit): SQLSTATE HY000. */

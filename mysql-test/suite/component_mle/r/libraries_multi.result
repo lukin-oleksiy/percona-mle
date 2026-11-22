@@ -52,14 +52,17 @@ $$;
 SELECT java_uses_js(7), java_uses_py();
 java_uses_js(7)	java_uses_py()
 149	mean 3.0
-# Another schema's library needs USING; a bad name is refused.
+# Another schema's library: by USING, or imported at run time when the
+# account whose rights apply may use it (Oracle's rule); a bad name is
+# refused.
 CREATE DATABASE other_lib;
 CREATE LIBRARY other_lib.tiny LANGUAGE JAVASCRIPT AS $$ export const v = 42 $$;
 CREATE FUNCTION java_other(using_it INT) RETURNS INT LANGUAGE JAVA AS $$
 return Mle.importLibrary("other_lib.tiny").getMember("v").asInt();
 $$;
 SELECT java_other(0);
-ERROR HY000: Java> java.lang.IllegalArgumentException: /other_lib/tiny: library other_lib.tiny is not available to test.java_other (java_other, line 2)
+java_other(0)
+42
 CREATE FUNCTION java_other_using() RETURNS INT LANGUAGE JAVA USING (other_lib.tiny) AS $$
 return Mle.importLibrary("other_lib.tiny").getMember("v").asInt();
 $$;

@@ -31,9 +31,12 @@
     BIGINT UNSIGNED, BIT    U64
     FLOAT / DOUBLE          F32 / F64
     DECIMAL                 DECIMAL (text)
-    CHAR, VARCHAR, TEXT, ENUM, SET   STRING, converted from the parameter's
-                            character set to utf8mb4 and back
-    BINARY, VARBINARY, BLOB, GEOMETRY   BYTES
+    CHAR, VARCHAR, TEXT, ENUM, SET   STRING; a parameter or return type must
+                            be declared utf8mb4 (protocol Appendix A,
+                            Oracle's rule): the server converts values of
+                            other character sets
+    BINARY, VARBINARY, BLOB   BYTES (GEOMETRY parameters and return types
+                            are refused)
     JSON                    JSON
     DATE, TIME, DATETIME    a calendar date and clock time, without a zone
     TIMESTAMP               an instant: microseconds since 1970 UTC
@@ -43,8 +46,12 @@
   time in the session's time zone, so the instant is computed from it
   (TimeZone): exactly for a zone that is an offset; by the zone's rules for
   SYSTEM and for a named zone, where a local time in the hour a zone repeats
-  is taken as its first occurrence. An instant a worker returns is given to
-  the server with its offset; the server stores it through local time too.
+  is taken as its first occurrence and one in an hour the zone skips as the
+  instant of the change (the server's rules for a named zone). The session
+  keeps the zone and the interval of local time in which its offset is the
+  one found last (ZoneCache), so a value costs a comparison and a
+  subtraction. An instant a worker returns is given to the server with its
+  offset; the server stores it through local time too.
 */
 
 #include <chrono>
@@ -86,23 +93,23 @@ struct ParamInfo {
   mle::wire::ParamMode mode = mle::wire::ParamMode::kIn;
   Kind kind = Kind::kInt;
   mle::ParamType type;
-  /** A STRING's character set when its text is not UTF-8 already: the value
-      is converted to utf8mb4 when it is read. */
-  CHARSET_INFO_h charset = nullptr;
 };
 
-/** Replaces each maximal subpart of an ill-formed UTF-8 sequence by U+FFFD
-    (protocol §7.1): for the text the host composes or takes from the server
-    for a str field (names, error and warning messages). */
-void repair_utf8(std::string *text);
+using mle::repair_utf8;
 
 /** @@session.time_zone of thd (nullptr: the current session): "SYSTEM", an
     offset "+05:30" or a zone name. Empty if the server does not tell. */
 std::string session_time_zone(MYSQL_THD thd = nullptr);
 
+/** @@session.time_zone of thd as the server holds it (valid until the
+    session's zone changes); empty if the server does not tell. */
+std::string_view session_time_zone_name(MYSQL_THD thd = nullptr);
+
 /**
-  A session's time zone, to turn the local time the server gives for a
-  TIMESTAMP into the instant the protocol carries (§7.2).
+  A time zone, to turn the local time the server gives for a TIMESTAMP into
+  the instant the protocol carries (§7.2). It remembers the interval of
+  local time around the value converted last in which the zone has one
+  offset: a value inside it costs a comparison and a subtraction.
 */
 class TimeZone {
  public:
@@ -113,14 +120,46 @@ class TimeZone {
       1970-01-01 00:00:00 UTC; MySQL's zero timestamp for a zero local time.
       False if the fields are no date or the instant is outside the
       protocol's range. */
-  bool instant(const mle::Temporal &local, int64_t *microseconds) const;
+  bool instant(const mle::Temporal &local, int64_t *microseconds);
+  /** Takes the interval other has found, if other is this zone. */
+  void learn(const TimeZone &other) {
+    if (other.m_id != m_id) return;
+    m_from = other.m_from;
+    m_to = other.m_to;
+    m_offset = other.m_offset;
+  }
+
  private:
-  enum class Kind { kSystem, kOffset, kNamed };
-  Kind m_kind = Kind::kOffset;
-  /** kOffset: seconds east of UTC. */
-  int32_t m_offset = 0;
-  /** kNamed. */
+  /** The instant, in seconds, of local (seconds since the epoch on the
+      zone's clock) by the zone's rules; sets the interval when local has
+      one offset. */
+  bool lookup(int64_t local, const mle::Temporal &fields, int64_t *seconds);
+
+  /** The rules: a zone of the zone data, or (nullptr) the C library's for
+      mysqld's own zone; unused while the interval is everything. */
   const std::chrono::time_zone *m_zone = nullptr;
+  /** Local times in [m_from, m_to) are the instants local - m_offset. */
+  int64_t m_from = 0;
+  int64_t m_to = 0;
+  int64_t m_offset = 0;
+  /** Which zone this is: copies of one set() share it. */
+  uint64_t m_id = 0;
+};
+
+/** A session's current zone, kept between statements: looked up again only
+    when the session's zone has another name. */
+class ZoneCache {
+ public:
+  /** The zone of thd's session now; nullptr (and *name, for the message)
+      if it is not known to MLE. */
+  TimeZone *current(MYSQL_THD thd, std::string *name);
+  /** A statement converted with its copy of the zone: what it found. */
+  void learn(const TimeZone &zone) { m_zone.learn(zone); }
+
+ private:
+  std::string m_name;
+  bool m_known = false;
+  TimeZone m_zone;
 };
 
 /** A session's time zone as OPTIONS names it (§9.8): an offset "+hh:mm" or
@@ -164,8 +203,9 @@ struct Routine {
   static void destroy(Routine *routine);
 
   /** The arguments of the running call (OUT parameters as NULL), each with
-      the tag of its declared type or NULL. False after reporting an error. */
-  bool read_args(std::vector<mle::Value> *args) const;
+      the tag of its declared type or NULL. zones: the session's, for
+      TIMESTAMP arguments. False after reporting an error. */
+  bool read_args(std::vector<mle::Value> *args, ZoneCache *zones) const;
 
   /** Stores the return value and the OUT/INOUT values of a successful
       call with the server's assignment rules. False after an error was

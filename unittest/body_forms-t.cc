@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -106,6 +107,7 @@ class MleBodyForms : public ::testing::Test {
       if (error) *error = error_of(res);
       return 0;
     }
+    s_prepared[p.routine_id] = p;
     return p.routine_id;
   }
 
@@ -125,9 +127,23 @@ class MleBodyForms : public ::testing::Test {
     return r.ret ? *r.ret : Value();
   }
 
+  /** Other options for the worker: OPTIONS goes only to a worker with
+      nothing prepared (§9.8), so RESET first, as when another session takes
+      the worker. What the worker did not take leaves it without options. */
+  static Outcome try_options(const OptionsMsg &o, std::string *err,
+                             Error *guest = nullptr) {
+    EXPECT_EQ(s_host->worker.reset(err), Outcome::kOk) << *err;
+    return s_host->options(o, err, guest);
+  }
+
+  /** try_options() that must succeed, and the routines prepared again. */
   static void set_options(const OptionsMsg &o) {
     std::string err;
-    ASSERT_EQ(s_host->options(o, &err), Outcome::kOk) << err;
+    ASSERT_EQ(try_options(o, &err), Outcome::kOk) << err;
+    for (const auto &[id, p] : s_prepared) {
+      ResultMsg res;
+      EXPECT_EQ(s_host->prepare(p, &res), 0u) << error_of(res);
+    }
   }
 
   /** OPTIONS with one setting (Appendix B.2) and the default zone. */
@@ -148,6 +164,8 @@ class MleBodyForms : public ::testing::Test {
   static inline Launcher *s_launcher = nullptr;
   static inline TestHost *s_host = nullptr;
   static inline uint64_t s_id = 0;
+  /** The routines prepared so far, for set_options(). */
+  static inline std::map<uint64_t, PrepareMsg> s_prepared;
 };
 
 // ---------------------------------------------------------------- JavaScript
@@ -242,12 +260,12 @@ TEST_F(MleBodyForms, JsIntegerTypeOption) {
   // Oracle's default UNSAFE_STRING: Number when safe, else String.
   EXPECT_EQ(ret(id, {small}), Value::string("number:5"));
   EXPECT_EQ(ret(id, {big}), Value::string("string:1152921504606846976"));
-  set_options(setting("js.integer_type", "unsafe_bigint"));
+  set_options(setting("integer_type", "unsafe_bigint"));
   EXPECT_EQ(ret(id, {small}), Value::string("number:5"));
   EXPECT_EQ(ret(id, {big}), Value::string("bigint:1152921504606846976"));
-  set_options(setting("js.integer_type", "bigint"));
+  set_options(setting("integer_type", "bigint"));
   EXPECT_EQ(ret(id, {small}), Value::string("bigint:5"));
-  set_options(setting("js.integer_type", "string"));
+  set_options(setting("integer_type", "string"));
   EXPECT_EQ(ret(id, {small}), Value::string("string:5"));
   // BIGINT UNSIGNED beyond 2^63.
   const uint64_t u = prepare("js", "iu", "return typeof a + ':' + String(a);",
@@ -264,7 +282,7 @@ TEST_F(MleBodyForms, JsDecimalTypeOption) {
                               kVarchar);
   ASSERT_NE(id, 0u);
   EXPECT_EQ(ret(id, {Value::decimal("1.50")}), Value::string("string:1.50"));
-  set_options(setting("js.decimal_type", "number"));
+  set_options(setting("decimal_type", "number"));
   EXPECT_EQ(ret(id, {Value::decimal("1.50")}), Value::string("number:1.5"));
 }
 
@@ -308,22 +326,23 @@ TEST_F(MleBodyForms, JsDatesInTheSessionTimeZone) {
             dt(Tag::kDate, 2024, 1, 3, 0, 0, 0));
   o.time_zone = "Europe/Kyiv";
   set_options(o);
+  EXPECT_EQ(ret(id, {dt(Tag::kDatetime, 2024, 1, 2, 3, 4, 5)}),
+            Value::string("2024-01-02T01:04:05.000Z"));  // Kyiv: +02:00
   // A zone the worker does not know: GUEST_ERROR with the marker
-  // MLE-TimeZone, and the options in force are unchanged (§9.8).
+  // MLE-TimeZone, and the worker has no options in force, as before (§9.8).
   o.time_zone = "Mars/Olympus";
   std::string err;
   Error guest;
-  EXPECT_EQ(s_host->options(o, &err, &guest), Outcome::kGuestError);
+  EXPECT_EQ(try_options(o, &err, &guest), Outcome::kGuestError);
   EXPECT_EQ(guest.language, wire::kLanguageTimeZone);
   EXPECT_NE(err.find("unknown time zone"), std::string::npos) << err;
-  EXPECT_TRUE(s_host->worker.options_in_force());
-  EXPECT_EQ(ret(id, {dt(Tag::kDatetime, 2024, 1, 2, 3, 4, 5)}),
-            Value::string("2024-01-02T01:04:05.000Z"));  // Kyiv: +02:00
+  EXPECT_FALSE(s_host->worker.options_in_force());
   // A value the worker does not accept for a setting it knows: MLE-Option;
   // a name it does not know is ignored.
-  EXPECT_EQ(s_host->options(setting("js.integer_type", "roman"), &err, &guest),
+  EXPECT_EQ(try_options(setting("integer_type", "roman"), &err, &guest),
             Outcome::kGuestError);
   EXPECT_EQ(guest.language, wire::kLanguageOption);
+  EXPECT_FALSE(s_host->worker.options_in_force());
   set_options(setting("zz.unknown_setting", "1"));
 }
 
@@ -367,8 +386,17 @@ TEST_F(MleBodyForms, JsOtherResults) {
   EXPECT_EQ(ret(js_expr("({a: 1, b: [true]})", json), {}),
             Value::json("{\"a\":1,\"b\":[true]}"));
   EXPECT_EQ(ret(js_expr("'{\"x\": 2}'", json), {}), Value::json("{\"x\":2}"));
-  EXPECT_EQ(ret(js_expr("({toJSON() { return 'me'; }})", json), {}),
+  // Oracle: a string that toJSON() gives is JSON text; one that is not
+  // (a Date's) fails the conversion.
+  EXPECT_EQ(ret(js_expr("({toJSON() { return '\"me\"'; }})", json), {}),
             Value::json("\"me\""));
+  for (const char *bad : {"({toJSON() { return 'me'; }})", "new Date(0)", "5"}) {
+    uint32_t s;
+    const ResultMsg r = call(js_expr(bad, json), {}, &s);
+    EXPECT_EQ(s, u(Outcome::kGuestError)) << bad;
+    ASSERT_TRUE(r.error.has_value()) << bad;
+    EXPECT_EQ(r.error->language, wire::kLanguageType) << bad;
+  }
   const ParamType blob = ty(Tag::kBytes, "BLOB");
   EXPECT_EQ(ret(js_expr("new Uint8Array([1, 2, 255])", blob), {}),
             Value::bytes(std::string("\x01\x02\xff", 3)));

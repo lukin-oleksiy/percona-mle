@@ -282,6 +282,9 @@ class Proto {
       const bool more = sent + len < body.size();
       m.len = static_cast<uint32_t>(len);
       m.flags = more ? uint32_t{wire::kMore} : 0U;
+      // A worker that asked to be retired says so in every RESULT, in all
+      // its chunks.
+      if (m_tainted && op == wire::Op::kResult) m.flags |= wire::kTainted;
       if (sent != 0 && chunk_delay_ms != 0) usleep(chunk_delay_ms * 1000);
       post(m, body.substr(sent, len));
       sent += len;
@@ -481,7 +484,7 @@ class Proto {
           _exit(static_cast<int>(status));
         }
         case Step::kTainted:
-          m_h->stats.tainted = 1;
+          m_tainted = true;
           break;
         case Step::kBadStats:
           m_h->stats.heap_used = ~0ULL;
@@ -512,6 +515,17 @@ class Proto {
           m_logging = true;
           log(r.h, r.body);
           break;
+        case Step::kDrainControl:
+          while (true) {
+            unsigned char buf[32];
+            const ssize_t n =
+                recv(wire::kControlFd, buf, sizeof buf, MSG_DONTWAIT);
+            if (n <= 0) break;
+            wire::MessageHeader h{};
+            h.total_len = static_cast<uint64_t>(n);
+            log(h, std::string(reinterpret_cast<const char *>(buf), n));
+          }
+          break;
         default:
           _exit(97);
       }
@@ -527,6 +541,7 @@ class Proto {
   std::map<wire::Op, std::string> m_armed;
   std::string m_log;
   bool m_logging = false;
+  bool m_tainted = false;
 };
 
 }  // namespace

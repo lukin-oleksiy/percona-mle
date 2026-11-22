@@ -29,6 +29,8 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <map>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -68,6 +70,9 @@ class Hooks : public CallHooks {
     SqlRefusal why;
     SqlAction action;
     uint64_t stmt_id;
+    /** The action had been given to sql() before. */
+    bool ran = false;
+    uint64_t error_id = 0;
   };
 
   void sql(const SqlMsg &q, SqlResultMsg *r) override {
@@ -77,10 +82,15 @@ class Hooks : public CallHooks {
     else
       r->kind = SqlResultKind::kOk;
   }
-  void sql_refused(SqlRefusal why, SqlAction action, uint64_t stmt_id,
-                   SqlResultMsg *error) override {
-    refused.push_back({why, action, stmt_id});
-    CallHooks::sql_refused(why, action, stmt_id, error);
+  void sql_into(const SqlMsg &q, SqlResultMsg *r, DirectReply *,
+                uint64_t error_id) override {
+    error_ids.push_back(error_id);
+    sql(q, r);
+  }
+  void sql_refused(SqlRefusal why, bool ran, SqlAction action, uint64_t stmt_id,
+                   uint64_t error_id, SqlResultMsg *error) override {
+    refused.push_back({why, action, stmt_id, ran, error_id});
+    CallHooks::sql_refused(why, ran, action, stmt_id, error_id, error);
   }
   bool sql_bytes_reserve(uint64_t bytes) override {
     if (bytes > bytes_bound - bytes_held) return false;
@@ -102,6 +112,8 @@ class Hooks : public CallHooks {
   std::function<void(const LibraryMsg &, LibraryResultMsg *)> on_library;
   std::vector<SqlAction> ran;
   std::vector<Refused> refused;
+  /** The error_id each call of sql_into() was given. */
+  std::vector<uint64_t> error_ids;
   std::vector<LibraryMsg> libraries;
   uint64_t bytes_bound = std::numeric_limits<uint64_t>::max();
   uint64_t bytes_held = 0;
@@ -402,7 +414,9 @@ class MleWorkerProtocol : public ::testing::Test {
         r.outcome = w.reset(&r.error);
         break;
       case Where::kOptions:
+        // OPTIONS goes only to a worker with nothing prepared: after RESET.
         armed(Op::kOptions);
+        EXPECT_EQ(w.reset(&err), Outcome::kOk) << err;
         r.outcome = w.options(OptionsMsg(), &r.guest, &r.error);
         break;
       case Where::kContinue:
@@ -558,7 +572,7 @@ TEST_F(MleWorkerProtocol, RequestsTheHostRefuses) {
   EXPECT_FALSE(w->options_in_force());
   OptionsMsg good;
   good.time_zone = "Europe/Kyiv";
-  good.settings = {{"js.decimal_type", "number"}};
+  good.settings = {{"decimal_type", "number"}};
   ASSERT_EQ(w->options(good, nullptr, &err), Outcome::kOk) << err;
   EXPECT_TRUE(w->options_in_force());
   // A CALL of an id that is not prepared, or with other arguments.
@@ -851,9 +865,11 @@ TEST_F(MleWorkerProtocol, HeaderViolations) {
             Script().post(u(Op::kSql), 1, 0, select), "bad status");
   violation("status of a LIBRARY", Where::kCall,
             Script().post(u(Op::kLibrary), 4, 0, import), "bad status");
-  // flags: only MORE, and MORE as §5.2 says.
-  violation("unknown flag", Where::kCall, raw_result(good, 0, 2),
+  // flags: only MORE and TAINTED, and MORE as §5.2 says.
+  violation("unknown flag", Where::kCall, raw_result(good, 0, 4),
             "unknown flags");
+  violation("unknown flag beside TAINTED", Where::kCall,
+            raw_result(good, 0, wire::kTainted | 8), "unknown flags");
   violation("MORE on a short chunk", Where::kCall,
             raw_result(good, 0, kMore, mle_test::kAuto, 2 * kArena),
             "does not fill the arena");
@@ -1115,12 +1131,17 @@ TEST_F(MleWorkerProtocol, ResultViolations) {
   m.findings = {"x"};
   violation("findings without check", Where::kPrepare, result(m),
             "findings where");
+  // Findings go only with status OK (§9.4).
+  m = failed("none");
+  m.findings = {"x"};
+  violation("findings of a failed PREPARE", Where::kPrepareCheck,
+            result(m, Status::kGuestError), "findings where");
   // Error.language.
   const char *kLanguage = "an Error.language that is not allowed";
   violation("a language the worker did not list", Where::kCall,
             fail_with(Status::kGuestError, "js"), kLanguage);
-  violation("MLE-Type of a PREPARE", Where::kPrepare,
-            fail_with(Status::kGuestError, wire::kLanguageType), kLanguage);
+  violation("MLE-Type of a PREPARE with another status", Where::kPrepare,
+            fail_with(Status::kInternal, wire::kLanguageType), kLanguage);
   violation("MLE-Type of a PARSE_LIBRARY", Where::kParseLibrary,
             fail_with(Status::kGuestError, wire::kLanguageType), kLanguage);
   violation("MLE-Type with another status", Where::kCall,
@@ -1373,9 +1394,14 @@ TEST_F(MleWorkerProtocol, OptionsErrors) {
                   fail_with(Status::kGuestError, marker), Outcome::kGuestError);
     EXPECT_EQ(r.guest.language, marker);
     EXPECT_EQ(r.guest.message, "boom");
-    EXPECT_TRUE(r.w->options_in_force());  // those of before
+    // As before the OPTIONS: none in force (it came after a RESET), and an
+    // OPTIONS that failed puts none in force.
+    EXPECT_FALSE(r.w->options_in_force());
     ResultMsg res;
     std::string err;
+    EXPECT_EQ(r.w->prepare(routine(3, ""), hooks, &res, &err),
+              Outcome::kRefused);
+    EXPECT_EQ(r.w->options(OptionsMsg(), nullptr, &err), Outcome::kOk) << err;
     EXPECT_EQ(r.w->prepare(routine(3, ""), hooks, &res, &err), Outcome::kOk)
         << err;
   }
@@ -1446,6 +1472,273 @@ TEST_F(MleWorkerProtocol, RetirementAfterTheTopLevelRequest) {
       << w->failure();
 }
 
+// §5.1, §11.5: TAINTED is bit 1 of msg.flags of a RESULT, alike in all its
+// chunks: the request keeps its outcome and the worker is retired when the
+// top-level request is over. In any other message it is a violation.
+TEST_F(MleWorkerProtocol, TaintedFlag) {
+  const std::string good = bytes_of(good_result());
+  Ran r = run(Where::kCall, raw_result(good, 0, wire::kTainted));
+  ASSERT_NE(r.w, nullptr);
+  EXPECT_EQ(r.outcome, Outcome::kOk) << r.error;
+  EXPECT_EQ(*r.result.ret, Value::i64(42));
+  EXPECT_FALSE(r.w->usable());
+  EXPECT_NE(r.w->failure().find("retired"), std::string::npos);
+  EXPECT_TRUE(r.w->process().wait_exit(2000));
+  // A RESULT of several chunks, each with the flag.
+  ResultMsg big = good_result();
+  big.console_out.assign(3 * kArena, 'o');
+  r = run(Where::kCall, Script().tainted().result(big));
+  EXPECT_EQ(r.outcome, Outcome::kOk) << r.error;
+  EXPECT_EQ(r.result.console_out.size(), 3u * kArena);
+  EXPECT_FALSE(r.w->usable());
+  // The RESULT of a request without guest code retires as well.
+  r = run(Where::kDrop, raw_result(bytes_of(ResultMsg()), 0, wire::kTainted));
+  EXPECT_EQ(r.outcome, Outcome::kOk) << r.error;
+  EXPECT_FALSE(r.w->usable());
+
+  // The chunks of a RESULT must agree on it.
+  const std::string full(kArena, 'x');
+  violation("TAINTED in the first chunk only", Where::kCall,
+            raw_result(full, 0, kMore | wire::kTainted, kArena, kArena + 10)
+                .wait()
+                .post(u(Op::kResult), 0, 0, "0123456789", 10, kArena + 10),
+            "chunk does not continue the message");
+  violation("TAINTED in the last chunk only", Where::kCall,
+            raw_result(full, 0, kMore, kArena, kArena + 10)
+                .wait()
+                .post(u(Op::kResult), 0, wire::kTainted, "0123456789", 10,
+                      kArena + 10),
+            "chunk does not continue the message");
+  // Elsewhere the flag is a violation.
+  const char *kElsewhere = "TAINTED in a message that is not a RESULT";
+  violation("TAINTED in an SQL", Where::kCall,
+            Script().post(u(Op::kSql), 0, wire::kTainted, bytes_of(execute())),
+            kElsewhere);
+  violation("TAINTED in a LIBRARY", Where::kCall,
+            Script().post(u(Op::kLibrary), 0, wire::kTainted,
+                          bytes_of(library())),
+            kElsewhere);
+  violation("TAINTED in a CONTINUE", Where::kContinue,
+            Script().post(u(Op::kContinue), 0, wire::kTainted, "", 0, 0),
+            kElsewhere);
+}
+
+// §10.2: KEEP (flags bit 1 of an SQL message) is not implemented by this
+// host: the server's statement service does not let a statement outlive the
+// stored program call that prepared it. The bit is an unknown flag.
+TEST_F(MleWorkerProtocol, KeepIsNotAccepted) {
+  SqlMsg m = action(SqlAction::kPrepare);
+  m.statement = "SELECT 1";
+  m.flags = 2;
+  violation("KEEP", Where::kCall, sql(m).answer(), "bad SQL");
+}
+
+// §9.8: OPTIONS goes only to a worker in which no id is prepared; the
+// options in force end with RESET.
+TEST_F(MleWorkerProtocol, OptionsOnlyWithNothingPrepared) {
+  auto w = start();
+  ASSERT_NE(w, nullptr);
+  std::string err;
+  // Nothing is prepared yet: the host may still replace the options.
+  EXPECT_EQ(w->options(OptionsMsg(), nullptr, &err), Outcome::kOk) << err;
+  prepare(*w, 1, Script().answer());
+  OptionsMsg other;
+  other.time_zone = "+05:00";
+  EXPECT_EQ(w->options(other, nullptr, &err), Outcome::kRefused);
+  EXPECT_NE(err.find("nothing is prepared"), std::string::npos) << err;
+  EXPECT_TRUE(w->options_in_force());
+  // DROP of the last routine: nothing is prepared again.
+  EXPECT_EQ(w->drop(1, &err), Outcome::kOk) << err;
+  EXPECT_EQ(w->options(other, nullptr, &err), Outcome::kOk) << err;
+  prepare(*w, 2, Script().answer());
+  EXPECT_EQ(w->reset(&err), Outcome::kOk) << err;
+  EXPECT_FALSE(w->options_in_force());
+  ResultMsg res;
+  EXPECT_EQ(w->prepare(routine(3, ""), hooks, &res, &err), Outcome::kRefused);
+  EXPECT_EQ(w->options(other, nullptr, &err), Outcome::kOk) << err;
+  EXPECT_EQ(w->prepare(routine(3, ""), hooks, &res, &err), Outcome::kOk) << err;
+}
+
+// The hook interface: sql_into() is told the id its reply has if it is an
+// ERROR, and sql_refused() whether the action had been given to sql_into().
+// An ERROR's SQLSTATE, number and message are made what §10.4 says.
+TEST_F(MleWorkerProtocol, HookErrorIdsAndRefusals) {
+  auto w = start();
+  ASSERT_NE(w, nullptr);
+  ResultMsg res;
+  std::string err;
+  prepare(*w, 1, Script()
+                     .message(Op::kSql, execute("a", 1))
+                     .message(Op::kSql, execute("b", 2))
+                     .message(Op::kSql, execute("c", 3))
+                     .log()
+                     .message(Op::kSql, execute("d", 4))
+                     .answer());
+  int n = 0;
+  hooks.on_sql = [&](const SqlMsg &, SqlResultMsg *r) {
+    r->kind = n++ == 1 || n == 4 ? SqlResultKind::kError : SqlResultKind::kOk;
+    // What a hook must not send: the Worker repairs it.
+    r->sql_errno = 0;
+    r->sqlstate = "bad";
+    r->message = "caf\xC3 broken";
+  };
+  ASSERT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kOk) << err;
+  // Each SQL message takes the next id of the top-level request, whether
+  // its reply is an ERROR (the second and fourth) or not.
+  EXPECT_EQ(hooks.error_ids, (std::vector<uint64_t>{1, 2, 3, 4}));
+  const auto log = parse_log(res.console_out);
+  ASSERT_EQ(log.size(), 2u);  // the CALL and the reply to the fourth
+  SqlResultMsg sent;
+  ASSERT_TRUE(decode(log[1].body, &sent, &err)) << err;
+  EXPECT_EQ(sent.kind, SqlResultKind::kError);
+  EXPECT_EQ(sent.error_id, 4u);
+  EXPECT_EQ(sent.sqlstate, "HY000");
+  EXPECT_EQ(sent.sql_errno, 1105u);
+  EXPECT_EQ(sent.message, "caf\xEF\xBF\xBD broken");
+  EXPECT_TRUE(hooks.refused.empty());
+
+  // Refusals: before the hook ran (serving PREPARE), and after it (the
+  // statement was interrupted while it ran).
+  hooks.on_sql = nullptr;
+  hooks.error_ids.clear();
+  EXPECT_EQ(w->prepare(routine(2, "prepare:" + sql(execute()).answer().hex()),
+                       hooks, &res, &err),
+            Outcome::kOk)
+      << err;
+  ASSERT_EQ(hooks.refused.size(), 1u);
+  EXPECT_FALSE(hooks.refused[0].ran);
+  EXPECT_EQ(hooks.refused[0].error_id, 1u);
+  hooks.refused.clear();
+  prepare(*w, 3, Script().message(Op::kSql, execute()).answer());
+  hooks.on_sql = [&](const SqlMsg &, SqlResultMsg *r) {
+    w->interrupt();
+    r->kind = SqlResultKind::kOk;
+  };
+  EXPECT_EQ(w->call(3, 0, {}, hooks, &res, &err), Outcome::kOk) << err;
+  EXPECT_TRUE(w->interrupted());
+  ASSERT_EQ(hooks.refused.size(), 1u);
+  EXPECT_EQ(hooks.refused[0].why, SqlRefusal::kInterrupted);
+  EXPECT_TRUE(hooks.refused[0].ran);
+}
+
+// The id an ERROR has is the one its hook was told, also when the hook ran
+// nested requests whose statements failed meanwhile; each is held (§10.4,
+// §10.8).
+TEST_F(MleWorkerProtocol, ErrorIdsWithNestedRequests) {
+  auto w = start();
+  ASSERT_NE(w, nullptr);
+  ResultMsg res;
+  std::string err;
+  prepare(*w, 1, Script().message(Op::kSql, execute()).answer());
+  prepare(*w, 2, Script().log().message(Op::kSql, execute()).answer());
+  std::map<uint32_t, uint64_t> told;  // by depth
+  std::string nested_log;
+  hooks.on_sql = [&](const SqlMsg &, SqlResultMsg *r) {
+    const uint64_t mine = hooks.error_ids.back();
+    const uint32_t depth = w->depth();
+    if (depth == 1) {
+      ResultMsg nested;
+      std::string e;
+      EXPECT_EQ(w->call(2, 0, {}, hooks, &nested, &e), Outcome::kOk) << e;
+      nested_log = nested.console_out;
+    }
+    told[depth] = mine;
+    r->kind = SqlResultKind::kError;
+    r->sql_errno = 1000 + depth;
+    r->sqlstate = "HY000";
+    r->message = "at depth " + std::to_string(depth);
+  };
+  ASSERT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kOk) << err;
+  ASSERT_EQ(told.size(), 2u);
+  EXPECT_LT(told[1], told[2]);  // the outer statement's id came first
+  // The nested statement's reply, as the worker received it.
+  const auto log = parse_log(nested_log);
+  ASSERT_EQ(log.size(), 2u);  // the nested CALL and the reply
+  SqlResultMsg sent;
+  ASSERT_TRUE(decode(log[1].body, &sent, &err)) << err;
+  EXPECT_EQ(sent.error_id, told[2]);
+  EXPECT_EQ(sent.sql_errno, 1002u);
+  // Both are held under the ids their hooks were told (the reply carries
+  // the id it is held under).
+  for (const auto &[depth, id] : told) {
+    const HeldError *held = w->held_error(id);
+    ASSERT_NE(held, nullptr) << depth;
+    EXPECT_EQ(held->message, "at depth " + std::to_string(depth));
+  }
+}
+
+// §11.1 step 1 with the atomic state: a thread that asks for interrupts all
+// the time while requests come and go. A record is made only between the
+// post of a request's first chunk and the receipt of its RESULT, so an
+// INTERRUPT names only an interruptible request that was sent, and no record
+// appears while the worker is idle.
+TEST_F(MleWorkerProtocol, InterruptStateUnderAKillerThread) {
+  auto w = start();
+  ASSERT_NE(w, nullptr);
+  ResultMsg res;
+  std::string err;
+  prepare(*w, 1, Script().answer());
+  prepare(*w, 2, Script().drain_control().answer());
+  // call_seq: OPTIONS 1, the PREPAREs 2 and 3; then the loop.
+  uint64_t seq = 3;
+  std::set<uint64_t> calls, others;
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> asked{0};
+  std::thread killer([&] {
+    while (!stop.load()) {
+      w->interrupt();
+      asked++;
+    }
+  });
+  int recorded = 0;
+  const int kRounds = 20000;
+  for (int i = 0; i < kRounds && w->usable(); i++) {
+    if (i % 7 == 3) {
+      // Not interruptible: no INTERRUPT may name it.
+      ASSERT_EQ(w->drop(1000 + i, &err), Outcome::kOk) << err;
+      others.insert(++seq);
+      EXPECT_FALSE(w->interrupted());
+      continue;
+    }
+    ASSERT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kOk) << err;
+    calls.insert(++seq);
+    // Idle: the record of the request that is over stays as it is.
+    const bool was = w->interrupted();
+    recorded += was;
+    for (int k = 0; k < 20; k++) w->interrupt();
+    ASSERT_EQ(w->interrupted(), was);
+  }
+  stop = true;
+  killer.join();
+  ASSERT_TRUE(w->usable()) << w->failure();
+  EXPECT_GT(asked.load(), 0u);
+  // What the worker got on its control socket.
+  ASSERT_EQ(w->call(2, 0, {}, hooks, &res, &err), Outcome::kOk) << err;
+  size_t datagrams = 0;
+  for (const Logged &l : parse_log(res.console_out)) {
+    ASSERT_EQ(l.h.op, 0u);
+    ASSERT_EQ(l.body.size(), wire::kInterruptSize);
+    uint64_t named;
+    memcpy(&named, l.body.data() + 1, sizeof named);
+    EXPECT_TRUE(calls.contains(named)) << "INTERRUPT(" << named << ")";
+    EXPECT_FALSE(others.contains(named));
+    datagrams++;
+  }
+  std::cout << "[ INFO     ] " << kRounds << " requests, " << asked.load()
+            << " interrupt() calls, " << recorded << " records, " << datagrams
+            << " INTERRUPTs still queued\n";
+  // After the storm the worker serves on, and a request is interrupted as
+  // ever.
+  prepare(*w, 5, Script().await_interrupt().result(failed("none", "stopped"),
+                                                   u(Status::kInterrupted)));
+  std::thread late([&] {
+    while (!w->interrupted()) w->interrupt();
+  });
+  EXPECT_EQ(w->call(5, 0, {}, hooks, &res, &err), Outcome::kInterrupted);
+  late.join();
+  EXPECT_TRUE(w->usable());
+}
+
 TEST_F(MleWorkerProtocol, StatsAreReplaced) {
   Ran r = legal("stats", Where::kCall, Script().bad_stats().answer(),
                 Outcome::kOk);
@@ -1453,7 +1746,8 @@ TEST_F(MleWorkerProtocol, StatsAreReplaced) {
   EXPECT_EQ(s.heap_max, 100u);
   EXPECT_EQ(s.heap_used, 100u);
   EXPECT_EQ(s.state, 0u);
-  EXPECT_FALSE(s.tainted);
+  // Nothing is decided by the statistics (§3.1): the worker stays in use.
+  EXPECT_TRUE(r.w->usable());
 }
 
 TEST_F(MleWorkerProtocol, MailboxCannotBeResized) {
@@ -1548,21 +1842,24 @@ TEST_F(MleWorkerProtocol, SqlAndLibrary) {
   EXPECT_EQ(r[0].kind, SqlResultKind::kRows);
   EXPECT_EQ(r[0].rows[0].as_text(), "caf\xe9");
   EXPECT_EQ(r[1].kind, SqlResultKind::kError);
-  EXPECT_EQ(r[1].error_id, 1u);
+  // Each SQL message takes the next id; an ERROR carries its message's.
+  EXPECT_EQ(r[1].error_id, 2u);
   EXPECT_EQ(r[1].failed_row, wire::kNoRow);
-  EXPECT_EQ(r[2].error_id, 2u);
+  EXPECT_EQ(r[2].error_id, 3u);
   EXPECT_EQ(r[2].failed_row, 1u);
   EXPECT_EQ(r[3].kind, SqlResultKind::kEnd);
   EXPECT_EQ(r[4].kind, SqlResultKind::kOk);
   // The ERRORs are held for the routine's final error (§10.8).
-  const HeldError *held = w->held_error(2);
+  const HeldError *held = w->held_error(3);
   ASSERT_NE(held, nullptr);
   EXPECT_EQ(held->sql_errno, 1062u);
   EXPECT_EQ(held->sqlstate, "23000");
   EXPECT_EQ(held->message, "second");
-  EXPECT_EQ(w->held_error(1)->message, "first");
+  ASSERT_NE(w->held_error(2), nullptr);
+  EXPECT_EQ(w->held_error(2)->message, "first");
   EXPECT_EQ(w->held_error(0), nullptr);
-  EXPECT_EQ(w->held_error(3), nullptr);
+  EXPECT_EQ(w->held_error(1), nullptr);  // the id of a reply that was no ERROR
+  EXPECT_EQ(w->held_error(4), nullptr);
   EXPECT_EQ(w->held_error(999), nullptr);
   LibraryResultMsg lib;
   ASSERT_EQ(log[6].h.op, u(Op::kLibraryResult));
@@ -1800,11 +2097,42 @@ TEST_F(MleWorkerProtocol, NestedRequests) {
   };
   hooks.on_library = [&](const LibraryMsg &, LibraryResultMsg *) {
     std::string e;
-    EXPECT_EQ(w->drop(3, &e), Outcome::kRefused);
+    ResultMsg nested;
+    EXPECT_EQ(w->call(2, 0, {}, hooks, &nested, &e), Outcome::kRefused);
   };
   ASSERT_EQ(w->call(2, 0, {}, hooks, &res, &err), Outcome::kOk) << err;
   EXPECT_EQ(*res.ret, Value::i64(42));
   EXPECT_FALSE(w->is_prepared(3));
+}
+
+// A DROP asked for where no request can be sent (the worker is busy and the
+// caller is not in the SQL hook of its innermost request): the id is not
+// prepared at once, and the DROP goes out before the next top-level request.
+TEST_F(MleWorkerProtocol, DropWhileBusy) {
+  auto w = start();
+  ASSERT_NE(w, nullptr);
+  ResultMsg res;
+  std::string err;
+  prepare(*w, 1, Script().message(Op::kLibrary, library()).answer());
+  prepare(*w, 2, Script().answer());
+  prepare(*w, 3, Script().answer());
+  hooks.on_library = [&](const LibraryMsg &, LibraryResultMsg *) {
+    std::string e;
+    EXPECT_EQ(w->drop(2, &e), Outcome::kOk) << e;
+    EXPECT_FALSE(w->is_prepared(2));
+    EXPECT_EQ(w->drop(3, &e), Outcome::kOk) << e;
+  };
+  ASSERT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kOk) << err;
+  EXPECT_FALSE(w->is_prepared(2));
+  EXPECT_FALSE(w->is_prepared(3));
+  // The host does not call what is not prepared.
+  EXPECT_EQ(w->call(2, 0, {}, hooks, &res, &err), Outcome::kRefused);
+  // The DROPs that waited go out before the next top-level request; the id
+  // can be prepared and called again after them.
+  prepare(*w, 3, Script().answer());
+  EXPECT_TRUE(w->is_prepared(3));
+  EXPECT_EQ(w->call(3, 0, {}, hooks, &res, &err), Outcome::kOk) << err;
+  EXPECT_TRUE(w->usable());
 }
 
 // §8.1: a RESULT at a nested depth with the outer request's shape, and an
@@ -2054,7 +2382,8 @@ TEST_F(MleWorkerProtocol, NoNewWorkAfterAnInterrupt) {
   for (int i = 1; i <= 3; i++) {
     EXPECT_EQ(r[i].kind, SqlResultKind::kError) << i;
     EXPECT_EQ(r[i].sql_errno, 1317u);
-    EXPECT_EQ(r[i].error_id, uint64_t(i));
+    // The i-th SQL message after the first: its id is i + 1.
+    EXPECT_EQ(r[i].error_id, uint64_t(i + 1));
   }
   EXPECT_EQ(r[2].failed_row, 0u);
   EXPECT_EQ(r[4].kind, SqlResultKind::kOk);

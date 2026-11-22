@@ -34,14 +34,21 @@
   runs with its definer's rights both are the definer; for one that runs
   with the invoker's rights it is (definer, invoker); for mle_eval() and
   CREATE LIBRARY both are the account of the context in force. A session
-  holds one worker per principal and worker kind. A worker whose principal
-  names an account that was dropped or renamed is retired before its next
-  top-level request.
+  holds one worker per principal and worker kind. At CREATE the code is the
+  creator's, and the server does not tell the definer then: the routine is
+  checked in the worker of the account of the context in force. Code that
+  a routine's SQL submits (a routine it creates, mle_eval) has that
+  routine's principal. A worker whose principal names an account that was
+  dropped, renamed, or created after the worker started is retired before
+  its next top-level request.
 
-  Options (§9.8). Before every top-level PREPARE, CALL or PARSE_LIBRARY the
-  session's time zone and settings are compared with the options in force
-  in that worker, and OPTIONS is sent when they differ or none are in force
-  (a new worker, a kept one after its RESET).
+  Options (§9.8, Appendix A: Oracle's rule). A session has one set of fixed
+  options: its time zone and settings as they are when a worker first takes
+  them, before the session's first PREPARE, CALL or PARSE_LIBRARY. They
+  hold until mle_session_reset() (or COM_CHANGE_USER), whatever the session
+  does to its zone meanwhile. Every worker the session uses gets them once,
+  when the session takes it (new, or kept and RESET): OPTIONS goes only to
+  a worker with nothing prepared, and nothing is compared on a request.
 
   Only the session's own thread uses it (deinit gets the THD explicitly; the
   KILL handler touches only the list of running workers). UNINSTALL is
@@ -125,10 +132,12 @@ class Session {
   bool has_programs() const { return !m_programs.empty(); }
   /** The pid of the current principal's worker, or -1 (debug UDF). */
   long worker_pid();
-  /** mle_set_session_state(): language settings by their OPTIONS names
-      (protocol Appendix B.2); an empty value is the setting's default. They
-      reach each worker with its next top-level request. False while the
-      session has programs (Oracle's rule). */
+  /** mle_set_session_state(): settings by their OPTIONS names (protocol
+      Appendix B.2); an empty value is the setting's default. False while
+      the session has programs cached (Oracle's rule) or a request of it is
+      in progress. They become part of the session's fixed options at its
+      next request; options fixed earlier end, with the session's workers
+      released. */
   bool set_settings(
       const std::vector<std::pair<std::string, std::string>> &settings);
 
@@ -138,17 +147,9 @@ class Session {
     std::unique_ptr<mle::Worker> worker;
     std::string principal;
     WorkerKind kind = WorkerKind::kJvm;
-    /** The options in force in the worker, and what they were made from:
-        the session's zone as the server names it and the version of the
-        session's settings. */
-    mle::OptionsMsg options;
-    std::string zone;
-    uint64_t settings_version = 0;
     /** engine_forgets() when no account of the principal was known to be
-        dropped or renamed. */
+        dropped, renamed or created. */
     uint64_t forgets = 0;
-    /** Routines that are gone but whose DROP could not be sent yet. */
-    std::vector<uint64_t> undropped;
   };
   /** The key of a slot in m_workers: the principal and the kind of the
       language's worker ('\0' between: not in account names). */
@@ -171,8 +172,9 @@ class Session {
       top level with the session's options in force. nullptr after reporting
       the error (or for a session that is killed: the server reports it). */
   Slot *worker_for(const std::string &key, const Routine &routine);
-  /** OPTIONS when the session's zone or settings differ from the options in
-      force in the slot's worker, or none are. False after reporting. */
+  /** OPTIONS with the session's fixed options when the slot's worker has
+      none in force; the first OPTIONS a worker of the session answers OK
+      fixes them. False after reporting. */
   bool options_in(const std::string &key, Slot &slot, const Routine &routine);
   /** PREPAREs the routine in the slot's worker unless it is prepared there. */
   bool prepare_in(const std::string &key, Slot &slot, Routine &routine);
@@ -224,10 +226,15 @@ class Session {
   std::map<std::string, Slot> m_workers;
   /** Argument buffer of the top-level call, reused. */
   std::vector<mle::Value> m_args;
-  /** The session's language settings that are not at their default, by
-      name; and a number that changes with them. */
+  /** The session's settings that are not at their default, by name: what
+      mle_set_session_state() gave for the options to be fixed next. */
   std::map<std::string, std::string> m_settings;
-  uint64_t m_settings_version = 1;
+  /** The session's fixed options (§9.8), and the session's zone as the
+      server named it when they were fixed (for messages). */
+  std::optional<mle::OptionsMsg> m_fixed;
+  std::string m_fixed_zone;
+  /** The session's current zone, for TIMESTAMP values. */
+  ZoneCache m_zones;
   std::string m_out;
   std::string m_err;
   /** Oracle's stack_trace: the frames of the last call's runtime error. */

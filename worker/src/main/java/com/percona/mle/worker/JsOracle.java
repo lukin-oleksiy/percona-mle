@@ -99,9 +99,19 @@ final class JsOracle {
             // (libBridge: a Python library's module).
             lib: function (s, n) { return this.libBridge(s, n); },
             str: (v) => String(v),
+            // MySQL JSON from a JavaScript value, by Oracle's table (JavaScript stored program
+            // data types): a string is JSON text (else an error); a scalar of another type is an
+            // error; an object whose toJSON() gives a string is that JSON text (a Date's is not
+            // JSON: an error), else it is stringified, and one that stringifies to nothing is an
+            // error. undefined here means that error; what guest code throws passes through.
             json_text: (v) => {
-              if (typeof v === 'string') return JSON.stringify(JSON.parse(v));
-              if (typeof v === 'boolean' || typeof v === 'number' || typeof v === 'bigint') return undefined;
+              const text = (t) => { try { return JSON.stringify(JSON.parse(t)) } catch (e) { return undefined } };
+              if (typeof v === 'string') return text(v);
+              if (typeof v !== 'object') return undefined;
+              if (typeof v.toJSON === 'function') {
+                const r = v.toJSON('');
+                return typeof r === 'string' ? text(r) : JSON.stringify(r);
+              }
               return JSON.stringify(v);
             },
             set_text: (v) => v instanceof Set ? [...v].map(String).join(',') : undefined,
@@ -224,8 +234,8 @@ final class JsOracle {
       }
       case Values.Temporal tm -> switch (tm.tag()) {
         case Wire.T_TIME -> formatTime(tm);
-        case Wire.T_DATE -> (double) ((LocalDate) tm.toJava()).atStartOfDay(o.zone).toInstant().toEpochMilli();
-        default -> (double) ((LocalDateTime) tm.toJava()).atZone(o.zone).toInstant().toEpochMilli();
+        // Oracle's rules (Values.Temporal.jsMillis): a zero date is an invalid Date.
+        default -> tm.jsMillis(o.zone);
       };
       // An instant, as a Date is; the zero timestamp is an invalid Date.
       case Values.Timestamp ts -> ts.zero() ? Double.NaN : (double) ts.millis();
@@ -361,13 +371,9 @@ final class JsOracle {
         return v.isString() ? v.asString() : h.getMember("str").execute(v).asString();
       }
       case Wire.T_JSON -> {
-        Value s;
-        try {
-          s = h.getMember("json_text").execute(v);
-        } catch (org.graalvm.polyglot.PolyglotException e) {
-          if (e.isGuestException()) throw cannot(v, t, h);
-          throw e;
-        }
+        // An exception of guest code (a toJSON that throws, a BigInt in a container) passes
+        // through as it is.
+        Value s = h.getMember("json_text").execute(v);
         if (s.isNull()) throw cannot(v, t, h);
         return new MleJson(s.asString());
       }

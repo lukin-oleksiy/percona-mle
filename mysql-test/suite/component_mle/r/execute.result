@@ -192,23 +192,19 @@ recursive_sum(998)
 498501
 SELECT recursive_sum(999);
 ERROR HY000: JavaScript> Maximum frame limit of 1000 exceeded. Frames on stack: 1001. (recursive_sum, line 2, in sum)
-# Reserved parameter names (6115) and unsupported character sets (6117).
+# Reserved parameter names (6115) and unsupported types (6117).
 CREATE FUNCTION js_kw(console INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
 ERROR HY000: JavaScript> The identifier 'console' is not valid.
 CREATE FUNCTION py_kw(lambda INT) RETURNS INT LANGUAGE PYTHON AS $$ return 1 $$;
 ERROR HY000: Python> The identifier 'lambda' is not valid.
+CREATE FUNCTION js_geo(g GEOMETRY) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+ERROR HY000: MLE-Type> The type GEOMETRY is not supported (parameter 'g')
 CREATE FUNCTION js_latin(s VARCHAR(10) CHARSET latin1) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
 ERROR HY000: MLE-Type> The character set latin1 is not supported; use utf8mb4 or binary (parameter 's')
 # The session works on after the errors.
 SELECT js_add(1, 1), py_add(1, 1), java_add(1, 1);
 js_add(1, 1)	py_add(1, 1)	java_add(1, 1)
 2	2	2
-# GEOMETRY is bytes (protocol 7.3): the server's SRID and WKB.
-CREATE FUNCTION js_geo(g GEOMETRY) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return g instanceof Uint8Array ? g.length : -1 $$;
-SELECT js_geo(ST_GeomFromText('POINT(1 2)')) AS srid_and_wkb_bytes;
-srid_and_wkb_bytes
-25
-DROP FUNCTION js_geo;
 #
 # A worker per session and principal (D-8): SQL SECURITY DEFINER runs
 # as the definer, INVOKER as the current user.

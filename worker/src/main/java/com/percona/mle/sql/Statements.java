@@ -31,9 +31,9 @@ import java.util.Map;
  * direct statement and its home is CLOSED. Only ids that are not CLOSED are kept.
  *
  * <p>One round trip is an {@link Exchange}: {@link #begin} before the SQL message is sent, then
- * exactly one of error, ok, rows or end for the reply, which moves the id to its next state. The
- * methods that take a reply return null, or what is wrong with the reply: the host broke the
- * protocol then, and the worker ends.
+ * exactly one of error, ok, rows or end for the reply, which moves the id to its next state. Of a
+ * reply the worker checks only its kind ({@link Exchange#accepts}); the rest is the host's to get
+ * right (§1).
  *
  * <p>The tracker also keeps the values of a prepared statement's last execution: the host takes
  * all values with every execution, so the API's partial re-binding is done here ({@link #bind}).
@@ -58,15 +58,17 @@ public final class Statements {
 
   public enum State { CLOSED, IDLE, ROWS, NEXT }
 
-  private static final int MAX_PARAMETERS = 65535;
-
   private static final class Statement {
     final boolean prepared;
     final boolean toClient;
     State state;
-    /** The current result set's columns, as the decoder keeps them, and its row count. */
+    /** The current result set's columns, as the decoder keeps them. */
     Object columns;
-    long totalRows;
+    /**
+     * A prepared statement: the columns received last for the id. A later result set of the id
+     * that has exactly these columns comes without them (§10.3).
+     */
+    Object lastColumns;
     /** The values of the last execution of a prepared statement. */
     Object[] bound;
 
@@ -78,6 +80,11 @@ public final class Statements {
   }
 
   private final Map<Long, Statement> open = new HashMap<>();
+
+  /** A new request starts with no ids (§10.1). */
+  public void clear() {
+    open.clear();
+  }
 
   public State state(long id) {
     Statement s = open.get(id);
@@ -159,9 +166,14 @@ public final class Statements {
       return action != FETCH;
     }
 
-    /** The columns the first batch of the current result set had, for a later batch. */
+    /**
+     * The columns of a batch that carries none: of a later batch, the ones its set's first batch
+     * had; of a first batch, which only a prepared id can have without columns, the ones received
+     * last for the id. Null if there are none.
+     */
     public Object columns() {
-      return s == null ? null : s.columns;
+      if (s == null) return null;
+      return firstBatch() ? s.lastColumns : s.columns;
     }
 
     private void home(Statement t) {
@@ -177,11 +189,7 @@ public final class Statements {
     }
 
     /** The reply is OK. */
-    public String ok(boolean moreResults, long parameterCount, boolean otherFieldsZero, Object[] lastRow) {
-      if (parameterCount > MAX_PARAMETERS) return "param_count " + parameterCount;
-      if (action != PREPARE && parameterCount != 0) return "param_count in an OK that does not answer PREPARE";
-      if ((action == PREPARE || action == CLOSE) && !otherFieldsZero) return "fields set in the OK to PREPARE or CLOSE";
-      if (moreResults && (toClient || action == EXECUTE_MANY)) return "more_results where one OK is the whole reply";
+    public void ok(boolean moreResults, Object[] lastRow) {
       switch (action) {
         case CLOSE -> open.remove(id);
         case PREPARE -> open.put(id, new Statement(true, toClient, State.IDLE));
@@ -198,30 +206,19 @@ public final class Statements {
           }
         }
       }
-      return null;
     }
 
-    /**
-     * The reply is ROWS: one batch. columns: of a first batch, what the decoder keeps for the
-     * later ones; hasColumns: the batch carried a column list.
-     */
-    public String rows(boolean hasColumns, Object columns, long totalRows, long nrows, boolean more,
-        boolean moreResults) {
-      if (firstBatch() != hasColumns)
-        return hasColumns ? "columns in a later batch of a result set" : "no columns in the first batch of a result set";
-      if (!firstBatch() && totalRows != s.totalRows) return "another total_rows in a later batch";
-      if (more && (nrows == 0 || moreResults)) return "a batch with more = 1 and no rows, or with more_results";
+    /** The reply is ROWS: one batch of the set whose columns, as the decoder keeps them, are columns. */
+    public void rows(Object columns, boolean more, boolean moreResults) {
       Statement t = s;
+      if (t != null && t.prepared) t.lastColumns = columns;
       if (more) {
         if (t == null) {  // EXECUTE: a direct statement with rows to fetch
           t = new Statement(false, toClient, State.ROWS);
           open.put(id, t);
         }
         t.state = State.ROWS;
-        if (firstBatch()) {
-          t.columns = columns;
-          t.totalRows = totalRows;
-        }
+        t.columns = columns;
       } else if (moreResults) {
         if (t == null) {
           t = new Statement(false, toClient, State.NEXT);
@@ -232,7 +229,6 @@ public final class Statements {
       } else {
         home(t);
       }
-      return null;
     }
 
     /** The reply is END (to NEXT_RESULT): there is no further result. */

@@ -156,19 +156,17 @@ $$;
 SELECT recursive_sum(998);
 --error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT recursive_sum(999);
---echo # Reserved parameter names (6115) and unsupported character sets (6117).
+--echo # Reserved parameter names (6115) and unsupported types (6117).
 --error ER_LANGUAGE_COMPONENT_KEYWORD
 CREATE FUNCTION js_kw(console INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
 --error ER_LANGUAGE_COMPONENT_KEYWORD
 CREATE FUNCTION py_kw(lambda INT) RETURNS INT LANGUAGE PYTHON AS $$ return 1 $$;
 --error ER_LANGUAGE_COMPONENT_UNSUPPORTED_TYPE
+CREATE FUNCTION js_geo(g GEOMETRY) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+--error ER_LANGUAGE_COMPONENT_UNSUPPORTED_TYPE
 CREATE FUNCTION js_latin(s VARCHAR(10) CHARSET latin1) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
 --echo # The session works on after the errors.
 SELECT js_add(1, 1), py_add(1, 1), java_add(1, 1);
---echo # GEOMETRY is bytes (protocol 7.3): the server's SRID and WKB.
-CREATE FUNCTION js_geo(g GEOMETRY) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return g instanceof Uint8Array ? g.length : -1 $$;
-SELECT js_geo(ST_GeomFromText('POINT(1 2)')) AS srid_and_wkb_bytes;
-DROP FUNCTION js_geo;
 
 --echo #
 --echo # A worker per session and principal (D-8): SQL SECURITY DEFINER runs

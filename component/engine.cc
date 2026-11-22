@@ -74,6 +74,24 @@ uint64_t g_forgets = 0;                          // guarded by g_mutex
 /** g_forgets for readers without the mutex. */
 std::atomic<uint64_t> g_forgets_now{0};
 std::map<std::string, uint64_t> g_forgotten_at;  // guarded by g_mutex
+/** g_forgets when an account was created last. */
+uint64_t g_created_at = 0;                       // guarded by g_mutex
+
+/** A principal of two accounts: the one that owns the code need not have
+    existed when a worker of the principal started. */
+bool names_two_accounts(std::string_view principal) {
+  return principal.find(kCodeOf) != std::string_view::npos;
+}
+
+/** Under g_mutex: whether an account of the principal was dropped or
+    renamed, or may have been created, after g_forgets was since. */
+bool forgotten_locked(std::string_view principal, uint64_t since) {
+  if (g_created_at > since && names_two_accounts(principal)) return true;
+  // Either account of the principal: whose worker it is, whose code ran.
+  for (const auto &[account, at] : g_forgotten_at)
+    if (at > since && principal_has_account(principal, account)) return true;
+  return false;
+}
 std::multiset<uint64_t> g_marks;                 // guarded by g_mutex
 
 void prune_forgotten_locked() {
@@ -670,13 +688,10 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker, WorkerKind kind,
   g_counters.memory_gcs += static_cast<long>(worker->stats().memory_gcs);
   uint64_t generation = 0;
   bool current = false;
-  // Under g_mutex: whether the account was dropped or renamed since the
-  // session began.
+  // Under g_mutex: whether an account of the principal was dropped,
+  // renamed or created since the session began.
   const auto forgotten = [&principal, mark] {
-    // Either account of the principal: whose worker it is, whose code ran.
-    for (const auto &[account, at] : g_forgotten_at)
-      if (at > mark && principal_has_account(principal, account)) return true;
-    return false;
+    return forgotten_locked(principal, mark);
   };
   {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -691,8 +706,7 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker, WorkerKind kind,
   // anything is kept, after RESET (it forgets the session's routines and
   // trims its heap).
   const bool keep = current && !principal.empty() && worker_cache_size() > 0 &&
-                    worker->usable() && !worker->stats().tainted &&
-                    worker->depth() == 0;
+                    worker->usable() && worker->depth() == 0;
   // Until the worker is kept (or not), a new session of this principal waits
   // for it (engine_reuse_worker). Registered before the worker stops counting
   // as held: once mle_workers no longer counts it, a new session finds it
@@ -704,9 +718,9 @@ void engine_release_worker(std::unique_ptr<mle::Worker> worker, WorkerKind kind,
     std::vector<std::unique_ptr<mle::Worker>> evicted;
     {
       std::string error;
-      // RESET also tells whether a routine left a thread running (tainted).
-      if (worker->reset(&error) == mle::Outcome::kOk && worker->usable() &&
-          !worker->stats().tainted) {
+      // A worker that must not be reused (a routine left a thread running)
+      // says so with the RESULT of RESET: it is retired then, not usable.
+      if (worker->reset(&error) == mle::Outcome::kOk && worker->usable()) {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_launcher && generation == g_generation && !forgotten()) {
           g_cache.push_back({kind, principal, std::move(worker),
@@ -790,13 +804,29 @@ void engine_forget_account(const std::string &principal) {
   gone.clear();  // kills them, without the mutex
 }
 
+void engine_account_created() {
+  std::vector<std::unique_ptr<mle::Worker>> gone;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_created_at = ++g_forgets;
+    g_forgets_now.store(g_forgets);
+    for (auto it = g_cache.begin(); it != g_cache.end();) {
+      if (names_two_accounts(it->principal)) {
+        gone.push_back(std::move(it->worker));
+        it = g_cache.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  gone.clear();  // kills them, without the mutex
+}
+
 uint64_t engine_forgets() { return g_forgets_now.load(); }
 
 bool engine_account_forgotten(const std::string &principal, uint64_t since) {
   std::lock_guard<std::mutex> lock(g_mutex);
-  for (const auto &[account, at] : g_forgotten_at)
-    if (at > since && principal_has_account(principal, account)) return true;
-  return false;
+  return forgotten_locked(principal, since);
 }
 
 long engine_memory_used_percent() {

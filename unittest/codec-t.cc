@@ -171,7 +171,9 @@ TEST(MleProtocol, RegionLayout) {
   EXPECT_EQ(offsetof(MessageHeader, total_len), 24u);
   EXPECT_EQ(offsetof(MessageHeader, call_seq), 32u);
   EXPECT_EQ(offsetof(wire::WorkerStats, state), 24u);
-  EXPECT_EQ(offsetof(wire::WorkerStats, tainted), 28u);
+  EXPECT_EQ(offsetof(wire::WorkerStats, reserved), 28u);
+  EXPECT_EQ(uint32_t{wire::kMore}, 1u);
+  EXPECT_EQ(uint32_t{wire::kTainted}, 2u);
   EXPECT_EQ(wire::kMagic, uint32_t('M') | uint32_t('L') << 8 |
                               uint32_t('E') << 16 | uint32_t('1') << 24);
   EXPECT_EQ(wire::kVersion, 0x00010000u);
@@ -1259,14 +1261,15 @@ TEST(MleCodec, OptionsRoundTrip) {
   OptionsMsg m;
   EXPECT_EQ(message_round_trip(m), m);
   m.time_zone = "Europe/Kyiv";
-  m.settings = {{"js.decimal_type", "number"}, {"js.integer_type", "bigint"}};
+  m.settings = {{"decimal_type", "number"}, {"integer_type", "bigint"}};
   EXPECT_EQ(message_round_trip(m), m);
   // time_zone, then the list of (name, value).
   std::string bytes;
   encode(m, &bytes);
-  EXPECT_EQ(bytes.substr(0, 4 + 11 + 4 + 4 + 15),
-            std::string("\x0b\0\0\0Europe/Kyiv\x02\0\0\0\x0f\0\0\0js.decimal_type",
-                        38));
+  EXPECT_EQ(bytes.substr(0, 4 + 11 + 4 + 4 + 12),
+            std::string("\x0b\0\0\0Europe/Kyiv\x02\0\0\0\x0c\0\0\0"
+                        "decimal_type",
+                        35));
 }
 
 TEST(MleCodec, OptionsDomains) {
@@ -1491,6 +1494,25 @@ TEST(MleAssembler, BadChunksAreRejected) {
   }
 }
 
+// All chunks of a RESULT carry the same TAINTED flag (§5.2).
+TEST(MleAssembler, TaintedInEveryChunk) {
+  const std::string data(64, 'x');
+  for (const bool tainted : {false, true}) {
+    for (const bool agrees : {false, true}) {
+      Assembler a(64, wire::kMaxWorkerMessage);
+      MessageHeader first = header(64, 100, true);
+      MessageHeader last = header(36, 100, false);
+      if (tainted) first.flags |= wire::kTainted;
+      if (tainted == agrees) last.flags |= wire::kTainted;
+      ASSERT_EQ(a.add(first, data.data()), Assembler::Step::kNeedMore);
+      EXPECT_EQ(a.add(last, data.data()),
+                agrees ? Assembler::Step::kDone : Assembler::Step::kError);
+      if (agrees)
+        EXPECT_EQ((a.header().flags & wire::kTainted) != 0, tainted);
+    }
+  }
+}
+
 // What the header alone tells (§13).
 TEST(MleAssembler, WorkerHeaderCheck) {
   std::string error;
@@ -1517,8 +1539,18 @@ TEST(MleAssembler, WorkerHeaderCheck) {
     EXPECT_TRUE(bad([](MessageHeader &h) { h.status = 1; }, uint32_t(op)));
     EXPECT_TRUE(bad([](MessageHeader &h) { h.status = 4; }, uint32_t(op)));
   }
-  // flags: only MORE, and MORE only with a full arena.
-  EXPECT_TRUE(bad([](MessageHeader &h) { h.flags = 2; }));
+  // flags: only MORE and TAINTED, MORE only with a full arena, TAINTED only
+  // in a RESULT.
+  EXPECT_FALSE(bad([](MessageHeader &h) { h.flags = wire::kTainted; }));
+  EXPECT_FALSE(bad([](MessageHeader &h) {
+    h.flags = wire::kMore | wire::kTainted, h.len = 1024, h.total_len = 5000;
+  }));
+  for (const wire::Op op : {wire::Op::kReady, wire::Op::kSql,
+                            wire::Op::kLibrary, wire::Op::kContinue})
+    EXPECT_TRUE(bad([](MessageHeader &h) { h.flags = wire::kTainted; },
+                    uint32_t(op)))
+        << uint32_t(op);
+  EXPECT_TRUE(bad([](MessageHeader &h) { h.flags = 4; }));
   EXPECT_TRUE(bad([](MessageHeader &h) { h.flags = 0x80000001; }));
   EXPECT_TRUE(bad([](MessageHeader &h) { h.flags = 1, h.total_len = 5000; }));
   EXPECT_FALSE(bad([](MessageHeader &h) {

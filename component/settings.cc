@@ -85,6 +85,7 @@ ulonglong g_sql_row_max = 0;
 ulonglong g_sql_call_results_max = 0;
 uint g_sql_statements_max = 0;
 uint g_sql_chunk_rows = 0;
+bool g_sql_exec_time = false;
 char *g_languages = nullptr;
 char *g_cgroup_base = nullptr;
 char *g_dir = nullptr;
@@ -253,6 +254,7 @@ Registered g_registered[] = {
     {"languages", false},  {"cgroup_base", false}, {"dir", false},
     {"java_home", false},  {"sql_result_max", false}, {"sql_row_max", false},
     {"sql_statements_max", false}, {"sql_chunk_rows", false},
+    {"sql_exec_time", false},
     {"sql_call_results_max", false},
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
     {"package_dir", false}, {"pool_prewarm", false},
@@ -566,6 +568,14 @@ bool register_settings() {
           "chunk also ends at about 768 KB).",
           nullptr, nullptr, &chunk_rows, &g_sql_chunk_rows))
     return true;
+  BOOL_CHECK_ARG(bool) exec_time;
+  exec_time.def_val = false;
+  if (reg("sql_exec_time", PLUGIN_VAR_BOOL,
+          "Measure the server's execution time of each SQL statement a "
+          "routine runs (what getExecutionTime() reports; two clock reads "
+          "per statement). OFF: the time is reported as 0.",
+          nullptr, nullptr, &exec_time, &g_sql_exec_time))
+    return true;
 
   STR_CHECK_ARG(languages) languages;
   languages.def_val = const_cast<char *>(kAllLanguageNames);
@@ -699,6 +709,7 @@ size_t sql_call_results_max() {
 }
 size_t sql_statements_max() { return g_sql_statements_max; }
 uint32_t sql_chunk_rows() { return g_sql_chunk_rows; }
+bool sql_exec_time() { return g_sql_exec_time; }
 int spin_us() { return static_cast<int>(g_spin_us); }
 int interrupt_grace_ms() { return static_cast<int>(g_interrupt_grace_ms); }
 

@@ -24,20 +24,22 @@ import java.time.ZoneOffset;
 /**
  * The session's options (OPTIONS, §9.8): the time zone, in which the languages show local time
  * (DATETIME and TIMESTAMP values as JavaScript Dates and Python datetimes), and the settings this
- * worker knows (Appendix B.2): js.integer_type and js.decimal_type, how JavaScript receives
- * integers and DECIMAL. A setting that OPTIONS does not carry has its default.
+ * worker knows (Appendix B.2): integer_type, how JavaScript receives integers, and decimal_type,
+ * how JavaScript (a string or a number) and Python (a Decimal or a float) receive DECIMAL. Java
+ * has 64-bit integers and BigDecimal and uses neither. A setting that OPTIONS does not carry has
+ * its default.
  */
 final class Options {
-  static final String INTEGER_TYPE = "js.integer_type";
-  static final String DECIMAL_TYPE = "js.decimal_type";
+  static final String INTEGER_TYPE = "integer_type";
+  static final String DECIMAL_TYPE = "decimal_type";
 
-  // js.integer_type: a number when safe (within 2^53 - 1) and else a string or a BigInt; always
+  // integer_type: a number when safe (within 2^53 - 1) and else a string or a BigInt; always
   // a string; always a BigInt. The numbers are those of SqlOptions.INTEGER_TYPES.
   static final int INT_UNSAFE_STRING = 0;
   static final int INT_UNSAFE_BIGINT = 1;
   static final int INT_STRING = 2;
   static final int INT_BIGINT = 3;
-  // js.decimal_type (SqlOptions.DECIMAL_TYPES).
+  // decimal_type (SqlOptions.DECIMAL_TYPES).
   static final int DECIMAL_STRING = 0;
   static final int DECIMAL_NUMBER = 1;
 
@@ -61,7 +63,7 @@ final class Options {
     }
   }
 
-  /** A value of js.integer_type as its number, or -1 for a value that is none. */
+  /** A value of integer_type as its number, or -1 for a value that is none. */
   static int integerType(String value) {
     return switch (value) {
       case "unsafe_string" -> INT_UNSAFE_STRING;
@@ -72,7 +74,7 @@ final class Options {
     };
   }
 
-  /** A value of js.decimal_type as its number, or -1 for a value that is none. */
+  /** A value of decimal_type as its number, or -1 for a value that is none. */
   static int decimalType(String value) {
     return switch (value) {
       case "string" -> DECIMAL_STRING;

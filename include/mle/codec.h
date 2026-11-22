@@ -178,6 +178,11 @@ class Reader {
 
 /** Well-formed UTF-8 (§7.1). */
 bool is_valid_utf8(std::string_view s);
+/** Replaces each maximal subpart of an ill-formed UTF-8 sequence by U+FFFD
+    (§7.1): for the text the host composes or takes from the server for a
+    str field (names, error and warning messages). Never for code or names
+    of libraries: those cross as they are or not at all. */
+void repair_utf8(std::string *text);
 /** -?[0-9]+(\.[0-9]+)?, 1 to 100 bytes. */
 bool is_valid_decimal(std::string_view s);
 /** The domain of a DATE, TIME or DATETIME. */
@@ -467,7 +472,8 @@ bool decode(std::string_view body, LibraryResultMsg *m, std::string *error);
     caller copies each MessageHeader out of the region first and passes the
     copy; add() copies the chunk's bytes once, so the arena may change
     afterwards. Every chunk is checked against the arena size, the message
-    size limit and the first chunk. What only the receiver knows (the ops
+    size limit and the first chunk (its op, status, depth, call_seq,
+    total_len and TAINTED flag). What only the receiver knows (the ops
     allowed, the expected depth and call_seq, the limit of this op) it
     checks itself on the first chunk, before add(). */
 class Assembler {
@@ -507,8 +513,8 @@ class Assembler {
 
 /** Checks the header of a message a worker posted (already copied out),
     as far as the header alone tells (§13): an assigned op, status 0 unless
-    the op is RESULT (0 to 4) or READY (0 or 4), no flag but MORE, reserved
-    0, len within the arena, MORE only with a full arena, total_len within a
+    the op is RESULT (0 to 4) or READY (0 or 4), no flag but MORE and, in a
+    RESULT, TAINTED, reserved 0, len within the arena, MORE only with a full arena, total_len within a
     worker's limit, and every field of a CONTINUE but depth and call_seq.
     Whether the op is allowed, depth, call_seq and the limit of the op are
     the caller's to check. */
