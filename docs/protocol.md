@@ -2172,7 +2172,7 @@ generation number rather than by clearing; and it copies from the
 region only the fields it uses (§1). A worker encodes text
 in one pass, repairing (§7.1) only where its encoder found something to
 repair, and allocates nothing per call that it can reuse. The measured
-regressions and their causes are in `protocol-review.md` §17 and §18.
+regressions and their causes are in `protocol-review.md` §17 and §19.
 
 **Workers and sessions.** A kept worker is given to any session that
 needs its principal; a stricter host gives it to sessions of one account

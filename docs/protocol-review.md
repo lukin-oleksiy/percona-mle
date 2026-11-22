@@ -569,7 +569,7 @@ the worker spends about the same time. The cost is per-request work on the host 
 then in force asked for (options compared per request) or that the implementation added while
 following them (principal, grace clock, error records, copies of the RESULT). The later revision
 (options fixed per session, `TAINTED` in the header, no statistics per request) removes the
-first; the rest is implementation. HEAD (`61590fe`) was measured the same way (§18).
+first; the rest is implementation. HEAD (`61590fe`) was measured the same way (§19).
 
 ## 18. Revision from the measurements and the implementers' questions (22 Nov)
 
@@ -597,3 +597,27 @@ rule, decode and convert by tag, the copy rule, EXHAUSTED against §5.3 and lang
 the body, the replacement of options, TIMESTAMP against §7.2, the principal cache key, defaults
 without options, script scope, cross-references). Python's TIMESTAMP changes from a naive to an
 aware `datetime` (the reviewer's point: the naive form does not round-trip).
+
+## 19. Measured: the code before the revision (`61590fe`) against the pre-specification code (22 Nov)
+
+Same scripts, builds and pinning as §17 (files `head-*` in `exp/bench/proto10/`); the machine
+was loaded (load 1–33 from other work on CPUs 0–7), so only quiet rounds are used.
+
+* **The per-call regression of §17 is gone:** call per row js/py/java −0.6 / −0.5 / +0.7 %;
+  harness call_*, mix_* +0.1..+2.4 %; lev, types, ret, lib, rows, prep, write, vector, connect
+  no longer flagged. mysqld still spends +79 ns per call (`decode_with<ResultMsg>` +32, a string
+  built per call +19, `worker_for` +9, the grace setting read per call +7, kill guard +12,
+  `check_result` +6), but the worker spends −118 ns (no statistics per call), so wall time is
+  unchanged.
+* **TIMESTAMP:** Java +2 % (was +16 %), JavaScript −4 %; Python noisy (+4.5 / +11 %): GraalPy
+  formats an ISO string and parses it per value.
+* **Cold start, pool on, Java:** +2 % (was +10 %).
+* **Remaining regression: strings returned by the JVM worker** after the session did other work:
+  echo 1 KiB +12..+17 %, 64 KiB +13 % (Java) and +31..+33 % (JavaScript, Python); in a fresh
+  session no difference. All of it is `Text.repair`'s per-character scan before `getBytes`
+  (`Values.writeAs` self time 1.9 → 74 µs per 64 KiB).
+* `stmts_*` flagged by the harness under load (+6..+14 %), not reproduced by a profile of one
+  statement; to be rechecked on a quiet machine.
+
+The implementation work of §18 (host: no whole-RESULT copy and no per-call allocation; JVM:
+one-pass text encoding, Python TIMESTAMP built directly) targets exactly these.
