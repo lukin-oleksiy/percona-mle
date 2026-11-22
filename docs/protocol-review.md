@@ -621,3 +621,35 @@ was loaded (load 1–33 from other work on CPUs 0–7), so only quiet rounds are
 
 The implementation work of §18 (host: no whole-RESULT copy and no per-call allocation; JVM:
 one-pass text encoding, Python TIMESTAMP built directly) targets exactly these.
+
+## 20. Code aligned with the revision (22 Nov)
+
+Commits on `protocol-1.0` (local): host and component `f54471b`, `20fb1c7`, `e450f5b`; JVM worker
+`36816af`; V8 `9a74326`, `3ebe9c1`, `b774302`, `fa21d62` (tests); CPython `53a5806`; specification
+answers `308b0a6`, `cc02a53`.
+
+* **Host:** one-chunk messages decoded in the region with each field copied before it is
+  checked; the discarded SQL message's body never read; held errors forgotten by `call_seq`; no
+  per-call allocation; the kill handler installed only when the host sleeps or a routine's SQL
+  runs; the principal cached by routine, kind and account. Measured on CPUs 0–7 against
+  `61590fe`: call_java −13 % (≈ −205 ns per call), call_js −11 %.
+* **Component:** the account rule of §1 (new `accounts.{hpp,cc}`); options replaced by
+  `mle_set_session_state()` when nothing is cached; zone intervals that exclude repeated and
+  skipped hours, SYSTEM through the C library (new `time_zone.{hpp,cc}`); TIMESTAMP parameters
+  bound as local time (DATE_FORMAT showed UTC fields); temporal parameters of CAST bound as text
+  (a server defect asserted in debug builds).
+* **JVM worker:** one-pass UTF-8 encoding (0.30 → 0.10–0.17 ns per ASCII character); zone
+  interval cache (instant→local 20 → 7 ns); Java TIMESTAMP is `Instant`; Python TIMESTAMP an
+  aware `datetime` built from fields, not from ISO text; GraalJS Date local time in the OPTIONS
+  zone with V8's zone names; catchable stack limits are GUEST_ERROR.
+* **V8 and CPython:** decode by tag, language checked, one-pass text, the same zone rules and
+  names, aware Python TIMESTAMP, RecursionError as GUEST_ERROR. The V8 MySQL tests had never run
+  with V8 installed; two never passed, now all 19 V8 and CPython tests pass.
+* **Tests:** all unit tests pass; MySQL tests: 60 of 61 with all workers (numpy_memory killed for
+  memory under parallel runs, the parked item), 40 of 41 JVM-only (`basics` needs native workers).
+
+Known differences left: GraalJS `Date()` called as a function names the zone in its short form;
+GraalJS converts a body-form argument with the declared type's converter (safe, but not "by the
+value's own tag"); the JavaScript entry form (test harness only) ignores `integer_type` and
+`decimal_type`; Python `ZoneInfo` with an IANA name is not covered by MySQL tests (no zone tables
+in the test server).
