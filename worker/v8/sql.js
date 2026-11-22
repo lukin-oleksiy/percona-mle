@@ -755,14 +755,14 @@
     const e = callOptions.get(st[0]);
     return e !== undefined && e[0] === st[1] ? e[1] : null;
   };
+  // A statement's options: its own, over the routine call's (setOptions), over the defaults. Oracle's
+  // setOptions: "Options not specified assume their default values"; the integerType and
+  // decimalType defaults are the session's (mle_set_session_state), so getOption gives them too.
   const effective = (o) => {
     const st = state();
-    let base = callScopeOptions(st);
-    if (base === null) {
-      const d = st[4];  // the session's decimalType
-      base = new Options({ decimalType: d < DECIMAL_TYPES.length ? DECIMAL_TYPES[d] : null });
-    }
-    return o === null || o === undefined ? base.over(null) : o.over(base);
+    const defaults = new Options({ integerType: INTEGER_TYPES[st[3]] ?? null, decimalType: DECIMAL_TYPES[st[4]] ?? null });
+    const base = (callScopeOptions(st) ?? NO_OPTIONS).over(defaults);
+    return o === null || o === undefined ? base : o.over(base);
   };
   const internal = () => effective(new Options({ passResult: false }));
 

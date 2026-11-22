@@ -207,6 +207,7 @@ TEST_F(V8Values, Others) {
   EXPECT_THROW(round_trip("42", type(w::Tag::kJson)), ConversionError);       // not a JSON document
   EXPECT_THROW(round_trip("'{bad'", type(w::Tag::kJson)), ConversionError);   // not JSON text
   EXPECT_EQ(round_trip("new Set(['a', 'b'])", type(w::Tag::kString, "SET")), "a,b");
+  EXPECT_EQ(round_trip("new Set(['a', Symbol('b')])", type(w::Tag::kString, "SET")), "a,Symbol(b)");
   EXPECT_EQ(round_trip("new Float32Array([1, 2.5])", type(w::Tag::kVector)), "1,2.5");
   EXPECT_EQ(round_trip("[3, 4]", type(w::Tag::kVector)), "3,4");
   EXPECT_EQ(round_trip("new Uint8Array([104, 105])", type(w::Tag::kBytes)), "104,105");
@@ -216,6 +217,83 @@ TEST_F(V8Values, Others) {
   EXPECT_THROW(round_trip("Infinity", type(w::Tag::kF64)), ConversionError);
   EXPECT_EQ(round_trip("'1.5e3'", type(w::Tag::kF64)), "1500");
   EXPECT_EQ(round_trip("1e21", type(w::Tag::kDecimal, "DECIMAL")), "1000000000000000000000");
+}
+
+TEST_F(V8Values, OracleRules) {
+  using mle::v8w::GuestThrew;
+  const auto message = [this](const char *src, ParamType t) {
+    try {
+      written(src, t);
+    } catch (const ConversionError &e) {
+      return e.message;
+    }
+    return std::string("converted");
+  };
+  // Math.round: a half towards +Infinity, for a Number and for a string's number.
+  for (const auto &[src, want] : {std::pair{"-2.5", "-2"}, {"2.5", "3"}, {"0.49999999999999994", "0"}, {"'-2.5'", "-2"},
+                                  {"'-2.51'", "-3"}, {"'2.5'", "3"}, {"'-0.5'", "0"}})
+    EXPECT_EQ(round_trip(src, type(w::Tag::kI64, "INT")), want) << src;
+  // A Number below 2^64 is a BIGINT UNSIGNED; 2^64 is out of range.
+  EXPECT_EQ(round_trip("1.8446744073709550e19", type(w::Tag::kU64, "BIGINT", true)), "18446744073709549568");
+  EXPECT_EQ(message("2 ** 64", type(w::Tag::kU64, "BIGINT", true)),
+            "Cannot convert value '18446744073709552000' to BIGINT from MLE");
+  // A BigInt as DOUBLE is cast; strings are decimal notation only.
+  EXPECT_EQ(round_trip("2n ** 70n", type(w::Tag::kF64)), "1.1805916207174113e+21");
+  EXPECT_THROW(written("10n ** 400n", type(w::Tag::kF64)), ConversionError);
+  for (const char *bad : {"'1.5f'", "'2d'", "'0x10'", "'0x1p3'", "''", "'Infinity'"})
+    EXPECT_THROW(written(bad, type(w::Tag::kF64)), ConversionError) << bad;
+  // A symbol is String(symbol) as text and in messages.
+  EXPECT_EQ(round_trip("Symbol('x')", type(w::Tag::kString, "TEXT")), "Symbol(x)");
+  EXPECT_EQ(round_trip("Symbol()", type(w::Tag::kString, "TEXT")), "Symbol()");
+  EXPECT_EQ(message("Symbol('x')", type(w::Tag::kI64, "BIGINT")), "Cannot convert value 'Symbol(x)' to BIGINT from MLE");
+  // JSON by Oracle's JavaScript-to-JSON table.
+  for (const char *none : {"({toJSON() {}})", "Symbol('x')", "(function () {})", "5", "true", "5n", "new Date(0)", "'{bad'"})
+    EXPECT_THROW(written(none, type(w::Tag::kJson)), ConversionError) << none;
+  const auto json = [this](const char *src) {
+    const std::vector<std::byte> b = written(src, type(w::Tag::kJson));
+    return std::string(reinterpret_cast<const char *>(b.data()) + 5, b.size() - 5);
+  };
+  EXPECT_EQ(json("new Set([1])"), "{}");
+  EXPECT_EQ(json("({toJSON() { return '{\"a\": 1}' }})"), "{\"a\":1}");
+  EXPECT_EQ(json("[Symbol('x'), 1]"), "[null,1]");
+  EXPECT_EQ(json("({a: Symbol('x'), b: 1})"), "{\"b\":1}");
+  EXPECT_EQ(json("'null'"), "null");
+  // What guest code throws stays pending: GuestThrew.
+  for (const auto &[src, t] : {std::pair{"({toJSON() { throw 1 }})", type(w::Tag::kJson)}, {"({a: 1n})", type(w::Tag::kJson)},
+                               {"({toString() { throw 1 }})", type(w::Tag::kString, "TEXT")},
+                               {"({toString() { throw 1 }})", type(w::Tag::kTime, "TIME")},
+                               {"[{valueOf() { throw 1 }}]", type(w::Tag::kVector)}}) {
+    v8::TryCatch tc(m_iso);
+    EXPECT_THROW(written(src, t), GuestThrew) << src;
+    EXPECT_TRUE(tc.HasCaught()) << src;
+  }
+  {
+    v8::TryCatch tc(m_iso);
+    std::array<std::byte, 64> buf{};
+    Writer wr(buf);
+    EXPECT_THROW(m_values->write_param(wr, js("({toJSON() { throw new Error('mine') }})")), GuestThrew);
+    EXPECT_EQ(str(tc.Exception()), "Error: mine");
+  }
+  // A zero TIME has no sign.
+  EXPECT_FALSE(parse_time("-00:00:00")->negative);
+  EXPECT_TRUE(parse_time("-00:00:00.000001")->negative);
+  // The GraalJS worker's messages.
+  EXPECT_EQ(message("new Date(Date.UTC(10000, 0, 2))", type(w::Tag::kDatetime, "DATETIME")),
+            "the year 10000 is out of range (0 to 9999)");
+  EXPECT_EQ(message("new Date(Date.UTC(-5, 0, 2))", type(w::Tag::kDate, "DATE")), "the year -5 is out of range (0 to 9999)");
+  EXPECT_EQ(message("new Date(Date.UTC(275000, 0, 2))", type(w::Tag::kDate, "DATE")),
+            "the year 275000 is out of range (0 to 9999)");
+  EXPECT_EQ(message("new Date(-1)", type(w::Tag::kTimestamp, "TIMESTAMP")),
+            "TIMESTAMP value out of range: 1969-12-31T23:59:59.999Z");
+  EXPECT_EQ(message("new Date(Date.UTC(10000, 0, 1))", type(w::Tag::kTimestamp, "TIMESTAMP")),
+            "TIMESTAMP value out of range: +10000-01-01T00:00:00Z");
+  EXPECT_EQ(message("1e101", type(w::Tag::kDecimal, "DECIMAL")), "value 1E+101 is out of range for DECIMAL");
+  EXPECT_EQ(message("'1e2000000000'", type(w::Tag::kDecimal, "DECIMAL")), "value 1E+2000000000 is out of range for DECIMAL");
+  EXPECT_EQ(message("'-1.5e70'", type(w::Tag::kDecimal, "DECIMAL")), "value -1.5E+70 is out of range for DECIMAL");
+  EXPECT_EQ(message("[]", type(w::Tag::kVector)), "a VECTOR has 1 to 16383 dimensions, not 0");
+  EXPECT_EQ(message("new Float32Array(16384)", type(w::Tag::kVector)), "a VECTOR has 1 to 16383 dimensions, not 16384");
+  EXPECT_EQ(message("'839:00:00'", type(w::Tag::kTime, "TIME")), "TIME value out of range: PT839H");
+  EXPECT_EQ(message("'-839:30:00.5'", type(w::Tag::kTime, "TIME")), "TIME value out of range: PT-839H-30M-0.5S");
 }
 
 TEST_F(V8Values, Dates) {
@@ -231,8 +309,8 @@ TEST_F(V8Values, Dates) {
   EXPECT_EQ(str(js("(d) => d.toISOString()").As<v8::Function>()->Call(m_ctx, v8::Undefined(m_iso), 1, &d)
                     .ToLocalChecked()),
             "2026-01-14T22:00:00.000Z");
-  // Oracle's rule: a zero date is an Invalid Date, as an argument and in a row; so is a partial
-  // date, and a zero DATETIME
+  // Oracle's rule: a zero date is an Invalid Date, as an argument and in a row; so is one with a
+  // zero month or day, and a zero DATETIME
   const auto invalid = [this](const mle::v8w::Temporal &value, const char *name) {
     std::array<std::byte, 64> buf{};
     Writer wr(buf);
@@ -246,9 +324,23 @@ TEST_F(V8Values, Dates) {
   EXPECT_TRUE(invalid(mle::v8w::Temporal{w::Tag::kDate, 0, 0, 0, 0, 0, 0, 0, false}, "DATE"));
   EXPECT_TRUE(invalid(mle::v8w::Temporal{w::Tag::kDate, 2024, 0, 15, 0, 0, 0, 0, false}, "DATE"));
   EXPECT_TRUE(invalid(mle::v8w::Temporal{w::Tag::kDatetime, 0, 0, 0, 0, 0, 0, 0, false}, "DATETIME"));
-  EXPECT_TRUE(invalid(mle::v8w::Temporal{w::Tag::kDate, 2024, 4, 31, 0, 0, 0, 0, false}, "DATE"));
+  EXPECT_TRUE(invalid(mle::v8w::Temporal{w::Tag::kDate, 2024, 4, 0, 0, 0, 0, 0, false}, "DATE"));
   // year 0 with a month and a day is a date (as Java's LocalDate)
   EXPECT_FALSE(invalid(mle::v8w::Temporal{w::Tag::kDate, 0, 1, 1, 0, 0, 0, 0, false}, "DATE"));
+  // An invalid date is the Date constructor's of its fields (Oracle): 2024-04-31 is 1 May, 31
+  // February is 2 March (Kyiv: UTC+3 in summer, +2 in winter).
+  const auto iso = [this](const mle::v8w::Temporal &value) {
+    std::array<std::byte, 64> buf{};
+    Writer wr(buf);
+    mle::v8w::write_temporal(wr, value);
+    Reader a(std::span<const std::byte>(buf.data(), wr.size()), 0);
+    v8::Local<v8::Value> d = m_values->argument(a, type(value.tag, "DATETIME"));
+    return str(js("(d) => d.toISOString()").As<v8::Function>()->Call(m_ctx, v8::Undefined(m_iso), 1, &d).ToLocalChecked());
+  };
+  EXPECT_EQ(iso({w::Tag::kDate, 2024, 4, 31, 0, 0, 0, 0, false}), "2024-04-30T21:00:00.000Z");
+  EXPECT_EQ(iso({w::Tag::kDate, 2024, 2, 31, 0, 0, 0, 0, false}), "2024-03-01T22:00:00.000Z");
+  EXPECT_EQ(iso({w::Tag::kDatetime, 2023, 12, 31, 23, 59, 59, 999999, false}), "2023-12-31T21:59:59.999Z");
+  EXPECT_EQ(iso({w::Tag::kDatetime, 2023, 13, 32, 0, 0, 0, 0, false}), "2024-01-31T22:00:00.000Z");
   // results back: the session's local date-time (00:00 on 2 July in Kyiv), the same instant again
   std::array<std::byte, 64> back{};
   Writer bw(back);
@@ -381,7 +473,8 @@ TEST_F(V8Values, Malformed) {
   // a DATE with a time (the time is not a DATE's), a bool that is 2
   EXPECT_FALSE(fails(bytes(8, 0xE8, 0x07, 2, 29, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), w::Tag::kDate));
   EXPECT_FALSE(fails(bytes(8, 0xE8, 0x07, 2, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2), w::Tag::kDate));
-  // a DATETIME with a clock time outside its domain: an Invalid Date
+  // a DATETIME with a clock time outside its domain rolls over, here beyond a Date's range: an
+  // Invalid Date
   const std::vector<std::byte> late_value = bytes(10, 0xE8, 0x07, 2, 29, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0);
   Reader late(late_value);
   EXPECT_TRUE(std::isnan(m_values->argument(late, type(w::Tag::kDatetime)).As<v8::Date>()->ValueOf()));

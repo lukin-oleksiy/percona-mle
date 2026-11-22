@@ -51,6 +51,10 @@ struct ConversionError {
   std::string message;
 };
 
+/** Guest code that a conversion runs (toString, toJSON, valueOf, a getter) threw. The exception is
+    still pending in V8: it becomes the routine's error, or the SQL API call's exception. */
+struct GuestThrew {};
+
 /** The message being written would exceed the limit of a worker's message (64 MiB, §12). */
 struct TooLarge {};
 
@@ -87,7 +91,8 @@ struct Options {
   /** An IANA name or an offset +hh:mm / -hh:mm from -13:59 to +14:00; false if it is neither. */
   bool set_zone(std::string_view text);
   /** Milliseconds since the epoch of a local date-time in the zone (Java's atZone: a gap moves
-      forward, an overlap takes the earlier offset). */
+      forward, an overlap takes the earlier offset). month and day are at least 1; fields past
+      their ranges roll over, as the Date constructor's do. */
   double epoch_ms(int year, unsigned month, unsigned day, int64_t hour, unsigned minute, unsigned second,
                   unsigned micro) const;
   /** The local date-time in the zone of milliseconds since the epoch. */
@@ -140,14 +145,19 @@ class Values {
   };
 
   /** Writes result v as type t (JsOracle.toJava, then Values.writeAs); ConversionError if it
-      cannot be one, TooLarge if the message would exceed its limit. */
+      cannot be one, GuestThrew if guest code it runs throws, TooLarge if the message would exceed
+      its limit. */
   void write_as(Writer &w, v8::Local<v8::Value> v, const ParamType &t);
 
-  /** Writes v as a SQL parameter (its own JavaScript type decides; Oracle's binding rules). */
+  /** Writes v as a SQL parameter (its own JavaScript type decides; Oracle's binding rules).
+      ConversionError, GuestThrew and TooLarge as write_as. */
   void write_param(Writer &w, v8::Local<v8::Value> v);
 
-  /** String(v), or "?" if that throws. */
+  /** String(v) for a message: "?" if that throws. */
   std::string str(v8::Local<v8::Value> v);
+
+  /** String(v) for a value: a symbol is "Symbol(description)"; GuestThrew if guest code throws. */
+  std::string text(v8::Local<v8::Value> v);
 
   v8::Isolate *isolate() const { return m_iso; }
   v8::Local<v8::Context> context() const { return m_ctx.Get(m_iso); }
@@ -157,6 +167,9 @@ class Values {
   v8::Local<v8::Value> value(Reader &r, const ParamType &t, bool argument);
   v8::Local<v8::Value> temporal(const Temporal &t);
   [[noreturn]] void cannot(v8::Local<v8::Value> v, const ParamType &t);
+  /** The JSON text of v by Oracle's JavaScript-to-JSON table (JsOracle's json_text); nullopt if v
+      has none. */
+  std::optional<std::string> json_text(v8::Local<v8::Value> v);
 
   const Options *rules() const { return m_rules != nullptr ? m_rules : m_opt; }
 

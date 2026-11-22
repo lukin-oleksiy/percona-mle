@@ -64,9 +64,6 @@ struct Config {
   /** The largest host message the worker holds, in bytes; a larger one is discarded and failed
       where it belongs (§5.3). 0: whatever memory can be allocated. */
   uint64_t message_max = 0;
-  /** The most kept statements per routine (§10.1): a statement a routine prepares stays prepared
-      for its later calls. 0: none is kept. */
-  uint32_t kept_statements = 32;
 };
 
 /** An Error of a RESULT (§7.4). */
@@ -161,12 +158,6 @@ class Worker {
     std::vector<ParamType> columns;
     /** Of a prepared statement: those columns as sql.js takes them (the labels; the columns). */
     v8::Global<v8::Value> labels, described;
-    /** A kept statement (§10.1): the scope of the request that uses it now, or 0; when it was used
-        last; and what it was prepared from (the flag and the text), by which a later PREPARE of
-        the routine finds it. */
-    uint64_t lease = 0;
-    uint64_t used = 0;
-    std::string key;
   };
   using Statements = std::unordered_map<uint64_t, Statement>;
 
@@ -183,10 +174,8 @@ class Worker {
     uint64_t library_epoch = 0;
     /** CALL: the code this activation started with. PREPARE: the routine being loaded. */
     std::shared_ptr<Routine> routine;
-    /** The statements of this request that are not kept. */
+    /** The statements this request opened (§10.1). */
     Statements statements;
-    /** The request uses kept statements of its routine (their lease is its scope). */
-    bool leased = false;
   };
 
   /** What a request ends with: the RESULT's status, Error and values. */
@@ -214,8 +203,8 @@ class Worker {
   void reset();
   void options(const common::Message &m, Reply *reply);
   void parse_library(const common::Message &m, Reply *reply);
-  /** The id is not prepared any more (§8.3): its code (a running activation keeps its own), its
-      library answers (§9.10) and its kept statements, which the host has closed (§10.1). */
+  /** The id is not prepared any more (§8.3): its code (a running activation keeps its own) and its
+      library answers (§9.10). */
   void drop_routine(uint64_t id);
   /** The buffer for a host message in chunks; nullptr if the worker cannot hold it. */
   std::byte *allocate(std::vector<std::byte> &buffer, size_t total);
@@ -248,14 +237,11 @@ class Worker {
     wire::SqlAction action = wire::SqlAction::kExecute;
     uint64_t id = 0;
     bool to_client = false;
-    /** PREPARE with KEEP, and what the kept statement is found by. */
-    bool keep = false;
-    std::string key;
     /** EXECUTE_MANY: the rows sent. */
     uint32_t rows = 0;
   };
-  /** Where a statement id is, if it is one the request q may use: its own, or a kept statement of
-      its routine that it uses now. st is nullptr for an id that is CLOSED. */
+  /** Where a statement id is, if it is one the request q may use (one it opened). st is nullptr
+      for an id that is CLOSED. */
   struct Found {
     Statement *st = nullptr;
     Statements *in = nullptr;
@@ -268,14 +254,6 @@ class Worker {
   v8::MaybeLocal<v8::Value> sql_result(Request &q, const Sent &sent, const common::Message &m, const Options &rules);
   /** Sends CLOSE for id and takes its OK (§10.1 rule 1): the id is CLOSED. */
   void sql_close(Request &q, uint64_t id);
-  /** A free kept statement of q's routine that was prepared from key; {0, nullptr} if none. */
-  std::pair<uint64_t, Statement *> free_kept(Request &q, const std::string &key);
-  /** Room for one more kept statement of q's routine: true if there is, after closing the free
-      one used longest ago when the routine has as many as it may. */
-  bool kept_room(Request &q);
-  /** The request ends: the kept statements it used are IDLE again and free for a later request
-      of the routine (§10.1). */
-  void release_statements(Request &q);
   /** Why guest code may not send SQL or LIBRARY now; nullptr if it may (§10.1, §10.6). */
   const char *host_unavailable() const;
 
@@ -359,9 +337,6 @@ class Worker {
   /** Statement ids are never used twice in a worker: unique among every request's and every
       routine's (§10.1). */
   uint64_t m_statement_ids = 0;
-  /** The kept statements of each routine id. */
-  std::unordered_map<uint64_t, Statements> m_kept;
-  uint64_t m_kept_tick = 0;
   std::vector<std::byte> m_sql_buf;
   std::vector<std::byte> m_values_buf;
   std::vector<std::byte> m_result_buf;

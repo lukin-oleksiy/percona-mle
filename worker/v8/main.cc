@@ -22,10 +22,7 @@
   bare isolate (no Node.js environment). Its worker_class is "v8" (docs/protocol.md, Appendix B.1).
 
     mle_v8_worker [--class=<name>] [--heap-mb=<n>] [--packages=<dir>] [--icu-data=<dir>]... [--spin=<n>]
-                  [--message-mb=<n>] [--kept-statements=<n>] [--dumpable]
-
-  --kept-statements: the most statements kept prepared per routine between its calls (§10.1);
-  default 32, 0: none is kept.
+                  [--message-mb=<n>] [--dumpable]
 
   Started by mle_launcher like the other workers: Landlock, the cgroup and the descriptors (3 =
   the region, 4 = control socket) are in place. Here: PR_SET_DUMPABLE 0 unless --dumpable; the
@@ -73,13 +70,11 @@ int main(int argc, char **argv) {
       config.spin = std::atoi(std::string(v).c_str());
     } else if (value("--message-mb=", &v)) {
       config.message_max = std::strtoull(std::string(v).c_str(), nullptr, 10) << 20;
-    } else if (value("--kept-statements=", &v)) {
-      config.kept_statements = static_cast<uint32_t>(std::strtoul(std::string(v).c_str(), nullptr, 10));
     } else {
       std::fprintf(stderr, "mle_v8_worker: unknown argument %s\n", argv[i]);
       std::fprintf(stderr,
                    "usage: mle_v8_worker [--class=<name>] [--heap-mb=<n>] [--packages=<dir>] [--icu-data=<dir>]... "
-                   "[--spin=<n>] [--message-mb=<n>] [--kept-statements=<n>] [--dumpable]\n");
+                   "[--spin=<n>] [--message-mb=<n>] [--dumpable]\n");
       return 20;
     }
   }

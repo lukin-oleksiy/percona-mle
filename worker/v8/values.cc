@@ -86,7 +86,7 @@ struct Decimal {
       if (i < s.size() && (s[i] == '+' || s[i] == '-')) eneg = s[i++] == '-';
       if (i == s.size()) return std::nullopt;
       for (; i < s.size(); i++) {
-        if (s[i] < '0' || s[i] > '9' || exp > 100000000) return std::nullopt;
+        if (s[i] < '0' || s[i] > '9' || exp > 100000000000) return std::nullopt;
         exp = exp * 10 + (s[i] - '0');
       }
       if (eneg) exp = -exp;
@@ -95,12 +95,15 @@ struct Decimal {
     const size_t nz = all.find_first_not_of('0');
     d.digits = nz == std::string::npos ? "0" : all.substr(nz);
     d.scale = frac - exp;
+    // Java's scale is an int: a number whose scale is not one is not a number there either.
+    if (d.scale < INT32_MIN || d.scale > INT32_MAX) return std::nullopt;
     if (d.zero()) d.negative = false;
     return d;
   }
 
-  /** Rounds (HALF_UP) to at most `to` digits after the point. */
-  void round_to(int64_t to) {
+  /** Rounds to at most `to` digits after the point: a half away from zero (HALF_UP), or, with
+      `math_round`, towards +Infinity as JavaScript's Math.round does. */
+  void round_to(int64_t to, bool math_round = false) {
     if (scale <= to) return;
     const int64_t drop = scale - to;
     if (drop > precision()) {
@@ -109,7 +112,10 @@ struct Decimal {
       scale = to;
       return;
     }
-    const bool up = digits[digits.size() - drop] >= '5';
+    const size_t first = digits.size() - static_cast<size_t>(drop);
+    bool up = digits[first] >= '5';
+    if (math_round && negative && digits[first] == '5')
+      up = digits.find_first_not_of('0', first + 1) != std::string::npos;  // more than a half
     digits.resize(digits.size() - drop);
     if (digits.empty()) digits = "0";
     scale = to;
@@ -142,7 +148,110 @@ struct Decimal {
     out += d.substr(0, d.size() - scale) + "." + d.substr(d.size() - scale);
     return out;
   }
+
+  /** Java's BigDecimal.toString(): plain, or with an exponent ("1E+101") when the scale is negative
+      or the number is below 1e-6 (the GraalJS worker's messages show numbers so). */
+  std::string java() const {
+    if (scale == 0) return (negative ? "-" : "") + digits;
+    const int64_t adjusted = precision() - 1 - scale;
+    if (scale > 0 && adjusted >= -6) return plain();
+    std::string out = (negative ? "-" : "") + digits.substr(0, 1);
+    if (digits.size() > 1) out += "." + digits.substr(1);
+    if (adjusted != 0) out += "E" + std::string(adjusted > 0 ? "+" : "") + std::to_string(adjusted);
+    return out;
+  }
 };
+
+/** Year, month and day of days since 1970-01-01 in the proleptic Gregorian calendar, for every
+    day a Date has (std::chrono's year ends at 32767). */
+void civil_from_days(int64_t z, int64_t *year, unsigned *month, unsigned *day) {
+  z += 719468;
+  const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  const auto doe = static_cast<unsigned>(z - era * 146097);
+  const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const unsigned mp = (5 * doy + 2) / 153;
+  *day = doy - (153 * mp + 2) / 5 + 1;
+  *month = mp < 10 ? mp + 3 : mp - 9;
+  *year = static_cast<int64_t>(yoe) + era * 400 + (*month <= 2 ? 1 : 0);
+}
+
+/** Days since 1970-01-01 of a date of the proleptic Gregorian calendar (month 1 to 12). */
+int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
+  y -= m <= 2 ? 1 : 0;
+  const int64_t era = (y >= 0 ? y : y - 399) / 400;
+  const auto yoe = static_cast<unsigned>(y - era * 400);
+  const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+
+/** Seconds since the epoch within the years a zone is asked about: tzdb's get_info throws beyond
+    std::chrono's years, and a Date reaches 275760. Outside 1000 BC to AD 11000, where no MySQL
+    date is, a time takes the offset at that edge. */
+std::chrono::seconds zone_range(std::chrono::seconds s) {
+  using namespace std::chrono;
+  constexpr seconds low = sys_days{year{-1000} / January / 1}.time_since_epoch();
+  constexpr seconds high = sys_days{year{11000} / January / 1}.time_since_epoch();
+  return std::clamp(s, low, high);
+}
+
+/** Java's Instant.toString() of milliseconds since the epoch ("1969-12-31T23:59:59.999Z",
+    "+10000-01-01T00:00:00Z"), as the GraalJS worker's TIMESTAMP messages show an instant. */
+std::string instant_text(int64_t ms) {
+  const int64_t secs = ms >= 0 ? ms / 1000 : -((-ms + 999) / 1000);
+  const auto milli = static_cast<unsigned>(ms - secs * 1000);
+  const int64_t days = secs >= 0 ? secs / 86400 : -((-secs + 86399) / 86400);
+  const auto rest = static_cast<unsigned>(secs - days * 86400);
+  int64_t year;
+  unsigned month, day;
+  civil_from_days(days, &year, &month, &day);
+  char y[32];
+  if (year < 0)
+    std::snprintf(y, sizeof y, "-%04lld", static_cast<long long>(-year));
+  else
+    std::snprintf(y, sizeof y, year > 9999 ? "+%lld" : "%04lld", static_cast<long long>(year));
+  char b[80];
+  std::snprintf(b, sizeof b, "%s-%02u-%02uT%02u:%02u:%02u", y, month, day, rest / 3600, rest / 60 % 60, rest % 60);
+  std::string out = b;
+  if (milli != 0) {
+    std::snprintf(b, sizeof b, ".%03u", milli);
+    out += b;
+  }
+  return out + "Z";
+}
+
+/** Java's Duration.toString() of a TIME ("PT839H", "PT-839H-30M-0.5S"), as the GraalJS worker's
+    TIME messages show one. */
+std::string duration_text(const Temporal &t) {
+  const int64_t total = (int64_t{t.hour} * 60 + t.minute) * 60 + t.second;
+  const int64_t nanos_abs = int64_t{t.micro} * 1000;
+  if (total == 0 && nanos_abs == 0) return "PT0S";
+  // Duration keeps floor seconds and nanoseconds 0 to 999999999.
+  int64_t seconds = t.negative ? -total : total;
+  int64_t nanos = nanos_abs;
+  if (t.negative && nanos_abs > 0) {
+    seconds--;
+    nanos = 1000000000 - nanos_abs;
+  }
+  const int64_t effective = seconds < 0 && nanos > 0 ? seconds + 1 : seconds;
+  const int64_t hours = effective / 3600, minutes = effective % 3600 / 60, secs = effective % 60;
+  std::string out = "PT";
+  if (hours != 0) out += std::to_string(hours) + "H";
+  if (minutes != 0) out += std::to_string(minutes) + "M";
+  if (secs == 0 && nanos == 0 && out.size() > 2) return out;
+  if (seconds < 0 && nanos > 0)
+    out += secs == 0 ? "-0" : std::to_string(secs);
+  else
+    out += std::to_string(secs);
+  if (nanos > 0) {
+    std::string frac = std::to_string(seconds < 0 ? 2 * 1000000000 - nanos : nanos + 1000000000);
+    while (frac.back() == '0') frac.pop_back();
+    frac[0] = '.';
+    out += frac;
+  }
+  return out + "S";
+}
 
 }  // namespace
 
@@ -236,18 +345,20 @@ bool Options::set_zone(std::string_view text) {
 double Options::epoch_ms(int year, unsigned month, unsigned day, int64_t hour, unsigned minute, unsigned second,
                          unsigned micro) const {
   using namespace std::chrono;
-  const local_days d{std::chrono::year(year) / std::chrono::month(month) / std::chrono::day(day)};
-  const local_time<microseconds> t = d + hours(hour) + minutes(minute) + seconds(second) + microseconds(micro);
+  // Fields past their ranges roll over, as the Date constructor's do (2024-04-31 is 1 May).
+  const int64_t y = int64_t{year} + (month - 1) / 12;
+  const local_days d{days(days_from_civil(y, (month - 1) % 12 + 1, 1) + (int64_t{day} - 1))};
+  // In seconds: microseconds since the epoch of a host's hour field (2^32 hours) would overflow.
+  const local_seconds t = d + hours(hour) + minutes(minute) + seconds(second);
   seconds off = offset;
   if (zone != nullptr) {
     // Java's atZone: a local time in a gap moves forward by the gap (the offset before it); in an
     // overlap the earlier offset.
-    const local_info info = zone->get_info(floor<seconds>(t));
+    const local_info info = zone->get_info(local_seconds{zone_range(t.time_since_epoch())});
     off = info.first.offset;
   }
-  const auto sys = t.time_since_epoch() - off;
-  // Milliseconds as Java's toEpochMilli (floor), as a double for Date.
-  return static_cast<double>(floor<milliseconds>(sys).count());
+  // Milliseconds as Java's toEpochMilli (floor), as a double for Date (beyond its range: NaN).
+  return static_cast<double>((t.time_since_epoch() - off).count() * 1000 + micro / 1000);
 }
 
 void Options::local(double ms, int *year, unsigned *month, unsigned *day, unsigned *hour, unsigned *minute,
@@ -255,14 +366,13 @@ void Options::local(double ms, int *year, unsigned *month, unsigned *day, unsign
   using namespace std::chrono;
   const sys_time<milliseconds> t{milliseconds(static_cast<int64_t>(std::floor(ms)))};
   seconds off = offset;
-  if (zone != nullptr) off = zone->get_info(floor<seconds>(t)).offset;
+  if (zone != nullptr) off = zone->get_info(sys_seconds{zone_range(floor<seconds>(t).time_since_epoch())}).offset;
   const auto local = t + off;
   const auto days = floor<std::chrono::days>(local);
-  const year_month_day ymd{days};
   const auto rest = local - days;
-  *year = static_cast<int>(ymd.year());
-  *month = static_cast<unsigned>(ymd.month());
-  *day = static_cast<unsigned>(ymd.day());
+  int64_t y;
+  civil_from_days(days.time_since_epoch().count(), &y, month, day);
+  *year = static_cast<int>(y);
   *hour = static_cast<unsigned>(duration_cast<hours>(rest).count());
   *minute = static_cast<unsigned>(duration_cast<minutes>(rest).count() % 60);
   *second = static_cast<unsigned>(duration_cast<seconds>(rest).count() % 60);
@@ -365,6 +475,8 @@ std::optional<Temporal> parse_time(std::string_view text) {
   t.minute = static_cast<uint8_t>(m);
   t.second = static_cast<uint8_t>(sec);
   t.micro = static_cast<uint32_t>(frac);
+  // A zero TIME has no sign (§7.2: "-00:00:00" is sent as 00:00:00, as Java's Duration has it).
+  if (h == 0 && m == 0 && sec == 0 && frac == 0) t.negative = false;
   return t;
 }
 
@@ -376,8 +488,9 @@ std::optional<std::string> decimal_text(std::string_view s, std::string_view tar
     const int64_t integer_digits = d->precision() - d->scale;
     if (d->zero() || integer_digits < -static_cast<int64_t>(kDecimalMaxScale)) return std::string("0");
     const std::string what = target == "SQL" ? "a DECIMAL parameter" : std::string(target);
+    // The number as Java's BigDecimal shows it ("1E+101"), as the GraalJS worker's message does.
     if (integer_digits > static_cast<int64_t>(kDecimalMaxDigits))
-      throw ConversionError{"value " + (integer_digits <= 80 ? d->plain()  // not 1e999999999's zeros
+      throw ConversionError{"value " + (d->precision() <= 40 ? d->java()
                                                              : "of " + std::to_string(integer_digits) + " digits") +
                             " is out of range for " + what};
     d->round_to(kDecimalMaxScale);
@@ -389,11 +502,31 @@ std::optional<std::string> decimal_text(std::string_view s, std::string_view tar
 
 // ------------------------------------------------------------ to JavaScript
 
+namespace {
+
+/** String(symbol): "Symbol(description)" (SymbolDescriptiveString). */
+std::string symbol_text(v8::Isolate *iso, Local<v8::Symbol> s) {
+  const Local<Value> d = s->Description(iso);
+  return "Symbol(" + (d->IsString() ? utf8(iso, d) : std::string()) + ")";
+}
+
+}  // namespace
+
 std::string Values::str(Local<Value> v) {
-  v8::TryCatch tc(m_iso);
+  const v8::TryCatch tc(m_iso);
+  if (v->IsString()) return utf8(m_iso, v);
+  if (v->IsSymbol()) return symbol_text(m_iso, v.As<v8::Symbol>());
   Local<v8::String> s;
-  if (v->IsSymbol()) return utf8(m_iso, v.As<v8::Symbol>()->Description(m_iso));
   if (!v->ToString(context()).ToLocal(&s)) return "?";
+  return utf8(m_iso, s);
+}
+
+std::string Values::text(Local<Value> v) {
+  if (v->IsString()) return utf8(m_iso, v);
+  if (v->IsSymbol()) return symbol_text(m_iso, v.As<v8::Symbol>());
+  // ToString runs the object's toString or valueOf: what that throws stays pending.
+  Local<v8::String> s;
+  if (!v->ToString(context()).ToLocal(&s)) throw GuestThrew{};
   return utf8(m_iso, s);
 }
 
@@ -427,14 +560,10 @@ Local<Value> Values::integer(int64_t v, bool is_unsigned, const ParamType *t) {
 
 Local<Value> Values::temporal(const Temporal &t) {
   if (t.tag == w::Tag::kTime) return v8_string(m_iso, time_text(t));
-  using namespace std::chrono;
-  const year_month_day ymd{year(t.year), month(t.month), day(t.day)};
-  // Oracle's rule: a zero date (and MySQL's partial dates and impossible days, which no Date can
-  // be) is an Invalid Date, as an argument and in a row. Year 0 with a month and a day is a date.
-  // So is a clock time no DATETIME has: the host sends none.
-  if (!ymd.ok() ||
-      (t.tag == w::Tag::kDatetime && (t.hour > 23 || t.minute > 59 || t.second > 59 || t.micro > 999999)))
-    return v8::Date::New(context(), std::nan("")).ToLocalChecked();
+  // Oracle's rule (srjs-data-arguments): a zero date, or one with a zero month or day, is an
+  // Invalid Date, as an argument and in a row; an invalid date such as 31 February is given to the
+  // Date constructor with its fields, which roll over (2024-02-31 is 2 March). Year 0 is a year.
+  if (t.month == 0 || t.day == 0) return v8::Date::New(context(), std::nan("")).ToLocalChecked();
   const double ms = t.tag == w::Tag::kDate ? m_opt->epoch_ms(t.year, t.month, t.day, 0, 0, 0, 0)
                                            : m_opt->epoch_ms(t.year, t.month, t.day, t.hour, t.minute,
                                                              t.second, t.micro);
@@ -536,8 +665,60 @@ Local<Value> Values::value(Reader &r, const ParamType &t, bool argument) {
 // ------------------------------------------------------------ from JavaScript
 
 void Values::cannot(Local<Value> v, const ParamType &t) {
-  const std::string shown = v->IsString() ? utf8(m_iso, v) : str(v);
-  throw ConversionError{"Cannot convert value '" + shown + "' to " + t.sql_name() + " from MLE"};
+  throw ConversionError{"Cannot convert value '" + str(v) + "' to " + t.sql_name() + " from MLE"};
+}
+
+namespace {
+
+/** After a failure under tc: a termination (an interrupt, the heap limit) goes on to the caller's
+    TryCatch, as GuestThrew. */
+void keep_termination(v8::TryCatch &tc) {
+  if (tc.HasTerminated()) {
+    tc.ReThrow();
+    throw GuestThrew{};
+  }
+}
+
+}  // namespace
+
+std::optional<std::string> Values::json_text(Local<Value> v) {
+  const Local<v8::Context> ctx = context();
+  // JSON text is parsed and written again; text that is not JSON (or whose objects give none,
+  // by an Object.prototype.toJSON) has none.
+  const auto of_text = [&](Local<v8::String> s) -> std::optional<std::string> {
+    v8::TryCatch tc(m_iso);
+    Local<Value> parsed;
+    Local<v8::String> out;
+    if (!v8::JSON::Parse(ctx, s).ToLocal(&parsed) || !v8::JSON::Stringify(ctx, parsed).ToLocal(&out)) {
+      keep_termination(tc);
+      return std::nullopt;
+    }
+    std::string text = utf8(m_iso, out);
+    if (text == "undefined") return std::nullopt;
+    return text;
+  };
+  if (v->IsString()) return of_text(v.As<v8::String>());
+  // A scalar that is not a string (typeof is not 'object') is not a JSON document (Oracle).
+  if (!v->IsObject() || v->IsFunction()) return std::nullopt;
+  // An object with a toJSON method is what that gives: a string is JSON text (a Date's is not
+  // JSON), anything else is stringified. Other objects are stringified. What guest code throws
+  // (toJSON, a getter, a BigInt in a container) stays pending.
+  const Local<v8::Object> o = v.As<v8::Object>();
+  Local<Value> to_json;
+  if (!o->Get(ctx, v8_string(m_iso, "toJSON")).ToLocal(&to_json)) throw GuestThrew{};
+  Local<Value> what = v;
+  if (to_json->IsFunction()) {
+    Local<Value> key = v8::String::Empty(m_iso);
+    if (!to_json.As<v8::Function>()->Call(ctx, o, 1, &key).ToLocal(&what)) throw GuestThrew{};
+    if (what->IsString()) return of_text(what.As<v8::String>());
+  }
+  Local<v8::String> out;
+  if (!v8::JSON::Stringify(ctx, what).ToLocal(&out)) throw GuestThrew{};
+  // V8's Stringify gives String(undefined) where JSON.stringify gives undefined (a symbol, a
+  // function, a toJSON that returns nothing): that has no JSON. No JSON text is that word.
+  std::string text = utf8(m_iso, out);
+  if (text == "undefined") return std::nullopt;
+  return text;
 }
 
 namespace {
@@ -585,17 +766,18 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
   const Local<v8::Context> ctx = context();
   const bool set_type = t.is("SET") || t.is("ENUM");
   if (set_type) {
-    std::string text;
+    // A Set is its items' String() joined by commas, anything else its own String().
+    std::string joined;
     if (v->IsSet()) {
       const Local<v8::Array> items = v.As<v8::Set>()->AsArray();
       for (uint32_t i = 0; i < items->Length(); i++) {
-        if (i > 0) text += ',';
-        text += str(items->Get(ctx, i).ToLocalChecked());
+        if (i > 0) joined += ',';
+        joined += text(items->Get(ctx, i).ToLocalChecked());
       }
     } else {
-      text = str(v);
+      joined = text(v);
     }
-    need(put_tag(wr, w::Tag::kString) && wr.str(text));
+    need(put_tag(wr, w::Tag::kString) && wr.str(joined));
     return;
   }
   switch (t.tag) {
@@ -615,16 +797,20 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
           b = u;
         }
       } else if (v->IsNumber()) {
+        // Oracle: "Round value to Integer; check whether value is out of range", by Math.round:
+        // the nearest integer, a half towards +Infinity (exact: d - floor(d) has no error).
         const double d = v.As<v8::Number>()->Value();
         if (!std::isfinite(d)) cannot(v, t);
-        const double r = d == std::floor(d) ? d : std::floor(d + 0.5);  // Math.round
-        if (std::fabs(r) > 1.8e19) cannot(v, t);
+        double r = std::floor(d);
+        if (d - r >= 0.5) r += 1;
+        if (!(std::fabs(r) < 0x1p100)) cannot(v, t);  // far outside every range; the range decides the rest
         b = static_cast<__int128>(r);
       } else if (v->IsString()) {
+        // Oracle: "Parse as number and round to Integer", by Math.round as a Number is.
         const std::optional<Decimal> d = Decimal::parse(trim(utf8(m_iso, v)));
         if (!d) cannot(v, t);
         Decimal rounded = *d;
-        rounded.round_to(0);
+        rounded.round_to(0, true);
         // At most 40 digits before the text ("1e999999999" would be a billion zeros).
         if (rounded.precision() - rounded.scale > 40 || !parse_int128(rounded.plain(), &b)) cannot(v, t);
       } else {
@@ -645,9 +831,15 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
         d = v->BooleanValue(m_iso) ? 1 : 0;
       } else if (v->IsNumber()) {
         d = v.As<v8::Number>()->Value();
+      } else if (v->IsBigInt()) {
+        // Oracle: "Cast to Float; check whether result is out of range": Number(v), the nearest
+        // double of its digits; beyond DOUBLE's range it is Infinity, which is out of range.
+        d = std::strtod(str(v).c_str(), nullptr);
       } else if (v->IsString()) {
         const std::string s = trim(utf8(m_iso, v));
-        // Java's Double.parseDouble: decimal notation only (no hex, no Infinity as a number here).
+        // Oracle: "Parse value to Float"; a non-numeric string is an error. Decimal notation only:
+        // what both JavaScript's Number() and Java's parseDouble read, without either's own forms
+        // (0x10, 0b1, '' as 0; 1.5f, 2d, hex floats) or Infinity and NaN.
         if (s.empty() || s.find_first_of("xXnN") != std::string::npos || s.find("Inf") != std::string::npos)
           cannot(v, t);
         char *end = nullptr;
@@ -680,22 +872,15 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
       return;
     }
     case w::Tag::kString: {
-      const std::string s = v->IsString() ? utf8(m_iso, v) : str(v);
+      // Oracle: "Convert to String" (a symbol too); what a toString throws is the routine's error.
+      const std::string s = text(v);
       need(put_tag(wr, w::Tag::kString) && wr.str(s));
       return;
     }
     case w::Tag::kJson: {
-      // Oracle: a string is JSON text (checked); an object or array is stringified; a bare number,
-      // boolean or BigInt is not a JSON document.
-      if (v->IsBoolean() || v->IsNumber() || v->IsBigInt()) cannot(v, t);
-      v8::TryCatch tc(m_iso);
-      Local<Value> obj = v;
-      if (v->IsString() && !v8::JSON::Parse(ctx, v.As<v8::String>()).ToLocal(&obj)) cannot(v, t);
-      Local<v8::String> text;
-      if (!v8::JSON::Stringify(ctx, obj).ToLocal(&text) || text.IsEmpty() || tc.HasCaught()) cannot(v, t);
-      Local<Value> as_value = text;
-      if (!as_value->IsString()) cannot(v, t);
-      need(put_tag(wr, w::Tag::kJson) && wr.str(utf8(m_iso, text)));
+      const std::optional<std::string> json = json_text(v);
+      if (!json) cannot(v, t);
+      need(put_tag(wr, w::Tag::kJson) && wr.str(*json));
       return;
     }
     case w::Tag::kBytes: {
@@ -715,35 +900,35 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
       return;
     }
     case w::Tag::kVector: {
+      // Oracle: a typed array is treated as a Float32Array; so is an array (Float32Array.from(v),
+      // as the GraalJS worker). 1 to 16383 dimensions (§7.2).
+      const auto dimensions = [](uint64_t n) {
+        if (n < 1 || n > w::kMaxVectorDimensions)
+          throw ConversionError{"a VECTOR has 1 to " + std::to_string(w::kMaxVectorDimensions) + " dimensions, not " +
+                                std::to_string(n)};
+      };
       std::vector<float> f;
       if (v->IsFloat32Array()) {
         const Local<v8::Float32Array> a = v.As<v8::Float32Array>();
-        if (a->Length() > w::kMaxVectorDimensions) throw ConversionError{"VECTOR too large: " + std::to_string(a->Length())};
+        dimensions(a->Length());
         f.resize(a->Length());
         a->CopyContents(f.data(), f.size() * 4);
-      } else if (v->IsArray() || v->IsArrayBufferView()) {
-        // Float32Array.from(v)
+      } else if (v->IsArray() || v->IsTypedArray()) {
         const Local<v8::Object> o = v.As<v8::Object>();
-        Local<Value> len;
-        if (!o->Get(ctx, v8_string(m_iso, "length")).ToLocal(&len) || !len->IsNumber()) cannot(v, t);
-        const double n = len.As<v8::Number>()->Value();
-        if (!(n >= 0 && n == std::floor(n))) cannot(v, t);
-        if (n > w::kMaxVectorDimensions) throw ConversionError{"VECTOR too large: " + std::to_string(int64_t(n))};
+        const uint64_t n = v->IsArray() ? v.As<v8::Array>()->Length() : v.As<v8::TypedArray>()->Length();
+        dimensions(n);
         f.resize(static_cast<size_t>(n));
         for (uint32_t i = 0; i < f.size(); i++) {
+          // Each element's Number(): what a getter or valueOf throws (a BigInt's TypeError) stays
+          // pending.
           Local<Value> e;
-          double x = std::nan("");
-          if (o->Get(ctx, i).ToLocal(&e)) {
-            Local<v8::Number> num;
-            if (e->ToNumber(ctx).ToLocal(&num)) x = num->Value();
-          }
-          f[i] = static_cast<float>(x);  // the host checks that the elements are finite (§7.2)
+          Local<v8::Number> num;
+          if (!o->Get(ctx, i).ToLocal(&e) || !e->ToNumber(ctx).ToLocal(&num)) throw GuestThrew{};
+          f[i] = static_cast<float>(num->Value());  // the host checks that the elements are finite (§7.2)
         }
       } else {
         cannot(v, t);
       }
-      if (f.size() > w::kMaxVectorDimensions) throw ConversionError{"VECTOR too large: " + std::to_string(f.size())};
-      if (f.empty()) throw ConversionError{"a VECTOR needs at least one dimension"};
       need(put_tag(wr, w::Tag::kVector) && wr.put(static_cast<uint32_t>(f.size())) && wr.align() &&
            wr.bytes(std::as_bytes(std::span<const float>(f))));
       return;
@@ -752,7 +937,9 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
       // The instant itself (§7.2), within the wire's range.
       if (!v->IsDate()) cannot(v, t);
       const double ms = v.As<v8::Date>()->ValueOf();
-      if (!std::isfinite(ms) || ms < 0 || ms > static_cast<double>(w::kMaxTimestamp / 1000)) cannot(v, t);
+      if (!std::isfinite(ms)) cannot(v, t);
+      if (ms < 0 || ms > static_cast<double>(w::kMaxTimestamp / 1000))
+        throw ConversionError{"TIMESTAMP value out of range: " + instant_text(static_cast<int64_t>(ms))};
       need(put_tag(wr, w::Tag::kTimestamp) && wr.put(static_cast<int64_t>(ms) * 1000));
       return;
     }
@@ -764,7 +951,9 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
       int year;
       unsigned month, day, hour, minute, second, micro;
       m_opt->local(ms, &year, &month, &day, &hour, &minute, &second, &micro);
-      if (year < 0 || year > 9999) cannot(v, t);
+      // The wire's year is 16 bits and MySQL's range ends at 9999 (a Date reaches 275760).
+      if (year < 0 || year > 9999)
+        throw ConversionError{"the year " + std::to_string(year) + " is out of range (0 to 9999)"};
       Temporal out{};
       out.tag = t.tag;
       out.year = static_cast<uint16_t>(year);
@@ -781,12 +970,13 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
       return;
     }
     case w::Tag::kTime: {
-      const std::string s = v->IsString() ? utf8(m_iso, v) : str(v);
+      // Oracle: TIME is a string, validated by MySQL; here by its form and the wire's range.
+      const std::string s = text(v);
       std::optional<Temporal> tm = parse_time(s);
       if (!tm) throw ConversionError{"Cannot convert value '" + s + "' to TIME from MLE"};
       if (tm->hour > w::kMaxTimeHour || (tm->hour == w::kMaxTimeHour && tm->minute == 59 && tm->second == 59 &&
                                           tm->micro > 0))
-        throw ConversionError{"TIME value out of range: " + s};
+        throw ConversionError{"TIME value out of range: " + duration_text(*tm)};
       if (!valid_temporal(*tm)) cannot(v, t);
       write_temporal(wr, *tm);
       return;
@@ -849,11 +1039,15 @@ void Values::write_param(Writer &wr, Local<Value> v) {
   } else if (v->IsSymbol() || v->IsFunction()) {
     throw ConversionError{std::string("cannot bind a ") + (v->IsSymbol() ? "symbol" : "function")};
   } else {
-    v8::TryCatch tc(m_iso);
-    Local<v8::String> json;
-    if (!v8::JSON::Stringify(ctx, v).ToLocal(&json) || tc.HasCaught() || !Local<Value>(json)->IsString())
-      throw ConversionError{"cannot bind " + str(v)};
-    need(put_tag(wr, w::Tag::kJson) && wr.str(utf8(m_iso, json)));
+    // Any other object as JSON, by the rule of a JSON result (json_text); one without JSON (a
+    // toJSON that returns nothing) cannot be bound, and what its toJSON throws stays pending.
+    const std::optional<std::string> json = json_text(v);
+    if (!json) {
+      Local<v8::String> tag;  // Object.prototype.toString.call(v)
+      if (!v.As<v8::Object>()->ObjectProtoToString(ctx).ToLocal(&tag)) throw GuestThrew{};
+      throw ConversionError{"cannot bind " + utf8(m_iso, tag)};
+    }
+    need(put_tag(wr, w::Tag::kJson) && wr.str(*json));
   }
 }
 

@@ -52,9 +52,6 @@ constexpr const char *kWrapper = "$mle$routine";
 constexpr size_t kConsoleLimit = 1 << 20;
 /** The language identifier of READY, PREPARE and Error (Appendix B.1). */
 constexpr const char *kJs = "js";
-/** SQL flags bit 1, KEEP (§10.2): only with PREPARE while serving a CALL; the statement is a kept
-    statement (§10.1). Belongs beside wire::kPassResultToClient in include/mle/protocol.h. */
-constexpr uint8_t kKeepStatement = 1U << 1;
 /** A CALL with at most this many arguments converts them without an allocation. */
 constexpr uint32_t kInlineArguments = 16;
 /** has_return 0 and no out_params: the values of a RESULT that has none (§9.4). */
@@ -358,7 +355,6 @@ void Worker::write_stats() {
 void Worker::drop_routine(uint64_t id) {
   m_routines.erase(id);
   m_answers.erase(id);
-  if (!m_kept.empty()) m_kept.erase(id);
 }
 
 const char *Worker::host_unavailable() const {
@@ -397,7 +393,6 @@ void Worker::handle(const Message &m) {
   q.depth = m.depth;
   q.scope = ++m_scopes;
   q.guest = false;
-  q.leased = false;
   q.routine_id = 0;
   q.library_epoch = 0;
   m_request = &q;
@@ -450,9 +445,8 @@ void Worker::handle(const Message &m) {
     if (top && guest && reply.status != w::Status::kOk) discard_microtasks();
   }
   post_result(q, reply);
-  // The host closes the statements the request left open; its kept ones are free again (§10.1).
+  // The host closes the statements the request left open (§10.1).
   if (!q.statements.empty()) q.statements.clear();
-  if (q.leased) release_statements(q);
   q.routine.reset();
   m_request = outer;
   if (top && (m_heap_changed || op == w::Op::kReset)) write_stats();
@@ -472,7 +466,6 @@ void Worker::drop(const Message &m) { drop_routine(Reader(m.body).get<uint64_t>(
 void Worker::reset() {
   m_routines.clear();
   m_answers.clear();
-  m_kept.clear();
   // RESET ends the options (§9.8) and discards the console output that waits (§9.4). globalThis
   // and the loaded libraries stay (Appendix B.6).
   m_options = Options();
@@ -851,6 +844,11 @@ void Worker::call(const Message &m, Request &q, Reply *reply) {
     reply->values = wr.written();
   } catch (const ConversionError &c) {
     reply->fail(w::Status::kGuestError, w::kLanguageType, c.message);
+  } catch (const GuestThrew &) {
+    // A toString or toJSON of the value threw: its exception is the routine's error, as one the
+    // body throws.
+    failed(tc, reply);
+    return;
   } catch (const TooLarge &) {
     reply->fail(w::Status::kGuestError, w::kLanguageType, "the routine's result is larger than MLE allows (64 MiB)");
   }
@@ -1147,45 +1145,7 @@ Message Worker::sql_reply(std::vector<std::byte> &assembled) {
 Worker::Found Worker::find_statement(Request &q, uint64_t id) {
   if (!q.statements.empty())
     if (const auto own = q.statements.find(id); own != q.statements.end()) return {&own->second, &q.statements};
-  if (q.leased) {
-    if (const auto kept = m_kept.find(q.routine_id); kept != m_kept.end())
-      if (const auto st = kept->second.find(id); st != kept->second.end() && st->second.lease == q.scope)
-        return {&st->second, &kept->second};
-  }
   return {};
-}
-
-void Worker::release_statements(Request &q) {
-  q.leased = false;
-  const auto kept = m_kept.find(q.routine_id);
-  if (kept == m_kept.end()) return;
-  for (auto &[id, st] : kept->second) {
-    if (st.lease != q.scope) continue;
-    st.lease = 0;
-    st.state = Statement::State::kIdle;  // the host has discarded its pending results
-  }
-}
-
-std::pair<uint64_t, Worker::Statement *> Worker::free_kept(Request &q, const std::string &key) {
-  if (const auto kept = m_kept.find(q.routine_id); kept != m_kept.end())
-    for (auto &[id, st] : kept->second)
-      if (st.lease == 0 && st.key == key) return {id, &st};
-  return {0, nullptr};
-}
-
-bool Worker::kept_room(Request &q) {
-  const auto kept = m_kept.find(q.routine_id);
-  if (kept == m_kept.end() || kept->second.size() < m_config.kept_statements) return true;
-  uint64_t oldest = 0, tick = UINT64_MAX;
-  for (const auto &[id, st] : kept->second)
-    if (st.lease == 0 && st.used < tick) {
-      oldest = id;
-      tick = st.used;
-    }
-  if (oldest == 0) return false;  // every one is in use (a recursion): this statement is not kept
-  kept->second.erase(oldest);
-  sql_close(q, oldest);
-  return true;
 }
 
 void Worker::sql_close(Request &q, uint64_t id) {
@@ -1208,7 +1168,6 @@ v8::MaybeLocal<Value> Worker::sql_result(Request &q, const Sent &sent, const Mes
   const uint64_t id = sent.id;
   Reader r(m.body);
   const auto kind = static_cast<w::SqlResultKind>(r.get<uint8_t>());
-  // Looked up now: a nested PREPARE or DROP may have taken the routine's kept statements.
   Found found = find_statement(q, id);
   Statement *st = found.st;  // nullptr: CLOSED
   // §10.1: may this kind answer the action? (The actions sent are allowed in the id's state: the
@@ -1274,16 +1233,10 @@ v8::MaybeLocal<Value> Worker::sql_result(Request &q, const Sent &sent, const Mes
       if (action == w::SqlAction::kClose) {
         if (st != nullptr) found.in->erase(id);
       } else if (action == w::SqlAction::kPrepare) {
-        Statement &s = sent.keep ? m_kept[q.routine_id][id] : q.statements[id];
+        Statement &s = q.statements[id];
         s.prepared = true;
         s.to_client = sent.to_client;
         s.param_count = pcount;
-        if (sent.keep) {
-          s.lease = q.scope;
-          s.used = ++m_kept_tick;
-          s.key = sent.key;
-          q.leased = true;
-        }
       } else if (more_results) {
         open().state = State::kNext;
       } else {
@@ -1427,7 +1380,7 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
   const bool has_params = action == w::SqlAction::kExecute || action == w::SqlAction::kExecutePrepared ||
                           action == w::SqlAction::kExecuteMany;
   if (!opens) {
-    // A statement belongs to the request that opened it (a kept one: that uses it): the handle of
+    // A statement belongs to the request that opened it: the handle of
     // another request (an earlier one, or the caller's) fails here, and nothing is sent.
     const std::optional<uint64_t> scope = integer(1, 9e15), handle = integer(2, 9e15);
     if (!scope || *scope != q.scope)
@@ -1440,11 +1393,6 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
     Statement *const st = find_statement(q, sent.id).st;
     if (action == w::SqlAction::kClose) {
       if (st == nullptr) return ok_reply(iso, 0, q.scope, sent.id);
-      if (st->lease != 0 && st->state == State::kIdle) {
-        // A kept statement with nothing to read stays prepared for the routine.
-        st->lease = 0;
-        return ok_reply(iso, 0, q.scope, sent.id);
-      }
     } else if (action == w::SqlAction::kNextResult) {
       if (st == nullptr || st->state == State::kIdle) {
         Local<Value> end[] = {v8::Number::New(iso, 3)};
@@ -1464,7 +1412,7 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
     std::optional<std::string> exact = utf8_exact(iso, info[3].As<v8::String>());
     if (!exact) return type_error("the SQL statement is not well-formed Unicode (an unpaired surrogate)");
     text = std::move(*exact);
-    // The one flag guest code decides; KEEP is the worker's.
+    // The one flag there is (§10.2).
     const std::optional<uint64_t> f = integer(5, w::kPassResultToClient);
     if (!f) return type_error("sql: unknown flags");
     flags = static_cast<uint8_t>(*f);
@@ -1490,22 +1438,6 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
   Options rules = m_options;
   if (const std::optional<uint64_t> v = integer(7, kMaxIntegerType); v) rules.integer_type = static_cast<IntegerType>(*v);
   if (const std::optional<uint64_t> v = integer(8, kMaxDecimalType); v) rules.decimal_type = static_cast<DecimalType>(*v);
-  if (action == w::SqlAction::kPrepare && static_cast<w::Op>(q.op) == w::Op::kCall && m_config.kept_statements != 0) {
-    // A statement a routine prepares is kept for the routine (§10.1): the same text prepared
-    // again, by this or a later call, gets a free one without a message. One that another
-    // activation uses (a recursion) is not free: this activation prepares its own.
-    sent.key.reserve(text.size() + 1);
-    sent.key.assign(1, sent.to_client ? '1' : '0');
-    sent.key += text;
-    if (const auto [kept, free] = free_kept(q, sent.key); free != nullptr) {
-      free->lease = q.scope;
-      free->used = ++m_kept_tick;
-      q.leased = true;
-      return ok_reply(iso, free->param_count, q.scope, kept);
-    }
-    sent.keep = kept_room(q);
-    if (sent.keep) flags |= kKeepStatement;
-  }
   if (opens) sent.id = ++m_statement_ids;
 
   // The message, composed where guest code (a parameter's toJSON) cannot post.
@@ -1528,6 +1460,10 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
                            std::to_string(w::kMaxWorkerMessage >> 20) + " MiB)");
   } catch (const ConversionError &c) {
     return type_error(c.message);
+  } catch (const GuestThrew &) {
+    // A parameter's toJSON or toString threw: its exception goes on to the guest code that runs
+    // the statement.
+    return {};
   }
   if (iso->IsExecutionTerminating()) return {};
   Mailbox::send(uint32_t(w::Op::kSql), 0, q.depth, m_seq, wr.written());
