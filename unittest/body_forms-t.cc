@@ -346,6 +346,44 @@ TEST_F(MleBodyForms, JsDatesInTheSessionTimeZone) {
   set_options(setting("zz.unknown_setting", "1"));
 }
 
+// Date.prototype.toString() names the zone as V8 does (Appendix B.4): ICU's
+// long name for standard or daylight saving time, as the zone is named today;
+// before 1970 and after 2038 daylight saving time as in an equivalent year
+// (V8's DateCache). The names below are V8's (node 24, one process per time).
+TEST_F(MleBodyForms, JsDateStringsNameTheZoneAsV8) {
+  const uint64_t id = prepare(
+      "js", "zn",
+      "return a.map((t) => { const d = new Date(t), s = d.toString(), u = d.toTimeString();"
+      " return s.slice(s.indexOf('(')) + (u.slice(u.indexOf('(')) === s.slice(s.indexOf('(')) ? '' : '!'); })"
+      ".join('|');",
+      {{"a", ParamMode::kIn, ty(Tag::kJson, "JSON")}}, kVarchar);
+  ASSERT_NE(id, 0u);
+  struct Case {
+    const char *zone, *times, *want;
+  };
+  for (const Case &c : std::vector<Case>{
+           {"Europe/Vilnius", "[1719835200000, 1704110400000, 0, -4499965298921, 8640000000000000]",
+            "(Eastern European Summer Time)|(Eastern European Standard Time)|"
+            "(Eastern European Standard Time)|(Eastern European Summer Time)|"
+            "(Eastern European Summer Time)"},
+           {"Europe/Moscow", "[1325419200000, 678283200000, 1719835200000]",
+            "(Moscow Standard Time)|(Moscow Summer Time)|(Moscow Standard Time)"},
+           {"Europe/Dublin", "[1931554337963, 1719835200000, 0, 182630298659]",
+            "(Greenwich Mean Time)|(Irish Standard Time)|(Greenwich Mean Time)|"
+            "(Irish Standard Time)"},
+           {"America/New_York", "[1719835200000, 1704110400000]",
+            "(Eastern Daylight Time)|(Eastern Standard Time)"},
+           {"Asia/Tokyo", "[-660000000000]", "(Japan Standard Time)"},
+           {"+05:30", "[1719835200000]", "(GMT+05:30)"},
+           {"-13:00", "[1719835200000]", "(GMT-13:00)"},
+           {"+00:00", "[1719835200000]", "(Coordinated Universal Time)"}}) {
+    OptionsMsg o;
+    o.time_zone = c.zone;
+    set_options(o);
+    EXPECT_EQ(ret(id, {Value::json(c.times)}), Value::string(c.want)) << c.zone;
+  }
+}
+
 TEST_F(MleBodyForms, JsIntegerResults) {
   struct Case {
     const char *expr;

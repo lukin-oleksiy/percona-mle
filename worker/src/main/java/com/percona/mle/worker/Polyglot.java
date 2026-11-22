@@ -18,6 +18,9 @@
 package com.percona.mle.worker;
 
 import com.percona.mle.api.MleJson;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
@@ -217,12 +220,31 @@ final class Polyglot {
     }
     if (name.equals(jsZone)) return;
     try {
-      if (setLocalTimeZone == null) {
+      if (getMainRealm == null) {
         Class<?> realm = Class.forName("com.oracle.truffle.js.runtime.JSRealm", true, Polyglot.class.getClassLoader());
         getMainRealm = realm.getMethod("getMain", com.oracle.truffle.api.nodes.Node.class);
-        setLocalTimeZone = realm.getMethod("setLocalTimeZone", String.class);
+        try {
+          java.lang.reflect.Field[] f = new java.lang.reflect.Field[REALM_ZONE_FIELDS.length];
+          for (int i = 0; i < f.length; i++) {
+            f[i] = realm.getDeclaredField(REALM_ZONE_FIELDS[i]);
+            f[i].setAccessible(true);
+          }
+          realmZoneFields = f;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+          setLocalTimeZone = realm.getMethod("setLocalTimeZone", String.class);  // another GraalJS
+        }
       }
-      setLocalTimeZone.invoke(getMainRealm.invoke(null, (Object) null), name);
+      Object realm = getMainRealm.invoke(null, (Object) null);
+      if (realmZoneFields != null) {
+        // What JSRealm.setLocalTimeZone does, but for its ICU TimeZone: that one is made when
+        // Intl first needs it, as for a new realm (making it loads ICU's zone data, ~10 ms at
+        // the worker's start).
+        realmZoneFields[0].set(realm, java.time.ZoneId.of(name));
+        for (int i = 1; i < realmZoneFields.length; i++) realmZoneFields[i].set(realm, null);
+      } else {
+        setLocalTimeZone.invoke(realm, name);
+      }
+      zoneNames.zone(name);
       if (jsZoneChanged != null) jsZoneChanged.executeVoid();
     } catch (ReflectiveOperationException e) {
       // GraalJS without this method: local time stays the process's (a build problem, not the session's)
@@ -232,45 +254,172 @@ final class Polyglot {
   }
 
   private static java.lang.reflect.Method getMainRealm, setLocalTimeZone;
+  /** JSRealm's zone (java.time), then what it keeps made for the zone: its ICU TimeZone, Date formats. */
+  private static final String[] REALM_ZONE_FIELDS = {"localTimeZoneId", "localTimeZone", "jsDateToStringFormat",
+      "jsShortTimeFormat", "jsShortTimeLocalFormat", "jsShortDateFormat", "jsShortDateLocalFormat"};
+  private static java.lang.reflect.Field[] realmZoneFields;
 
-  /** Tells the Date methods below that the zone changed (they keep its formatter). */
+  /** Tells the Date methods below that the zone changed (they keep its name for a span of time). */
   private Value jsZoneChanged;
+
+  private final ZoneNames zoneNames = new ZoneNames();
+
+  /**
+   * The name V8 gives JavaScript's local time zone in Date.prototype.toString(): ICU's long name
+   * of the zone for standard or for daylight saving time, as the zone names them today
+   * (icu::TimeZone::getDisplayName(isDst, LONG), which V8 keeps per zone: "Eastern European
+   * Summer Time", "Coordinated Universal Time", "GMT+05:30" for a zone without a name), by whether
+   * ICU's zone has daylight saving time then. name(t) also gives the span [from, until) around t
+   * (ms) between two of the zone's transitions, in which the name stays: the Date methods keep
+   * the name and ask again only outside the span. GraalJS's ICU; main thread only.
+   */
+  public static final class ZoneNames {
+    /** The span of the last name(t), in ms since the epoch; empty before the first. */
+    public double from = 1, until = 0;
+    private String id;
+    private Object zone;  // ICU's TimeZone, made on first use, as the names
+    private String standard, daylight;
+    private final int[] offsets = new int[2];
+
+    /** The zone of local time now: its ICU id. */
+    void zone(String icuId) {
+      if (icuId.equals(id)) return;
+      id = icuId;
+      zone = null;
+      standard = daylight = null;
+      from = 1;
+      until = 0;
+    }
+
+    public String name(double t) {
+      try {
+        if (zone == null) zone = (Object) Icu.GET_TIME_ZONE.invokeExact(id);
+        long ms = (long) t;
+        // V8 asks whether a time before 1970 or after 2038 has daylight saving time in an
+        // equivalent year (2008-2035: as leap, beginning on the same weekday): at the time
+        // shifted by delta, which holds in [lo, hi) (t's UTC year, on t's side of that range).
+        long delta = 0, lo = 0, hi = MAX_EPOCH_MS + 1;
+        if (ms < 0 || ms > MAX_EPOCH_MS) {
+          int year = java.time.LocalDate.ofEpochDay(Math.floorDiv(ms, DAY_MS)).getYear();
+          lo = java.time.LocalDate.of(year, 1, 1).toEpochDay() * DAY_MS;
+          hi = java.time.LocalDate.of(year + 1, 1, 1).toEpochDay() * DAY_MS;
+          delta = java.time.LocalDate.of(equivalentYear(year), 1, 1).toEpochDay() * DAY_MS - lo;
+          if (ms < 0) hi = Math.min(hi, 0);
+          else lo = Math.max(lo, MAX_EPOCH_MS + 1);
+        }
+        long at = ms + delta;
+        Icu.GET_OFFSET.invokeExact(zone, at, false, offsets);
+        // The transitions around: at or before the time, and the first one after it.
+        Object prev = (Object) Icu.PREVIOUS_TRANSITION.invokeExact(zone, at, true);
+        Object next = (Object) Icu.NEXT_TRANSITION.invokeExact(zone, at, false);
+        from = Math.max(lo, prev == null ? Long.MIN_VALUE : (long) Icu.TRANSITION_TIME.invokeExact(prev) - delta);
+        until = Math.min(hi, next == null ? Long.MAX_VALUE : (long) Icu.TRANSITION_TIME.invokeExact(next) - delta);
+        boolean dst = offsets[1] != 0;
+        String name = dst ? daylight : standard;
+        if (name == null) {
+          name = (String) Icu.DISPLAY_NAME.invokeExact(zone, dst, Icu.LONG, Icu.US);
+          if (dst) daylight = name;
+          else standard = name;
+        }
+        return name;
+      } catch (Throwable e) {
+        throw new IllegalStateException("cannot name JavaScript's time zone: " + e, e);
+      }
+    }
+
+    /**
+     * GraalJS's ICU (com.ibm.icu shadowed; only GraalJS has it on its class path): TimeZone,
+     * BasicTimeZone, TimeZoneTransition and ULocale, loaded on first use.
+     */
+    private static final class Icu {
+      static final MethodHandle GET_TIME_ZONE, GET_OFFSET, PREVIOUS_TRANSITION, NEXT_TRANSITION,
+          TRANSITION_TIME, DISPLAY_NAME;
+      static final int LONG;
+      static final Object US;
+
+      static {
+        try {
+          String p = "org.graalvm.shadowed.com.ibm.icu.util.";
+          ClassLoader l = Polyglot.class.getClassLoader();
+          Class<?> tz = Class.forName(p + "TimeZone", true, l);
+          Class<?> basic = Class.forName(p + "BasicTimeZone", true, l);
+          Class<?> transition = Class.forName(p + "TimeZoneTransition", true, l);
+          Class<?> locale = Class.forName(p + "ULocale", true, l);
+          var lookup = MethodHandles.publicLookup();
+          GET_TIME_ZONE = lookup.findStatic(tz, "getTimeZone", MethodType.methodType(tz, String.class))
+              .asType(MethodType.methodType(Object.class, String.class));
+          GET_OFFSET = lookup.findVirtual(tz, "getOffset",
+              MethodType.methodType(void.class, long.class, boolean.class, int[].class))
+              .asType(MethodType.methodType(void.class, Object.class, long.class, boolean.class, int[].class));
+          PREVIOUS_TRANSITION = lookup.findVirtual(basic, "getPreviousTransition",
+              MethodType.methodType(transition, long.class, boolean.class))
+              .asType(MethodType.methodType(Object.class, Object.class, long.class, boolean.class));
+          NEXT_TRANSITION = lookup.findVirtual(basic, "getNextTransition",
+              MethodType.methodType(transition, long.class, boolean.class))
+              .asType(MethodType.methodType(Object.class, Object.class, long.class, boolean.class));
+          TRANSITION_TIME = lookup.findVirtual(transition, "getTime", MethodType.methodType(long.class))
+              .asType(MethodType.methodType(long.class, Object.class));
+          DISPLAY_NAME = lookup.findVirtual(tz, "getDisplayName",
+              MethodType.methodType(String.class, boolean.class, int.class, locale))
+              .asType(MethodType.methodType(String.class, Object.class, boolean.class, int.class, Object.class));
+          LONG = tz.getField("LONG").getInt(null);
+          US = locale.getField("US").get(null);
+        } catch (ReflectiveOperationException e) {
+          throw new ExceptionInInitializerError(e);
+        }
+      }
+    }
+
+    private static final long DAY_MS = 86_400_000L, MAX_EPOCH_MS = Integer.MAX_VALUE * 1000L;
+
+    /** V8's DateCache::EquivalentYear (ECMA-262 5.1, 15.9.1.8). */
+    private static int equivalentYear(int year) {
+      int weekDay = (int) Math.floorMod(java.time.LocalDate.of(year, 1, 1).toEpochDay() + 4, 7L);
+      int recent = (java.time.Year.isLeap(year) ? 1956 : 1967) + (weekDay * 12) % 28;
+      return 2008 + (recent + 3 * 28 - 2008) % 28;
+    }
+  }
 
   /**
    * Date.prototype.toString() and toTimeString() as V8 (and Oracle's MLE) show them: GraalJS names
    * the zone in short ("GMT+3", "EET") unless in its V8 compatibility mode, which changes much else;
-   * V8 gives ICU's long name ("Eastern European Summer Time", "GMT+05:30", "Coordinated Universal
-   * Time"). The rest is GraalJS's own: toDateString(), the local fields, the offset.
+   * V8 gives ICU's long name (ZoneNames). The rest is GraalJS's own: toDateString(), the local
+   * fields, the offset.
    */
   private static final String DATE_STRINGS = """
-      (() => {
+      ((zones) => {
         const P = Date.prototype, toDateString = P.toDateString, getTime = P.getTime;
-        let format = null;
-        const zoneName = (d) => {
-          if (format === null) format = new Intl.DateTimeFormat('en-US', { timeZoneName: 'long' });
-          const part = format.formatToParts(d).find((p) => p.type === 'timeZoneName');
-          return part === undefined ? '' : part.value;
+        let from = 1, until = 0, name = '';
+        const zoneName = (t) => {
+          if (!(t >= from && t < until)) {
+            name = zones.name(t);
+            from = zones.from;
+            until = zones.until;
+          }
+          return name;
         };
         const two = (n) => (n < 10 ? '0' : '') + n;
-        const time = (d) => {
+        const time = (d, t) => {
           const o = -d.getTimezoneOffset(), a = Math.abs(o);
           return two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds()) + ' GMT'
-              + (o < 0 ? '-' : '+') + two(Math.floor(a / 60)) + two(a % 60) + ' (' + zoneName(d) + ')';
+              + (o < 0 ? '-' : '+') + two(Math.floor(a / 60)) + two(a % 60) + ' (' + zoneName(t) + ')';
         };
         const methods = {
           toString() {
-            if (Number.isNaN(getTime.call(this))) return 'Invalid Date';
-            return toDateString.call(this) + ' ' + time(this);
+            const t = getTime.call(this);
+            if (Number.isNaN(t)) return 'Invalid Date';
+            return toDateString.call(this) + ' ' + time(this, t);
           },
           toTimeString() {
-            if (Number.isNaN(getTime.call(this))) return 'Invalid Date';
-            return time(this);
+            const t = getTime.call(this);
+            if (Number.isNaN(t)) return 'Invalid Date';
+            return time(this, t);
           },
         };
         for (const n of ['toString', 'toTimeString'])
           Object.defineProperty(P, n, { value: methods[n], writable: true, enumerable: false, configurable: true });
-        return () => { format = null; };
-      })()
+        return () => { from = 1; until = 0; };
+      })
       """;
 
   static boolean isGuest(String language) {
@@ -318,7 +467,7 @@ final class Polyglot {
       if (JS) {
         js = jsHelpers(c);
         jsOracle = JsOracle.helpers(c);
-        jsZoneChanged = c.eval(Source.create("js", DATE_STRINGS));
+        jsZoneChanged = c.eval(Source.create("js", DATE_STRINGS)).execute(zoneNames);
         // USING in JavaScript routines (Phase 6): $c.lib(...) gets every library's module.
         jsOracle.putMember("libBridge",
             (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString(), true));
