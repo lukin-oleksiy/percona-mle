@@ -229,43 +229,49 @@ final class Polyglot {
     if (name.equals(jsZone)) return;
     try {
       if (getMainRealm == null) {
+        // Method handles and var handles: a reflective Field.set makes an accessor per field on
+        // its first use (~1.3 ms for these, at every worker's start).
         Class<?> realm = Class.forName("com.oracle.truffle.js.runtime.JSRealm", true, Polyglot.class.getClassLoader());
-        getMainRealm = realm.getMethod("getMain", com.oracle.truffle.api.nodes.Node.class);
+        MethodHandles.Lookup lookup = MethodHandles.privateLookupIn(realm, MethodHandles.lookup());
+        getMainRealm = lookup.findStatic(realm, "getMain", MethodType.methodType(realm, com.oracle.truffle.api.nodes.Node.class))
+            .asType(MethodType.methodType(Object.class, com.oracle.truffle.api.nodes.Node.class));
         try {
-          java.lang.reflect.Field[] f = new java.lang.reflect.Field[REALM_ZONE_FIELDS.length];
-          for (int i = 0; i < f.length; i++) {
-            f[i] = realm.getDeclaredField(REALM_ZONE_FIELDS[i]);
-            f[i].setAccessible(true);
-          }
+          java.lang.invoke.VarHandle[] f = new java.lang.invoke.VarHandle[REALM_ZONE_FIELDS.length];
+          for (int i = 0; i < f.length; i++) f[i] = lookup.unreflectVarHandle(realm.getDeclaredField(REALM_ZONE_FIELDS[i]));
           realmZoneFields = f;
         } catch (ReflectiveOperationException | RuntimeException e) {
           setLocalTimeZone = realm.getMethod("setLocalTimeZone", String.class);  // another GraalJS
         }
       }
-      Object realm = getMainRealm.invoke(null, (Object) null);
+      Object realm = (Object) getMainRealm.invokeExact((com.oracle.truffle.api.nodes.Node) null);
       if (realmZoneFields != null) {
         // What JSRealm.setLocalTimeZone does, but for its ICU TimeZone: that one is made when
         // Intl first needs it, as for a new realm (making it loads ICU's zone data, ~10 ms at
         // the worker's start).
-        realmZoneFields[0].set(realm, java.time.ZoneId.of(name));
-        for (int i = 1; i < realmZoneFields.length; i++) realmZoneFields[i].set(realm, null);
+        realmZoneFields[0].set(realm, (Object) java.time.ZoneId.of(name));
+        for (int i = 1; i < realmZoneFields.length; i++) realmZoneFields[i].set(realm, (Object) null);
       } else {
         setLocalTimeZone.invoke(realm, name);
       }
+      // The Date methods keep a name only when they asked for one: else they have none to forget.
+      boolean named = zoneNames.takeAsked();
       zoneNames.zone(name);
-      if (jsZoneChanged != null) jsZoneChanged.executeVoid();
-    } catch (ReflectiveOperationException e) {
+      if (jsZoneChanged != null && named) jsZoneChanged.executeVoid();
+    } catch (RuntimeException | Error e) {
+      throw e;
+    } catch (Throwable e) {
       // GraalJS without this method: local time stays the process's (a build problem, not the session's)
       throw new IllegalStateException("cannot set JavaScript's time zone: " + e, e);
     }
     jsZone = name;
   }
 
-  private static java.lang.reflect.Method getMainRealm, setLocalTimeZone;
+  private static MethodHandle getMainRealm;
+  private static java.lang.reflect.Method setLocalTimeZone;
   /** JSRealm's zone (java.time), then what it keeps made for the zone: its ICU TimeZone, Date formats. */
   private static final String[] REALM_ZONE_FIELDS = {"localTimeZoneId", "localTimeZone", "jsDateToStringFormat",
       "jsShortTimeFormat", "jsShortTimeLocalFormat", "jsShortDateFormat", "jsShortDateLocalFormat"};
-  private static java.lang.reflect.Field[] realmZoneFields;
+  private static java.lang.invoke.VarHandle[] realmZoneFields;
 
   /** Tells the Date methods below that the zone changed (they keep its name for a span of time). */
   private Value jsZoneChanged;
@@ -299,7 +305,17 @@ final class Polyglot {
       until = 0;
     }
 
+    /** Whether name() was called since the last takeAsked(): the Date methods may keep a name. */
+    boolean takeAsked() {
+      boolean a = asked;
+      asked = false;
+      return a;
+    }
+
+    private boolean asked;
+
     public String name(double t) {
+      asked = true;
       try {
         if (zone == null) zone = (Object) Icu.GET_TIME_ZONE.invokeExact(id);
         long ms = (long) t;
