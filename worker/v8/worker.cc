@@ -242,14 +242,16 @@ SetDefaultZone icu_set_default_zone() {
 
 /** ICU's id of a zone of OPTIONS, named as the launcher's TZ named it before (Date.toString()
     unchanged): +00:00 is UTC, a whole hour Etc/GMT with IANA's sign (west positive), another
-    offset ICU's custom id GMT+05:30; an IANA name as it is. */
+    offset (and -13:00) ICU's custom id GMT+05:30; an IANA name as it is. */
 std::u16string icu_zone_id(std::string_view zone) {
   std::string id(zone);
   if (zone.size() == 6 && (zone[0] == '+' || zone[0] == '-')) {
     const int hours = (zone[1] - '0') * 10 + (zone[2] - '0');
     if (zone.substr(1) == "00:00")
       id = "UTC";
-    else if (zone.substr(3) == ":00")
+    else if (zone.substr(3) == ":00" && (zone[0] == '+' || hours <= 12))
+      // IANA's Etc/GMT zones reach Etc/GMT-14 (+14:00) but only Etc/GMT+12 (-12:00); -13:00
+      // takes the custom id below.
       id = std::string("Etc/GMT") + (zone[0] == '+' ? "-" : "+") + std::to_string(hours);
     else
       id = "GMT" + id;
