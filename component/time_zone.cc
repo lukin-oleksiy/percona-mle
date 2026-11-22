@@ -165,11 +165,13 @@ bool TimeZone::set(std::string_view name) {
   m_libc = false;
   m_from = m_to = 0;
   m_offset = 0;
+  m_at_from = m_at_to = 0;
+  m_at_offset = 0;
   if (int32_t offset = 0; parse_offset(name, &offset)) {
     // One offset for all time.
-    m_from = INT64_MIN;
-    m_to = INT64_MAX;
-    m_offset = offset;
+    m_from = m_at_from = INT64_MIN;
+    m_to = m_at_to = INT64_MAX;
+    m_offset = m_at_offset = offset;
     return true;
   }
   // SYSTEM is mysqld's own zone: by its name in the zone data if it has
@@ -291,6 +293,34 @@ bool TimeZone::lookup(int64_t local, int64_t *seconds) {
     return true;
   }
   return false;
+}
+
+bool TimeZone::local(int64_t microseconds, mle::Temporal *t) {
+  namespace ch = std::chrono;
+  const int64_t seconds = ch::floor<ch::seconds>(ch::microseconds{microseconds}).count();
+  if (seconds < m_at_from || seconds >= m_at_to) {
+    Period p;
+    if (!period_at(seconds, &p)) return false;
+    m_at_from = p.begin;
+    m_at_to = p.end;
+    m_at_offset = p.offset;
+  }
+  const ch::local_time<ch::microseconds> at{
+      ch::microseconds{microseconds + m_at_offset * 1000000}};
+  const auto day = ch::floor<ch::days>(at);
+  const ch::year_month_day date{day};
+  const int year = static_cast<int>(date.year());
+  if (year < 1 || year > 9999) return false;
+  const ch::hh_mm_ss<ch::microseconds> time{at - day};
+  *t = mle::Temporal();
+  t->year = static_cast<uint16_t>(year);
+  t->month = static_cast<uint8_t>(static_cast<unsigned>(date.month()));
+  t->day = static_cast<uint8_t>(static_cast<unsigned>(date.day()));
+  t->hour = static_cast<uint32_t>(time.hours().count());
+  t->minute = static_cast<uint8_t>(time.minutes().count());
+  t->second = static_cast<uint8_t>(time.seconds().count());
+  t->microsecond = static_cast<uint32_t>(time.subseconds().count());
+  return true;
 }
 
 bool TimeZone::instant(const mle::Temporal &t, int64_t *microseconds) {

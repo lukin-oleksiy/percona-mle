@@ -18,6 +18,7 @@
 #include "sql.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -147,6 +148,11 @@ struct SqlRunner::Statement {
   my_h_statement h = nullptr;
   /** Opened by PREPARE: at home in IDLE, kept until CLOSE or the end of the
       request. Else opened by EXECUTE: at home in CLOSED. */
+  /** The statement's text (prepared ids), and its cast_markers() once a
+      temporal value was bound. */
+  std::string sql;
+  std::vector<uint32_t> casts;
+  bool casts_known = false;
   bool prepared = false;
   /** PASS_RESULT_TO_CLIENT, for the life of the id. */
   bool to_client = false;
@@ -561,13 +567,159 @@ my_h_statement new_statement(bool to_client, size_t capacity,
   return h;
 }
 
+/** The parameter markers (by index) that are the whole first argument of a
+    CAST or a CONVERT: "?" right after "cast(" or "convert(" (any case,
+    spaces and comments between), outside quotes and comments. A light scan
+    of the text, done only for a statement that binds a TIME, DATETIME or
+    TIMESTAMP (BindContext). */
+std::vector<uint32_t> cast_markers(std::string_view sql) {
+  std::vector<uint32_t> out;
+  uint32_t marker = 0;
+  std::string word;          // the identifier read last, in lower case
+  char last = 0;             // the last significant character ('w': a word)
+  bool after_cast = false;   // last is the '(' of a CAST or CONVERT
+  const size_t n = sql.size();
+  const auto skip_to = [&](size_t from, std::string_view end) {
+    const size_t at = sql.find(end, from);
+    return at == std::string_view::npos ? n : at + end.size();
+  };
+  for (size_t i = 0; i < n;) {
+    const char c = sql[i];
+    if (c == '\'' || c == '"' || c == '`') {
+      for (i++; i < n; i++) {
+        if (sql[i] == '\\' && c != '`') {
+          i++;
+        } else if (sql[i] == c) {
+          if (i + 1 < n && sql[i + 1] == c) {
+            i++;
+          } else {
+            break;
+          }
+        }
+      }
+      i++;
+      last = 'x';
+      after_cast = false;
+      continue;
+    }
+    if (c == '#' || (c == '-' && i + 1 < n && sql[i + 1] == '-' &&
+                     (i + 2 >= n || isspace(static_cast<unsigned char>(sql[i + 2]))))) {
+      i = skip_to(i, "\n");
+      continue;
+    }
+    if (c == '/' && i + 1 < n && sql[i + 1] == '*') {
+      i = skip_to(i + 2, "*/");
+      continue;
+    }
+    if (isspace(static_cast<unsigned char>(c))) {
+      i++;
+      continue;
+    }
+    if (isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$') {
+      word.clear();
+      for (; i < n && (isalnum(static_cast<unsigned char>(sql[i])) ||
+                       sql[i] == '_' || sql[i] == '$');
+           i++)
+        word += static_cast<char>(tolower(static_cast<unsigned char>(sql[i])));
+      last = 'w';
+      after_cast = false;
+      continue;
+    }
+    if (c == '?') {
+      if (after_cast) out.push_back(marker);
+      marker++;
+    }
+    after_cast = c == '(' && last == 'w' && (word == "cast" || word == "convert");
+    last = c;
+    i++;
+  }
+  return out;
+}
+
+/** What binding needs beyond the values: the session's current zone, for
+    TIMESTAMP values, read at the first one; the statement's text, for
+    cast_markers(), scanned at the first TIME, DATETIME or TIMESTAMP (or
+    the result of that scan, kept with a prepared statement). */
+struct BindContext {
+  MYSQL_THD thd;
+  ZoneCache *zones;
+  std::string_view sql;
+  std::vector<uint32_t> *casts = nullptr;
+  bool *casts_known = nullptr;
+  TimeZone *zone = nullptr;
+  bool zone_read = false;
+  std::vector<uint32_t> own_casts;
+  bool own_casts_known = false;
+};
+
+/** Whether the marker is the argument of a CAST or CONVERT to a character
+    type. The server gives that marker a string type that it keeps whatever
+    value is bound (an "inherited" type, Item_charset_conversion), and then
+    formats a bound TIME or DATETIME with the string type's decimals, which
+    no temporal value has: a debug server asserts (my_useconds_to_str), a
+    release one reads outside an array, and a TIME becomes NULL. Such a
+    value is bound as the text the server would make of it. Every other
+    marker resolved as a string (SELECT ?, CONCAT(?)) is prepared again for
+    a temporal value and keeps the value's type; the server does not tell
+    the two apart, so the marker's place in the text does. Wanted: the
+    server formats a temporal value of a parameter with the value's own
+    decimals. */
+bool string_marker(my_h_statement h, uint32_t index, BindContext &c) {
+  if (c.casts == nullptr) {
+    c.casts = &c.own_casts;
+    c.casts_known = &c.own_casts_known;
+  }
+  if (!*c.casts_known) {
+    *c.casts = cast_markers(c.sql);
+    *c.casts_known = true;
+  }
+  if (!std::binary_search(c.casts->begin(), c.casts->end(), index)) return false;
+  uint64_t type = 0;
+  if (mysql_service_mysql_stmt_metadata->param_metadata(h, index, "type", &type))
+    return false;
+  constexpr uint64_t kStrings =
+      MYSQL_SP_ARG_TYPE_VARCHAR | MYSQL_SP_ARG_TYPE_VAR_STRING |
+      MYSQL_SP_ARG_TYPE_STRING | MYSQL_SP_ARG_TYPE_ENUM | MYSQL_SP_ARG_TYPE_SET |
+      MYSQL_SP_ARG_TYPE_TINY_BLOB | MYSQL_SP_ARG_TYPE_MEDIUM_BLOB |
+      MYSQL_SP_ARG_TYPE_LONG_BLOB | MYSQL_SP_ARG_TYPE_BLOB |
+      MYSQL_SP_ARG_TYPE_JSON;
+  return (type & kStrings) != 0;
+}
+
+/** "YYYY-MM-DD hh:mm:ss.ffffff", as the server writes a DATETIME parameter
+    (with six decimals, its type DATETIME(6)). */
+size_t datetime_text(const mle::Temporal &t, char *b, size_t n) {
+  return static_cast<size_t>(snprintf(b, n, "%04u-%02u-%02u %02u:%02u:%02u.%06u",
+                                      t.year, t.month, t.day, t.hour, t.minute,
+                                      t.second, t.microsecond));
+}
+
 /** Binds value v to marker index; the server converts it to what the
     marker needs. */
-bool bind_value(my_h_statement h, uint32_t index, const Value &v) {
+bool bind_value(my_h_statement h, uint32_t index, const Value &v,
+                BindContext &c) {
   auto bind = [&](bool is_null, uint64_t type, bool is_unsigned,
                   const void *data, unsigned long length) {
     return mysql_service_mysql_stmt_bind->bind_param(
         h, index, is_null, type, is_unsigned, data, length, nullptr, 0);
+  };
+  // A DATETIME (or a TIMESTAMP's local time) for a marker of a string.
+  auto bind_datetime = [&](const mle::Temporal &t) {
+    if (string_marker(h, index, c)) {
+      char b[48];
+      return bind(false, MYSQL_SP_ARG_TYPE_VARCHAR, false, b,
+                  datetime_text(t, b, sizeof b));
+    }
+    mle_time m{};
+    m.year = t.year;
+    m.month = t.month;
+    m.day = t.day;
+    m.hour = t.hour;
+    m.minute = t.minute;
+    m.second = t.second;
+    m.second_part = t.microsecond;
+    m.time_type = MYSQL_TIMESTAMP_TYPE_DATETIME;
+    return bind(false, MYSQL_SP_ARG_TYPE_DATETIME, false, &m, sizeof m);
   };
   switch (v.tag()) {
     case Tag::kNull:
@@ -602,8 +754,21 @@ bool bind_value(my_h_statement h, uint32_t index, const Value &v) {
                   f.size() * sizeof(float));
     }
     case Tag::kTimestamp: {
-      // An instant: UTC fields with a zero displacement, which the server
-      // converts to the session's zone. The zero timestamp is no instant.
+      // An instant reaches the server as local time in the session's
+      // current zone (§7.2): every expression then sees the session's local
+      // time, as for a TIMESTAMP column (an instant in a repeated hour is
+      // stored as its first occurrence).
+      if (v.as_timestamp() != mle::wire::kZeroTimestamp) {
+        if (!c.zone_read) {
+          c.zone_read = true;
+          c.zone = c.zones != nullptr ? c.zones->current(c.thd, nullptr) : nullptr;
+        }
+        if (mle::Temporal t; c.zone != nullptr && c.zone->local(v.as_timestamp(), &t))
+          return bind_datetime(t);
+      }
+      // The zero timestamp; or a zone MLE does not know: UTC fields with a
+      // zero displacement, which the server converts where it resolved a
+      // temporal type.
       mle_time m{};
       m.time_type = MYSQL_TIMESTAMP_TYPE_DATETIME;
       if (v.as_timestamp() != mle::wire::kZeroTimestamp) {
@@ -624,13 +789,17 @@ bool bind_value(my_h_statement h, uint32_t index, const Value &v) {
     case Tag::kTime:
     case Tag::kDatetime: {
       const mle::Temporal &t = v.as_temporal();
-      if (v.tag() == Tag::kTime && t.negative) {
-        // The service drops mle_time::neg (convert_to_mysql_time, server
-        // bug): bind a negative TIME as text, the server converts it.
+      // The service drops mle_time::neg (convert_to_mysql_time, server
+      // bug): a negative TIME is bound as text, the server converts it. So
+      // is a TIME for a marker of a string (string_marker()).
+      if (v.tag() == Tag::kTime && (t.negative || string_marker(h, index, c))) {
+        // As the server writes a TIME parameter (TIME(6)).
         char b[48];
-        snprintf(b, sizeof b, "-%u:%02u:%02u.%06u", t.hour, t.minute, t.second,
-                 t.microsecond);
-        return bind(false, MYSQL_SP_ARG_TYPE_VARCHAR, false, b, strlen(b));
+        const int len = snprintf(b, sizeof b, "%s%02u:%02u:%02u.%06u",
+                                 t.negative ? "-" : "", t.hour, t.minute,
+                                 t.second, t.microsecond);
+        return bind(false, MYSQL_SP_ARG_TYPE_VARCHAR, false, b,
+                    static_cast<unsigned long>(len));
       }
       mle_time m{};
       m.year = t.year;
@@ -650,6 +819,7 @@ bool bind_value(my_h_statement h, uint32_t index, const Value &v) {
         type = MYSQL_SP_ARG_TYPE_TIME;
         m.time_type = MYSQL_TIMESTAMP_TYPE_TIME;
       }
+      if (v.tag() == Tag::kDatetime) return bind_datetime(t);
       return bind(false, type, false, &m, sizeof m);
     }
   }
@@ -658,9 +828,9 @@ bool bind_value(my_h_statement h, uint32_t index, const Value &v) {
 
 /** values[from, from + n) to markers 0..n-1. */
 bool bind_values(my_h_statement h, const std::vector<Value> &values,
-                 size_t from, size_t n) {
+                 size_t from, size_t n, BindContext &c) {
   for (size_t i = 0; i < n; i++)
-    if (bind_value(h, static_cast<uint32_t>(i), values[from + i])) return true;
+    if (bind_value(h, static_cast<uint32_t>(i), values[from + i], c)) return true;
   return false;
 }
 
@@ -710,6 +880,7 @@ void SqlRunner::explain_refusal(SqlResultMsg *result) {
 
 void SqlRunner::execute_text(const mle::SqlMsg &request,
                              SqlResultMsg *result) {
+  BindContext bind{m_thd, m_zones, request.statement};
   if (request.params.empty() && refused_here(result)) return;
   if (too_many_statements(result) || over_budget(nullptr, result)) return;
   const bool to_client =
@@ -739,7 +910,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
                          request.params.size() > markers
                              ? "more values than parameter markers"
                              : "fewer values than parameter markers");
-      failed = bind_values(s->h, request.params, 0, request.params.size()) ||
+      failed = bind_values(s->h, request.params, 0, request.params.size(), bind) ||
                mysql_service_mysql_stmt_execute->execute(s->h);
     }
   } else {
@@ -768,6 +939,7 @@ void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
                      "cannot create a statement");
   s->prepared = true;
   s->to_client = to_client;
+  s->sql = request.statement;
   const mysql_cstring_with_length text{request.statement.data(),
                                        request.statement.size()};
   if (mysql_service_mysql_stmt_execute->prepare(text, s->h))
@@ -783,6 +955,7 @@ void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
 
 void SqlRunner::execute_prepared(const mle::SqlMsg &request, Statement &s,
                                  SqlResultMsg *result) {
+  BindContext bind{m_thd, m_zones, s.sql, &s.casts, &s.casts_known};
   // All pending results of the id go first; an ERROR from here on leaves it
   // IDLE.
   s.discard();
@@ -795,7 +968,7 @@ void SqlRunner::execute_prepared(const mle::SqlMsg &request, Statement &s,
   const bool timed = sql_exec_time();
   const uint64_t t0 = timed ? now_us() : 0;
   const bool failed =
-      bind_values(s.h, request.params, 0, request.params.size()) ||
+      bind_values(s.h, request.params, 0, request.params.size(), bind) ||
       mysql_service_mysql_stmt_execute->execute(s.h);
   count_results(s);
   if (failed) return statement_error(s, result);
@@ -806,6 +979,7 @@ void SqlRunner::execute_prepared(const mle::SqlMsg &request, Statement &s,
 
 void SqlRunner::execute_many(const mle::SqlMsg &request, Statement &s,
                              SqlResultMsg *result) {
+  BindContext bind{m_thd, m_zones, s.sql, &s.casts, &s.casts_known};
   // The prepared statement once per row, in the caller's session and
   // transaction, without a round trip to the worker in between. It stops at
   // the first failing row; the rows before it stay executed (the
@@ -849,7 +1023,7 @@ void SqlRunner::execute_many(const mle::SqlMsg &request, Statement &s,
     const auto failed_at_row = [&] {
       result->failed_row = static_cast<uint32_t>(i);
     };
-    if (bind_values(s.h, request.params, i * width, width) ||
+    if (bind_values(s.h, request.params, i * width, width, bind) ||
         mysql_service_mysql_stmt_execute->execute(s.h)) {
       statement_error(s, result);
       return failed_at_row();

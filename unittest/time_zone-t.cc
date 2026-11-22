@@ -147,6 +147,32 @@ void vilnius_2024(TimeZone &zone) {
   EXPECT_EQ(zone.to(), local_of(2024, 3, 31, 3));
 }
 
+/** The local time of an instant, in seconds on the zone's clock. */
+int64_t local_seconds(TimeZone &zone, int64_t utc) {
+  mle::Temporal t;
+  EXPECT_TRUE(zone.local(utc * 1000000, &t)) << utc;
+  return local_of(t.year, t.month, t.day, t.hour, t.minute, t.second);
+}
+
+/** Instants to local time (how a TIMESTAMP parameter reaches the server):
+    the repeated hour is shown twice, the skipped one never. */
+void vilnius_local(TimeZone &zone) {
+  EXPECT_EQ(local_seconds(zone, utc_of(2024, 10, 27, 0, 30)), local_of(2024, 10, 27, 3, 30));
+  EXPECT_EQ(local_seconds(zone, utc_of(2024, 10, 27, 1, 30)), local_of(2024, 10, 27, 3, 30));
+  EXPECT_EQ(local_seconds(zone, utc_of(2024, 3, 31, 0, 59) + 59), local_of(2024, 3, 31, 2, 59, 59));
+  EXPECT_EQ(local_seconds(zone, utc_of(2024, 3, 31, 1, 0)), local_of(2024, 3, 31, 4, 0));
+  EXPECT_EQ(local_seconds(zone, utc_of(2024, 6, 1, 9)), local_of(2024, 6, 1, 12));
+  mle::Temporal t;
+  ASSERT_TRUE(zone.local(utc_of(2024, 6, 1, 9) * 1000000 + 123456, &t));
+  EXPECT_EQ(t.microsecond, 123456u);
+  const ch::time_zone *rules = ch::locate_zone("Europe/Vilnius");
+  for (int64_t at = utc_of(2024, 1, 1, 0); at < utc_of(2026, 1, 1, 0); at += 3593)
+    ASSERT_EQ(local_seconds(zone, at), rules->to_local(ch::sys_seconds{ch::seconds{at}})
+                                           .time_since_epoch()
+                                           .count())
+        << at;
+}
+
 TEST(MleTimeZone, Offset) {
   TimeZone zone;
   ASSERT_TRUE(zone.set("+05:30"));
@@ -164,6 +190,9 @@ TEST(MleTimeZone, NamedZoneAtTransitions) {
   TimeZone fresh;
   ASSERT_TRUE(fresh.set("Europe/Vilnius"));
   agrees_with(fresh, ch::locate_zone("Europe/Vilnius"), 2024);
+  TimeZone instants;
+  ASSERT_TRUE(instants.set("Europe/Vilnius"));
+  vilnius_local(instants);
 }
 
 TEST(MleTimeZone, NamedZonesAgreeWithTheZoneData) {
@@ -223,6 +252,9 @@ TEST_F(MleSystemZone, TransitionsFromTheCLibrary) {
   TimeZone fresh;
   ASSERT_TRUE(fresh.set("SYSTEM"));
   agrees_with(fresh, ch::locate_zone("Europe/Vilnius"), 2024, 61);
+  TimeZone instants;
+  ASSERT_TRUE(instants.set("SYSTEM"));
+  vilnius_local(instants);
 }
 
 }  // namespace mle_time_zone_unittest

@@ -315,7 +315,13 @@ class Hooks : public mle::CallHooks {
       arena. */
   void sql_into(const mle::SqlMsg &m, mle::SqlResultMsg *r,
                 mle::DirectReply *direct, uint64_t error_id) override {
-    if (m_sql != nullptr) return m_sql->handle(m, r, direct, error_id);
+    if (m_sql != nullptr) {
+      // A KILL during the statement must make its record at once: the
+      // server ends the statement in its own way and may clear the
+      // session's kill state before the host looks again (§11.1).
+      if (m_session != nullptr) m_session->install_kill_handler();
+      return m_sql->handle(m, r, direct, error_id);
+    }
     // No statement ids exist here: CLOSE closes nothing, every other action
     // is an ERROR and its id stays CLOSED.
     *r = mle::SqlResultMsg();

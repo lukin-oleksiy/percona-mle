@@ -1,0 +1,121 @@
+#
+# component_mle: TIME, DATETIME and TIMESTAMP values a routine binds to
+# statement parameters. A TIMESTAMP (an instant) reaches the server as
+# local time in the session's current zone (protocol §7.2), in every
+# expression. A TIME or DATETIME given to CAST(? AS CHAR) is the text the
+# server makes of it (the server formatted it with the string type's
+# decimals: a debug server asserted, a TIME became NULL).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE tz (id INT PRIMARY KEY, ts TIMESTAMP(6), dt DATETIME(6));
+SET time_zone = '+03:00';
+CREATE PROCEDURE probe(q TEXT, which INT, OUT r TEXT) LANGUAGE PYTHON AS $$
+import datetime
+vals = [datetime.datetime(2024, 6, 1, 12, 30, 45, 123456), datetime.datetime(2024, 6, 1, 9, 0, 0, tzinfo=datetime.timezone.utc), datetime.time(1, 2, 3, 500000), datetime.timedelta(hours=-838, minutes=-10)]
+v = session.run_sql(q, [vals[which]]).fetch_one()[0]
+r = type(v).__name__ + ' ' + str(v)
+$$;
+# 0: DATETIME, 1: TIMESTAMP (09:00 UTC), 2: TIME, 3: a negative TIME.
+CALL probe('SELECT ?', 0, @r);
+SELECT @r AS select_marker;
+select_marker
+datetime 2024-06-01 12:30:45.123456
+CALL probe('SELECT CONCAT(?, "")', 0, @r);
+SELECT @r AS concat;
+concat
+str 2024-06-01 12:30:45.123456
+CALL probe('SELECT CAST(? AS CHAR)', 0, @r);
+SELECT @r AS cast_char;
+cast_char
+str 2024-06-01 12:30:45.123456
+CALL probe('SELECT CONVERT(? USING utf8mb4)', 0, @r);
+SELECT @r AS convert_using;
+convert_using
+str 2024-06-01 12:30:45.123456
+CALL probe('SELECT ?', 1, @r);
+SELECT @r AS select_marker;
+select_marker
+datetime 2024-06-01 12:00:00
+CALL probe('SELECT CONCAT(?, "")', 1, @r);
+SELECT @r AS concat;
+concat
+str 2024-06-01 12:00:00.000000
+CALL probe('SELECT CAST(? AS CHAR)', 1, @r);
+SELECT @r AS cast_char;
+cast_char
+str 2024-06-01 12:00:00.000000
+CALL probe('SELECT CONVERT(? USING utf8mb4)', 1, @r);
+SELECT @r AS convert_using;
+convert_using
+str 2024-06-01 12:00:00.000000
+CALL probe('SELECT ?', 2, @r);
+SELECT @r AS select_marker;
+select_marker
+timedelta 1:02:03.500000
+CALL probe('SELECT CONCAT(?, "")', 2, @r);
+SELECT @r AS concat;
+concat
+str 01:02:03.500000
+CALL probe('SELECT CAST(? AS CHAR)', 2, @r);
+SELECT @r AS cast_char;
+cast_char
+str 01:02:03.500000
+CALL probe('SELECT CONVERT(? USING utf8mb4)', 2, @r);
+SELECT @r AS convert_using;
+convert_using
+str 01:02:03.500000
+CALL probe('SELECT ?', 3, @r);
+SELECT @r AS select_marker;
+select_marker
+str -838:10:00.000000
+CALL probe('SELECT CONCAT(?, "")', 3, @r);
+SELECT @r AS concat;
+concat
+str -838:10:00.000000
+CALL probe('SELECT CAST(? AS CHAR)', 3, @r);
+SELECT @r AS cast_char;
+cast_char
+str -838:10:00.000000
+CALL probe('SELECT CONVERT(? USING utf8mb4)', 3, @r);
+SELECT @r AS convert_using;
+convert_using
+str -838:10:00.000000
+CALL probe('SELECT DATE_FORMAT(?, "%Y-%m-%d %H:%i:%s")', 1, @r);
+SELECT @r AS date_format_of_timestamp;
+date_format_of_timestamp
+str 2024-06-01 12:00:00
+# Only the marker that is CAST's argument: not one in quotes, a
+# comment, or another expression.
+CREATE PROCEDURE mixed(OUT r TEXT) LANGUAGE PYTHON AS $$
+import datetime
+d = datetime.datetime(2024, 6, 1, 12, 30, 45)
+row = session.run_sql("SELECT ? AS a, '?' AS q /* cast(? */, CAST( /* x */ ? AS CHAR) AS c, CONCAT(?, '') AS s", [d, d, d]).fetch_one()
+r = ' | '.join(type(v).__name__ + ' ' + str(v) for v in row)
+$$;
+CALL mixed(@r);
+SELECT @r AS mixed;
+mixed
+datetime 2024-06-01 12:30:45 | str ? | str 2024-06-01 12:30:45.000000 | str 2024-06-01 12:30:45.000000
+CREATE PROCEDURE store() LANGUAGE PYTHON AS $$
+import datetime
+at = datetime.datetime(2024, 6, 1, 9, 0, 0, tzinfo=datetime.timezone.utc)
+session.run_sql("INSERT INTO tz VALUES (1, ?, ?)", [at, at])
+session.prepare("INSERT INTO tz VALUES (?, ?, ?)").bind(2, at, at).execute()
+$$;
+CALL store();
+SELECT id, ts, dt FROM tz ORDER BY id;
+id	ts	dt
+1	2024-06-01 12:00:00.000000	2024-06-01 12:00:00.000000
+2	2024-06-01 12:00:00.000000	2024-06-01 12:00:00.000000
+SET time_zone = '+00:00';
+SELECT id, ts AS ts_in_utc FROM tz ORDER BY id;
+id	ts_in_utc
+1	2024-06-01 09:00:00.000000
+2	2024-06-01 09:00:00.000000
+DROP PROCEDURE probe;
+DROP PROCEDURE store;
+DROP PROCEDURE mixed;
+DROP TABLE tz;
+REVOKE CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

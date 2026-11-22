@@ -191,7 +191,8 @@ class CallHooks {
       sleeps in bounded sleeps (§4.3) until it does. Called once per wait,
       before the first sleep, and followed by a look for a kill: the hook
       may set up a faster way to notice one (a kill handler) that a short
-      request does not need. */
+      request does not need. (sql() runs on the hooks' side: they set it up
+      there themselves if a statement needs it.) */
   virtual void sleeping() {}
   /** A database library the routine imports (§9.10); by default REFUSED.
       Not called once an interrupt was noticed. Must not use the Worker. */

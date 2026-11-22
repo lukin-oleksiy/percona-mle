@@ -75,6 +75,11 @@ class TimeZone {
       False if the fields are no date or the instant is outside the
       protocol's range. */
   bool instant(const mle::Temporal &local, int64_t *microseconds);
+  /** The local time of an instant (microseconds since 1970 UTC, not the
+      zero timestamp) in this zone: how a TIMESTAMP reaches the server
+      (§7.2). False for an instant outside the years 1-9999. It keeps the
+      span of instants with the offset found last, as instant() does. */
+  bool local(int64_t microseconds, mle::Temporal *local);
   /** Takes the interval other has found, if other is this zone. */
   void learn(const TimeZone &other) {
     if (other.m_id != m_id) return;
@@ -113,6 +118,10 @@ class TimeZone {
   int64_t m_from = 0;
   int64_t m_to = 0;
   int64_t m_offset = 0;
+  /** Instants in [m_at_from, m_at_to) (seconds) have the offset m_at_offset. */
+  int64_t m_at_from = 0;
+  int64_t m_at_to = 0;
+  int64_t m_at_offset = 0;
   /** Which zone this is: copies of one set() share it. */
   uint64_t m_id = 0;
 };
