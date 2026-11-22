@@ -21,9 +21,9 @@ import datetime as _dt
 import decimal as _decimal
 import json as _json
 import math as _math
-import re as _re
 import struct as _struct
 import array as _array
+import codecs as _codecs
 
 import _mlewire
 
@@ -74,15 +74,22 @@ _P_TAG_U64 = _struct.Struct('<BQ').pack
 _P_TAG_F64 = _struct.Struct('<Bd').pack
 _P_TAG_F32 = _struct.Struct('<Bf').pack
 
-_SURROGATE = _re.compile('[\ud800-\udfff]')
+
+def _replace_surrogates(e):
+    """The encoder's error handler for utf8(): each surrogate of the run it found becomes U+FFFD
+    (as bytes: the UTF-8 encoder takes only ASCII text from a handler)."""
+    if not isinstance(e, UnicodeEncodeError):
+        raise e
+    return b'\xef\xbf\xbd' * (e.end - e.start), e.end
+
+
+_codecs.register_error('mle.surrogate', _replace_surrogates)
 
 
 def utf8(s):
-    """Guest text as well-formed UTF-8 (§7.1): each unpaired surrogate becomes U+FFFD."""
-    try:
-        return s.encode('utf-8')
-    except UnicodeEncodeError:
-        return _SURROGATE.sub('\ufffd', s).encode('utf-8')
+    """Guest text as well-formed UTF-8 (§7.1): each unpaired surrogate becomes U+FFFD. One pass:
+    the encoder calls the handler only where it finds a surrogate."""
+    return s.encode('utf-8', 'mle.surrogate')
 
 
 def cut(b, limit):
@@ -115,21 +122,23 @@ class _LazyNumpy:
 _numpy = _LazyNumpy()
 
 
-# The time zone of OPTIONS (sql.Api.zone sets it): a TIMESTAMP, which is an instant on the wire, is
-# a naive datetime of the local time in this zone for routines, as a DATETIME is; and an aware
-# datetime that goes where there is no zone (DATETIME) is converted to it.
-ZONE = _dt.timezone.utc
+# The time zone of OPTIONS (sql.Api.zone sets it; +00:00 without OPTIONS, §1): a TIMESTAMP, which
+# is an instant on the wire, is an aware datetime in this zone (Appendix B.4: zoneinfo.ZoneInfo for
+# an IANA name, a fixed datetime.timezone for an offset). It shows the local fields and keeps the
+# instant, so it goes back as a TIMESTAMP; a naive datetime (a DATETIME) goes back as a DATETIME.
+ZONE = _dt.timezone(_dt.timedelta(0))
 _EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 _MICROSECOND = _dt.timedelta(microseconds=1)
 
 
 def timestamp(us, rows):
-    """A TIMESTAMP of the host (helper of the C++ codec): the local time in the zone of OPTIONS.
-    The zero timestamp, and what Python's datetime cannot hold, is None in a row and a conversion
-    error as a routine argument (as zero dates are)."""
+    """A TIMESTAMP of the host (helper of the C++ codec): an aware datetime in the zone of OPTIONS
+    (ZoneInfo keeps the offset intervals of its zone). The zero timestamp, and what Python's
+    datetime cannot hold, is None in a row and a conversion error as a routine argument (as zero
+    dates are)."""
     try:
         if us != ZERO_TIMESTAMP:
-            return (_EPOCH + _dt.timedelta(microseconds=us)).astimezone(ZONE).replace(tzinfo=None)
+            return (_EPOCH + _dt.timedelta(microseconds=us)).astimezone(ZONE)
     except OverflowError:
         pass
     if rows:
@@ -137,22 +146,20 @@ def timestamp(us, rows):
     raise ConversionError('the TIMESTAMP value has no Python equivalent (zero timestamp?)')
 
 
+def aware(v):
+    """Whether a datetime is an instant (it has a zone with an offset)."""
+    return v.tzinfo is not None and v.utcoffset() is not None
+
+
 def instant(v):
-    """A datetime as a TIMESTAMP of the wire, or None if it is outside the wire's range: an aware
-    one is an instant; a naive one is local time in the zone of OPTIONS (a repeated hour: its
-    first occurrence)."""
-    if v.tzinfo is None or v.utcoffset() is None:
-        v = v.replace(tzinfo=ZONE)
+    """An aware datetime as a TIMESTAMP of the wire, or None if it is outside the wire's range."""
     us = (v - _EPOCH) // _MICROSECOND
     return us if 0 <= us <= MAX_TIMESTAMP else None
 
 
 def local(v):
-    """A datetime as it goes where there is no zone: an aware one as local time in the zone of
-    OPTIONS."""
-    if v.tzinfo is not None and v.utcoffset() is not None:
-        return v.astimezone(ZONE).replace(tzinfo=None)
-    return v
+    """An aware datetime as local time in the zone of OPTIONS, naive."""
+    return v.astimezone(ZONE).replace(tzinfo=None)
 
 
 class ConversionError(Exception):
@@ -281,15 +288,7 @@ class Writer:
             b.append(T_DECIMAL)
             self.str(text)
         elif isinstance(v, _dt.datetime):
-            if v.tzinfo is not None and v.utcoffset() is not None:
-                # An aware datetime is an instant: a TIMESTAMP (§7.2). Outside the wire's range of
-                # instants it is the local time in the session's zone.
-                us = instant(v)
-                if us is not None:
-                    b += _P_TAG_I64(T_TIMESTAMP, us)
-                    return
-                v = local(v)
-            self.temporal(T_DATETIME, v.year, v.month, v.day, v.hour, v.minute, v.second, v.microsecond, 0)
+            self.datetime(v)
         elif isinstance(v, _dt.date):
             self.temporal(T_DATE, v.year, v.month, v.day, 0, 0, 0, 0, 0)
         elif isinstance(v, _dt.timedelta):
@@ -327,6 +326,17 @@ class Writer:
             raise ConversionError('the year %d is out of range (0 to 9999)' % year)
         self.b.append(tag)
         self.b += _CIVIL.pack(year, month, day, hour, minute, second, micro, neg)
+
+    def datetime(self, v):
+        """A datetime by its own kind (§7.2): an aware one is an instant, a TIMESTAMP (outside the
+        wire's range of instants: its local time in the zone of OPTIONS); a naive one a DATETIME."""
+        if aware(v):
+            us = instant(v)
+            if us is not None:
+                self.b += _P_TAG_I64(T_TIMESTAMP, us)
+                return
+            v = local(v)
+        self.temporal(T_DATETIME, v.year, v.month, v.day, v.hour, v.minute, v.second, v.microsecond, 0)
 
     def time(self, d):
         neg = d < _dt.timedelta(0)
@@ -415,23 +425,16 @@ class Writer:
             if isinstance(v, _dt.datetime) or not isinstance(v, _dt.date):
                 raise _cannot(v, t)
             self.temporal(T_DATE, v.year, v.month, v.day, 0, 0, 0, 0, 0)
-        elif tag == T_DATETIME:
+        elif tag == T_DATETIME or tag == T_TIMESTAMP:
+            # By the value's own kind, as a parameter (the host converts to the declared type).
             if isinstance(v, _dt.datetime):
-                v = local(v)
-                self.temporal(tag, v.year, v.month, v.day, v.hour, v.minute, v.second, v.microsecond, 0)
+                if tag == T_TIMESTAMP and aware(v) and instant(v) is None:
+                    raise _range(v, t)
+                self.datetime(v)
             elif isinstance(v, _dt.date):
-                self.temporal(tag, v.year, v.month, v.day, 0, 0, 0, 0, 0)
+                self.temporal(T_DATETIME, v.year, v.month, v.day, 0, 0, 0, 0, 0)
             else:
                 raise _cannot(v, t)
-        elif tag == T_TIMESTAMP:
-            if not isinstance(v, _dt.datetime):
-                if not isinstance(v, _dt.date):
-                    raise _cannot(v, t)
-                v = _dt.datetime(v.year, v.month, v.day)
-            us = instant(v)
-            if us is None:
-                raise _range(v, t)
-            b += _P_TAG_I64(T_TIMESTAMP, us)
         elif tag == T_TIME:
             if isinstance(v, _dt.timedelta):
                 self.time(v)

@@ -173,11 +173,17 @@ assert v[:9] == [None, -5, 2**64 - 1, 1.25, 0.5, decimal.Decimal('-12.345'), 'h√
 assert type(v[5]) is decimal.Decimal
 assert v[9] == dt.date(2026, 11, 19) and type(v[9]) is dt.date
 assert v[10] == dt.datetime(2026, 11, 19, 12, 34, 56, 123456)
-# A TIMESTAMP is an instant: the local time in the zone of OPTIONS, UTC here.
-assert v[11] == dt.datetime(2024, 1, 1) and v[11].tzinfo is None, v[11]
-wire.ZONE = dt.timezone(dt.timedelta(hours=2))
-assert _mlewire.decode(body, ARGS, 14)[0][11] == dt.datetime(2024, 1, 1, 2)
-wire.ZONE = dt.timezone.utc
+# A TIMESTAMP is an instant: an aware datetime in the zone of OPTIONS (B.4), +00:00 here.
+assert v[11] == dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc) and v[11].tzinfo is wire.ZONE, repr(v[11])
+assert str(v[11]) == '2024-01-01 00:00:00+00:00', str(v[11])
+wire.ZONE = dt.timezone(dt.timedelta(hours=5, minutes=30))
+ts = _mlewire.decode(body, ARGS, 14)[0][11]
+assert ts.replace(tzinfo=None) == dt.datetime(2024, 1, 1, 5, 30) and ts.utcoffset() == dt.timedelta(hours=5, minutes=30), ts
+import zoneinfo
+wire.ZONE = zoneinfo.ZoneInfo('Europe/Vilnius')
+ts = _mlewire.decode(body, ARGS, 14)[0][11]
+assert repr(ts) == 'datetime.datetime(2024, 1, 1, 2, 0, tzinfo=zoneinfo.ZoneInfo(key=\'Europe/Vilnius\'))', repr(ts)
+wire.ZONE = dt.timezone(dt.timedelta(0))
 assert v[12] == -dt.timedelta(hours=838, minutes=59, seconds=59)
 assert v[13].dtype == np.float32 and v[13].tolist() == [1.0, -2.5, 3.0]
 seen = []
@@ -234,10 +240,14 @@ assert _mlewire.encode_values(b, ['\ud83d', 1, None, 2.5, b'\xff'], sql._encode_
 assert bytes(b[:8]) == b'\x06\x03\x00\x00\x00\xef\xbf\xbd', bytes(b)
 t = wire.ParamType(wire.T_TIMESTAMP, False, 0, 0, 0, 'TIMESTAMP')
 w = wire.Writer()
-w.write_as(dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc), t)   # an instant
-w.write_as(dt.datetime(2024, 1, 1), t)                             # local time in the zone of OPTIONS
-assert bytes(w.b) == bytes.fromhex('0b0020211 0d70d0600'.replace(' ', '')) * 2, w.b.hex()
-for bad, t in ((dt.datetime(1969, 1, 1), t),
+w.write_as(dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc), t)   # an instant: TIMESTAMP
+w.write_as(dt.datetime(2024, 1, 1), t)                             # naive: DATETIME, the host converts
+assert bytes(w.b) == bytes.fromhex('0b00202110d70d0600' '0ae80701010000000000000000000000'), w.b.hex()
+w = wire.Writer()
+w.write_as(dt.datetime(2024, 1, 1, 1, tzinfo=dt.timezone(dt.timedelta(hours=1))),
+           wire.ParamType(wire.T_DATETIME, False, 0, 0, 0, 'DATETIME'))  # aware as DATETIME: TIMESTAMP
+assert bytes(w.b) == bytes.fromhex('0b00202110d70d0600'), w.b.hex()
+for bad, t in ((dt.datetime(1969, 1, 1, tzinfo=dt.timezone.utc), t),
                (float('nan'), wire.ParamType(wire.T_F64, False, 0, 0, 0, 'DOUBLE')),
                (1e300, wire.ParamType(wire.T_F32, False, 0, 0, 0, 'FLOAT')),
                ([], wire.ParamType(wire.T_VECTOR, False, 0, 0, 0, 'VECTOR')),

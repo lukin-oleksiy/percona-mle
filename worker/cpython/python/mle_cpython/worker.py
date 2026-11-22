@@ -322,7 +322,7 @@ class Dispatcher:
                 self.options(body)
             elif op == wire.PARSE_LIBRARY:
                 r = Reader(body)
-                r.str()  # the language: one of READY's
+                _language(r.str())
                 name, source = r.str(), r.str()
                 ctx.append(Source(name, source.split('\n')))
                 compile(source, name, 'exec')
@@ -377,7 +377,7 @@ class Dispatcher:
         # The whole message is taken out of the arena before guest code, which may post, runs.
         r = Reader(body)
         rid = r.u64()
-        r.str()  # the language: one of READY's
+        _language(r.str())
         name, entry, source = r.str(), r.str(), r.str()
         params = []
         for _ in range(r.count(23)):
@@ -549,8 +549,10 @@ class Dispatcher:
 
     def described(self, source, e):
         frames = self.frames(e, source)
-        if isinstance(e, (MemoryError, RecursionError)):
-            # The heap or the stack is exhausted: the worker asks to be retired (§9.4).
+        if isinstance(e, MemoryError):
+            # The heap is exhausted: the runtime may be unsound; the worker asks to be retired (§9.4,
+            # B.5). A RecursionError is a limit guest code can catch and that leaves the runtime
+            # sound: an ordinary error of guest code.
             return _Failed(wire.EXHAUSTED, wire.LANGUAGE, '%s: %s' % (type(e).__name__, e), frames, taint=True)
         if isinstance(e, ConversionError):
             return _Failed(wire.GUEST_ERROR, wire.LANGUAGE_TYPE, str(e), frames)
@@ -688,6 +690,12 @@ def _describe(e):
     if prefix != name and prefix.endswith('.' + name):
         text = name + text[len(prefix):]
     return text
+
+
+def _language(language):
+    """The language of a PREPARE or PARSE_LIBRARY: the one READY announced (§1 item 4)."""
+    if language != wire.LANGUAGE:
+        _mlewire.protocol_failure('a request for a language the worker did not announce')
 
 
 def _no_js(name):

@@ -1668,18 +1668,18 @@ _SESSION_METHODS = frozenset(n for n in vars(Session) if not n.startswith('_'))
 # ---------------------------------------------------------------------------- the api
 
 def zone_of(text):
-    """A zone of OPTIONS (§9.8), an IANA name or an offset (+hh:mm), as a tzinfo; None if this
-    worker does not know it."""
-    t = (text or '').strip()
-    if not t or t.upper() in ('UTC', 'Z'):
-        return _dt.timezone.utc
-    m = _re.fullmatch(r'([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?', t)
+    """A zone of OPTIONS (§9.8) as the tzinfo of Appendix B.4: an IANA name as zoneinfo.ZoneInfo,
+    an offset +hh:mm / -hh:mm from -13:59 to +14:00 as datetime.timezone(timedelta(...)) (+00:00
+    too); None if it is neither, or a name this worker does not know."""
+    m = _re.fullmatch(r'([+-])(\d\d):(\d\d)', text, _re.ASCII)
     if m:
-        d = _dt.timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0), seconds=int(m.group(4) or 0))
-        return _dt.timezone(-d if m.group(1) == '-' else d)
+        minutes = int(m.group(2)) * 60 + int(m.group(3))
+        if int(m.group(3)) > 59 or minutes > (13 * 60 + 59 if m.group(1) == '-' else 14 * 60):
+            return None
+        return _dt.timezone(_dt.timedelta(minutes=-minutes if m.group(1) == '-' else minutes))
     try:
         import zoneinfo
-        return zoneinfo.ZoneInfo(t)
+        return zoneinfo.ZoneInfo(text)
     except Exception:
         return None
 
@@ -1696,7 +1696,7 @@ class Api:
     def reset(self):
         """RESET ends the options (§9.8) and the session's state."""
         self.decimal_type = 0
-        self.zone = _dt.timezone.utc
+        self.zone = _dt.timezone(_dt.timedelta(0))  # without options: +00:00 (§1)
         self.session._reset()
 
     @property
@@ -1705,7 +1705,7 @@ class Api:
 
     @zone.setter
     def zone(self, tz):
-        """The time zone of OPTIONS, a tzinfo: TIMESTAMP values are local times in it."""
+        """The time zone of OPTIONS, a tzinfo: TIMESTAMP values are aware datetimes in it."""
         wire.ZONE = tz
 
     def globals(self):
