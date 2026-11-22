@@ -526,3 +526,47 @@ Also from that pass: Oracle's documentation says an impossible date (31 February
 JavaScript Date constructor with its fields (it rolls over), so only zero dates and dates with a
 zero month or day are an Invalid Date; and the JVM worker shows a JavaScript Date's local time in
 the host's zone instead of the zone of OPTIONS (a defect).
+
+## 17. Measured: specification 1.0 against the pre-specification code (22 Nov)
+
+Base `2a87613` (before the specification) against `fa03bf4` (first end-to-end protocol 1.0 on
+the JVM path); JVM worker only (V8 and CPython could not run on the old wire). Release builds,
+everything pinned to CPUs 8–15, governor `powersave`. Scripts and raw results:
+`exp/bench/proto10/` (README there). Figures are from the quiet passes; loaded passes agree in
+direction.
+
+**Per call: +0.24 µs (+16–20 %), 90 % of it in mysqld.** call_* +18–19 %, call per row over 1M
+rows 1.40 → 1.64 µs (java), lev +10–15 %, ret +10–17 %, lib +9–19 %, errors_js +14 %,
+nested_js_py +9 %, types_java +9 %. The profile of call_java (ns per call, new − old):
+
+| Where | ns | What |
+|---|---|---|
+| `Session::options_in` | +59 | zone name read through `mysql_thd_attributes`, a `std::string` built and compared per request (the rule then in force: options compared per request) |
+| `Worker::call/request/receive` | +134 | incl. +25 waiting for the worker; new on the path: `forget_record` +15, error and result copies +16–19, the grace clock's `tick` +13, `check_result` +5, `send` +11 |
+| `Session::principal` | +20 | the pair computed per call |
+| kill hooks | +16 | |
+| worker (Java) | +24 | `Values.read` on the call path +13, `Dispatcher.result` +16, offset by a cheaper `writeResult` |
+
+**Unchanged:** fetching rows (1 and 3 columns, 200k rows), SQL from routines (`stmts`, `prep`,
+10k SELECTs, 10k prepared INSERTs, writes, vectors), `topk`, connect, cold start without the pool,
+and memory per idle worker (PSS within 1 %).
+
+**Specific regressions:**
+
+* TIMESTAMP in a named zone (Europe/Vilnius), Java: +16 % per row. The conversion is now done
+  twice — the host to an instant through libstdc++'s zone database (`_M_get_sys_info` per value),
+  the worker back to local time (`ZoneRules.getOffset` per value). With a fixed-offset zone the
+  JavaScript path got 16 % faster.
+* Strings returned by Java code after the session did a large fetch: +44 µs per 64 KiB
+  (~0.7 ns per character). `Text.utf8` scans every character for unpaired surrogates before
+  `getBytes`; the JIT compiled that loop badly once the large fetch had shaped its profile. In a
+  fresh session there is no difference.
+* Java cold start with the pool on: +10 % (53 → 59 ms) in whole-client measurements, not
+  reproduced when the phases were timed separately. Unexplained.
+
+**Reading.** None of these costs is the wire's: the messages are the same size or smaller, and
+the worker spends about the same time. The cost is per-request work on the host that the rules
+then in force asked for (options compared per request) or that the implementation added while
+following them (principal, grace clock, error records, copies of the RESULT). The later revision
+(options fixed per session, `TAINTED` in the header, no statistics per request) removes the
+first; the rest is implementation. HEAD (`61590fe`) is being measured the same way.
