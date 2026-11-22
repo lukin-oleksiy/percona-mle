@@ -382,6 +382,12 @@ TEST_F(MleBodyForms, JsDateStringsNameTheZoneAsV8) {
     set_options(o);
     EXPECT_EQ(ret(id, {Value::json(c.times)}), Value::string(c.want)) << c.zone;
   }
+  // The whole text, with an offset of seconds (local mean time) as V8 shows it.
+  OptionsMsg o;
+  o.time_zone = "Europe/Vilnius";
+  set_options(o);
+  EXPECT_EQ(ret(js_expr("new Date(-1e13).toString() + ' | ' + new Date(NaN).toTimeString()", kVarchar), {}),
+            Value::string("Mon Feb 10 1653 07:54:36 GMT+0141 (Eastern European Standard Time) | Invalid Date"));
 }
 
 TEST_F(MleBodyForms, JsIntegerResults) {

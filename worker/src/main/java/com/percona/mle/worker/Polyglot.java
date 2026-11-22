@@ -383,42 +383,34 @@ final class Polyglot {
   /**
    * Date.prototype.toString() and toTimeString() as V8 (and Oracle's MLE) show them: GraalJS names
    * the zone in short ("GMT+3", "EET") unless in its V8 compatibility mode, which changes much else;
-   * V8 gives ICU's long name (ZoneNames). The rest is GraalJS's own: toDateString(), the local
-   * fields, the offset.
+   * V8 gives ICU's long name (ZoneNames). The rest is GraalJS's own (its date, time and offset are
+   * V8's): its text with the long name in place of the short one.
    */
   private static final String DATE_STRINGS = """
       ((zones) => {
-        const P = Date.prototype, toDateString = P.toDateString, getTime = P.getTime;
-        let from = 1, until = 0, name = '';
-        const zoneName = (t) => {
+        const P = Date.prototype, toString = P.toString, toTimeString = P.toTimeString, getTime = P.getTime;
+        let from = Infinity, until = -Infinity, name = '';  // numbers as ZoneNames gives them (doubles)
+        const named = (s, t) => {
           if (!(t >= from && t < until)) {
             name = zones.name(t);
             from = zones.from;
             until = zones.until;
           }
-          return name;
-        };
-        const two = (n) => (n < 10 ? '0' : '') + n;
-        const time = (d, t) => {
-          const o = -d.getTimezoneOffset(), a = Math.abs(o);
-          return two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds()) + ' GMT'
-              + (o < 0 ? '-' : '+') + two(Math.floor(a / 60)) + two(a % 60) + ' (' + zoneName(t) + ')';
+          return s.slice(0, s.lastIndexOf(' (') + 2) + name + ')';
         };
         const methods = {
           toString() {
-            const t = getTime.call(this);
-            if (Number.isNaN(t)) return 'Invalid Date';
-            return toDateString.call(this) + ' ' + time(this, t);
+            const t = getTime.call(this), s = toString.call(this);
+            return t === t ? named(s, t) : s;
           },
           toTimeString() {
-            const t = getTime.call(this);
-            if (Number.isNaN(t)) return 'Invalid Date';
-            return time(this, t);
+            const t = getTime.call(this), s = toTimeString.call(this);
+            return t === t ? named(s, t) : s;
           },
         };
         for (const n of ['toString', 'toTimeString'])
           Object.defineProperty(P, n, { value: methods[n], writable: true, enumerable: false, configurable: true });
-        return () => { from = 1; until = 0; };
+        return () => { from = Infinity; until = -Infinity; };
       })
       """;
 
