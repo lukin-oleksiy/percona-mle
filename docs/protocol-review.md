@@ -676,3 +676,44 @@ prep −3..−7 %; types py/java −4..−5 %; nested_js_py −7..−9 %; vector
 | errors_py, write200_py | +3 % | stack-trace capture and JIT; borderline |
 
 Being fixed (JVM worker and host), then measured again.
+
+## 22. Parity round: fixes and the final measurement (22–23 Nov)
+
+Commits `73c780d` (host), `b2af6d2` … `0b233db` (JVM worker, host VECTOR check); all on
+`protocol-1.0`. Measured as before (release builds, CPUs 8–15, base and new runs alternated);
+final runs R6 at `cb7008a` and R7 at `0b233db`; files `r2-*` … `r7-*` and the R2–R7 notes in
+`exp/bench/proto10/README`; the R6 tables in `r6-summary.txt`.
+
+**What was slower, and the fix:**
+
+| Case (at `cc02a53`) | Cause | Fix | Now |
+|---|---|---|---|
+| sel/stmts +3..+17 % | per statement: column metadata asked three times, columns copied, a new message built | metadata once per column, columns in place, one message per depth (`73c780d`) | −2..+2 %, parity; mysqld −0.3 % instructions per SELECT |
+| types_js +59 % | `Date.prototype.toString` asked Intl for the zone name per call | GraalJS's text with V8's zone name, cached per zone and between transitions (`b2af6d2`, `c4c44d2`) | −2.8 % |
+| echo 64 KiB +5..+7 % | a second pass over the UTF-8 output for `?` | Latin-1 strings through the JDK encoder, others through one repairing pass (`905bc2e`) | parity; echo1k −4..−7 % |
+| connect_kept_js +0.4 ms | RESET switched both languages to +00:00 and OPTIONS back again | RESET makes the defaults due; applied only if guest code runs before the next OPTIONS (`23a92cc`) | parity |
+| cold start, pool off, js/java +2.7..+3.9 % | a fifth FFM downcall (lseek); classes the AOT training never reached; Date code parsed at every start; ICU zone made at start; reflection for the realm's zone | lseek shares read's stub (`9a5c76d`); training through the dispatcher (`b8f7d13`); Date methods made on first use (`cb7008a`); var handles by name (`78b1ee9`, `ce680be`) | js +0.1..+0.4 %, java −0.1..+0.4 %, 95 % intervals include 0 |
+| insvec_py +4 % | the host's finite check of VECTOR floats (§7.2), one branch per element | blocks of 64 floats without branches (`8435e1c`) | +0.4 % (interval −0.4..+1.9 %) |
+
+**Final picture (R6/R7, against `2a87613`):** calls −13..−16 %; TIMESTAMP −13..−23 %; lev, ret,
+lib, prep, nested −4..−10 %; types −2..−6 %; echo1k −4..−7 %; rows, mix, stmts, writes, topk,
+fetches, echo64k, connections, idle PSS and cold start with or without the pool: no difference
+measurable. errors_py/errors_js: equal once warm; the harness's median falls in JIT warm-up, whose
+shape differs between the builds.
+
+**Left, needs a decision:** the component subscribes to query events for the library epoch (§9.10)
+and the account rule (Appendix A). The server dispatches every statement's START and STATUS_END to
+the component; the component's helper filters them only after the dispatch. That is ≈ 550
+instructions (≈ 0.1 µs) per statement for **every statement on the server**, MLE or not: INSERT from
+a routine +1.2 % mysqld instructions (+2 % task-clock in a fresh session); SELECT stays at parity
+only because the new SQL path is cheaper elsewhere. Options: subscribe only while a routine with
+libraries or a worker waiting for an account exists (registration at run time; design needed);
+a server-side filter or version counter; or accept the cost.
+
+**Changes visible to guest code from this round:** none in values. JavaScript `Date` strings now
+match V8 (node 24) for every zone compared except Africa/Casablanca (GraalJS's ICU data differs);
+before, ≈ 40 % of times differed. `Date.prototype.toString` is a stand-in function until its first
+call, so its identity changes once.
+
+**Tests:** unit tests pass on the JVM-only and all-worker debug builds; MySQL tests 40 of 41 on the
+JVM-only build (`basics` needs the native workers).
