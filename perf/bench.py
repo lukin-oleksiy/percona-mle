@@ -456,6 +456,7 @@ class Bench:
             'server_build': self.a.server, 'server_commit': mle_perf.source_commit(self.a.server),
             'server_build_type': mle_perf.cmake_cache(self.a.server, 'CMAKE_BUILD_TYPE'),
             'mle_build': self.a.mle, 'mle_commit': mle_perf.source_commit(self.a.mle),
+            'mle_component_built': mle_perf.built_at(self.a.mle),
             'mle_build_type': mle_perf.cmake_cache(self.a.mle, 'CMAKE_BUILD_TYPE'),
             'server_version': s.value('SELECT VERSION()'),
             'languages': s.value("SELECT VARIABLE_VALUE FROM performance_schema.global_status "

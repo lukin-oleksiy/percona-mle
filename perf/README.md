@@ -28,7 +28,7 @@ js_lang measurements. The same work is written once per runtime in `bench_setup.
 
 Statements are timed inside the server (`SYSDATE(6)`), in one session, after a warm-up that ends when two runs in a
 row are within 3 % (at most 20); the best of 5 runs is reported (all runs are in the JSON). Cold starts are the
-median of 7 new `mysql` processes. A full run takes about 15 minutes; the data directory (1M rows, 100,000 vectors
+median of 7 new `mysql` processes. A full run takes about 10 minutes on a 16-CPU laptop; the data directory (1M rows, 100,000 vectors
 with an HNSW index) is made once in `<MLE build>/perf-bench` in about 2 minutes. `--quick` (fewer runs) checks the
 tool; its numbers are not for publishing.
 

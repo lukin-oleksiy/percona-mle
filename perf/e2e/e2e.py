@@ -365,6 +365,7 @@ class E2E:
             'server_build': self.a.server, 'server_commit': mle_perf.source_commit(self.a.server),
             'server_build_type': mle_perf.cmake_cache(self.a.server, 'CMAKE_BUILD_TYPE'),
             'mle_build': self.a.mle, 'mle_commit': mle_perf.source_commit(self.a.mle),
+            'mle_component_built': mle_perf.built_at(self.a.mle),
             'mle_build_type': mle_perf.cmake_cache(self.a.mle, 'CMAKE_BUILD_TYPE'),
             'server_version': s.value('SELECT VERSION()'),
             'languages': s.value("SELECT VARIABLE_VALUE FROM performance_schema.global_status "
@@ -414,6 +415,7 @@ def main():
     ap.add_argument('--python', default=None, help='a Python with mysql.connector and numpy (default: a venv)')
     ap.add_argument('--min-available-gib', type=float, default=10.0, help='stop clients below this')
     ap.add_argument('--timeout', type=int, default=900, help='seconds per measurement')
+    ap.add_argument('--wait-quiet', action='store_true', help='wait for a load average below 1.5 first')
     ap.add_argument('--json', default=None, help='write the results here')
     args = ap.parse_args()
     args.server, args.mle = os.path.abspath(args.server), os.path.abspath(args.mle)
@@ -438,7 +440,7 @@ def main():
             env['network'] = e.net
             e.net['rtt_ms'] = e.rtt_ms()
             env['server_warm_s'] = e.warm_server()
-            env['load_start'] = mle_perf.load()
+            env['load_start'] = mle_perf.wait_quiet(enabled=args.wait_quiet)
             print('# %s, %d CPUs, %.0f GiB, %s, governor %s, load %.2f' %
                   (env['cpu'], env['cpus'], env['memory_gib'], env['os'], env['governor'], env['load_start']))
             print('# MLE %s (%s), server %s (%s); client JDK %s' % (

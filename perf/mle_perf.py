@@ -72,6 +72,15 @@ def source_commit(build):
     return r.stdout.strip() + ('+' if dirty else '')
 
 
+def built_at(mle_build):
+    """When the MLE build's component was linked (the source tree's commit may be newer than the build)."""
+    try:
+        return time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(os.path.getmtime(
+            os.path.join(mle_build, 'plugin_output_directory', 'component_mle.so'))))
+    except OSError:
+        return ''
+
+
 def read_pss(pid):
     """PSS and RSS (MiB) of a process: {'pss': ..., 'rss': ...}, or None. Workers are not
     dumpable: their smaps_rollup needs root (sudo -n); mysqld's is the user's own."""

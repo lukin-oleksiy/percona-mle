@@ -82,7 +82,7 @@ libraries, errors, vectors, a new connection's worker) on both builds in alterna
 exits with status 1 when a case is slower beyond the threshold (5 %) in all rounds but one.
 
 Absolute numbers of one build, every runtime (calls, SQL from routines, vectors, the vector library against numpy,
-cold start, memory per worker; about 15 minutes): `perf/bench.py --server <release server build> --mle
+cold start, memory per worker; about 10 minutes): `perf/bench.py --server <release server build> --mle
 ../BUILD-mle-release --json results.json`. See `perf/README.md`.
 
 ## Diagnostics

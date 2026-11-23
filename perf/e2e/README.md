@@ -68,7 +68,7 @@ perf/e2e/e2e.py --server ../BUILD-release --mle ../BUILD-mle-release --json e2e.
 
 The first run makes the data directory (a few minutes) in `<work>` (default `<MLE build>/perf-e2e`);
 later runs reuse it while `setup.sql` and `client/Rerank.java` stay the same (otherwise delete
-`<work>/data` and `<work>/setup.sha1`). The full run takes ~10–15 minutes; `--quick` (fewer requests and
+`<work>/data` and `<work>/setup.sha1`). The full run takes about 8 minutes on a 16-CPU laptop (`--wait-quiet` first waits for a load average below 1.5); `--quick` (fewer requests and
 less warm-up, for checking the tool) ~5. `--cases chatty,wb200` or `--only 'python\.(app|cpython)'`
 measure a part; `--no-concurrency` one client only. The server uses port 13994 (`--port`); the
 namespace is `e2e<port>` with `10.213.94.0/24` (`--subnet`), removed at the end (`net.sh down e2e13994`
