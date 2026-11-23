@@ -38,15 +38,15 @@ test says so). The builds differ in <build>/plugin_output_directory
 (component_mle.so and mle/); the server and its other components are shared.
 """
 import argparse
-import hashlib
 import json
 import os
 import re
-import shutil
 import statistics
 import subprocess
 import sys
 import time
+
+import mle_perf
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Cases measured from outside: a new connection's first call (ms are too coarse inside).
@@ -58,116 +58,14 @@ CONNECT = {
 # Percent over which a case counts, where the default is too tight for what the case measures.
 THRESHOLDS = {'connect_kept_js': 15, 'connect_kept_py': 15, 'connect_pool_py': 25, 'scan': 100,
               'errors_js': 10, 'errors_py': 10}
+# mysqld's options for the MLE component.
+START_OPTIONS = ('--loose-mle.pool_prewarm=python', '--loose-mle.sql_result_max=1073741824')
 # call_* are judged without the scan they ride on.
 NET_OF_SCAN = ('call_js', 'call_py', 'call_java', 'call_invoker')
 
 
-class Server:
-    def __init__(self, args):
-        self.a = args
-        self.bin = os.path.join(args.server, 'runtime_output_directory')
-        self.data = os.path.join(args.work, 'data')
-        self.sock = os.path.join(args.work, 'mysqld.sock')
-        self.proc = None
-
-    def plugin_dir(self, build):
-        """The server's plugins with this build's component_mle and mle/."""
-        d = os.path.join(self.a.work, 'plugins-' + hashlib.sha1(build.encode()).hexdigest()[:8])
-        shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d)
-        src = os.path.join(self.a.server, 'plugin_output_directory')
-        for name in os.listdir(src):
-            if name not in ('component_mle.so', 'mle'):
-                os.symlink(os.path.join(src, name), os.path.join(d, name))
-        for name in ('component_mle.so', 'mle'):
-            target = os.path.join(build, 'plugin_output_directory', name)
-            if not os.path.exists(target):
-                sys.exit('no %s: not an MLE build directory?' % target)
-            os.symlink(os.path.realpath(target), os.path.join(d, name))
-        return d
-
-    def mysqld(self, *more):
-        return [os.path.join(self.bin, 'mysqld'), '--no-defaults', '--datadir=' + self.data,
-                '--basedir=' + self.a.server, '--lc-messages-dir=' + os.path.join(self.a.server, 'share'),
-                *more]
-
-    def start(self, build):
-        log = open(os.path.join(self.a.work, 'mysqld.log'), 'a')
-        self.proc = subprocess.Popen(
-            self.mysqld('--plugin-dir=' + self.plugin_dir(build), '--socket=' + self.sock,
-                        '--port=%d' % self.a.port, '--mysqlx=OFF', '--skip-log-bin',
-                        '--innodb-buffer-pool-size=2G', '--innodb-flush-log-at-trx-commit=2',
-                        '--log-error=' + os.path.join(self.a.work, 'error.log'),
-                        '--pid-file=' + os.path.join(self.a.work, 'mysqld.pid'),
-                        '--loose-mle.pool_prewarm=python',
-                        '--loose-mle.sql_result_max=1073741824'),
-            stdout=log, stderr=log)
-        for _ in range(120):
-            if subprocess.run([os.path.join(self.bin, 'mysqladmin'), '-uroot', '-S', self.sock, 'ping'],
-                              capture_output=True).returncode == 0:
-                return
-            if self.proc.poll() is not None:
-                break
-            time.sleep(0.5)
-        sys.exit('mysqld did not start: see %s/error.log' % self.a.work)
-
-    def stop(self):
-        if self.proc is None:
-            return
-        subprocess.run([os.path.join(self.bin, 'mysqladmin'), '-uroot', '-S', self.sock, 'shutdown'],
-                       capture_output=True)
-        self.proc.wait()
-        self.proc = None
-
-    def sql(self, text, user='root', check=True):
-        r = subprocess.run([os.path.join(self.bin, 'mysql'), '-u' + user, '-S', self.sock, '-N', '-B',
-                            '--default-character-set=utf8mb4'],
-                           input=text, capture_output=True, text=True)
-        if check and r.returncode != 0:
-            raise RuntimeError('%s\n%s' % (text[:200], r.stderr.strip()))
-        return r.stdout
-
-    def prepare_data(self, build):
-        """The data directory, made once (with the build given) and reused."""
-        setup = open(os.path.join(HERE, 'setup.sql')).read()
-        stamp = os.path.join(self.a.work, 'setup.sha1')
-        digest = hashlib.sha1(setup.encode()).hexdigest()
-        if os.path.isdir(self.data) and os.path.exists(stamp):
-            if open(stamp).read().strip() == digest:
-                return
-            sys.exit('perf/setup.sql changed since %s was made: delete it and run again' % self.data)
-        print('# preparing the data in %s (once; a few minutes)' % self.data, flush=True)
-        shutil.rmtree(self.data, ignore_errors=True)
-        r = subprocess.run(self.mysqld('--initialize-insecure'), capture_output=True, text=True)
-        if r.returncode != 0:
-            sys.exit('mysqld --initialize-insecure failed:\n' + r.stderr[-2000:])
-        self.start(build)
-        try:
-            self.sql("INSTALL COMPONENT 'file://component_lang_router'", check=False)
-            self.sql("INSTALL COMPONENT 'file://component_mle'")
-            langs = self.sql("SELECT VARIABLE_VALUE FROM performance_schema.global_status "
-                             "WHERE VARIABLE_NAME = 'mle_languages_supported'").strip()
-            r = subprocess.run([os.path.join(self.bin, 'mysql'), '-uroot', '-S', self.sock, '--force',
-                                '--default-character-set=utf8mb4'],
-                               input=setup, capture_output=True, text=True)
-            errors = [l for l in r.stderr.splitlines() if l.startswith('ERROR')]
-            if errors and 'JavaScript' in langs:  # the Python-only build refuses the other languages' routines
-                sys.exit('perf/setup.sql failed:\n' + '\n'.join(errors[:20]))
-        finally:
-            self.stop()
-        open(stamp, 'w').write(digest)
-
-
 def quiet(args):
-    load = float(open('/proc/loadavg').read().split()[0])
-    try:
-        governor = open('/sys/devices/system/cpu/cpufreq/policy0/scaling_governor').read().strip()
-    except OSError:
-        governor = 'unknown'
-    while args.wait_quiet and load >= 1.5:
-        time.sleep(15)
-        load = float(open('/proc/loadavg').read().split()[0])
-    return load, governor
+    return mle_perf.wait_quiet(enabled=args.wait_quiet), mle_perf.governor()
 
 
 def measure(server, args, cases):
@@ -254,8 +152,9 @@ def main():
     args.work = os.path.abspath(args.work or os.path.join(args.new, 'perf'))
     os.makedirs(args.work, exist_ok=True)
 
-    server = Server(args)
-    server.prepare_data(args.new)
+    server = mle_perf.Server(args.server, args.work, args.port)
+    server.prepare_data(args.new, os.path.join(HERE, 'setup.sql'),
+                        [('component_lang_router', False), ('component_mle', True)])
     load, governor = quiet(args)
     print('# base %s\n# new  %s\n# %d rounds, threshold %g %%, load %.2f, governor %s' %
           (args.base, args.new, args.rounds, args.threshold, load, governor), flush=True)
@@ -269,14 +168,10 @@ def main():
             order = ('base', 'new') if rnd % 2 == 0 else ('new', 'base')
             for variant in order:
                 quiet(args)
-                server.start(getattr(args, variant))
+                server.start(getattr(args, variant), START_OPTIONS)
                 try:
                     if cases is None:
                         cases = server.sql('SELECT name FROM perf.cases ORDER BY ord').split() + list(CONNECT)
-                        langs = server.sql("SELECT VARIABLE_VALUE FROM performance_schema.global_status "
-                                           "WHERE VARIABLE_NAME = 'mle_languages_supported'")
-                        if 'JavaScript' not in langs:  # the Python-only build
-                            cases = [c for c in cases if not re.search(r'js|java|invoker', c)]
                         if args.only:
                             cases = [c for c in cases if re.search(args.only, c) or
                                      (c == 'scan' and any(re.search(args.only, n) for n in NET_OF_SCAN))]

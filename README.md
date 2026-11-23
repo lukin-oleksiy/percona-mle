@@ -29,7 +29,7 @@ comments cite the project's design notes by name (e.g. `14-phase6-libraries.md`)
 | `harness/` | a command-line driver for workers (development) |
 | `unittest/` | GoogleTest unit tests (9 binaries) |
 | `mysql-test/suite/component_mle` | the MTR suite |
-| `perf/` | the performance regression test: two builds side by side |
+| `perf/` | performance tools: the regression test (two builds side by side), the benchmark of one build (every runtime), the end-to-end benchmark against an application |
 | `docker/` | the server + MLE image, the DBA tools image, compose |
 | `packaging/`, `cmake/packaging.cmake` | packages (CPack, deb and rpm) and their scripts |
 | `cmake/server.cmake` | building against a configured Percona Server tree |
@@ -80,6 +80,10 @@ Performance, a change against the commit before it (release builds, a quiet mach
 It runs each case of `perf/setup.sql` (the call path, values of every kind, SQL from routines read and written,
 libraries, errors, vectors, a new connection's worker) on both builds in alternating order on the same data, and
 exits with status 1 when a case is slower beyond the threshold (5 %) in all rounds but one.
+
+Absolute numbers of one build, every runtime (calls, SQL from routines, vectors, the vector library against numpy,
+cold start, memory per worker; about 15 minutes): `perf/bench.py --server <release server build> --mle
+../BUILD-mle-release --json results.json`. See `perf/README.md`.
 
 ## Diagnostics
 
