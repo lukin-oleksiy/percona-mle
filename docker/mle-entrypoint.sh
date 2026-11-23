@@ -86,7 +86,8 @@ first_start() {
     wait "$pid" || true
     exit 1
   fi
-  mle_privileges="CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE"
+  # component_mle registers all five, whichever workers are installed.
+  mle_privileges="CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE, CREATE_JS_ROUTINE, CREATE_CPYTHON_ROUTINE"
   # --binary-mode: the client passes the bytes on as they are (no \r\n to
   # \n). The first SQL error ends the batch and, with set -e, this script.
   {
