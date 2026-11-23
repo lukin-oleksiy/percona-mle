@@ -230,14 +230,19 @@ final class Polyglot {
     try {
       if (getMainRealm == null) {
         // Method handles and var handles: a reflective Field.set makes an accessor per field on
-        // its first use (~1.3 ms for these, at every worker's start).
-        Class<?> realm = Class.forName("com.oracle.truffle.js.runtime.JSRealm", true, Polyglot.class.getClassLoader());
+        // its first use (~1.3 ms for these, at every worker's start). Found by name and type, not
+        // through reflection: JSRealm's Field objects would load the type of each of its fields
+        // (ICU's TimeZone among them) at every worker's start.
+        ClassLoader loader = Polyglot.class.getClassLoader();
+        Class<?> realm = Class.forName("com.oracle.truffle.js.runtime.JSRealm", true, loader);
         MethodHandles.Lookup lookup = MethodHandles.privateLookupIn(realm, MethodHandles.lookup());
         getMainRealm = lookup.findStatic(realm, "getMain", MethodType.methodType(realm, com.oracle.truffle.api.nodes.Node.class))
             .asType(MethodType.methodType(Object.class, com.oracle.truffle.api.nodes.Node.class));
         try {
+          Class<?> format = Class.forName("org.graalvm.shadowed.com.ibm.icu.text.DateFormat", false, loader);
           java.lang.invoke.VarHandle[] f = new java.lang.invoke.VarHandle[REALM_ZONE_FIELDS.length];
-          for (int i = 0; i < f.length; i++) f[i] = lookup.unreflectVarHandle(realm.getDeclaredField(REALM_ZONE_FIELDS[i]));
+          f[0] = lookup.findVarHandle(realm, REALM_ZONE_FIELDS[0], java.time.ZoneId.class);
+          for (int i = 1; i < f.length; i++) f[i] = lookup.findVarHandle(realm, REALM_ZONE_FIELDS[i], format);
           realmZoneFields = f;
         } catch (ReflectiveOperationException | RuntimeException e) {
           setLocalTimeZone = realm.getMethod("setLocalTimeZone", String.class);  // another GraalJS
@@ -247,7 +252,9 @@ final class Polyglot {
       if (realmZoneFields != null) {
         // What JSRealm.setLocalTimeZone does, but for its ICU TimeZone: that one is made when
         // Intl first needs it, as for a new realm (making it loads ICU's zone data, ~10 ms at
-        // the worker's start).
+        // the worker's start). Its field (localTimeZone) stays null: only setLocalTimeZone sets
+        // it, which this path never calls, and getLocalTimeZone() makes the zone from
+        // localTimeZoneId while it is null.
         realmZoneFields[0].set(realm, (Object) java.time.ZoneId.of(name));
         for (int i = 1; i < realmZoneFields.length; i++) realmZoneFields[i].set(realm, (Object) null);
       } else {
@@ -268,8 +275,8 @@ final class Polyglot {
 
   private static MethodHandle getMainRealm;
   private static java.lang.reflect.Method setLocalTimeZone;
-  /** JSRealm's zone (java.time), then what it keeps made for the zone: its ICU TimeZone, Date formats. */
-  private static final String[] REALM_ZONE_FIELDS = {"localTimeZoneId", "localTimeZone", "jsDateToStringFormat",
+  /** JSRealm's zone (java.time), then what it keeps made for the zone: its Date formats (ICU's DateFormat). */
+  private static final String[] REALM_ZONE_FIELDS = {"localTimeZoneId", "jsDateToStringFormat",
       "jsShortTimeFormat", "jsShortTimeLocalFormat", "jsShortDateFormat", "jsShortDateLocalFormat"};
   private static java.lang.invoke.VarHandle[] realmZoneFields;
 
