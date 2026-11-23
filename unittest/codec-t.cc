@@ -22,6 +22,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -637,6 +638,30 @@ TEST(MleCodec, NonFiniteFloatsAreNotMalformed) {
   encode(sql, &bytes);
   SqlMsg back;
   EXPECT_TRUE(decode(bytes, &back, &error)) << error;
+}
+
+// A VECTOR's floats are checked in blocks: every bit pattern that is not
+// finite is found at every position, around the blocks' edges too.
+TEST(MleCodec, NonFiniteVectorElementAnywhere) {
+  const std::vector<uint32_t> bad_bits = {0x7f800000, 0xff800000, 0x7f800001,
+                                          0x7fc00000, 0xffffffff, 0x7fffffff};
+  const std::vector<uint32_t> good_bits = {0x00000000, 0x80000000, 0x00000001,
+                                           0x7f7fffff, 0xff7fffff, 0x00800000};
+  const auto with = [](size_t n, size_t at, uint32_t bits) {
+    std::vector<float> f(n, 0.5f);
+    std::memcpy(&f[at], &bits, sizeof bits);
+    return Value::vector(std::move(f));
+  };
+  for (size_t n : {1, 2, 63, 64, 65, 127, 128, 129, 768, 1000}) {
+    EXPECT_TRUE(is_finite(Value::vector(std::vector<float>(n, -1.0f)))) << n;
+    for (size_t at : {size_t{0}, n / 2, n - 1, std::min<size_t>(63, n - 1),
+                      std::min<size_t>(64, n - 1)}) {
+      for (uint32_t bits : bad_bits)
+        EXPECT_FALSE(is_finite(with(n, at, bits))) << n << " " << at << " " << bits;
+      for (uint32_t bits : good_bits)
+        EXPECT_TRUE(is_finite(with(n, at, bits))) << n << " " << at << " " << bits;
+    }
+  }
 }
 
 TEST(MleCodec, TrailingBytesAreRejected) {
