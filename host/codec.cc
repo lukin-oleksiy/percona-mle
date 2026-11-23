@@ -236,17 +236,42 @@ const char *tag_name(Tag tag) {
   return "?";
 }
 
+namespace {
+
+/** Whether every one of the n floats is finite. A float is NaN or infinite
+    when its exponent bits are all ones; adding one to the exponent then
+    carries into bit 31 (the sign is masked off). Branch-free over blocks of
+    a fixed size, which the compiler vectorizes: a VECTOR(768) parameter of
+    every row an INSERT gets costs ~100 instructions, not ~4,000
+    (std::isfinite per element, with an exit after each). */
+bool finite_floats(const float *f, size_t n) {
+  constexpr uint32_t kExponent = 0x7f800000, kCarry = 0x00800000;
+  constexpr size_t kBlock = 64;
+  const auto bad = [](const float *p, size_t count) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < count; i++) {
+      uint32_t b;
+      std::memcpy(&b, p + i, sizeof b);
+      acc |= (b & kExponent) + kCarry;
+    }
+    return (acc & 0x80000000U) != 0;
+  };
+  size_t i = 0;
+  for (; i + kBlock <= n; i += kBlock)
+    if (bad(f + i, kBlock)) return false;
+  return !bad(f + i, n - i);
+}
+
+}  // namespace
+
 bool is_finite(const Value &v) {
   switch (v.tag()) {
     case Tag::kF64:
       return std::isfinite(v.as_f64());
     case Tag::kF32:
       return std::isfinite(v.as_f32());
-    case Tag::kVector: {
-      const auto &f = v.as_vector();
-      return std::all_of(f.begin(), f.end(),
-                         [](float x) { return std::isfinite(x); });
-    }
+    case Tag::kVector:
+      return finite_floats(v.as_vector().data(), v.as_vector().size());
     default:
       return true;
   }
