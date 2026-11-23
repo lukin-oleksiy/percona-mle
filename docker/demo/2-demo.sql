@@ -1,78 +1,86 @@
--- Demo 2: one CALL, three languages, and vectors (as the application account: docker/run.sh sql < 2-demo.sql,
+-- Demo 2: polyglot on the JVM worker (as the application account: docker/run.sh sql < 2-demo.sql,
 -- after docker/run.sh root --force < 2-setup.sql).
 
 -- A small shop: products with embeddings.
-SELECT id, name, price, VECTOR_DIM(embedding) AS embedding_dimensions FROM products;
+SELECT id, name, category, price, VECTOR_TO_STRING(embedding) AS embedding FROM products;
 
--- Python reads the embeddings with SQL and ranks the products with numpy.
-CREATE PROCEDURE py_rank(IN q VECTOR(4), IN k INT, OUT ids JSON) LANGUAGE PYTHON AS $$
+-- Python with numpy: the similarity of two vectors (a VECTOR arrives as a numpy array).
+CREATE FUNCTION py_cosine(a VECTOR(4), b VECTOR(4)) RETURNS DOUBLE LANGUAGE PYTHON AS $$
     import numpy as np
-    c = session.run_sql('SELECT id, embedding FROM products').fetch_columns()
-    m = c['embedding']
-    score = (m @ q) / (np.linalg.norm(m, axis=1) * np.linalg.norm(q))
-    ids = [int(c['id'][i]) for i in np.argsort(-score)[:k]]
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
 $$;
 
--- Java books the order in a transaction, with exact decimal arithmetic.
-CREATE PROCEDURE java_book(IN ids JSON, OUT total DECIMAL(10,2)) LANGUAGE JAVA AS $$
-    var s = Mle.session();
-    var sum = java.math.BigDecimal.ZERO;
+-- JavaScript borrows numpy from Python: one worker, one runtime, no copy through SQL.
+CREATE FUNCTION js_norm(v VECTOR(4)) RETURNS DOUBLE LANGUAGE JAVASCRIPT AS $$
+    const norm = Polyglot.eval('python', 'import numpy\nlambda xs: float(numpy.linalg.norm(list(xs)))')
+    return Math.round(norm(v) * 1000) / 1000
+$$;
+
+-- Java: exact money arithmetic, and a JavaScript regular expression for the title.
+CREATE FUNCTION java_offer(name VARCHAR(40), price DECIMAL(8,2), qty INT) RETURNS VARCHAR(80) LANGUAGE JAVA AS $$
+    BigDecimal total = price.multiply(BigDecimal.valueOf(qty));
+    String title = Mle.context().eval("js", "(s) => s.replace(/\\b\\w/g, (c) => c.toUpperCase())")
+        .execute(name).asString();
+    return qty + " x " + title + " = " + total;
+$$;
+
+-- Three languages in one SELECT.
+SET @q = STRING_TO_VECTOR('[1.0, 0.1, 0.0, 0.1]');
+
+SELECT name, ROUND(py_cosine(embedding, @q), 3) AS similarity, js_norm(embedding) AS norm,
+       java_offer(name, price, 3) AS offer
+  FROM products ORDER BY similarity DESC LIMIT 4;
+
+-- Statistics MySQL has no SQL for (a median per group), from Python, with MLE's Java library.
+CREATE PROCEDURE py_price_stats(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import java
+    Stats = java.type('com.percona.mle.api.Stats')
+    prices = Stats.load('SELECT category, price FROM products')
+    r = str(prices.groupBy('category').median('price'))
+$$;
+
+CALL py_price_stats(@r);
+
+SELECT @r AS median_price_per_category;
+
+-- A whole request in one CALL: Python recommends, Java books the order, JavaScript drives both.
+CREATE PROCEDURE py_recommend(IN q VECTOR(4), IN k INT) LANGUAGE PYTHON AS $$
+    import numpy as np
+    c = session.run_sql('SELECT id, embedding FROM products ORDER BY id').fetch_columns()
+    m = c['embedding']
+    sims = m @ q / (np.linalg.norm(m, axis=1) * np.linalg.norm(q))
+    session.execute_many('INSERT INTO recommendations VALUES (?, ?, ?)',
+                         [(n + 1, int(c['id'][i]), round(float(sims[i]), 3)) for n, i in enumerate(np.argsort(-sims)[:k])])
+$$;
+
+CREATE PROCEDURE java_order(IN qty INT, OUT total DECIMAL(10,2)) LANGUAGE JAVA AS $$
+    Session s = Mle.session();
+    BigDecimal sum = BigDecimal.ZERO;
     s.startTransaction();
-    for (Row r : s.runSql("SELECT id, price FROM products WHERE JSON_CONTAINS(?, CAST(id AS JSON))", ids)) {
-      s.runSql("INSERT INTO orders (product_id, price) VALUES (?, ?)", r.get(0), r.get(1));
-      sum = sum.add((java.math.BigDecimal) r.get(1));
+    for (Row r : s.runSql("SELECT p.id, p.price FROM recommendations r JOIN products p ON p.id = r.product_id")) {
+      BigDecimal amount = ((BigDecimal) r.get(1)).multiply(BigDecimal.valueOf(qty));
+      s.runSql("INSERT INTO order_lines (product_id, qty, amount) VALUES (?, ?, ?)", r.get(0), qty, amount);
+      sum = sum.add(amount);
     }
     s.commit();
-    total[0] = sum.multiply(new java.math.BigDecimal("1.07")).setScale(2, java.math.RoundingMode.HALF_UP);
+    total[0] = sum;
 $$;
 
--- JavaScript calls both: one procedure, one round trip for the application.
-CREATE PROCEDURE js_order(IN q VECTOR(4), OUT report TEXT) LANGUAGE JAVASCRIPT AS $$
-    session.runSql('CALL py_rank(?, 3, @ids)', [q])
-    session.runSql('CALL java_book(@ids, @total)')
-    const row = session.runSql('SELECT @ids AS ids, @total AS total').fetchOne()
-    report = `products ${row.ids} ordered, total with 7 % tax: ${row.total}`
+CREATE PROCEDURE js_shop(IN q VECTOR(4), IN k INT, IN qty INT, OUT report TEXT) LANGUAGE JAVASCRIPT AS $$
+    session.runSql('DELETE FROM recommendations')
+    session.runSql('CALL py_recommend(?, ?)', [q, k])
+    session.runSql('CALL java_order(?, @total)', [qty])
+    const total = session.runSql('SELECT @total AS t').fetchOne().t
+    report = `${k} products recommended and ordered, ${qty} each: total ${total}`
 $$;
 
-CALL js_order(STRING_TO_VECTOR('[1, 0.1, 0, 0]'), @report);
+CALL js_shop(@q, 3, 2, @report);
 
 SELECT @report;
 
-SELECT o.id, p.name, o.price FROM orders o JOIN products p ON p.id = o.product_id;
+SELECT r.rank_no, p.name, r.similarity, l.qty, l.amount
+  FROM recommendations r JOIN products p ON p.id = r.product_id JOIN order_lines l ON l.product_id = p.id
+  ORDER BY r.rank_no;
 
--- Vectors at scale: 50,000 embeddings of 768 dimensions. The ten nearest to one of them, in SQL:
-SET @q = (SELECT embedding FROM vecs WHERE id = 7);
-
-SELECT GROUP_CONCAT(id) AS sql_exact FROM
-  (SELECT id FROM vecs ORDER BY DISTANCE(embedding, @q, 'EUCLIDEAN') LIMIT 10) x;
-
-SELECT GROUP_CONCAT(id) AS hnsw_index FROM
-  (SELECT id FROM vecs_hnsw ORDER BY DISTANCE(embedding, @q, 'EUCLIDEAN') LIMIT 10) x;
-
--- The same with numpy: all rows arrive as one matrix.
-CREATE PROCEDURE py_topk(IN q VECTOR(768), OUT r TEXT) LANGUAGE PYTHON AS $$
-    import numpy as np
-    c = session.run_sql('SELECT id, embedding FROM vecs').fetch_columns()
-    m = c['embedding']
-    d = np.einsum('ij,ij->i', m, m) - 2 * (m @ q)
-    k = np.argpartition(d, 10)[:10]
-    r = ','.join(str(int(c['id'][i])) for i in k[np.argsort(d[k])])
-$$;
-
-CALL py_topk(@q, @numpy);
-
-SELECT @numpy;
-
--- MLE's vector library is written once, in Java (SIMD, threads); here JavaScript uses it.
--- "Ten near the query but not near each other" (MMR) is something SQL has no syntax for.
-CREATE PROCEDURE js_diverse(IN q VECTOR(768), OUT nearest TEXT, OUT diverse TEXT) LANGUAGE JAVASCRIPT AS $$
-    const Vectors = Java.type('com.percona.mle.api.Vectors')
-    const set = Vectors.load('SELECT id, embedding FROM vecs')
-    const ids = (m) => Array.from({ length: m.size() }, (_, i) => m.id(i)).join(',')
-    nearest = ids(set.nearest(q, 10, 'euclidean'))
-    diverse = ids(set.mmr(q, 10, 0.5))
-$$;
-
-CALL js_diverse(@q, @nearest, @diverse);
-
-SELECT @nearest AS nearest, @diverse AS diverse;
+-- All of it ran in one worker process: Python, Java and JavaScript share one runtime.
+SHOW GLOBAL STATUS WHERE Variable_name IN ('mle_sessions', 'mle_workers');

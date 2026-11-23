@@ -1,37 +1,21 @@
--- Demo 2, setup (as root: docker/run.sh root --force < 2-setup.sql; not shown): a small shop, and 50,000 embeddings of 768 dimensions with and
--- without an HNSW index. Filling them takes a minute or two.
--- The 50,000 x 768 matrix is larger than the default limit of a routine's SQL result (64 MB).
-SET PERSIST mle.sql_result_max = 1073741824;
+-- Demo 2, setup (as root: docker/run.sh root --force < 2-setup.sql; not shown): a small shop with embeddings.
 USE app;
-DROP PROCEDURE IF EXISTS py_rank; DROP PROCEDURE IF EXISTS java_book; DROP PROCEDURE IF EXISTS js_order;
-DROP PROCEDURE IF EXISTS py_topk; DROP PROCEDURE IF EXISTS js_topk; DROP PROCEDURE IF EXISTS js_diverse;
-DROP PROCEDURE IF EXISTS fill_vecs;
-DROP TABLE IF EXISTS orders, products, vecs, vecs_hnsw;
-CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(30), price DECIMAL(10,2), embedding VECTOR(4) NOT NULL);
+DROP FUNCTION IF EXISTS py_cosine; DROP FUNCTION IF EXISTS js_norm; DROP FUNCTION IF EXISTS java_offer;
+DROP FUNCTION IF EXISTS js_stars; DROP PROCEDURE IF EXISTS py_recommend; DROP PROCEDURE IF EXISTS java_order;
+DROP PROCEDURE IF EXISTS js_shop; DROP PROCEDURE IF EXISTS py_price_stats;
+DROP TABLE IF EXISTS recommendations, order_lines, products;
+CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(40), category VARCHAR(20), price DECIMAL(8,2),
+  embedding VECTOR(4) NOT NULL);
 INSERT INTO products VALUES
-  (1, 'espresso beans', 12.40, STRING_TO_VECTOR('[0.9, 0.1, 0.0, 0.1]')),
-  (2, 'filter coffee',   9.90, STRING_TO_VECTOR('[0.8, 0.2, 0.1, 0.0]')),
-  (3, 'green tea',       7.25, STRING_TO_VECTOR('[0.3, 0.9, 0.0, 0.1]')),
-  (4, 'black tea',       6.10, STRING_TO_VECTOR('[0.4, 0.8, 0.1, 0.0]')),
-  (5, 'coffee grinder', 49.00, STRING_TO_VECTOR('[0.7, 0.0, 0.7, 0.1]')),
-  (6, 'tea pot',        24.50, STRING_TO_VECTOR('[0.1, 0.6, 0.7, 0.0]')),
-  (7, 'dark chocolate',  3.80, STRING_TO_VECTOR('[0.3, 0.2, 0.0, 0.9]'));
-CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, product_id INT, price DECIMAL(10,2));
-CREATE TABLE vecs (id BIGINT UNSIGNED PRIMARY KEY, embedding VECTOR(768) NOT NULL);
-CREATE TABLE vecs_hnsw (id BIGINT UNSIGNED PRIMARY KEY, embedding VECTOR(768) NOT NULL,
-  VECTOR KEY vk (embedding) TYPE hnsw (M = 16));
-DELIMITER //
-CREATE PROCEDURE fill_vecs(IN n INT) LANGUAGE PYTHON AS $$
-    import numpy as np
-    rng = np.random.default_rng(42)
-    for start in range(0, n, 1000):
-        session.start_transaction()
-        session.execute_many('INSERT INTO vecs VALUES (?, ?)',
-                             [(i, rng.random(768, dtype=np.float32)) for i in range(start, min(start + 1000, n))])
-        session.commit()
-$$ //
-DELIMITER ;
-CALL fill_vecs(50000);
-INSERT INTO vecs_hnsw SELECT * FROM vecs;
-DROP PROCEDURE fill_vecs;
+  (1, 'red apple',      'fruit', 0.50, STRING_TO_VECTOR('[0.9, 0.1, 0.0, 0.2]')),
+  (2, 'green apple',    'fruit', 0.45, STRING_TO_VECTOR('[0.8, 0.3, 0.0, 0.1]')),
+  (3, 'banana',         'fruit', 0.25, STRING_TO_VECTOR('[0.1, 0.9, 0.1, 0.0]')),
+  (4, 'orange',         'fruit', 0.60, STRING_TO_VECTOR('[0.3, 0.6, 0.2, 0.1]')),
+  (5, 'apple juice',    'drink', 2.10, STRING_TO_VECTOR('[0.7, 0.0, 0.6, 0.3]')),
+  (6, 'orange juice',   'drink', 2.40, STRING_TO_VECTOR('[0.2, 0.5, 0.7, 0.2]')),
+  (7, 'sparkling water','drink', 0.90, STRING_TO_VECTOR('[0.0, 0.1, 0.9, 0.1]')),
+  (8, 'apple pie',      'bakery', 4.20, STRING_TO_VECTOR('[0.8, 0.0, 0.1, 0.8]')),
+  (9, 'bread',          'bakery', 2.80, STRING_TO_VECTOR('[0.1, 0.1, 0.0, 0.9]'));
+CREATE TABLE recommendations (rank_no INT, product_id INT, similarity DOUBLE);
+CREATE TABLE order_lines (id INT AUTO_INCREMENT PRIMARY KEY, product_id INT, qty INT, amount DECIMAL(10,2));
 GRANT ALL ON app.* TO app;

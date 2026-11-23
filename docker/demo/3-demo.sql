@@ -1,75 +1,83 @@
--- Demo 3: routines that misbehave (as the application account, after docker/run.sh root --force < 3-setup.sql).
--- The step marked "session 2" runs in a second connection while the statement before it is running.
+-- Demo 3: vectors and the built-in library (as the application account: docker/run.sh sql < 3-demo.sql,
+-- after docker/run.sh root --force < 3-setup.sql).
 
--- How long has the server been up?
-SHOW GLOBAL STATUS LIKE 'Uptime';
+-- 50,000 embeddings of 768 dimensions. The ten nearest to one of them, in SQL, exactly and with HNSW:
+SET @q = (SELECT embedding FROM vecs WHERE id = 7);
 
--- A routine cannot read the server's files (or open the network, or start processes).
-CREATE FUNCTION try_escape() RETURNS TEXT LANGUAGE PYTHON AS $$
-    out = []
-    for path in ('/etc/passwd', '/var/lib/mysql/auto.cnf'):
-        try:
-            open(path).read()
-            out.append(path + ': read')
-        except OSError as e:
-            out.append(path + ': ' + type(e).__name__)
-    return ', '.join(out)
-$$;
+SELECT GROUP_CONCAT(id) AS sql_exact FROM
+  (SELECT id FROM vecs ORDER BY DISTANCE(embedding, @q, 'EUCLIDEAN') LIMIT 10) x;
 
-SELECT try_escape();
+SELECT GROUP_CONCAT(id) AS hnsw_index FROM
+  (SELECT id FROM vecs_hnsw ORDER BY DISTANCE(embedding, @q, 'EUCLIDEAN') LIMIT 10) x;
 
--- Endless loops in Python, Java and JavaScript.
-CREATE FUNCTION spin_py() RETURNS INT LANGUAGE PYTHON AS $$
-    while True:
-        pass
-$$;
-
-CREATE FUNCTION spin_java() RETURNS INT LANGUAGE JAVA AS $$ while (true) {} $$;
-
-CREATE FUNCTION spin_js() RETURNS INT LANGUAGE JAVASCRIPT AS $$ for (;;) {} $$;
-
--- The statement time limit stops them.
-SELECT /*+ MAX_EXECUTION_TIME(1500) */ spin_py();
-
-SELECT /*+ MAX_EXECUTION_TIME(1500) */ spin_java();
-
-SELECT /*+ MAX_EXECUTION_TIME(1500) */ spin_js();
-
--- So does KILL QUERY from another session.
---@ background
-SELECT spin_py();
-
---@ session2
-KILL QUERY @first_session;
-
--- Native code that crashes: numpy reading through a broken view of memory.
-CREATE FUNCTION crash() RETURNS DOUBLE LANGUAGE PYTHON AS $$
+-- With numpy: all rows arrive as one matrix. The same Python on the JVM worker and on the CPython worker.
+CREATE PROCEDURE py_topk(IN q VECTOR(768), OUT r TEXT) LANGUAGE PYTHON AS $$
     import numpy as np
-    bad = np.lib.stride_tricks.as_strided(np.zeros(1), shape=(2,), strides=(1 << 46,))
-    return float(bad.sum())
+    c = session.run_sql('SELECT id, embedding FROM vecs').fetch_columns()
+    m = c['embedding']
+    d = np.einsum('ij,ij->i', m, m) - 2 * (m @ q)
+    k = np.argpartition(d, 10)[:10]
+    r = ','.join(str(int(c['id'][i])) for i in k[np.argsort(d[k])])
 $$;
 
-SELECT crash();
-
--- A routine that takes all the memory it can get.
-CREATE FUNCTION hog() RETURNS INT LANGUAGE JAVASCRIPT AS $$
-    const keep = []
-    for (;;) keep.push(new Array(1000000).fill(1.5))
+CREATE PROCEDURE cpy_topk(IN q VECTOR(768), OUT r TEXT) LANGUAGE CPYTHON AS $$
+    import numpy as np
+    c = session.run_sql('SELECT id, embedding FROM vecs').fetch_columns()
+    m = c['embedding']
+    d = np.einsum('ij,ij->i', m, m) - 2 * (m @ q)
+    k = np.argpartition(d, 10)[:10]
+    r = ','.join(str(int(c['id'][i])) for i in k[np.argsort(d[k])])
 $$;
 
-SELECT hog();
+CALL py_topk(@q, @graalpy);
 
--- Only the session's worker was lost each time. All three languages answer:
-CREATE FUNCTION alive_py() RETURNS TEXT LANGUAGE PYTHON AS $$ return 'Python' $$;
+CALL cpy_topk(@q, @cpython);
 
-CREATE FUNCTION alive_java() RETURNS TEXT LANGUAGE JAVA AS $$ return "Java"; $$;
+SELECT @graalpy AS graalpy, @cpython AS cpython;
 
-CREATE FUNCTION alive_js() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$ return 'JavaScript' $$;
+-- MLE's vector library is written once in Java (SIMD, threads). From JavaScript:
+-- "ten near the query but not near each other" (MMR), which SQL has no syntax for.
+CREATE PROCEDURE js_diverse(IN q VECTOR(768), OUT nearest TEXT, OUT diverse TEXT) LANGUAGE JAVASCRIPT AS $$
+    const Vectors = Java.type('com.percona.mle.api.Vectors')
+    const set = Vectors.load('SELECT id, embedding FROM vecs')
+    const ids = (m) => Array.from({ length: m.size() }, (_, i) => m.id(i)).join(',')
+    nearest = ids(set.nearest(q, 10, 'euclidean'))
+    diverse = ids(set.mmr(q, 10, 0.5))
+$$;
 
-SELECT alive_py(), alive_java(), alive_js();
+CALL js_diverse(@q, @nearest, @diverse);
 
--- mysqld never stopped: its uptime went on, and it counted what happened.
-SHOW GLOBAL STATUS WHERE Variable_name IN ('Uptime', 'mle_status', 'mle_worker_failures', 'mle_oom_errors');
+SELECT @nearest AS nearest, @diverse AS diverse;
 
--- The server's log names each cause.
---@ shell docker logs $NAME 2>&1 | grep "Component mle reported" | tail -3 | sed "s/.*reported: //" | fold -w 120
+-- Related items: the 10 most similar for each of 10,000 vectors. The library, from Python:
+CREATE PROCEDURE py_related(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import java, time
+    V = java.type('com.percona.mle.api.Vectors')
+    s = V.load('SELECT id, embedding FROM items ORDER BY id')
+    t = time.perf_counter()
+    rel = s.related(10, 'cosine')
+    r = '%d rows: %.2f s, %d threads' % (len(rel), time.perf_counter() - t, V.threads())
+$$;
+
+CALL py_related(@r);
+
+SELECT @r AS vector_library;
+
+-- The same with numpy on the CPython worker (one BLAS thread):
+CREATE PROCEDURE cpy_related(OUT r TEXT) LANGUAGE CPYTHON AS $$
+    import time
+    import numpy as np
+    c = session.run_sql('SELECT id, embedding FROM items ORDER BY id').fetch_columns()
+    m = c['embedding'] / np.linalg.norm(c['embedding'], axis=1, keepdims=True)
+    t = time.perf_counter()
+    best = []
+    for lo in range(0, len(m), 1024):
+        sc = m[lo:lo + 1024] @ m.T
+        sc[np.arange(len(sc)), np.arange(lo, lo + len(sc))] = -np.inf
+        best.append(np.argpartition(-sc, 10, axis=1)[:, :10])
+    r = '%d rows: %.2f s' % (sum(len(b) for b in best), time.perf_counter() - t)
+$$;
+
+CALL cpy_related(@r);
+
+SELECT @r AS numpy_on_cpython;

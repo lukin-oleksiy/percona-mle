@@ -1,11 +1,11 @@
--- Demo 1, setup (as root: docker/run.sh root --force < 1-setup.sql; not shown): V8 (js_lang) for comparison, 20,000 pairs of strings, and the
--- Levenshtein distance in SQL, Java, JavaScript and V8 (the demo adds Python).
-INSTALL COMPONENT 'file://component_js_lang';
-GRANT CREATE_JS_ROUTINE ON *.* TO app;
+-- Demo 1, setup (as root: docker/run.sh root --force < 1-setup.sql; not shown): 20,000 pairs of strings, and
+-- the Levenshtein distance as an SQL stored function and in Java, JavaScript on GraalJS and JavaScript on V8
+-- (the demo writes the Python ones itself).
 USE app;
-DROP FUNCTION IF EXISTS py_hello; DROP FUNCTION IF EXISTS java_hello; DROP FUNCTION IF EXISTS js_hello;
-DROP FUNCTION IF EXISTS sql_lev; DROP FUNCTION IF EXISTS py_lev; DROP FUNCTION IF EXISTS java_lev;
-DROP FUNCTION IF EXISTS js_lev; DROP FUNCTION IF EXISTS v8_lev;
+DROP FUNCTION IF EXISTS py_hello; DROP FUNCTION IF EXISTS cpy_hello; DROP FUNCTION IF EXISTS java_hello;
+DROP FUNCTION IF EXISTS gjs_hello; DROP FUNCTION IF EXISTS v8_hello;
+DROP FUNCTION IF EXISTS sql_lev; DROP FUNCTION IF EXISTS py_lev; DROP FUNCTION IF EXISTS cpy_lev;
+DROP FUNCTION IF EXISTS java_lev; DROP FUNCTION IF EXISTS gjs_lev; DROP FUNCTION IF EXISTS v8_lev;
 DROP TABLE IF EXISTS words;
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE TABLE words AS WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 20000)
@@ -29,6 +29,7 @@ BEGIN
   END WHILE;
   RETURN ORD(SUBSTRING(prev, lb + 1, 1));
 END //
+DELIMITER ;
 CREATE DEFINER = app FUNCTION java_lev(a VARCHAR(64), b VARCHAR(64)) RETURNS INT DETERMINISTIC LANGUAGE JAVA AS $$
     int[] prev = new int[b.length() + 1], cur = new int[b.length() + 1];
     for (int j = 0; j <= b.length(); j++) prev[j] = j;
@@ -40,8 +41,8 @@ CREATE DEFINER = app FUNCTION java_lev(a VARCHAR(64), b VARCHAR(64)) RETURNS INT
       int[] t = prev; prev = cur; cur = t;
     }
     return prev[b.length()];
-$$ //
-CREATE DEFINER = app FUNCTION js_lev(a VARCHAR(64), b VARCHAR(64)) RETURNS INT DETERMINISTIC LANGUAGE JAVASCRIPT AS $$
+$$;
+CREATE DEFINER = app FUNCTION gjs_lev(a VARCHAR(64), b VARCHAR(64)) RETURNS INT DETERMINISTIC LANGUAGE JAVASCRIPT AS $$
   let prev = Array.from({ length: b.length + 1 }, (_, j) => j)
   for (let i = 1; i <= a.length; i++) {
     const cur = [i]
@@ -50,7 +51,7 @@ CREATE DEFINER = app FUNCTION js_lev(a VARCHAR(64), b VARCHAR(64)) RETURNS INT D
     prev = cur
   }
   return prev[b.length]
-$$ //
+$$;
 CREATE DEFINER = app FUNCTION v8_lev(a VARCHAR(64), b VARCHAR(64)) RETURNS INT DETERMINISTIC LANGUAGE JS AS $$
   let prev = Array.from({ length: b.length + 1 }, (_, j) => j)
   for (let i = 1; i <= a.length; i++) {
@@ -60,5 +61,4 @@ CREATE DEFINER = app FUNCTION v8_lev(a VARCHAR(64), b VARCHAR(64)) RETURNS INT D
     prev = cur
   }
   return prev[b.length]
-$$ //
-DELIMITER ;
+$$;

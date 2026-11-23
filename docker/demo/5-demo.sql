@@ -1,67 +1,11 @@
--- Demo 5: the CPython worker (as the application account, on a container started with MLE_WORKER=CPYTHON,
--- after docker/run.sh root --force < 5-setup.sql).
+-- Demo 5: routines that misbehave (as the application account, after docker/run.sh root --force < 5-setup.sql).
+-- The step marked "session 2" runs in a second connection while the statement before it is running.
 
--- The same server and component; this one runs Python routines on the distribution's CPython.
-SHOW GLOBAL STATUS WHERE Variable_name IN ('mle_status', 'mle_languages_supported');
+-- How long has the server been up?
+SHOW GLOBAL STATUS LIKE 'Uptime';
 
--- The Python of the first demo, unchanged.
-CREATE FUNCTION py_hello(name VARCHAR(20)) RETURNS VARCHAR(60) LANGUAGE PYTHON AS $$
-    return f'Hello {name}, from Python'
-$$;
-
-SELECT py_hello('Percona') AS python;
-
-CREATE FUNCTION py_lev(a VARCHAR(64), b VARCHAR(64)) RETURNS INT DETERMINISTIC LANGUAGE PYTHON AS $$
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
-        prev = cur
-    return prev[-1]
-$$;
-
-SELECT COUNT(*) AS pairs, SUM(py_lev(a, b)) AS python FROM words;
-
--- numpy: a VECTOR argument arrives as a numpy array.
-CREATE FUNCTION cosine(a VECTOR(3), b VECTOR(3)) RETURNS DOUBLE DETERMINISTIC LANGUAGE PYTHON AS $$
-    import numpy as np
-    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
-$$;
-
-SELECT cosine(STRING_TO_VECTOR('[1, 2, 3]'), STRING_TO_VECTOR('[3, 2, 1]')) AS cosine;
-
--- SQL from Python, the same API as on the JVM build: read rows, compute, write the results back.
-CREATE PROCEDURE save_distances() MODIFIES SQL DATA LANGUAGE PYTHON AS $$
-    def lev(a, b):
-        prev = list(range(len(b) + 1))
-        for i, ca in enumerate(a, 1):
-            cur = [i]
-            for j, cb in enumerate(b, 1):
-                cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
-            prev = cur
-        return prev[-1]
-    rows = session.run_sql("SELECT n, a, b FROM words").fetch_all()
-    session.run_sql("DELETE FROM distances")
-    session.execute_many("INSERT INTO distances (n, d) VALUES (?, ?)", [(n, lev(a, b)) for n, a, b in rows])
-$$;
-
-CALL save_distances();
-
-SELECT d AS distance, COUNT(*) AS pairs FROM distances GROUP BY d ORDER BY d;
-
--- What a worker costs: the memory of the process that ran all of this, numpy loaded.
-CREATE FUNCTION worker_memory() RETURNS TEXT LANGUAGE PYTHON AS $$
-    import numpy
-    pss = next(int(l.split()[1]) for l in open('/proc/self/smaps_rollup') if l.startswith('Pss:'))
-    rss = next(int(l.split()[1]) for l in open('/proc/self/status') if l.startswith('VmRSS:'))
-    return f'RSS {rss // 1024} MB, PSS {pss // 1024} MB'
-$$;
-
-SELECT worker_memory();
-
--- The same sandbox and limits as the JVM build.
-CREATE FUNCTION try_escape() RETURNS TEXT LANGUAGE PYTHON AS $$
+-- A routine cannot read the server's files (or open the network, or start processes): on the CPython worker,
+CREATE FUNCTION cpy_try_escape() RETURNS TEXT LANGUAGE CPYTHON AS $$
     out = []
     for path in ('/etc/passwd', '/var/lib/mysql/auto.cnf'):
         try:
@@ -72,14 +16,79 @@ CREATE FUNCTION try_escape() RETURNS TEXT LANGUAGE PYTHON AS $$
     return ', '.join(out)
 $$;
 
-SELECT try_escape();
+SELECT cpy_try_escape();
 
+-- Endless loops on every worker: GraalPy, CPython, Java, V8.
 CREATE FUNCTION spin_py() RETURNS INT LANGUAGE PYTHON AS $$
     while True:
         pass
 $$;
 
+CREATE FUNCTION spin_cpy() RETURNS INT LANGUAGE CPYTHON AS $$
+    while True:
+        pass
+$$;
+
+CREATE FUNCTION spin_java() RETURNS INT LANGUAGE JAVA AS $$ while (true) {} $$;
+
+CREATE FUNCTION spin_v8() RETURNS INT LANGUAGE JS AS $$ for (;;) {} $$;
+
+-- The statement time limit stops them.
 SELECT /*+ MAX_EXECUTION_TIME(1500) */ spin_py();
 
--- Python only: Java and JavaScript need the JVM build.
-CREATE FUNCTION java_hello() RETURNS INT LANGUAGE JAVA AS $$ return 1; $$;
+SELECT /*+ MAX_EXECUTION_TIME(1500) */ spin_cpy();
+
+SELECT /*+ MAX_EXECUTION_TIME(1500) */ spin_java();
+
+SELECT /*+ MAX_EXECUTION_TIME(1500) */ spin_v8();
+
+-- So does KILL QUERY from another session.
+--@ background
+SELECT spin_cpy();
+
+--@ session2
+KILL QUERY @first_session;
+
+-- Native code that crashes: numpy reading through a broken view of memory, on the CPython worker.
+CREATE FUNCTION crash_cpy() RETURNS DOUBLE LANGUAGE CPYTHON AS $$
+    import numpy as np
+    bad = np.lib.stride_tricks.as_strided(np.zeros(1), shape=(2,), strides=(1 << 46,))
+    return float(bad.sum())
+$$;
+
+SELECT crash_cpy();
+
+-- Routines that take all the memory they can get: on V8, and on the JVM worker.
+CREATE FUNCTION hog_v8() RETURNS INT LANGUAGE JS AS $$
+    const keep = []
+    for (;;) keep.push(new Array(1000000).fill(1.5))
+$$;
+
+SELECT hog_v8();
+
+CREATE FUNCTION hog_py() RETURNS INT LANGUAGE PYTHON AS $$
+    keep = []
+    while True:
+        keep.append([1.5] * 1000000)
+$$;
+
+SELECT hog_py();
+
+-- Only the session's worker was lost each time. Every worker answers:
+CREATE FUNCTION alive_py() RETURNS TEXT LANGUAGE PYTHON AS $$ return 'GraalPy' $$;
+
+CREATE FUNCTION alive_cpy() RETURNS TEXT LANGUAGE CPYTHON AS $$ return 'CPython' $$;
+
+CREATE FUNCTION alive_java() RETURNS TEXT LANGUAGE JAVA AS $$ return "Java"; $$;
+
+CREATE FUNCTION alive_gjs() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$ return 'GraalJS' $$;
+
+CREATE FUNCTION alive_v8() RETURNS TEXT LANGUAGE JS AS $$ return 'V8' $$;
+
+SELECT alive_py(), alive_cpy(), alive_java(), alive_gjs(), alive_v8();
+
+-- mysqld never stopped: its uptime went on, and it counted what happened.
+SHOW GLOBAL STATUS WHERE Variable_name IN ('Uptime', 'mle_status', 'mle_worker_failures', 'mle_oom_errors');
+
+-- The server's log names each cause.
+--@ shell docker logs $NAME 2>&1 | grep "Component mle reported" | tail -4 | sed "s/.*reported: //" | fold -w 120

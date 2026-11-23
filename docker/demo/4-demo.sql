@@ -1,8 +1,13 @@
 -- Demo 4: errors at CREATE and at run time (as the application account, after
 -- docker/run.sh root --force < 4-setup.sql).
 
--- Compile time. CREATE checks the code: a Python syntax error names the line.
+-- Compile time. CREATE checks the code: a Python syntax error names the line, on either Python worker.
 CREATE FUNCTION py_bad(a INT) RETURNS INT LANGUAGE PYTHON AS $$
+    b = a +* 2
+    return b
+$$;
+
+CREATE FUNCTION cpy_bad(a INT) RETURNS INT LANGUAGE CPYTHON AS $$
     b = a +* 2
     return b
 $$;
@@ -13,8 +18,12 @@ CREATE FUNCTION java_bad(a INT) RETURNS INT LANGUAGE JAVA AS $$
     return s.length();
 $$;
 
--- JavaScript shows the place too.
-CREATE FUNCTION js_bad(a INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+-- JavaScript shows the place, on GraalJS and on V8.
+CREATE FUNCTION gjs_bad(a INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+    return a +* 2
+$$;
+
+CREATE FUNCTION v8_bad(a INT) RETURNS INT LANGUAGE JS AS $$
     return a +* 2
 $$;
 
@@ -44,8 +53,18 @@ SELECT py_share(10, 0);
 -- The traceback, with the source lines, comes back as warnings too.
 SHOW WARNINGS;
 
--- The same in JavaScript and in Java.
-CREATE FUNCTION js_share(total INT, parts INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+-- The same body on the CPython worker gives the same answer.
+CREATE FUNCTION cpy_share(total INT, parts INT) RETURNS INT LANGUAGE CPYTHON AS $$
+    def per_part(total, parts):
+        print('dividing', total, 'by', parts)
+        return total // parts
+    return per_part(total, parts)
+$$;
+
+SELECT cpy_share(10, 0);
+
+-- JavaScript on V8, and Java.
+CREATE FUNCTION v8_share(total INT, parts INT) RETURNS INT LANGUAGE JS AS $$
     function per_part(total, parts) {
         if (parts === 0) throw new RangeError('no parts')
         return Math.floor(total / parts)
@@ -53,7 +72,7 @@ CREATE FUNCTION js_share(total INT, parts INT) RETURNS INT LANGUAGE JAVASCRIPT A
     return per_part(total, parts)
 $$;
 
-SELECT js_share(10, 0);
+SELECT v8_share(10, 0);
 
 CREATE FUNCTION java_share(total INT, parts INT) RETURNS INT LANGUAGE JAVA AS $$
     int per = total / parts;
