@@ -1,0 +1,1652 @@
+{
+ "schema": 1,
+ "tool": "perf/bench.py",
+ "time": "2026-11-23T10:46:42+0200",
+ "suites": [
+  "calls",
+  "library",
+  "cold",
+  "memory"
+ ],
+ "environment": {
+  "cpu": "AMD Ryzen 9 7940HS w/ Radeon 780M Graphics",
+  "cpus": 16,
+  "memory_gib": 59.4,
+  "kernel": "7.0.0-43-generic",
+  "os": "Ubuntu 26.04.1 LTS",
+  "governor": "performance",
+  "server_build": "BUILD-lang-router-release",
+  "server_commit": "587c064a86",
+  "server_build_type": "RelWithDebInfo",
+  "mle_build": "BUILD-mle-release",
+  "mle_commit": "7bd42aa6c9",
+  "mle_build_type": "RelWithDebInfo",
+  "server_version": "26.7.0-1",
+  "languages": "JavaScript,Python,Java,JS,CPython",
+  "graalpy": "GraalPy 25.5.5 (Python 3.13.14), numpy 2.4.4",
+  "cpython": "CPython 3.14.4, numpy 2.4.4",
+  "jvm": "OpenJDK 64-Bit Server VM 25.0.5.0.3+1-jvmci-25.5-b26",
+  "libnode": "libnode.so.127",
+  "js_lang": true,
+  "router": true,
+  "settings": {
+   "lang_router.language_map": "JS=mle",
+   "mle.cgroup_base": "AUTO",
+   "mle.console": "OFF",
+   "mle.cpython_memory_max": "1073741824",
+   "mle.cpython_pool_size": "2",
+   "mle.dir": "BUILD-mle-release/perf-bench/plugins-71cfc984/mle",
+   "mle.heap_max": "536870912",
+   "mle.interrupt_grace_ms": "1000",
+   "mle.java_home": "",
+   "mle.languages": "JAVASCRIPT,PYTHON,JAVA,JS,CPYTHON",
+   "mle.malloc_mmap_threshold": "4194304",
+   "mle.max_workers": "64",
+   "mle.memory_max": "2147483648",
+   "mle.package_dir": "",
+   "mle.pool_prewarm": "vectors",
+   "mle.pool_size": "2",
+   "mle.spin_us": "50",
+   "mle.sql_call_results_max": "0",
+   "mle.sql_chunk_rows": "1000",
+   "mle.sql_exec_time": "OFF",
+   "mle.sql_result_max": "1073741824",
+   "mle.sql_row_max": "16777216",
+   "mle.sql_statements_max": "1024",
+   "mle.v8_heap_max": "536870912",
+   "mle.v8_memory_max": "1073741824",
+   "mle.v8_pool_size": "2",
+   "mle.vector_threads": "4",
+   "mle.worker_cache_size": "4",
+   "mle.worker_cache_timeout": "60"
+  },
+  "load_start": 1.25,
+  "load_end": 16.6,
+  "seconds": 552,
+  "quick": false
+ },
+ "results": {
+  "calls.add.sql": {
+   "value": 1.071578,
+   "unit": "us_per_row",
+   "load": 1.9,
+   "best": 1242003,
+   "median": 1246920,
+   "runs": [
+    1248852,
+    1242349,
+    1242003,
+    1246920,
+    1249319
+   ],
+   "warm": 3,
+   "converged": true,
+   "scan_us": 170425,
+   "rows": 1000000
+  },
+  "calls.add.js_lang": {
+   "value": 1.252164,
+   "unit": "us_per_row",
+   "load": 1.76,
+   "best": 1420156,
+   "median": 1429359,
+   "runs": [
+    1436209,
+    1429359,
+    1429613,
+    1420156,
+    1425009
+   ],
+   "warm": 2,
+   "converged": true,
+   "scan_us": 167992,
+   "rows": 1000000
+  },
+  "calls.add.v8": {
+   "value": 1.313069,
+   "unit": "us_per_row",
+   "load": 1.8,
+   "best": 1483494,
+   "median": 1495791,
+   "runs": [
+    1495791,
+    1483859,
+    1507713,
+    1500052,
+    1483494
+   ],
+   "warm": 2,
+   "converged": true,
+   "scan_us": 170425,
+   "rows": 1000000
+  },
+  "calls.add.graaljs": {
+   "value": 1.290674,
+   "unit": "us_per_row",
+   "load": 1.84,
+   "best": 1461099,
+   "median": 1465911,
+   "runs": [
+    1461857,
+    1461099,
+    1480077,
+    1490176,
+    1465911
+   ],
+   "warm": 3,
+   "converged": true,
+   "scan_us": 170425,
+   "rows": 1000000
+  },
+  "calls.add.graalpy": {
+   "value": 1.272415,
+   "unit": "us_per_row",
+   "load": 1.87,
+   "best": 1442840,
+   "median": 1454015,
+   "runs": [
+    1484313,
+    1454015,
+    1464395,
+    1442840,
+    1446806
+   ],
+   "warm": 4,
+   "converged": true,
+   "scan_us": 170425,
+   "rows": 1000000
+  },
+  "calls.add.cpython": {
+   "value": 1.28738,
+   "unit": "us_per_row",
+   "load": 1.89,
+   "best": 1457805,
+   "median": 1458208,
+   "runs": [
+    1457995,
+    1461467,
+    1457805,
+    1458208,
+    1462325
+   ],
+   "warm": 2,
+   "converged": true,
+   "scan_us": 170425,
+   "rows": 1000000
+  },
+  "calls.add.java": {
+   "value": 1.177603,
+   "unit": "us_per_row",
+   "load": 1.9,
+   "best": 1348028,
+   "median": 1368212,
+   "runs": [
+    1348028,
+    1368212,
+    1367770,
+    1369398,
+    1385574
+   ],
+   "warm": 2,
+   "converged": true,
+   "scan_us": 170425,
+   "rows": 1000000
+  },
+  "calls.levenshtein.sql": {
+   "value": 91.68405,
+   "unit": "us_per_row",
+   "load": 1.78,
+   "best": 1837608,
+   "median": 1840633,
+   "runs": [
+    1841246,
+    1840633,
+    1840036,
+    1837608,
+    1871711
+   ],
+   "warm": 3,
+   "converged": true,
+   "scan_us": 3927,
+   "rows": 20000
+  },
+  "calls.levenshtein.js_lang": {
+   "value": 2.2146,
+   "unit": "us_per_row",
+   "load": 1.78,
+   "best": 48172,
+   "median": 49575,
+   "runs": [
+    48489,
+    49575,
+    48172,
+    50670,
+    49668
+   ],
+   "warm": 4,
+   "converged": true,
+   "scan_us": 3880,
+   "rows": 20000
+  },
+  "calls.levenshtein.v8": {
+   "value": 2.4695,
+   "unit": "us_per_row",
+   "load": 1.78,
+   "best": 53317,
+   "median": 55844,
+   "runs": [
+    54260,
+    53317,
+    61560,
+    58109,
+    55844
+   ],
+   "warm": 3,
+   "converged": true,
+   "scan_us": 3927,
+   "rows": 20000
+  },
+  "calls.levenshtein.graaljs": {
+   "value": 2.7056,
+   "unit": "us_per_row",
+   "load": 1.88,
+   "best": 58039,
+   "median": 61629,
+   "runs": [
+    58039,
+    61629,
+    62717,
+    66240,
+    58463
+   ],
+   "warm": 5,
+   "converged": true,
+   "scan_us": 3927,
+   "rows": 20000
+  },
+  "calls.levenshtein.graalpy": {
+   "value": 2.79605,
+   "unit": "us_per_row",
+   "load": 1.88,
+   "best": 59848,
+   "median": 60669,
+   "runs": [
+    65300,
+    62745,
+    60669,
+    60611,
+    59848
+   ],
+   "warm": 7,
+   "converged": true,
+   "scan_us": 3927,
+   "rows": 20000
+  },
+  "calls.levenshtein.cpython": {
+   "value": 8.85395,
+   "unit": "us_per_row",
+   "load": 1.88,
+   "best": 181006,
+   "median": 183843,
+   "runs": [
+    183843,
+    181006,
+    184816,
+    182345,
+    185812
+   ],
+   "warm": 2,
+   "converged": true,
+   "scan_us": 3927,
+   "rows": 20000
+  },
+  "calls.levenshtein.java": {
+   "value": 1.4734,
+   "unit": "us_per_row",
+   "load": 1.88,
+   "best": 33395,
+   "median": 33878,
+   "runs": [
+    34797,
+    33878,
+    33584,
+    33966,
+    33395
+   ],
+   "warm": 4,
+   "converged": true,
+   "scan_us": 3927,
+   "rows": 20000
+  },
+  "calls.js_math_5m.js_lang": {
+   "value": 214.379,
+   "unit": "ms",
+   "load": 1.81,
+   "best": 214379,
+   "median": 221137,
+   "runs": [
+    214379,
+    222649,
+    222055,
+    221137,
+    214976
+   ],
+   "warm": 2,
+   "converged": true
+  },
+  "calls.js_math_5m.v8": {
+   "value": 216.29,
+   "unit": "ms",
+   "load": 1.81,
+   "best": 216290,
+   "median": 216860,
+   "runs": [
+    216639,
+    224546,
+    216860,
+    225752,
+    216290
+   ],
+   "warm": 2,
+   "converged": true
+  },
+  "calls.js_math_5m.graaljs": {
+   "value": 121.803,
+   "unit": "ms",
+   "load": 1.81,
+   "best": 121803,
+   "median": 122245,
+   "runs": [
+    122171,
+    128916,
+    124622,
+    122245,
+    121803
+   ],
+   "warm": 6,
+   "converged": true
+  },
+  "calls.js_sort_200k_objects.js_lang": {
+   "value": 53.648,
+   "unit": "ms",
+   "load": 1.81,
+   "best": 53648,
+   "median": 57060,
+   "runs": [
+    57112,
+    56674,
+    60388,
+    57060,
+    53648
+   ],
+   "warm": 7,
+   "converged": true
+  },
+  "calls.js_sort_200k_objects.v8": {
+   "value": 38.637,
+   "unit": "ms",
+   "load": 3.74,
+   "best": 38637,
+   "median": 47244,
+   "runs": [
+    56408,
+    41259,
+    47244,
+    48239,
+    38637
+   ],
+   "warm": 16,
+   "converged": true
+  },
+  "calls.js_sort_200k_objects.graaljs": {
+   "value": 98.215,
+   "unit": "ms",
+   "load": 3.74,
+   "best": 98215,
+   "median": 113854,
+   "runs": [
+    113854,
+    117744,
+    111368,
+    282402,
+    98215
+   ],
+   "warm": 13,
+   "converged": true
+  },
+  "calls.js_json_200k.js_lang": {
+   "value": 83.774,
+   "unit": "ms",
+   "load": 3.74,
+   "best": 83774,
+   "median": 85681,
+   "runs": [
+    92177,
+    83774,
+    85681,
+    89250,
+    85470
+   ],
+   "warm": 2,
+   "converged": true
+  },
+  "calls.js_json_200k.v8": {
+   "value": 95.901,
+   "unit": "ms",
+   "load": 3.74,
+   "best": 95901,
+   "median": 98357,
+   "runs": [
+    98568,
+    100769,
+    98357,
+    95901,
+    97586
+   ],
+   "warm": 2,
+   "converged": true
+  },
+  "calls.js_json_200k.graaljs": {
+   "value": 135.683,
+   "unit": "ms",
+   "load": 3.76,
+   "best": 135683,
+   "median": 145628,
+   "runs": [
+    317290,
+    180949,
+    135683,
+    145628,
+    141972
+   ],
+   "warm": 6,
+   "converged": true
+  },
+  "calls.read_100k_rows.sql": {
+   "value": 95.219,
+   "unit": "ms",
+   "load": 3.76,
+   "best": 95219,
+   "median": 95883,
+   "runs": [
+    95219,
+    97230,
+    96994,
+    95883,
+    95868
+   ],
+   "warm": 3,
+   "converged": true
+  },
+  "calls.read_100k_rows.v8": {
+   "value": 31.554,
+   "unit": "ms",
+   "load": 3.76,
+   "best": 31554,
+   "median": 32615,
+   "runs": [
+    34640,
+    33212,
+    32615,
+    31554,
+    31582
+   ],
+   "warm": 8,
+   "converged": true
+  },
+  "calls.read_100k_rows.graaljs": {
+   "value": 27.369,
+   "unit": "ms",
+   "load": 3.76,
+   "best": 27369,
+   "median": 28052,
+   "runs": [
+    30051,
+    30970,
+    28052,
+    27369,
+    27920
+   ],
+   "warm": 6,
+   "converged": true
+  },
+  "calls.read_100k_rows.graalpy": {
+   "value": 27.88,
+   "unit": "ms",
+   "load": 3.76,
+   "best": 27880,
+   "median": 28230,
+   "runs": [
+    28230,
+    30519,
+    27880,
+    29637,
+    27920
+   ],
+   "warm": 6,
+   "converged": true
+  },
+  "calls.read_100k_rows.cpython": {
+   "value": 37.895,
+   "unit": "ms",
+   "load": 3.76,
+   "best": 37895,
+   "median": 38367,
+   "runs": [
+    37902,
+    38542,
+    38760,
+    38367,
+    37895
+   ],
+   "warm": 2,
+   "converged": true
+  },
+  "calls.read_100k_rows.java": {
+   "value": 19.614,
+   "unit": "ms",
+   "load": 3.76,
+   "best": 19614,
+   "median": 19902,
+   "runs": [
+    19614,
+    19902,
+    22450,
+    19955,
+    19665
+   ],
+   "warm": 5,
+   "converged": true
+  },
+  "calls.small_statements.v8": {
+   "value": 6.3796,
+   "unit": "us_per_stmt",
+   "load": 3.62,
+   "best": 31898,
+   "median": 32535,
+   "runs": [
+    32614,
+    33106,
+    32535,
+    31898,
+    32035
+   ],
+   "warm": 4,
+   "converged": true
+  },
+  "calls.small_statements.graaljs": {
+   "value": 5.7114,
+   "unit": "us_per_stmt",
+   "load": 3.62,
+   "best": 28557,
+   "median": 30926,
+   "runs": [
+    33488,
+    31757,
+    30926,
+    29425,
+    28557
+   ],
+   "warm": 8,
+   "converged": true
+  },
+  "calls.small_statements.graalpy": {
+   "value": 7.3748,
+   "unit": "us_per_stmt",
+   "load": 3.62,
+   "best": 36874,
+   "median": 45228,
+   "runs": [
+    51832,
+    47991,
+    45228,
+    37977,
+    36874
+   ],
+   "warm": 7,
+   "converged": true
+  },
+  "calls.small_statements.cpython": {
+   "value": 10.628,
+   "unit": "us_per_stmt",
+   "load": 3.62,
+   "best": 53140,
+   "median": 54451,
+   "runs": [
+    54444,
+    55134,
+    54451,
+    53140,
+    56511
+   ],
+   "warm": 4,
+   "converged": true
+  },
+  "calls.small_statements.java": {
+   "value": 5.6282,
+   "unit": "us_per_stmt",
+   "load": 3.62,
+   "best": 28141,
+   "median": 29147,
+   "runs": [
+    29614,
+    29147,
+    29471,
+    28858,
+    28141
+   ],
+   "warm": 4,
+   "converged": true
+  },
+  "calls.execute_many_1000.v8": {
+   "value": 11.318,
+   "unit": "ms",
+   "load": 3.62,
+   "best": 11318,
+   "median": 11402,
+   "runs": [
+    11402,
+    11318,
+    11342,
+    11446,
+    11642
+   ],
+   "warm": 4,
+   "converged": true
+  },
+  "calls.execute_many_1000.graaljs": {
+   "value": 12.695,
+   "unit": "ms",
+   "load": 3.62,
+   "best": 12695,
+   "median": 13521,
+   "runs": [
+    13652,
+    15254,
+    13521,
+    12695,
+    13164
+   ],
+   "warm": 6,
+   "converged": true
+  },
+  "calls.execute_many_1000.graalpy": {
+   "value": 15.519,
+   "unit": "ms",
+   "load": 3.62,
+   "best": 15519,
+   "median": 16288,
+   "runs": [
+    16222,
+    16548,
+    20830,
+    16288,
+    15519
+   ],
+   "warm": 7,
+   "converged": true
+  },
+  "calls.execute_many_1000.cpython": {
+   "value": 14.327,
+   "unit": "ms",
+   "load": 3.62,
+   "best": 14327,
+   "median": 14565,
+   "runs": [
+    14640,
+    14358,
+    14565,
+    14797,
+    14327
+   ],
+   "warm": 5,
+   "converged": true
+  },
+  "calls.execute_many_1000.java": {
+   "value": 13.582,
+   "unit": "ms",
+   "load": 3.62,
+   "best": 13582,
+   "median": 15074,
+   "runs": [
+    14516,
+    16127,
+    15074,
+    13582,
+    15811
+   ],
+   "warm": 3,
+   "converged": true
+  },
+  "calls.top10_of_100k.sql": {
+   "value": 102.092,
+   "unit": "ms",
+   "load": 3.62,
+   "best": 102092,
+   "median": 103117,
+   "runs": [
+    107980,
+    105133,
+    103117,
+    102092,
+    102830
+   ],
+   "warm": 3,
+   "converged": true
+  },
+  "calls.top10_of_100k.hnsw": {
+   "value": 0.248,
+   "unit": "ms",
+   "load": 3.62,
+   "best": 248,
+   "median": 263,
+   "runs": [
+    290,
+    248,
+    251,
+    267,
+    263
+   ],
+   "warm": 10,
+   "converged": true,
+   "recall": 0.5
+  },
+  "calls.top10_of_100k.graalpy": {
+   "value": 279.693,
+   "unit": "ms",
+   "load": 3.57,
+   "best": 279693,
+   "median": 287438,
+   "runs": [
+    292286,
+    283722,
+    289801,
+    279693,
+    287438
+   ],
+   "warm": 5,
+   "converged": true
+  },
+  "calls.top10_of_100k.cpython": {
+   "value": 373.642,
+   "unit": "ms",
+   "load": 3.37,
+   "best": 373642,
+   "median": 378064,
+   "runs": [
+    373642,
+    382245,
+    378064,
+    391171,
+    375016
+   ],
+   "warm": 2,
+   "converged": true
+  },
+  "calls.top10_of_100k.java": {
+   "value": 237.644,
+   "unit": "ms",
+   "load": 3.37,
+   "best": 237644,
+   "median": 245185,
+   "runs": [
+    245185,
+    238418,
+    247936,
+    237644,
+    251425
+   ],
+   "warm": 7,
+   "converged": true
+  },
+  "calls.vector_argument.graalpy": {
+   "value": 4.45976,
+   "unit": "us_per_row",
+   "load": 3.05,
+   "best": 463974,
+   "median": 495942,
+   "runs": [
+    495942,
+    463974,
+    509258,
+    474021,
+    496284
+   ],
+   "warm": 20,
+   "converged": false,
+   "scan_us": 17998,
+   "rows": 100000
+  },
+  "calls.vector_argument.cpython": {
+   "value": 3.6403,
+   "unit": "us_per_row",
+   "load": 3.05,
+   "best": 382028,
+   "median": 390626,
+   "runs": [
+    390626,
+    383105,
+    382028,
+    391444,
+    396349
+   ],
+   "warm": 2,
+   "converged": true,
+   "scan_us": 17998,
+   "rows": 100000
+  },
+  "library.related_10k.library_java": {
+   "value": 228.8,
+   "unit": "ms",
+   "load": 3.13,
+   "what": "the library from Java",
+   "runs": [
+    {
+     "load_s": 0.0929,
+     "compute_s": 0.3473,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.2071,
+     "compute_s": 0.2288,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.0161,
+     "compute_s": 0.2362,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.0225,
+     "compute_s": 0.2333,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.014,
+     "compute_s": 0.2325,
+     "check": 500287001,
+     "threads": 4
+    }
+   ],
+   "load_ms": 207.1,
+   "threads": 4
+  },
+  "library.related_10k.library_graaljs": {
+   "value": 243.0,
+   "unit": "ms",
+   "load": 3.13,
+   "what": "the library from JavaScript",
+   "runs": [
+    {
+     "load_s": 0.023,
+     "compute_s": 0.244,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.019,
+     "compute_s": 0.276,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.018,
+     "compute_s": 0.253,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.018,
+     "compute_s": 0.266,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.024,
+     "compute_s": 0.243,
+     "check": 500287001,
+     "threads": 4
+    }
+   ],
+   "load_ms": 24.0,
+   "threads": 4
+  },
+  "library.related_10k.library_graalpy": {
+   "value": 234.89310300001875,
+   "unit": "ms",
+   "load": 3.13,
+   "what": "the library from Python (GraalPy)",
+   "runs": [
+    {
+     "load_s": 0.021354311000010284,
+     "compute_s": 0.27301537499999995,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.014711481999995613,
+     "compute_s": 0.25909519199998954,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.023129551000010906,
+     "compute_s": 0.25722426199999404,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.014634105999988378,
+     "compute_s": 0.24074760900001024,
+     "check": 500287001,
+     "threads": 4
+    },
+    {
+     "load_s": 0.024337644999974373,
+     "compute_s": 0.23489310300001875,
+     "check": 500287001,
+     "threads": 4
+    }
+   ],
+   "load_ms": 24.337644999974373,
+   "threads": 4
+  },
+  "library.related_10k.numpy_graalpy": {
+   "value": 1968.869854000019,
+   "unit": "ms",
+   "load": 3.04,
+   "what": "numpy in GraalPy (JVM worker)",
+   "runs": [
+    {
+     "load_s": 0.02141453499999102,
+     "compute_s": 2.061613442999999,
+     "check": 500287001,
+     "threads": ""
+    },
+    {
+     "load_s": 0.01674273299997253,
+     "compute_s": 1.968869854000019,
+     "check": 500287001,
+     "threads": ""
+    },
+    {
+     "load_s": 0.015837970999996287,
+     "compute_s": 2.224697598000006,
+     "check": 500287001,
+     "threads": ""
+    },
+    {
+     "load_s": 0.017039151999995283,
+     "compute_s": 2.2647718430000054,
+     "check": 500287001,
+     "threads": ""
+    },
+    {
+     "load_s": 0.019174840000005133,
+     "compute_s": 2.3984993089999875,
+     "check": 500287001,
+     "threads": ""
+    }
+   ],
+   "load_ms": 16.74273299997253,
+   "threads": ""
+  },
+  "library.related_10k.numpy_cpython": {
+   "value": 1923.1209608260542,
+   "unit": "ms",
+   "load": 2.73,
+   "what": "numpy in CPython (CPython worker)",
+   "runs": [
+    {
+     "load_s": 0.023739690193906426,
+     "compute_s": 1.9231209608260542,
+     "check": 500287001,
+     "threads": "1"
+    },
+    {
+     "load_s": 0.02270195004530251,
+     "compute_s": 1.9883977409917861,
+     "check": 500287001,
+     "threads": "1"
+    },
+    {
+     "load_s": 0.022992686834186316,
+     "compute_s": 1.949966702144593,
+     "check": 500287001,
+     "threads": "1"
+    },
+    {
+     "load_s": 0.026606578147038817,
+     "compute_s": 2.0253843509126455,
+     "check": 500287001,
+     "threads": "1"
+    },
+    {
+     "load_s": 0.029052420984953642,
+     "compute_s": 1.9385276960674673,
+     "check": 500287001,
+     "threads": "1"
+    }
+   ],
+   "load_ms": 23.739690193906426,
+   "threads": "1"
+  },
+  "library.related_10k.library_java_1_thread": {
+   "value": 817.5,
+   "unit": "ms",
+   "load": 2.76,
+   "what": "the library from Java, one thread (mle.vector_threads = 1)",
+   "runs": [
+    {
+     "load_s": 0.0619,
+     "compute_s": 0.8525,
+     "check": 500287001,
+     "threads": 1
+    },
+    {
+     "load_s": 0.0376,
+     "compute_s": 0.8336,
+     "check": 500287001,
+     "threads": 1
+    },
+    {
+     "load_s": 0.0291,
+     "compute_s": 0.8426,
+     "check": 500287001,
+     "threads": 1
+    },
+    {
+     "load_s": 0.0297,
+     "compute_s": 0.8402,
+     "check": 500287001,
+     "threads": 1
+    },
+    {
+     "load_s": 0.0293,
+     "compute_s": 0.8175,
+     "check": 500287001,
+     "threads": 1
+    }
+   ],
+   "load_ms": 29.3,
+   "threads": 1
+  },
+  "cold.no_pool.none": {
+   "value": 5.530877970159054,
+   "unit": "ms",
+   "load": 2.76,
+   "runs": [
+    5.438844906166196,
+    5.845088977366686,
+    5.707951029762626,
+    5.485632922500372,
+    5.530877970159054,
+    4.925959976390004,
+    5.745721980929375
+   ]
+  },
+  "cold.no_pool.js_lang": {
+   "value": 6.373493932187557,
+   "unit": "ms",
+   "load": 2.76,
+   "runs": [
+    5.799334030598402,
+    6.381298881024122,
+    7.636440917849541,
+    6.245241966098547,
+    6.226958008483052,
+    6.373493932187557,
+    7.295058108866215
+   ]
+  },
+  "cold.no_pool.v8": {
+   "value": 30.011815950274467,
+   "unit": "ms",
+   "load": 2.94,
+   "runs": [
+    41.58205911517143,
+    28.99882895871997,
+    34.788043005391955,
+    30.011815950274467,
+    29.904593946412206,
+    35.88732308708131,
+    29.915163991972804
+   ]
+  },
+  "cold.no_pool.graaljs": {
+   "value": 741.3933139760047,
+   "unit": "ms",
+   "load": 2.72,
+   "runs": [
+    721.4394749607891,
+    767.1622768975794,
+    746.0589651018381,
+    731.0784640721977,
+    767.3589061014354,
+    741.3933139760047,
+    733.9598550461233
+   ]
+  },
+  "cold.no_pool.graalpy": {
+   "value": 2368.706601904705,
+   "unit": "ms",
+   "load": 2.89,
+   "runs": [
+    2346.5488760266453,
+    2346.8105671927333,
+    2368.706601904705,
+    2385.679620783776,
+    2394.2655781283975,
+    2456.395982997492,
+    2367.7274589426816
+   ]
+  },
+  "cold.no_pool.graalpy_numpy": {
+   "value": 5311.210945947096,
+   "unit": "ms",
+   "load": 3.31,
+   "runs": [
+    5104.481835849583,
+    5629.6699091326445,
+    5146.155007183552,
+    5311.210945947096,
+    5431.3822239637375,
+    4983.5770591162145,
+    5594.871375942603
+   ]
+  },
+  "cold.no_pool.java": {
+   "value": 787.3167721554637,
+   "unit": "ms",
+   "load": 3.12,
+   "runs": [
+    818.8627050258219,
+    781.0509810224175,
+    784.6431301441044,
+    800.5959910806268,
+    787.3167721554637,
+    869.1699129994959,
+    786.7326128762215
+   ]
+  },
+  "cold.no_pool.cpython": {
+   "value": 68.84766696020961,
+   "unit": "ms",
+   "load": 3.12,
+   "runs": [
+    67.0014328788966,
+    68.33484210073948,
+    72.75135209783912,
+    68.84766696020961,
+    68.76551290042698,
+    71.17956504225731,
+    72.41807598620653
+   ]
+  },
+  "cold.no_pool.cpython_numpy": {
+   "value": 236.33548291400075,
+   "unit": "ms",
+   "load": 2.87,
+   "runs": [
+    236.33548291400075,
+    242.17347893863916,
+    242.1213409397751,
+    239.00621896609664,
+    236.08346888795495,
+    236.18176416493952,
+    229.53379480168223
+   ]
+  },
+  "cold.pool.v8": {
+   "value": 8.799499832093716,
+   "unit": "ms",
+   "load": 2.43,
+   "runs": [
+    8.859782945364714,
+    9.376164991408587,
+    8.786964928731322,
+    8.186134975403547,
+    8.799499832093716,
+    8.272907929494977,
+    9.236801881343126
+   ]
+  },
+  "cold.pool.graaljs": {
+   "value": 19.63356602936983,
+   "unit": "ms",
+   "load": 2.44,
+   "runs": [
+    21.123539889231324,
+    20.310630090534687,
+    19.749424187466502,
+    19.260823959484696,
+    19.518760964274406,
+    18.424911191686988,
+    19.63356602936983
+   ]
+  },
+  "cold.pool.graalpy": {
+   "value": 1777.6178079657257,
+   "unit": "ms",
+   "load": 2.89,
+   "runs": [
+    1824.3697150610387,
+    1749.4409538339823,
+    1760.3736689779907,
+    1822.5337900221348,
+    1777.6178079657257,
+    1775.6147379986942,
+    1823.5650800634176
+   ]
+  },
+  "cold.pool.graalpy_numpy": {
+   "value": 4564.002959989011,
+   "unit": "ms",
+   "load": 3.69,
+   "runs": [
+    4630.357465939596,
+    4596.660685027018,
+    4606.236696941778,
+    4564.002959989011,
+    4540.330975083634,
+    4555.837815161794,
+    4506.737750023603
+   ]
+  },
+  "cold.pool.java": {
+   "value": 50.8160050958395,
+   "unit": "ms",
+   "load": 3.65,
+   "runs": [
+    48.84460521861911,
+    50.8160050958395,
+    55.463760858401656,
+    51.26126203685999,
+    52.18470981344581,
+    48.40124095790088,
+    49.874273128807545
+   ]
+  },
+  "cold.pool.cpython": {
+   "value": 16.640054993331432,
+   "unit": "ms",
+   "load": 3.09,
+   "runs": [
+    24.0227859467268,
+    16.17024908773601,
+    16.189584974199533,
+    16.640054993331432,
+    15.912905102595687,
+    17.02253194525838,
+    18.064613919705153
+   ]
+  },
+  "cold.pool.cpython_numpy": {
+   "value": 189.93430584669113,
+   "unit": "ms",
+   "load": 2.69,
+   "runs": [
+    186.45724188536406,
+    191.77902699448168,
+    189.32290491648018,
+    190.72165805846453,
+    185.37544691935182,
+    190.09586982429028,
+    189.93430584669113
+   ]
+  },
+  "memory.mle.one.v8": {
+   "value": 39.8408203125,
+   "unit": "MiB_pss_per_worker",
+   "load": 2.47,
+   "pss": [
+    39.8408203125
+   ],
+   "rss": [
+    48.51953125
+   ],
+   "total_pss": 39.8408203125
+  },
+  "memory.mle.eight.v8": {
+   "value": 10.3740234375,
+   "unit": "MiB_pss_per_worker",
+   "load": 2.47,
+   "pss": [
+    10.2734375,
+    10.3017578125,
+    10.3466796875,
+    10.35546875,
+    10.392578125,
+    10.4111328125,
+    10.4599609375,
+    10.54296875
+   ],
+   "rss": [
+    47.34375,
+    47.61328125,
+    47.73046875,
+    47.75,
+    47.8125,
+    48.265625,
+    48.31640625,
+    48.375
+   ],
+   "total_pss": 83.083984375
+  },
+  "memory.mle.one.graaljs": {
+   "value": 321.1865234375,
+   "unit": "MiB_pss_per_worker",
+   "load": 2.27,
+   "pss": [
+    321.1865234375
+   ],
+   "rss": [
+    335.19921875
+   ],
+   "total_pss": 321.1865234375
+  },
+  "memory.mle.eight.graaljs": {
+   "value": 201.546875,
+   "unit": "MiB_pss_per_worker",
+   "load": 3.93,
+   "pss": [
+    198.888671875,
+    200.7060546875,
+    201.154296875,
+    201.3154296875,
+    201.7783203125,
+    203.8330078125,
+    214.5146484375,
+    214.619140625
+   ],
+   "rss": [
+    337.11328125,
+    339.03515625,
+    339.515625,
+    339.67578125,
+    340.109375,
+    342.61328125,
+    353.31640625,
+    353.484375
+   ],
+   "total_pss": 1636.8095703125
+  },
+  "memory.mle.one.graalpy": {
+   "value": 546.2646484375,
+   "unit": "MiB_pss_per_worker",
+   "load": 3.33,
+   "pss": [
+    546.2646484375
+   ],
+   "rss": [
+    561.75
+   ],
+   "total_pss": 546.2646484375
+  },
+  "memory.mle.eight.graalpy": {
+   "value": 430.1064453125,
+   "unit": "MiB_pss_per_worker",
+   "load": 7.2,
+   "pss": [
+    361.638671875,
+    415.9462890625,
+    423.37109375,
+    428.9658203125,
+    431.2470703125,
+    432.4580078125,
+    470.109375,
+    481.7333984375
+   ],
+   "rss": [
+    496.5546875,
+    550.671875,
+    558.4140625,
+    563.61328125,
+    566.1875,
+    567.21484375,
+    604.9921875,
+    616.71875
+   ],
+   "total_pss": 3445.4697265625
+  },
+  "memory.mle.one.graalpy_numpy": {
+   "value": 618.7275390625,
+   "unit": "MiB_pss_per_worker",
+   "load": 6.62,
+   "pss": [
+    618.7275390625
+   ],
+   "rss": [
+    634.3203125
+   ],
+   "total_pss": 618.7275390625
+  },
+  "memory.mle.eight.graalpy_numpy": {
+   "value": 565.7666015625,
+   "unit": "MiB_pss_per_worker",
+   "load": 15.65,
+   "pss": [
+    516.56640625,
+    552.3388671875,
+    555.826171875,
+    555.84765625,
+    575.685546875,
+    586.7099609375,
+    629.3017578125,
+    630.880859375
+   ],
+   "rss": [
+    656.0234375,
+    691.703125,
+    695.1796875,
+    695.20703125,
+    715.05859375,
+    726.12109375,
+    768.640625,
+    770.08984375
+   ],
+   "total_pss": 4603.1572265625
+  },
+  "memory.mle.one.java": {
+   "value": 283.54296875,
+   "unit": "MiB_pss_per_worker",
+   "load": 15.65,
+   "pss": [
+    283.54296875
+   ],
+   "rss": [
+    287.88671875
+   ],
+   "total_pss": 283.54296875
+  },
+  "memory.mle.eight.java": {
+   "value": 161.01123046875,
+   "unit": "MiB_pss_per_worker",
+   "load": 13.4,
+   "pss": [
+    155.1201171875,
+    157.748046875,
+    158.2919921875,
+    160.8642578125,
+    161.158203125,
+    161.7099609375,
+    161.7529296875,
+    162.6015625
+   ],
+   "rss": [
+    280.94921875,
+    283.515625,
+    284.11328125,
+    286.59375,
+    286.87890625,
+    287.50390625,
+    287.5625,
+    288.41015625
+   ],
+   "total_pss": 1279.2470703125
+  },
+  "memory.mle.one.cpython": {
+   "value": 17.5400390625,
+   "unit": "MiB_pss_per_worker",
+   "load": 13.4,
+   "pss": [
+    17.5400390625
+   ],
+   "rss": [
+    25.1875
+   ],
+   "total_pss": 17.5400390625
+  },
+  "memory.mle.eight.cpython": {
+   "value": 11.783203125,
+   "unit": "MiB_pss_per_worker",
+   "load": 12.32,
+   "pss": [
+    11.7802734375,
+    11.7802734375,
+    11.7822265625,
+    11.7822265625,
+    11.7841796875,
+    11.78515625,
+    11.7890625,
+    11.841796875
+   ],
+   "rss": [
+    25.15625,
+    25.16015625,
+    25.22265625,
+    25.2265625,
+    25.234375,
+    25.23828125,
+    25.2421875,
+    25.26171875
+   ],
+   "total_pss": 94.3251953125
+  },
+  "memory.mle.one.cpython_numpy": {
+   "value": 33.71875,
+   "unit": "MiB_pss_per_worker",
+   "load": 11.42,
+   "pss": [
+    33.71875
+   ],
+   "rss": [
+    41.47265625
+   ],
+   "total_pss": 33.71875
+  },
+  "memory.mle.eight.cpython_numpy": {
+   "value": 23.23486328125,
+   "unit": "MiB_pss_per_worker",
+   "load": 11.42,
+   "pss": [
+    23.224609375,
+    23.228515625,
+    23.2314453125,
+    23.232421875,
+    23.2373046875,
+    23.244140625,
+    23.248046875,
+    23.2529296875
+   ],
+   "rss": [
+    41.19921875,
+    41.22265625,
+    41.45703125,
+    41.46484375,
+    41.46875,
+    41.46875,
+    41.50390625,
+    41.5234375
+   ],
+   "total_pss": 185.8994140625
+  },
+  "memory.mle.eight.js_lang": {
+   "value": 0.470703125,
+   "unit": "MiB_pss_per_session_in_mysqld",
+   "load": 10.58,
+   "mysqld_before": 2903.576171875,
+   "mysqld_after": 2907.341796875
+  },
+  "memory.aot_relocated.one.graaljs": {
+   "value": 336.9873046875,
+   "unit": "MiB_pss_per_worker",
+   "load": 9.03,
+   "pss": [
+    336.9873046875
+   ],
+   "rss": [
+    351.5
+   ],
+   "total_pss": 336.9873046875
+  },
+  "memory.aot_relocated.eight.graaljs": {
+   "value": 278.38671875,
+   "unit": "MiB_pss_per_worker",
+   "load": 10.07,
+   "pss": [
+    272.1669921875,
+    276.2919921875,
+    277.6650390625,
+    278.1748046875,
+    278.5986328125,
+    278.607421875,
+    279.5546875,
+    281.330078125
+   ],
+   "rss": [
+    352.78125,
+    357.078125,
+    358.453125,
+    358.76171875,
+    359.390625,
+    359.39453125,
+    360.34375,
+    362.12109375
+   ],
+   "total_pss": 2222.3896484375
+  },
+  "memory.aot_relocated.one.graalpy_numpy": {
+   "value": 706.525390625,
+   "unit": "MiB_pss_per_worker",
+   "load": 8.84,
+   "pss": [
+    706.525390625
+   ],
+   "rss": [
+    722.18359375
+   ],
+   "total_pss": 706.525390625
+  },
+  "memory.aot_relocated.eight.graalpy_numpy": {
+   "value": 644.93310546875,
+   "unit": "MiB_pss_per_worker",
+   "load": 17.79,
+   "pss": [
+    609.8203125,
+    619.525390625,
+    622.0283203125,
+    623.515625,
+    666.3505859375,
+    672.4921875,
+    684.390625,
+    695.92578125
+   ],
+   "rss": [
+    697.86328125,
+    707.53515625,
+    709.88671875,
+    711.5703125,
+    754.40625,
+    760.4296875,
+    772.203125,
+    783.91796875
+   ],
+   "total_pss": 5194.048828125
+  }
+ }
+}

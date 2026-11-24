@@ -1,7 +1,7 @@
 # Percona MLE — multi-language stored programs for Percona Server
 
-Stored functions and procedures in **JavaScript** (Oracle MySQL compatible `LANGUAGE JAVASCRIPT`), **Python**
-(with numpy) and **Java**, run by GraalVM in sandboxed worker processes outside the server.
+Stored functions and procedures in **JavaScript**, **Python** (with numpy) and **Java**, run in sandboxed worker
+processes outside the server, with SQL from routines in every language.
 
 ```sql
 CREATE FUNCTION similarity(a VECTOR(768), b VECTOR(768)) RETURNS DOUBLE DETERMINISTIC LANGUAGE PYTHON AS $$
@@ -10,12 +10,25 @@ CREATE FUNCTION similarity(a VECTOR(768), b VECTOR(768)) RETURNS DOUBLE DETERMIN
 $$;
 ```
 
+Three kinds of worker, one package each; they can be installed together, and a routine's `LANGUAGE` chooses the
+worker:
+
+| Worker | `LANGUAGE` | Runtime | For |
+|---|---|---|---|
+| JVM worker | `JAVASCRIPT` (Oracle MySQL compatible), `PYTHON`, `JAVA` | GraalVM: GraalJS, GraalPy, Java | all three languages, calls between them (polyglot), libraries shared across languages, the built-in vector and statistics library (`com.percona.mle.api`) |
+| CPython worker | `CPYTHON` | the distribution's CPython (3.12+) with numpy | Python with little memory and a fast start |
+| V8 worker | `JS` | the distribution's libnode (V8) | JavaScript with little memory and a fast start; the language name js_lang uses |
+
+All three speak one protocol with the server, specified in `docs/protocol.md` (version 1.0), start through the
+same launcher and sandbox, and give guest code the same SQL API.
+
 A separate product: it builds against Percona Server and installs into it as a component (`component_mle`); the
 server needs only its generic language router (`component_lang_router`, built with js_lang or
 `-DWITH_LANG_ROUTER=ON`). Supported server lines: trunk-based releases (26.x), then 9.7.
 
-*A proof of concept.* Licensed under the GNU General Public License version 2 (`LICENSE`), as Percona Server. Code
-comments cite the project's design notes by name (e.g. `14-phase6-libraries.md`); those notes are not published.
+*An MVP:* the protocol is specified and reviewed, the three workers implement it; not for production yet. Licensed
+under the GNU General Public License version 2 (`LICENSE`), as Percona Server. Code comments cite the project's
+design notes by name (e.g. `14-phase6-libraries.md`); those notes are not published.
 
 ## Layout
 
@@ -27,9 +40,10 @@ comments cite the project's design notes by name (e.g. `14-phase6-libraries.md`)
 | `worker/` | `mle_worker` (a JNI launcher of the JVM) and `mle-worker.jar` (GraalJS, GraalPy, Java routines, the SQL API); Maven; the numpy venv; the AOT cache; `cpython/`: the CPython worker; `v8/`: the V8 worker; `common/`: their shared C++ |
 | `tools/` | `mle_package` (the DBA's npm/PyPI/Maven tool), `mle_aot_cache` (makes the AOT cache at install) |
 | `harness/` | a command-line driver for workers (development) |
-| `unittest/` | GoogleTest unit tests (9 binaries) |
+| `unittest/` | GoogleTest unit tests (12 binaries) |
 | `mysql-test/suite/component_mle` | the MTR suite |
-| `perf/` | performance tools: the regression test (two builds side by side), the benchmark of one build (every runtime), the end-to-end benchmark against an application |
+| `docs/` | `protocol.md`: the host–worker protocol, specification 1.0; `protocol-review.md`: its reviews, the differences from the code before it, the measurements |
+| `perf/` | performance tools: the regression test (two builds side by side), the benchmark of one build (every runtime), the end-to-end benchmark against an application |; `perf/results/`: published runs (JSON) |
 | `docker/` | the server + MLE image, the DBA tools image, compose |
 | `packaging/`, `cmake/packaging.cmake` | packages (CPack, deb and rpm) and their scripts |
 | `cmake/server.cmake` | building against a configured Percona Server tree |
@@ -81,9 +95,128 @@ It runs each case of `perf/setup.sql` (the call path, values of every kind, SQL 
 libraries, errors, vectors, a new connection's worker) on both builds in alternating order on the same data, and
 exits with status 1 when a case is slower beyond the threshold (5 %) in all rounds but one.
 
-Absolute numbers of one build, every runtime (calls, SQL from routines, vectors, the vector library against numpy,
-cold start, memory per worker; about 10 minutes): `perf/bench.py --server <release server build> --mle
-../BUILD-mle-release --json results.json`. See `perf/README.md`.
+## Performance
+
+Absolute numbers of one build, every runtime (about 10 minutes), and an application against the same logic in a
+stored procedure (about 8 minutes); `perf/README.md` and `perf/e2e/README.md` say what each case does:
+
+    perf/bench.py --server <release server build> --mle ../BUILD-mle-release --wait-quiet --json bench.json
+    perf/e2e/e2e.py --server <release server build> --mle ../BUILD-mle-release --wait-quiet --json e2e.json
+
+**The run below:** 23 Nov 2026, full runs (not `--quick`), one run of each tool; the JSON with every measurement is
+in `perf/results/2026-11-23/`. A developer laptop, not a dedicated machine: HP ZBook Power G10 A, AMD Ryzen 9
+7940HS (8 cores, 16 threads), 64 GB, Ubuntu 26.04.1, kernel 7.0, CPU governor `performance`. Release builds
+(RelWithDebInfo): MLE `7bd42aa` (component and workers as on `main`), Percona Server 26.7.0 with js_lang and the
+language router. GraalVM CE 25.5.5 (JDK 25.0.5), GraalPy 25.5.5 (Python 3.13), CPython 3.14.4, numpy 2.4.4, libnode
+127. MLE defaults, except `mle.heap_max` 2 GB and `mle.memory_max` 4 GB in the end-to-end run. bench.py times
+statements in the server and reports the best of 5 runs after a warm-up; lower is better everywhere except requests
+per second.
+
+### Calls (bench.py)
+
+µs per row over 1,000,000 rows, net of a plain scan of the same rows:
+
+| | SQL (PSM) | js_lang | V8 worker | GraalJS | GraalPy | CPython | Java |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `a + b` | 1.07 | 1.25 | 1.31 | 1.29 | 1.27 | 1.29 | 1.18 |
+| Levenshtein of two strings | 91.7 | 2.22 | 2.47 | 2.71 | 2.80 | 8.85 | 1.47 |
+
+A call into a worker costs 0.1–0.25 µs more than an SQL stored function's, about what js_lang's V8 inside mysqld costs;
+per-row logic runs 10–60 times faster than in an SQL stored function.
+
+JavaScript, one call (ms):
+
+| | js_lang | V8 worker | GraalJS |
+|---|---:|---:|---:|
+| `Math.sqrt(i) * Math.sin(i)`, 5,000,000 times | 214 | 216 | 122 |
+| make and sort 200,000 objects | 53.6 | 38.6 | 98.2 |
+| `JSON.stringify` 200,000 small objects, `JSON.parse` the array | 83.8 | 95.9 | 136 |
+
+### SQL from routines (bench.py)
+
+| | SQL (PSM) | V8 worker | GraalJS | GraalPy | CPython | Java |
+|---|---:|---:|---:|---:|---:|---:|
+| read 100,000 rows one by one (ms) | 95.2 | 31.6 | 27.4 | 27.9 | 37.9 | 19.6 |
+| a small statement (µs each) | | 6.38 | 5.71 | 7.38 | 10.6 | 5.63 |
+| `executeMany`, 1,000 rows (ms) | | 11.3 | 12.7 | 15.5 | 14.3 | 13.6 |
+
+### Vectors (bench.py)
+
+| | ms |
+|---|---:|
+| 10 nearest of 100,000 `VECTOR(768)`: SQL, exact | 102 |
+| the same with an HNSW index (`M = 16`, default search settings; 5 of the exact 10 found) | 0.25 |
+| the same in GraalPy, numpy | 280 |
+| the same in CPython, numpy | 374 |
+| the same in Java, the Vector API | 238 |
+| related items of 10,000 vectors (cosine), the built-in library from Java / JavaScript / Python | 229 / 243 / 235 |
+| the same, the library on one thread (`mle.vector_threads` is 4) | 818 |
+| the same in numpy, one BLAS thread: GraalPy / CPython | 1,969 / 1,923 |
+
+A `VECTOR(768)` argument costs 4.5 µs per row in GraalPy and 3.6 µs in CPython.
+
+### A new connection's first call (bench.py)
+
+ms at the client, median of 7 new `mysql` processes; a plain connection with no routine takes 5.5 ms:
+
+| | new worker (pool off) | worker from the pool |
+|---|---:|---:|
+| js_lang (in mysqld) | 6.4 | |
+| V8 worker | 30 | 8.8 |
+| CPython | 69 | 17 |
+| CPython, `import numpy` | 236 | 190 |
+| GraalJS | 741 | 20 |
+| Java | 787 | 51 |
+| GraalPy | 2,369 | 1,778 |
+| GraalPy, `import numpy` | 5,311 | 4,564 |
+
+### Memory per worker (bench.py)
+
+PSS in MiB per worker, one worker alone and each of eight at once (they share code and the AOT cache):
+
+| | one | each of eight |
+|---|---:|---:|
+| V8 worker | 40 | 10 |
+| CPython | 18 | 12 |
+| CPython, numpy | 34 | 23 |
+| Java | 284 | 161 |
+| GraalJS | 321 | 202 |
+| GraalPy | 546 | 430 |
+| GraalPy, numpy | 619 | 566 |
+
+js_lang costs 0.5 MiB per session inside mysqld. The JVM worker maps its AOT cache at the cache's own address
+(`-XX:ArchiveRelocationMode=0`); relocated, as the JDK does by default, each of eight GraalJS workers takes 278 MiB
+instead of 202, and GraalPy with numpy 645 instead of 566.
+
+### An application against the same logic in MLE (e2e.py)
+
+Clients in a network namespace with 1 ms added delay (round trip 1.17 ms, an application server on a LAN); clients
+and server on the same laptop. Median ms per request with one client (change against the application in the same
+language), and requests per second with several clients:
+
+| Case | Java app | `LANGUAGE JAVA` | Python app (numpy) | `LANGUAGE PYTHON` (GraalPy) | `LANGUAGE CPYTHON` |
+|---|---:|---:|---:|---:|---:|
+| `chatty`: 3 dependent queries, 200 HNSW candidates | 6.55 | 3.69 (−44 %) | 7.55 | 6.23 (−18 %) | 5.05 (−33 %) |
+| `mmr500`: re-rank 500 candidates with their vectors | 4.62 | 3.89 (−16 %) | 7.13 | 7.46 (+5 %) | 7.08 (−1 %) |
+| `rescore1000`: rescore 1,000 candidates | 5.49 | 4.74 (−14 %) | 6.37 | 7.40 (+16 %) | 7.19 (+13 %) |
+| `bulk`: ~5,000 vectors of a category | 26.3 | 17.2 (−35 %) | 40.6 | 21.3 (−48 %) | 25.5 (−37 %) |
+| `wb200`: read 200 rows, score, upsert, commit | 7.05 | 4.43 (−37 %) | 7.01 | 6.38 (−9 %) | 6.62 (−6 %) |
+| `wb1000`: the same with 1,000 rows | 14.4 | 10.6 (−26 %) | 18.5 | 14.8 (−20 %) | 15.1 (−18 %) |
+| `wbvec200`: write back 200 rows with a `VECTOR(768)` each | 15.8 | 11.2 (−29 %) | 27.9 | 14.4 (−48 %) | 15.5 (−44 %) |
+| `chatty`, 8 clients (req/s) | 1,216 | 1,650 | 923 | 946 | 1,282 |
+| `mmr500`, 8 clients (req/s) | 1,176 | 1,415 | 757 | 897 | 913 |
+| `wb200`, 4 clients (req/s) | 546 | 793 | 504 | 549 | 606 |
+
+MLE wins where the application needs several round trips or moves many rows; where one query brings all the data
+and the work is numpy's, the Python application is as fast or faster (`mmr500`, `rescore1000`).
+
+### The protocol specification against the code before it
+
+`perf/regression.py`, the specified protocol (1.0) against the code before the specification (`2a87613`):
+calls 13–16 % faster, `TIMESTAMP` values 13–23 %, per-row logic, libraries and prepared and nested calls 4–10 %; the
+other cases (rows, statements, writes, vectors, connections, cold start, idle memory) equal within measurement.
+One cost is open: the component's subscription to query events adds about 0.1 µs to every statement on the server,
+MLE or not (`docs/protocol-review.md` §22).
 
 ## Diagnostics
 

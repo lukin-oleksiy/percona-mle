@@ -1,0 +1,1639 @@
+{
+ "schema": 1,
+ "tool": "perf/e2e/e2e.py",
+ "time": "2026-11-23T10:54:39+0200",
+ "cases": {
+  "chatty": "3 dependent queries: profile and history, 200 HNSW candidates, promotions",
+  "mmr500": "MMR re-rank of 500 HNSW candidates (with their vectors)",
+  "rescore1000": "rescore 1,000 HNSW candidates",
+  "bulk": "all ~5,000 vectors of a category: centroid, 10 typical, 10 outliers",
+  "wb200": "write-back: read 200 rows, score, upsert, commit",
+  "wb1000": "write-back: read 1,000 rows, score, upsert, commit",
+  "wbvec200": "write-back: 200 rows with a VECTOR(768) each"
+ },
+ "variants": {
+  "java.app": "Java application (Connector/J)",
+  "java.jvm": "MLE, LANGUAGE JAVA (JVM worker)",
+  "python.app": "Python application (numpy)",
+  "python.jvm": "MLE, LANGUAGE PYTHON (GraalPy)",
+  "python.cpython": "MLE, LANGUAGE CPYTHON"
+ },
+ "environment": {
+  "cpu": "AMD Ryzen 9 7940HS w/ Radeon 780M Graphics",
+  "cpus": 16,
+  "memory_gib": 59.4,
+  "kernel": "7.0.0-43-generic",
+  "os": "Ubuntu 26.04.1 LTS",
+  "governor": "performance",
+  "server_build": "BUILD-lang-router-release",
+  "server_commit": "587c064a86",
+  "server_build_type": "RelWithDebInfo",
+  "mle_build": "BUILD-mle-release",
+  "mle_commit": "7bd42aa6c9",
+  "mle_build_type": "RelWithDebInfo",
+  "server_version": "26.7.0-1",
+  "languages": "JavaScript,Python,Java,JS,CPython",
+  "settings": {
+   "bind_address": "127.0.0.1,10.213.94.1",
+   "innodb_buffer_pool_size": "4294967296",
+   "innodb_flush_log_at_trx_commit": "1",
+   "mle.cgroup_base": "AUTO",
+   "mle.console": "OFF",
+   "mle.cpython_memory_max": "1073741824",
+   "mle.cpython_pool_size": "2",
+   "mle.dir": "BUILD-mle-release/perf-e2e/plugins-71cfc984/mle",
+   "mle.heap_max": "2147483648",
+   "mle.interrupt_grace_ms": "1000",
+   "mle.java_home": "",
+   "mle.languages": "JAVASCRIPT,PYTHON,JAVA,JS,CPYTHON",
+   "mle.malloc_mmap_threshold": "4194304",
+   "mle.max_workers": "64",
+   "mle.memory_max": "4294967296",
+   "mle.package_dir": "",
+   "mle.pool_prewarm": "vectors",
+   "mle.pool_size": "2",
+   "mle.spin_us": "50",
+   "mle.sql_call_results_max": "0",
+   "mle.sql_chunk_rows": "1000",
+   "mle.sql_exec_time": "OFF",
+   "mle.sql_result_max": "1073741824",
+   "mle.sql_row_max": "16777216",
+   "mle.sql_statements_max": "1024",
+   "mle.v8_heap_max": "536870912",
+   "mle.v8_memory_max": "1073741824",
+   "mle.v8_pool_size": "2",
+   "mle.vector_threads": "4",
+   "mle.worker_cache_size": "4",
+   "mle.worker_cache_timeout": "60"
+  },
+  "java_client": {
+   "jdk": "OpenJDK Runtime Environment GraalVM CE 25.5.5.0.3+1.1 (build 25.0.5.0.3+1-jvmci-25.5-b26)",
+   "connector": "mysql-connector-j-9.5.0.jar",
+   "dot": "vector-api"
+  },
+  "tool_commit": "7bd42aa6c9",
+  "network": {
+   "mode": "netns+netem",
+   "delay_ms": 1.0,
+   "mtu": 1500,
+   "rtt_ms": 1.17
+  },
+  "server_warm_s": 5.7,
+  "load_start": 14.28,
+  "load_end": 14.59,
+  "seconds": 478,
+  "quick": false,
+  "python_client": {
+   "mysql-connector-python": "26.10.0",
+   "numpy": "2.5.5"
+  }
+ },
+ "checks": {
+  "chatty": "same ids",
+  "mmr500": "same ids",
+  "rescore1000": "same ids",
+  "bulk": "same ids",
+  "wb200": "same ids",
+  "wb1000": "same ids",
+  "wbvec200": "same ids"
+ },
+ "results": {
+  "e2e.chatty.java.app.p50_ms": {
+   "value": 6.553,
+   "unit": "ms"
+  },
+  "e2e.chatty.java.app.p95_ms": {
+   "value": 7.145,
+   "unit": "ms"
+  },
+  "e2e.chatty.java.app.qps": {
+   "value": 151.8,
+   "unit": "requests/s"
+  },
+  "e2e.chatty.java.jvm.p50_ms": {
+   "value": 3.69,
+   "unit": "ms"
+  },
+  "e2e.chatty.java.jvm.p95_ms": {
+   "value": 4.248,
+   "unit": "ms"
+  },
+  "e2e.chatty.java.jvm.qps": {
+   "value": 265.5,
+   "unit": "requests/s"
+  },
+  "e2e.chatty.python.app.p50_ms": {
+   "value": 7.55,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.app.p95_ms": {
+   "value": 8.404,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.app.qps": {
+   "value": 130.6,
+   "unit": "requests/s"
+  },
+  "e2e.chatty.python.jvm.p50_ms": {
+   "value": 6.226,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.jvm.p95_ms": {
+   "value": 7.055,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.jvm.qps": {
+   "value": 158.8,
+   "unit": "requests/s"
+  },
+  "e2e.chatty.python.cpython.p50_ms": {
+   "value": 5.046,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.cpython.p95_ms": {
+   "value": 5.636,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.cpython.qps": {
+   "value": 195.2,
+   "unit": "requests/s"
+  },
+  "e2e.mmr500.java.app.p50_ms": {
+   "value": 4.62,
+   "unit": "ms"
+  },
+  "e2e.mmr500.java.app.p95_ms": {
+   "value": 4.998,
+   "unit": "ms"
+  },
+  "e2e.mmr500.java.app.qps": {
+   "value": 215.5,
+   "unit": "requests/s"
+  },
+  "e2e.mmr500.java.jvm.p50_ms": {
+   "value": 3.888,
+   "unit": "ms"
+  },
+  "e2e.mmr500.java.jvm.p95_ms": {
+   "value": 4.601,
+   "unit": "ms"
+  },
+  "e2e.mmr500.java.jvm.qps": {
+   "value": 252.5,
+   "unit": "requests/s"
+  },
+  "e2e.mmr500.python.app.p50_ms": {
+   "value": 7.131,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.app.p95_ms": {
+   "value": 7.619,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.app.qps": {
+   "value": 138.6,
+   "unit": "requests/s"
+  },
+  "e2e.mmr500.python.jvm.p50_ms": {
+   "value": 7.46,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.jvm.p95_ms": {
+   "value": 8.31,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.jvm.qps": {
+   "value": 130.7,
+   "unit": "requests/s"
+  },
+  "e2e.mmr500.python.cpython.p50_ms": {
+   "value": 7.085,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.cpython.p95_ms": {
+   "value": 7.606,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.cpython.qps": {
+   "value": 140.8,
+   "unit": "requests/s"
+  },
+  "e2e.rescore1000.java.app.p50_ms": {
+   "value": 5.486,
+   "unit": "ms"
+  },
+  "e2e.rescore1000.java.app.p95_ms": {
+   "value": 5.836,
+   "unit": "ms"
+  },
+  "e2e.rescore1000.java.app.qps": {
+   "value": 181.0,
+   "unit": "requests/s"
+  },
+  "e2e.rescore1000.java.jvm.p50_ms": {
+   "value": 4.735,
+   "unit": "ms"
+  },
+  "e2e.rescore1000.java.jvm.p95_ms": {
+   "value": 5.23,
+   "unit": "ms"
+  },
+  "e2e.rescore1000.java.jvm.qps": {
+   "value": 208.1,
+   "unit": "requests/s"
+  },
+  "e2e.rescore1000.python.app.p50_ms": {
+   "value": 6.374,
+   "unit": "ms"
+  },
+  "e2e.rescore1000.python.app.p95_ms": {
+   "value": 6.842,
+   "unit": "ms"
+  },
+  "e2e.rescore1000.python.app.qps": {
+   "value": 155.6,
+   "unit": "requests/s"
+  },
+  "e2e.rescore1000.python.jvm.p50_ms": {
+   "value": 7.4,
+   "unit": "ms"
+  },
+  "e2e.rescore1000.python.jvm.p95_ms": {
+   "value": 8.049,
+   "unit": "ms"
+  },
+  "e2e.rescore1000.python.jvm.qps": {
+   "value": 132.1,
+   "unit": "requests/s"
+  },
+  "e2e.rescore1000.python.cpython.p50_ms": {
+   "value": 7.188,
+   "unit": "ms"
+  },
+  "e2e.rescore1000.python.cpython.p95_ms": {
+   "value": 7.832,
+   "unit": "ms"
+  },
+  "e2e.rescore1000.python.cpython.qps": {
+   "value": 137.9,
+   "unit": "requests/s"
+  },
+  "e2e.bulk.java.app.p50_ms": {
+   "value": 26.261,
+   "unit": "ms"
+  },
+  "e2e.bulk.java.app.p95_ms": {
+   "value": 28.759,
+   "unit": "ms"
+  },
+  "e2e.bulk.java.app.qps": {
+   "value": 37.7,
+   "unit": "requests/s"
+  },
+  "e2e.bulk.java.jvm.p50_ms": {
+   "value": 17.17,
+   "unit": "ms"
+  },
+  "e2e.bulk.java.jvm.p95_ms": {
+   "value": 19.902,
+   "unit": "ms"
+  },
+  "e2e.bulk.java.jvm.qps": {
+   "value": 56.9,
+   "unit": "requests/s"
+  },
+  "e2e.bulk.python.app.p50_ms": {
+   "value": 40.573,
+   "unit": "ms"
+  },
+  "e2e.bulk.python.app.p95_ms": {
+   "value": 43.84,
+   "unit": "ms"
+  },
+  "e2e.bulk.python.app.qps": {
+   "value": 24.5,
+   "unit": "requests/s"
+  },
+  "e2e.bulk.python.jvm.p50_ms": {
+   "value": 21.261,
+   "unit": "ms"
+  },
+  "e2e.bulk.python.jvm.p95_ms": {
+   "value": 25.473,
+   "unit": "ms"
+  },
+  "e2e.bulk.python.jvm.qps": {
+   "value": 45.7,
+   "unit": "requests/s"
+  },
+  "e2e.bulk.python.cpython.p50_ms": {
+   "value": 25.502,
+   "unit": "ms"
+  },
+  "e2e.bulk.python.cpython.p95_ms": {
+   "value": 27.927,
+   "unit": "ms"
+  },
+  "e2e.bulk.python.cpython.qps": {
+   "value": 38.8,
+   "unit": "requests/s"
+  },
+  "e2e.wb200.java.app.p50_ms": {
+   "value": 7.052,
+   "unit": "ms"
+  },
+  "e2e.wb200.java.app.p95_ms": {
+   "value": 7.844,
+   "unit": "ms"
+  },
+  "e2e.wb200.java.app.qps": {
+   "value": 140.1,
+   "unit": "requests/s"
+  },
+  "e2e.wb200.java.jvm.p50_ms": {
+   "value": 4.434,
+   "unit": "ms"
+  },
+  "e2e.wb200.java.jvm.p95_ms": {
+   "value": 5.073,
+   "unit": "ms"
+  },
+  "e2e.wb200.java.jvm.qps": {
+   "value": 222.1,
+   "unit": "requests/s"
+  },
+  "e2e.wb200.python.app.p50_ms": {
+   "value": 7.014,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.app.p95_ms": {
+   "value": 7.807,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.app.qps": {
+   "value": 140.5,
+   "unit": "requests/s"
+  },
+  "e2e.wb200.python.jvm.p50_ms": {
+   "value": 6.38,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.jvm.p95_ms": {
+   "value": 7.86,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.jvm.qps": {
+   "value": 150.2,
+   "unit": "requests/s"
+  },
+  "e2e.wb200.python.cpython.p50_ms": {
+   "value": 6.621,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.cpython.p95_ms": {
+   "value": 7.412,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.cpython.qps": {
+   "value": 146.8,
+   "unit": "requests/s"
+  },
+  "e2e.wb1000.java.app.p50_ms": {
+   "value": 14.364,
+   "unit": "ms"
+  },
+  "e2e.wb1000.java.app.p95_ms": {
+   "value": 18.695,
+   "unit": "ms"
+  },
+  "e2e.wb1000.java.app.qps": {
+   "value": 66.1,
+   "unit": "requests/s"
+  },
+  "e2e.wb1000.java.jvm.p50_ms": {
+   "value": 10.581,
+   "unit": "ms"
+  },
+  "e2e.wb1000.java.jvm.p95_ms": {
+   "value": 12.811,
+   "unit": "ms"
+  },
+  "e2e.wb1000.java.jvm.qps": {
+   "value": 91.4,
+   "unit": "requests/s"
+  },
+  "e2e.wb1000.python.app.p50_ms": {
+   "value": 18.459,
+   "unit": "ms"
+  },
+  "e2e.wb1000.python.app.p95_ms": {
+   "value": 20.641,
+   "unit": "ms"
+  },
+  "e2e.wb1000.python.app.qps": {
+   "value": 53.1,
+   "unit": "requests/s"
+  },
+  "e2e.wb1000.python.jvm.p50_ms": {
+   "value": 14.748,
+   "unit": "ms"
+  },
+  "e2e.wb1000.python.jvm.p95_ms": {
+   "value": 18.401,
+   "unit": "ms"
+  },
+  "e2e.wb1000.python.jvm.qps": {
+   "value": 65.0,
+   "unit": "requests/s"
+  },
+  "e2e.wb1000.python.cpython.p50_ms": {
+   "value": 15.111,
+   "unit": "ms"
+  },
+  "e2e.wb1000.python.cpython.p95_ms": {
+   "value": 17.541,
+   "unit": "ms"
+  },
+  "e2e.wb1000.python.cpython.qps": {
+   "value": 64.8,
+   "unit": "requests/s"
+  },
+  "e2e.wbvec200.java.app.p50_ms": {
+   "value": 15.8,
+   "unit": "ms"
+  },
+  "e2e.wbvec200.java.app.p95_ms": {
+   "value": 18.057,
+   "unit": "ms"
+  },
+  "e2e.wbvec200.java.app.qps": {
+   "value": 61.1,
+   "unit": "requests/s"
+  },
+  "e2e.wbvec200.java.jvm.p50_ms": {
+   "value": 11.155,
+   "unit": "ms"
+  },
+  "e2e.wbvec200.java.jvm.p95_ms": {
+   "value": 16.691,
+   "unit": "ms"
+  },
+  "e2e.wbvec200.java.jvm.qps": {
+   "value": 82.2,
+   "unit": "requests/s"
+  },
+  "e2e.wbvec200.python.app.p50_ms": {
+   "value": 27.88,
+   "unit": "ms"
+  },
+  "e2e.wbvec200.python.app.p95_ms": {
+   "value": 30.414,
+   "unit": "ms"
+  },
+  "e2e.wbvec200.python.app.qps": {
+   "value": 35.8,
+   "unit": "requests/s"
+  },
+  "e2e.wbvec200.python.jvm.p50_ms": {
+   "value": 14.376,
+   "unit": "ms"
+  },
+  "e2e.wbvec200.python.jvm.p95_ms": {
+   "value": 21.671,
+   "unit": "ms"
+  },
+  "e2e.wbvec200.python.jvm.qps": {
+   "value": 64.7,
+   "unit": "requests/s"
+  },
+  "e2e.wbvec200.python.cpython.p50_ms": {
+   "value": 15.538,
+   "unit": "ms"
+  },
+  "e2e.wbvec200.python.cpython.p95_ms": {
+   "value": 18.333,
+   "unit": "ms"
+  },
+  "e2e.wbvec200.python.cpython.qps": {
+   "value": 60.8,
+   "unit": "requests/s"
+  },
+  "e2e.chatty.java.app.c8_p50_ms": {
+   "value": 6.426,
+   "unit": "ms"
+  },
+  "e2e.chatty.java.app.c8_p95_ms": {
+   "value": 7.533,
+   "unit": "ms"
+  },
+  "e2e.chatty.java.app.c8_qps": {
+   "value": 1215.8,
+   "unit": "requests/s"
+  },
+  "e2e.chatty.java.jvm.c8_p50_ms": {
+   "value": 4.655,
+   "unit": "ms"
+  },
+  "e2e.chatty.java.jvm.c8_p95_ms": {
+   "value": 5.733,
+   "unit": "ms"
+  },
+  "e2e.chatty.java.jvm.c8_qps": {
+   "value": 1650.5,
+   "unit": "requests/s"
+  },
+  "e2e.chatty.python.app.c8_p50_ms": {
+   "value": 8.52,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.app.c8_p95_ms": {
+   "value": 9.667,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.app.c8_qps": {
+   "value": 923.1,
+   "unit": "requests/s"
+  },
+  "e2e.chatty.python.jvm.c8_p50_ms": {
+   "value": 7.941,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.jvm.c8_p95_ms": {
+   "value": 9.151,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.jvm.c8_qps": {
+   "value": 945.7,
+   "unit": "requests/s"
+  },
+  "e2e.chatty.python.cpython.c8_p50_ms": {
+   "value": 6.051,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.cpython.c8_p95_ms": {
+   "value": 7.109,
+   "unit": "ms"
+  },
+  "e2e.chatty.python.cpython.c8_qps": {
+   "value": 1281.6,
+   "unit": "requests/s"
+  },
+  "e2e.mmr500.java.app.c8_p50_ms": {
+   "value": 6.701,
+   "unit": "ms"
+  },
+  "e2e.mmr500.java.app.c8_p95_ms": {
+   "value": 7.714,
+   "unit": "ms"
+  },
+  "e2e.mmr500.java.app.c8_qps": {
+   "value": 1176.2,
+   "unit": "requests/s"
+  },
+  "e2e.mmr500.java.jvm.c8_p50_ms": {
+   "value": 5.399,
+   "unit": "ms"
+  },
+  "e2e.mmr500.java.jvm.c8_p95_ms": {
+   "value": 6.946,
+   "unit": "ms"
+  },
+  "e2e.mmr500.java.jvm.c8_qps": {
+   "value": 1414.7,
+   "unit": "requests/s"
+  },
+  "e2e.mmr500.python.app.c8_p50_ms": {
+   "value": 10.439,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.app.c8_p95_ms": {
+   "value": 11.99,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.app.c8_qps": {
+   "value": 757.4,
+   "unit": "requests/s"
+  },
+  "e2e.mmr500.python.jvm.c8_p50_ms": {
+   "value": 8.581,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.jvm.c8_p95_ms": {
+   "value": 9.746,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.jvm.c8_qps": {
+   "value": 897.4,
+   "unit": "requests/s"
+  },
+  "e2e.mmr500.python.cpython.c8_p50_ms": {
+   "value": 8.566,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.cpython.c8_p95_ms": {
+   "value": 9.705,
+   "unit": "ms"
+  },
+  "e2e.mmr500.python.cpython.c8_qps": {
+   "value": 912.8,
+   "unit": "requests/s"
+  },
+  "e2e.wb200.java.app.c4_p50_ms": {
+   "value": 7.167,
+   "unit": "ms"
+  },
+  "e2e.wb200.java.app.c4_p95_ms": {
+   "value": 7.883,
+   "unit": "ms"
+  },
+  "e2e.wb200.java.app.c4_qps": {
+   "value": 546.3,
+   "unit": "requests/s"
+  },
+  "e2e.wb200.java.jvm.c4_p50_ms": {
+   "value": 4.646,
+   "unit": "ms"
+  },
+  "e2e.wb200.java.jvm.c4_p95_ms": {
+   "value": 6.066,
+   "unit": "ms"
+  },
+  "e2e.wb200.java.jvm.c4_qps": {
+   "value": 792.8,
+   "unit": "requests/s"
+  },
+  "e2e.wb200.python.app.c4_p50_ms": {
+   "value": 7.627,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.app.c4_p95_ms": {
+   "value": 9.207,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.app.c4_qps": {
+   "value": 504.2,
+   "unit": "requests/s"
+  },
+  "e2e.wb200.python.jvm.c4_p50_ms": {
+   "value": 6.983,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.jvm.c4_p95_ms": {
+   "value": 8.65,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.jvm.c4_qps": {
+   "value": 548.7,
+   "unit": "requests/s"
+  },
+  "e2e.wb200.python.cpython.c4_p50_ms": {
+   "value": 6.514,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.cpython.c4_p95_ms": {
+   "value": 7.391,
+   "unit": "ms"
+  },
+  "e2e.wb200.python.cpython.c4_qps": {
+   "value": 605.8,
+   "unit": "requests/s"
+  }
+ },
+ "runs": [
+  {
+   "case": "chatty",
+   "client": "java",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 6.553,
+   "p95_ms": 7.145,
+   "mean_ms": 6.586,
+   "qps": 151.8,
+   "warm": [
+    450
+   ],
+   "converged": true,
+   "seconds": 5.1,
+   "load": 13.45
+  },
+  {
+   "case": "chatty",
+   "client": "java",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 3.69,
+   "p95_ms": 4.248,
+   "mean_ms": 3.765,
+   "qps": 265.5,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 3.1,
+   "load": 12.62
+  },
+  {
+   "case": "chatty",
+   "client": "python",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 7.55,
+   "p95_ms": 8.404,
+   "mean_ms": 7.653,
+   "qps": 130.6,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 4.8,
+   "load": 11.69
+  },
+  {
+   "case": "chatty",
+   "client": "python",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 6.226,
+   "p95_ms": 7.055,
+   "mean_ms": 6.292,
+   "qps": 158.8,
+   "warm": [
+    450
+   ],
+   "converged": true,
+   "seconds": 10.3,
+   "load": 10.58
+  },
+  {
+   "case": "chatty",
+   "client": "python",
+   "variant": "cpython",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 5.046,
+   "p95_ms": 5.636,
+   "mean_ms": 5.117,
+   "qps": 195.2,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 3.5,
+   "load": 9.81
+  },
+  {
+   "case": "mmr500",
+   "client": "java",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 4.62,
+   "p95_ms": 4.998,
+   "mean_ms": 4.638,
+   "qps": 215.5,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 3.5,
+   "load": 9.1
+  },
+  {
+   "case": "mmr500",
+   "client": "java",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 3.888,
+   "p95_ms": 4.601,
+   "mean_ms": 3.957,
+   "qps": 252.5,
+   "warm": [
+    500
+   ],
+   "converged": true,
+   "seconds": 3.3,
+   "load": 9.1
+  },
+  {
+   "case": "mmr500",
+   "client": "python",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 7.131,
+   "p95_ms": 7.619,
+   "mean_ms": 7.21,
+   "qps": 138.6,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 4.5,
+   "load": 8.45
+  },
+  {
+   "case": "mmr500",
+   "client": "python",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 7.46,
+   "p95_ms": 8.31,
+   "mean_ms": 7.646,
+   "qps": 130.7,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 5.0,
+   "load": 7.94
+  },
+  {
+   "case": "mmr500",
+   "client": "python",
+   "variant": "cpython",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 7.085,
+   "p95_ms": 7.606,
+   "mean_ms": 7.099,
+   "qps": 140.8,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 4.4,
+   "load": 7.38
+  },
+  {
+   "case": "rescore1000",
+   "client": "java",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 5.486,
+   "p95_ms": 5.836,
+   "mean_ms": 5.521,
+   "qps": 181.0,
+   "warm": [
+    500
+   ],
+   "converged": true,
+   "seconds": 4.6,
+   "load": 6.87
+  },
+  {
+   "case": "rescore1000",
+   "client": "java",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 4.735,
+   "p95_ms": 5.23,
+   "mean_ms": 4.803,
+   "qps": 208.1,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 3.2,
+   "load": 6.32
+  },
+  {
+   "case": "rescore1000",
+   "client": "python",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 6.374,
+   "p95_ms": 6.842,
+   "mean_ms": 6.422,
+   "qps": 155.6,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 4.0,
+   "load": 6.32
+  },
+  {
+   "case": "rescore1000",
+   "client": "python",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 7.4,
+   "p95_ms": 8.049,
+   "mean_ms": 7.563,
+   "qps": 132.1,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 4.9,
+   "load": 5.97
+  },
+  {
+   "case": "rescore1000",
+   "client": "python",
+   "variant": "cpython",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 7.188,
+   "p95_ms": 7.832,
+   "mean_ms": 7.245,
+   "qps": 137.9,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 4.5,
+   "load": 5.5
+  },
+  {
+   "case": "bulk",
+   "client": "java",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 26.261,
+   "p95_ms": 28.759,
+   "mean_ms": 26.556,
+   "qps": 37.7,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 16.8,
+   "load": 4.77
+  },
+  {
+   "case": "bulk",
+   "client": "java",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 17.17,
+   "p95_ms": 19.902,
+   "mean_ms": 17.579,
+   "qps": 56.9,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 11.0,
+   "load": 4.27
+  },
+  {
+   "case": "bulk",
+   "client": "python",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 40.573,
+   "p95_ms": 43.84,
+   "mean_ms": 40.878,
+   "qps": 24.5,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 24.7,
+   "load": 3.49
+  },
+  {
+   "case": "bulk",
+   "client": "python",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 21.261,
+   "p95_ms": 25.473,
+   "mean_ms": 21.891,
+   "qps": 45.7,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 13.5,
+   "load": 3.18
+  },
+  {
+   "case": "bulk",
+   "client": "python",
+   "variant": "cpython",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 25.502,
+   "p95_ms": 27.927,
+   "mean_ms": 25.746,
+   "qps": 38.8,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 15.9,
+   "load": 2.47
+  },
+  {
+   "case": "wb200",
+   "client": "java",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 7.052,
+   "p95_ms": 7.844,
+   "mean_ms": 7.133,
+   "qps": 140.1,
+   "warm": [
+    600
+   ],
+   "converged": true,
+   "seconds": 6.5,
+   "load": 2.35
+  },
+  {
+   "case": "wb200",
+   "client": "java",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 4.434,
+   "p95_ms": 5.073,
+   "mean_ms": 4.501,
+   "qps": 222.1,
+   "warm": [
+    450
+   ],
+   "converged": true,
+   "seconds": 3.4,
+   "load": 2.25
+  },
+  {
+   "case": "wb200",
+   "client": "python",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 7.014,
+   "p95_ms": 7.807,
+   "mean_ms": 7.111,
+   "qps": 140.5,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 4.5,
+   "load": 2.25
+  },
+  {
+   "case": "wb200",
+   "client": "python",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 6.38,
+   "p95_ms": 7.86,
+   "mean_ms": 6.655,
+   "qps": 150.2,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 4.6,
+   "load": 2.47
+  },
+  {
+   "case": "wb200",
+   "client": "python",
+   "variant": "cpython",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 6.621,
+   "p95_ms": 7.412,
+   "mean_ms": 6.806,
+   "qps": 146.8,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 4.2,
+   "load": 2.35
+  },
+  {
+   "case": "wb1000",
+   "client": "java",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 14.364,
+   "p95_ms": 18.695,
+   "mean_ms": 15.135,
+   "qps": 66.1,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 10.1,
+   "load": 2.36
+  },
+  {
+   "case": "wb1000",
+   "client": "java",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 10.581,
+   "p95_ms": 12.811,
+   "mean_ms": 10.94,
+   "qps": 91.4,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 6.9,
+   "load": 2.15
+  },
+  {
+   "case": "wb1000",
+   "client": "python",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 18.459,
+   "p95_ms": 20.641,
+   "mean_ms": 18.839,
+   "qps": 53.1,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 11.5,
+   "load": 1.82
+  },
+  {
+   "case": "wb1000",
+   "client": "python",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 14.748,
+   "p95_ms": 18.401,
+   "mean_ms": 15.375,
+   "qps": 65.0,
+   "warm": [
+    500
+   ],
+   "converged": true,
+   "seconds": 11.1,
+   "load": 1.77
+  },
+  {
+   "case": "wb1000",
+   "client": "python",
+   "variant": "cpython",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 15.111,
+   "p95_ms": 17.541,
+   "mean_ms": 15.437,
+   "qps": 64.8,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 9.4,
+   "load": 1.66
+  },
+  {
+   "case": "wbvec200",
+   "client": "java",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 15.8,
+   "p95_ms": 18.057,
+   "mean_ms": 16.349,
+   "qps": 61.1,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 10.7,
+   "load": 1.71
+  },
+  {
+   "case": "wbvec200",
+   "client": "java",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 11.155,
+   "p95_ms": 16.691,
+   "mean_ms": 12.168,
+   "qps": 82.2,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 7.6,
+   "load": 1.97
+  },
+  {
+   "case": "wbvec200",
+   "client": "python",
+   "variant": "app",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 27.88,
+   "p95_ms": 30.414,
+   "mean_ms": 27.947,
+   "qps": 35.8,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 16.9,
+   "load": 1.9
+  },
+  {
+   "case": "wbvec200",
+   "client": "python",
+   "variant": "jvm",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 14.376,
+   "p95_ms": 21.671,
+   "mean_ms": 15.444,
+   "qps": 64.7,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 9.9,
+   "load": 1.98
+  },
+  {
+   "case": "wbvec200",
+   "client": "python",
+   "variant": "cpython",
+   "clients": 1,
+   "requests": 200,
+   "p50_ms": 15.538,
+   "p95_ms": 18.333,
+   "mean_ms": 16.438,
+   "qps": 60.8,
+   "warm": [
+    400
+   ],
+   "converged": true,
+   "seconds": 10.0,
+   "load": 1.91
+  },
+  {
+   "case": "chatty",
+   "client": "java",
+   "variant": "app",
+   "clients": 8,
+   "requests": 1600,
+   "p50_ms": 6.426,
+   "p95_ms": 7.533,
+   "mean_ms": 6.535,
+   "qps": 1215.8,
+   "warm": [
+    500,
+    600,
+    400,
+    600,
+    450,
+    600,
+    400,
+    400
+   ],
+   "converged": true,
+   "seconds": 5.9,
+   "load": 2.39
+  },
+  {
+   "case": "chatty",
+   "client": "java",
+   "variant": "jvm",
+   "clients": 8,
+   "requests": 1600,
+   "p50_ms": 4.655,
+   "p95_ms": 5.733,
+   "mean_ms": 4.75,
+   "qps": 1650.5,
+   "warm": [
+    550,
+    550,
+    450,
+    450,
+    750,
+    500,
+    600,
+    550
+   ],
+   "converged": true,
+   "seconds": 7.3,
+   "load": 4.5
+  },
+  {
+   "case": "chatty",
+   "client": "python",
+   "variant": "app",
+   "clients": 8,
+   "requests": 1600,
+   "p50_ms": 8.52,
+   "p95_ms": 9.667,
+   "mean_ms": 8.606,
+   "qps": 923.1,
+   "warm": [
+    400,
+    400,
+    400,
+    400,
+    600,
+    500,
+    400,
+    400
+   ],
+   "converged": true,
+   "seconds": 6.9,
+   "load": 4.22
+  },
+  {
+   "case": "chatty",
+   "client": "python",
+   "variant": "jvm",
+   "clients": 8,
+   "requests": 1600,
+   "p50_ms": 7.941,
+   "p95_ms": 9.151,
+   "mean_ms": 8.262,
+   "qps": 945.7,
+   "warm": [
+    600,
+    550,
+    650,
+    550,
+    550,
+    600,
+    650,
+    500
+   ],
+   "converged": true,
+   "seconds": 46.0,
+   "load": 19.15
+  },
+  {
+   "case": "chatty",
+   "client": "python",
+   "variant": "cpython",
+   "clients": 8,
+   "requests": 1600,
+   "p50_ms": 6.051,
+   "p95_ms": 7.109,
+   "mean_ms": 6.179,
+   "qps": 1281.6,
+   "warm": [
+    500,
+    500,
+    400,
+    400,
+    400,
+    500,
+    400,
+    500
+   ],
+   "converged": true,
+   "seconds": 4.9,
+   "load": 18.26
+  },
+  {
+   "case": "mmr500",
+   "client": "java",
+   "variant": "app",
+   "clients": 8,
+   "requests": 1600,
+   "p50_ms": 6.701,
+   "p95_ms": 7.714,
+   "mean_ms": 6.754,
+   "qps": 1176.2,
+   "warm": [
+    500,
+    400,
+    400,
+    400,
+    400,
+    400,
+    400,
+    400
+   ],
+   "converged": true,
+   "seconds": 5.3,
+   "load": 17.68
+  },
+  {
+   "case": "mmr500",
+   "client": "java",
+   "variant": "jvm",
+   "clients": 8,
+   "requests": 1600,
+   "p50_ms": 5.399,
+   "p95_ms": 6.946,
+   "mean_ms": 5.581,
+   "qps": 1414.7,
+   "warm": [
+    400,
+    400,
+    400,
+    500,
+    550,
+    500,
+    400,
+    450
+   ],
+   "converged": true,
+   "seconds": 7.5,
+   "load": 16.75
+  },
+  {
+   "case": "mmr500",
+   "client": "python",
+   "variant": "app",
+   "clients": 8,
+   "requests": 1600,
+   "p50_ms": 10.439,
+   "p95_ms": 11.99,
+   "mean_ms": 10.489,
+   "qps": 757.4,
+   "warm": [
+    850,
+    650,
+    550,
+    750,
+    550,
+    550,
+    750,
+    650
+   ],
+   "converged": true,
+   "seconds": 11.1,
+   "load": 14.99
+  },
+  {
+   "case": "mmr500",
+   "client": "python",
+   "variant": "jvm",
+   "clients": 8,
+   "requests": 1600,
+   "p50_ms": 8.581,
+   "p95_ms": 9.746,
+   "mean_ms": 8.821,
+   "qps": 897.4,
+   "warm": [
+    550,
+    800,
+    600,
+    800,
+    650,
+    750,
+    600,
+    550
+   ],
+   "converged": true,
+   "seconds": 44.2,
+   "load": 22.3
+  },
+  {
+   "case": "mmr500",
+   "client": "python",
+   "variant": "cpython",
+   "clients": 8,
+   "requests": 1600,
+   "p50_ms": 8.566,
+   "p95_ms": 9.705,
+   "mean_ms": 8.651,
+   "qps": 912.8,
+   "warm": [
+    400,
+    400,
+    400,
+    400,
+    400,
+    400,
+    400,
+    400
+   ],
+   "converged": true,
+   "seconds": 5.8,
+   "load": 20.91
+  },
+  {
+   "case": "wb200",
+   "client": "java",
+   "variant": "app",
+   "clients": 4,
+   "requests": 800,
+   "p50_ms": 7.167,
+   "p95_ms": 7.883,
+   "mean_ms": 7.301,
+   "qps": 546.3,
+   "warm": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "converged": true,
+   "seconds": 5.1,
+   "load": 19.24
+  },
+  {
+   "case": "wb200",
+   "client": "java",
+   "variant": "jvm",
+   "clients": 4,
+   "requests": 800,
+   "p50_ms": 4.646,
+   "p95_ms": 6.066,
+   "mean_ms": 4.908,
+   "qps": 792.8,
+   "warm": [
+    400,
+    450,
+    400,
+    500
+   ],
+   "converged": true,
+   "seconds": 5.7,
+   "load": 18.02
+  },
+  {
+   "case": "wb200",
+   "client": "python",
+   "variant": "app",
+   "clients": 4,
+   "requests": 800,
+   "p50_ms": 7.627,
+   "p95_ms": 9.207,
+   "mean_ms": 7.892,
+   "qps": 504.2,
+   "warm": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "converged": true,
+   "seconds": 4.8,
+   "load": 16.9
+  },
+  {
+   "case": "wb200",
+   "client": "python",
+   "variant": "jvm",
+   "clients": 4,
+   "requests": 800,
+   "p50_ms": 6.983,
+   "p95_ms": 8.65,
+   "mean_ms": 7.247,
+   "qps": 548.7,
+   "warm": [
+    550,
+    550,
+    850,
+    600
+   ],
+   "converged": true,
+   "seconds": 23.1,
+   "load": 15.42
+  },
+  {
+   "case": "wb200",
+   "client": "python",
+   "variant": "cpython",
+   "clients": 4,
+   "requests": 800,
+   "p50_ms": 6.514,
+   "p95_ms": 7.391,
+   "mean_ms": 6.59,
+   "qps": 605.8,
+   "warm": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "converged": true,
+   "seconds": 4.5,
+   "load": 14.59
+  }
+ ]
+}
