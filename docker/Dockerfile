@@ -1,6 +1,8 @@
-# Percona Server with component_mle (JavaScript, Python + numpy, Java) on
-# Ubuntu 26.04. Built by build-image.sh from a release build installed into
-# stage/ (cmake --install), with the GraalVM runtime in lib/plugin/mle/jdk
+# Percona Server with component_mle on Ubuntu 26.04: the JVM worker
+# (JavaScript, Java, Python + numpy) and, when the build has them, the CPython
+# worker (Python + numpy) and the V8 worker (JavaScript). Built by
+# build-image.sh from a release build installed into stage/ (cmake --install),
+# with the GraalVM runtime in lib/plugin/mle/jdk
 # (the image is made from a local build; a reproducible multi-stage build
 # comes later).
 FROM ubuntu:26.04
