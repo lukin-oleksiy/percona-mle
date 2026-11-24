@@ -1,4 +1,4 @@
-# Percona Server + MLE in Docker (POC)
+# Percona Server + MLE in Docker
 
 Design and measured container constraints: `19-docker.md` (MLE design notes).
 
