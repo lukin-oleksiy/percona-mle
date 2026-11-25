@@ -128,7 +128,23 @@ final class JsOracle {
               return JSON.stringify(v);
             },
             set_text: (v) => v instanceof Set ? [...v].map(String).join(',') : undefined,
-            date_ms: (v) => v instanceof Date ? v.getTime() : undefined,
+            // Oracle's Table 27.3: a Date, or a string cast to a Date. MySQL's literal forms
+            // ('2024-01-31', '2024-01-31 10:00:00.5') are local time in the zone of OPTIONS (ECMAScript
+            // reads a date-only string as UTC; a DATE west of UTC would be the day before).
+            date_ms: (v) => {
+              if (v instanceof Date) return v.getTime();
+              if (typeof v !== 'string') return undefined;
+              const m = /^(\\d{4}-\\d{2}-\\d{2})(?:[ T](\\d{2}:\\d{2})(?::(\\d{2})(?:\\.(\\d{1,9}))?)?)?$/.exec(v.trim());
+              return (m === null ? new Date(v)
+                  : new Date(m[1] + 'T' + (m[2] ?? '00:00') + ':' + (m[3] ?? '00') + '.'
+                             + (m[4] ?? '').padEnd(3, '0').slice(0, 3))).getTime();
+            },
+            // YEAR (Table 27.3): a Date's year; a string's 4-digit year; else the integer rules.
+            year: (v) => {
+              if (v instanceof Date) return v.getFullYear();
+              const m = typeof v === 'string' ? /(?<!\\d)\\d{4}(?!\\d)/.exec(v) : null;
+              return m === null ? undefined : Number(m[0]);
+            },
             // Host access to the bytes needs an ArrayBuffer (typed arrays have no buffer
             // elements in the polyglot API).
             buffer: (v) => v instanceof ArrayBuffer ? v
@@ -364,6 +380,10 @@ final class JsOracle {
     if (t.is("SET") || t.is("ENUM")) {
       Value s = h.getMember("set_text").execute(v);
       return s.isString() ? s.asString() : h.getMember("str").execute(v).asString();
+    }
+    if (t.is("YEAR")) {
+      Value y = h.getMember("year").execute(v);
+      if (!y.isNull()) v = y;
     }
     switch (t.tag()) {
       case Wire.T_I64, Wire.T_U64 -> {

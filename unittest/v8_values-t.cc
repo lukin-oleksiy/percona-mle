@@ -434,7 +434,10 @@ TEST_F(V8Values, Timestamps) {
   EXPECT_THROW(written("new Date(-1)", ts), ConversionError);
   EXPECT_THROW(written("new Date(Date.UTC(10000, 0, 1))", ts), ConversionError);
   EXPECT_THROW(written("new Date(NaN)", ts), ConversionError);
-  EXPECT_THROW(written("'2024-01-01'", ts), ConversionError);
+  // A string is cast to a Date (Oracle's Table 27.3; MVP review JVML-4): one with an offset is
+  // that instant whatever the zone; one that is no date stays an error.
+  EXPECT_EQ(written("'2024-01-01T00:00:00Z'", ts), jan);
+  EXPECT_THROW(written("'not a date'", ts), ConversionError);
   // Oracle's rule: the zero timestamp (the spec's vector) is an Invalid Date, as an argument and
   // in a row
   const std::vector<std::byte> zero = bytes(0x0B, 0, 0, 0, 0, 0, 0, 0, 0x80);

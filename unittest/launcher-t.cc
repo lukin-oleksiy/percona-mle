@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -572,6 +573,67 @@ TEST(MleLauncher, LockdownDeniesEscapes) {
   unlink(allowed.c_str());
   rmdir(scratch.c_str());
   rmdir(allowed_dir.c_str());
+}
+
+// A system directory that holds a hidden path is allowed entry by entry. An entry that is a
+// symbolic link adds no rule: its target outside the allowed directories stays unreadable, as with
+// the directory allowed whole (MVP review HOST-1; independent review C7).
+TEST(MleLauncher, HiddenPathWalkAddsNoRuleForSymlinks) {
+  const std::vector<std::string> allowed = {"/usr/lib/", "/lib/", "/lib64/", "/usr/lib64/", "/usr/libexec/"};
+  const auto inside = [&](const std::string &p) {
+    for (const std::string &a : allowed)
+      if (p.starts_with(a)) return true;
+    return false;
+  };
+  // A link in /usr/lib to a readable file outside it (on Ubuntu /usr/lib/cpp -> /usr/bin/...),
+  // a plain file beside it, and a file to hide.
+  std::string link, plain;
+  if (DIR *d = opendir("/usr/lib")) {
+    while (dirent *e = readdir(d)) {
+      const std::string p = std::string("/usr/lib/") + e->d_name;
+      struct stat st;
+      if (lstat(p.c_str(), &st) != 0) continue;
+      char target[PATH_MAX];
+      if (S_ISLNK(st.st_mode) && link.empty() && realpath(p.c_str(), target) != nullptr && !inside(target) &&
+          access(target, R_OK) == 0 && stat(target, &st) == 0 && S_ISREG(st.st_mode))
+        link = p;
+      else if (S_ISREG(st.st_mode) && access(p.c_str(), R_OK) == 0 && plain.empty())
+        plain = p;
+    }
+    closedir(d);
+  }
+  if (link.empty() || plain.empty()) GTEST_SKIP() << "no symbolic link in /usr/lib to a file outside it";
+  // The hidden path: another file of /usr/lib (a test cannot create one there).
+  std::string hidden;
+  if (DIR *d = opendir("/usr/lib")) {
+    while (dirent *e = readdir(d)) {
+      const std::string p = std::string("/usr/lib/") + e->d_name;
+      struct stat st;
+      if (p != plain && lstat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode) && access(p.c_str(), R_OK) == 0) {
+        hidden = p;
+        break;
+      }
+    }
+    closedir(d);
+  }
+  if (hidden.empty()) GTEST_SKIP() << "no second file in /usr/lib to hide";
+  char target[PATH_MAX];
+  ASSERT_NE(realpath(link.c_str(), target), nullptr);
+
+  ClassConfig c = test_class("t", {"read", plain, hidden, link, target});
+  c.hidden_paths = {hidden};
+  auto l = start(config({c}));
+  ASSERT_NE(l, nullptr);
+  std::string error;
+  auto w = l->acquire("t", &error);
+  ASSERT_NE(w, nullptr) << error;
+  ReadyMsg ready;
+  ASSERT_TRUE(wait_ready(*w, &ready, &error)) << error;
+  auto r = parse_report(ready.info);
+  EXPECT_EQ(r[plain], "OK") << ready.info;
+  EXPECT_EQ(r[hidden], "EACCES") << ready.info;
+  EXPECT_EQ(r[link], "EACCES") << ready.info;
+  EXPECT_EQ(r[target], "EACCES") << ready.info;
 }
 
 // ---------------------------------------------------------------- cgroup

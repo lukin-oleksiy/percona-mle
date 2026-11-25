@@ -1,0 +1,58 @@
+#
+# component_mle: fixes of the CPython worker from the MVP code review
+# (exp note 65).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_CPYTHON_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10)) ENGINE=InnoDB;
+INSERT INTO t VALUES (1, 'a'), (2, 'b');
+#
+# CPY-1: a row hashes as the tuple it equals (Python 3.14 caches the hash of
+# a tuple; rows hashed to 0).
+#
+CALL cpy_hash(@r);
+SELECT @r;
+@r
+True True 2
+#
+# CPY-2: an import_library() while the rows of a result are unread does
+# not write over them.
+#
+CALL cpy_import_between(@r);
+SELECT @r;
+@r
+lib [(1, 'a'), (2, 'b')]
+#
+# CPY-3: guest code run while parameters are encoded can change the list
+# it gave (the encoder reads a copy).
+#
+CALL cpy_mutating_params(@r);
+SELECT @r;
+@r
+(5, 2, 'three')
+#
+# CPY-4: the own encode() of a str subclass is not what goes to the host.
+#
+CALL cpy_str_subclass(@r);
+SELECT @r, cpy_str_subclass_return();
+@r	cpy_str_subclass_return()
+statement text	returned as it is
+#
+# JVML-1: generated savepoint names differ between workers of one
+# transaction (CPython here, GraalPy inside).
+#
+CALL cpy_outer_sp(@r);
+SELECT @r;
+@r
+rows after rollback_to: 2
+DROP PROCEDURE cpy_hash;
+DROP PROCEDURE cpy_import_between;
+DROP LIBRARY cpylib;
+DROP PROCEDURE cpy_mutating_params;
+DROP PROCEDURE cpy_str_subclass;
+DROP FUNCTION cpy_str_subclass_return;
+DROP PROCEDURE graal_inner_sp;
+DROP PROCEDURE cpy_outer_sp;
+DROP TABLE t;
+REVOKE CREATE_CPYTHON_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

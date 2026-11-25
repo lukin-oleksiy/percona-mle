@@ -113,7 +113,7 @@ SELECT @r;
 ['apple', 'peach', 'watermelon', 'pear']
 True False
 affected 2 id 1
-TxSp1 [1, 2, 10]
+TxSp1_<tag> [1, 2, 10]
 'test' 5 '`a``b`'
 27 Decimal('1.5') None 100
 SELECT @yourvar;

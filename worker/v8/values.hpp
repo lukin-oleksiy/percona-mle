@@ -125,8 +125,8 @@ struct Temporal {
 /** What the conversions need of the context: the session options and JSON. */
 class Values {
  public:
-  Values(v8::Isolate *isolate, v8::Local<v8::Context> context, const Options *options)
-      : m_iso(isolate), m_ctx(isolate, context), m_opt(options) {}
+  /** Made before guest code runs: it keeps the context's Date constructor as it is then. */
+  Values(v8::Isolate *isolate, v8::Local<v8::Context> context, const Options *options);
 
   /** A routine argument of type t from the wire (Oracle's conversions, as JsOracle.hostForm and
       its converters do them): DATE, DATETIME and TIMESTAMP as a Date, a zero or partial date and
@@ -179,6 +179,11 @@ class Values {
   v8::Local<v8::Value> value(Reader &r, const ParamType &t, bool argument);
   v8::Local<v8::Value> temporal(const Temporal &t);
   [[noreturn]] void cannot(v8::Local<v8::Value> v, const ParamType &t);
+  /** Oracle's Table 27.3 for DATE, DATETIME and TIMESTAMP: a Date's time value, or a string cast
+      to a Date (MySQL's literal forms as local time, as JsOracle's date_ms); NaN for anything else. */
+  double date_ms(v8::Local<v8::Value> v);
+  /** Table 27.3 for YEAR: a Date's local year, a string's 4-digit year; nullopt: the integer rules. */
+  std::optional<double> year_of(v8::Local<v8::Value> v);
   /** The JSON text of v by Oracle's JavaScript-to-JSON table (JsOracle's json_text); nullopt if v
       has none. */
   std::optional<std::string> json_text(v8::Local<v8::Value> v);
@@ -187,6 +192,7 @@ class Values {
 
   v8::Isolate *m_iso;
   v8::Global<v8::Context> m_ctx;
+  v8::Global<v8::Function> m_date;  // Date, as it was before guest code ran
   const Options *m_opt;
   const Options *m_rules = nullptr;  // a statement's, while its rows are decoded
 };

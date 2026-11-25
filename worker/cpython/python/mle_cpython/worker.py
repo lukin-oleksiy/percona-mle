@@ -285,6 +285,7 @@ class Dispatcher:
         from . import libraries, sql
         self.libraries = libraries.Libraries()
         self.sql = sql.Api(self)
+        self.libraries.before_send = self.sql.flush_raw
         self.globals = self.sql.globals()
         self.globals['import_library'] = self.libraries.import_library
         self.globals['import_js'] = _no_js

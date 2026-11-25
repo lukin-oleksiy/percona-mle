@@ -22,6 +22,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <regex>
 #include <vector>
 
 namespace mle::v8w {
@@ -847,6 +849,54 @@ bool parse_int128(const std::string &plain, __int128 *out) {
 
 }  // namespace
 
+Values::Values(v8::Isolate *isolate, Local<v8::Context> context, const Options *options)
+    : m_iso(isolate), m_ctx(isolate, context), m_opt(options) {
+  Local<Value> d;
+  if (context->Global()->Get(context, v8_string(isolate, "Date")).ToLocal(&d) && d->IsFunction())
+    m_date.Reset(isolate, d.As<v8::Function>());
+}
+
+double Values::date_ms(Local<Value> v) {
+  if (v->IsDate()) return v.As<v8::Date>()->ValueOf();
+  if (!v->IsString() || m_date.IsEmpty()) return std::numeric_limits<double>::quiet_NaN();
+  // MySQL's literal forms are local time in the zone of OPTIONS: an ECMAScript date-time without
+  // an offset is local, a date-only one would be UTC (a DATE west of UTC: the day before).
+  static const std::regex literal(R"(^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?)?$)");
+  const std::string s = trim(utf8(m_iso, v));
+  std::smatch m;
+  Local<Value> arg = v;
+  if (std::regex_match(s, m, literal)) {
+    std::string frac = m[4].str();
+    frac.resize(3, '0');
+    arg = v8_string(m_iso, m[1].str() + 'T' + (m[2].matched ? m[2].str() : "00:00") + ':' +
+                               (m[3].matched ? m[3].str() : "00") + '.' + frac);
+  }
+  const Local<v8::Context> ctx = context();
+  Local<v8::Object> date;
+  if (!m_date.Get(m_iso)->NewInstance(ctx, 1, &arg).ToLocal(&date)) throw GuestThrew{};
+  return date->IsDate() ? date.As<v8::Date>()->ValueOf() : std::numeric_limits<double>::quiet_NaN();
+}
+
+std::optional<double> Values::year_of(Local<Value> v) {
+  if (v->IsDate()) {
+    const double ms = v.As<v8::Date>()->ValueOf();
+    if (!std::isfinite(ms)) return std::numeric_limits<double>::quiet_NaN();
+    int year;
+    unsigned month, day, hour, minute, second, micro;
+    m_opt->local(ms, &year, &month, &day, &hour, &minute, &second, &micro);
+    return year;
+  }
+  if (!v->IsString()) return std::nullopt;
+  const std::string s = utf8(m_iso, v);
+  for (size_t i = 0; i < s.size();) {
+    size_t j = i;
+    while (j < s.size() && s[j] >= '0' && s[j] <= '9') j++;
+    if (j - i == 4) return std::stod(s.substr(i, 4));
+    i = j == i ? i + 1 : j;
+  }
+  return std::nullopt;
+}
+
 void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
   if (v.IsEmpty() || v->IsNullOrUndefined()) {
     need(put_tag(wr, w::Tag::kNull));
@@ -868,6 +918,9 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
     }
     need(put_tag(wr, w::Tag::kString) && wr.str(joined));
     return;
+  }
+  if (t.is("YEAR")) {
+    if (const std::optional<double> y = year_of(v)) v = v8::Number::New(m_iso, *y);
   }
   switch (t.tag) {
     case w::Tag::kI64:
@@ -1024,8 +1077,7 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
     }
     case w::Tag::kTimestamp: {
       // The instant itself (§7.2), within the wire's range.
-      if (!v->IsDate()) cannot(v, t);
-      const double ms = v.As<v8::Date>()->ValueOf();
+      const double ms = date_ms(v);
       if (!std::isfinite(ms)) cannot(v, t);
       if (ms < 0 || ms > static_cast<double>(w::kMaxTimestamp / 1000))
         throw ConversionError{"TIMESTAMP value out of range: " + instant_text(static_cast<int64_t>(ms))};
@@ -1034,8 +1086,7 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
     }
     case w::Tag::kDate:
     case w::Tag::kDatetime: {
-      if (!v->IsDate()) cannot(v, t);
-      double ms = v.As<v8::Date>()->ValueOf();
+      double ms = date_ms(v);
       if (!std::isfinite(ms)) cannot(v, t);
       // Oracle (Table 27.3): to DATE "rounding off any time part to the closest second".
       if (t.tag == w::Tag::kDate) ms = std::floor((ms + 500) / 1000) * 1000;

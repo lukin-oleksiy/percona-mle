@@ -1,0 +1,181 @@
+--echo #
+--echo # component_mle: fixes of the CPython worker from the MVP code review
+--echo # (exp note 65).
+--echo #
+--source ../include/have_mle_component.inc
+--source ../include/have_mle_cpython.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_CPYTHON_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10)) ENGINE=InnoDB;
+INSERT INTO t VALUES (1, 'a'), (2, 'b');
+
+# Through the client: mysqltest takes the indentation off the lines of a body.
+--write_file $MYSQLTEST_VARDIR/tmp/cpython_review_mvp.sql
+CREATE PROCEDURE cpy_hash(OUT r TEXT) LANGUAGE CPYTHON AS $$
+    rows = session.run_sql('SELECT id, name FROM t ORDER BY id').fetch_all()
+    r = '%s %s %s' % ((1, 'a') in set(rows), hash(rows[0]) == hash((1, 'a')), len(set(rows)))
+$$;
+CREATE LIBRARY cpylib LANGUAGE CPYTHON AS $$
+def label():
+    return 'lib'
+FILLER = '''The body is long, so that the LIBRARY_RESULT that brings it covers the rows in the arena.
+filler line 000 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 002 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 003 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 004 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 005 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 006 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 007 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 008 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 009 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 010 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 011 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 012 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 013 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 014 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 015 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 016 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 017 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 018 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 019 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 020 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 021 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 022 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 023 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 024 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 025 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 026 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 027 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 028 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 029 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 030 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 031 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 032 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 033 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 034 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 035 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 036 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 037 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 038 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 039 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 040 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 041 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 042 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 043 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 044 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 045 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 046 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 047 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 048 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 049 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 050 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 051 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 052 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 053 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 054 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 055 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 056 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 057 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 058 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 059 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 060 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 061 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 062 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+filler line 063 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'''
+$$;
+CREATE PROCEDURE cpy_import_between(OUT r TEXT) LANGUAGE CPYTHON AS $$
+    res = session.run_sql('SELECT id, name FROM t ORDER BY id')
+    lib = import_library('test.cpylib')
+    r = '%s %s' % (lib.label(), [tuple(row) for row in res.fetch_all()])
+$$;
+CREATE PROCEDURE cpy_mutating_params(OUT r TEXT) LANGUAGE CPYTHON AS $$
+    params = []
+    class Clearing(int):
+        def __int__(self):
+            params.clear()
+            return 5
+        __index__ = __int__
+    params.extend([Clearing(1), 2, 'three'])
+    r = str(tuple(session.run_sql('SELECT ?, ?, ?', params).fetch_one()))
+$$;
+CREATE PROCEDURE cpy_str_subclass(OUT r TEXT) LANGUAGE CPYTHON AS $$
+    class S(str):
+        def encode(self, *a, **k):
+            return b'\xff'
+    r = session.run_sql(S("SELECT 'statement text'")).fetch_one()[0]
+$$;
+CREATE FUNCTION cpy_str_subclass_return() RETURNS TEXT LANGUAGE CPYTHON AS $$
+    class S(str):
+        def encode(self, *a, **k):
+            return b'\xff'
+    return S('returned as it is')
+$$;
+CREATE PROCEDURE graal_inner_sp() LANGUAGE PYTHON AS $$
+    session.set_savepoint()
+    session.run_sql("INSERT INTO t VALUES (4, 'd')")
+$$;
+CREATE PROCEDURE cpy_outer_sp(OUT r TEXT) LANGUAGE CPYTHON AS $$
+    session.start_transaction()
+    sp = session.set_savepoint()
+    session.run_sql("INSERT INTO t VALUES (3, 'c')")
+    session.run_sql('CALL graal_inner_sp()')
+    session.rollback_to(sp)
+    r = 'rows after rollback_to: %d' % session.run_sql('SELECT COUNT(*) FROM t').fetch_one()[0]
+    session.rollback()
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/cpython_review_mvp.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/cpython_review_mvp.sql
+
+--connect (con1, localhost, root,,test)
+--echo #
+--echo # CPY-1: a row hashes as the tuple it equals (Python 3.14 caches the hash of
+--echo # a tuple; rows hashed to 0).
+--echo #
+CALL cpy_hash(@r);
+SELECT @r;
+
+--echo #
+--echo # CPY-2: an import_library() while the rows of a result are unread does
+--echo # not write over them.
+--echo #
+CALL cpy_import_between(@r);
+SELECT @r;
+
+--echo #
+--echo # CPY-3: guest code run while parameters are encoded can change the list
+--echo # it gave (the encoder reads a copy).
+--echo #
+CALL cpy_mutating_params(@r);
+SELECT @r;
+
+--echo #
+--echo # CPY-4: the own encode() of a str subclass is not what goes to the host.
+--echo #
+CALL cpy_str_subclass(@r);
+SELECT @r, cpy_str_subclass_return();
+
+--echo #
+--echo # JVML-1: generated savepoint names differ between workers of one
+--echo # transaction (CPython here, GraalPy inside).
+--echo #
+CALL cpy_outer_sp(@r);
+SELECT @r;
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP PROCEDURE cpy_hash;
+DROP PROCEDURE cpy_import_between;
+DROP LIBRARY cpylib;
+DROP PROCEDURE cpy_mutating_params;
+DROP PROCEDURE cpy_str_subclass;
+DROP FUNCTION cpy_str_subclass_return;
+DROP PROCEDURE graal_inner_sp;
+DROP PROCEDURE cpy_outer_sp;
+DROP TABLE t;
+REVOKE CREATE_CPYTHON_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

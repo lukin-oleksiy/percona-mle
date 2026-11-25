@@ -180,11 +180,18 @@ void native_compile_function(const v8::FunctionCallbackInfo<Value> &info) {
   v8::Isolate *iso = info.GetIsolate();
   const Local<v8::Context> ctx = iso->GetCurrentContext();
   v8::ScriptOrigin origin(info[1]);
-  v8::ScriptCompiler::Source src(info[0]->ToString(ctx).ToLocalChecked(), origin);
+  Local<v8::String> text;
+  if (!info[0]->ToString(ctx).ToLocal(&text)) return;  // what threw stays pending
+  v8::ScriptCompiler::Source src(text, origin);
   std::vector<Local<v8::String>> params;
   if (info[2]->IsArray()) {
     const Local<v8::Array> a = info[2].As<v8::Array>();
-    for (uint32_t i = 0; i < a->Length(); i++) params.push_back(a->Get(ctx, i).ToLocalChecked().As<v8::String>());
+    for (uint32_t i = 0; i < a->Length(); i++) {
+      Local<Value> p;
+      Local<v8::String> name;
+      if (!a->Get(ctx, i).ToLocal(&p) || !p->ToString(ctx).ToLocal(&name)) return;
+      params.push_back(name);
+    }
   }
   Local<v8::Function> f;
   if (v8::ScriptCompiler::CompileFunction(ctx, &src, params.size(), params.data(), 0, nullptr).ToLocal(&f))
@@ -876,7 +883,11 @@ void Worker::call(const Message &m, Request &q, Reply *reply) {
       return;
     }
     outs = ret.As<v8::Array>();
-    ret = outs->Get(ctx, 0).ToLocalChecked();
+    // Such an array can have getters (that throw, or are interrupted): an empty result fails the call.
+    if (!outs->Get(ctx, 0).ToLocal(&ret)) {
+      failed(tc, reply);
+      return;
+    }
   }
   Writer wr(m_values_buf, w::kMaxWorkerMessage);
   const auto need = [](bool fits) {
@@ -897,7 +908,9 @@ void Worker::call(const Message &m, Request &q, Reply *reply) {
     for (size_t k = 0; k < routine.outs.size(); k++) {
       const uint32_t i = routine.outs[k];
       need(wr.put(i));
-      m_values->write_as(wr, outs->Get(ctx, static_cast<uint32_t>(k + 1)).ToLocalChecked(), routine.params[i]);
+      Local<Value> out;
+      if (!outs->Get(ctx, static_cast<uint32_t>(k + 1)).ToLocal(&out)) throw GuestThrew{};
+      m_values->write_as(wr, out, routine.params[i]);
     }
     reply->values = wr.written();
   } catch (const ConversionError &c) {

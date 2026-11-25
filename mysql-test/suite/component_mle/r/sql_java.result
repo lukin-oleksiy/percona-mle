@@ -120,7 +120,7 @@ SELECT @r;
 @r
 1146 42S02 Table 'test.bogus' doesn't exist
 1210 Incorrect arguments to bind: 2 values for 1 parameter markers
-TxSp1: 1 2 10, autocommit 1
+TxSp1_<tag>: 1 2 10, autocommit 1
 CREATE PROCEDURE j_uncaught() LANGUAGE JAVA AS $$ Mle.session().runSql("SELECT * FROM bogus"); $$;
 CALL j_uncaught();
 ERROR 42S02: Table 'test.bogus' doesn't exist

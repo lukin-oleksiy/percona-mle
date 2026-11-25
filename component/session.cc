@@ -22,13 +22,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <memory>
 #include <mutex>
 #include <string_view>
+#include <type_traits>
 #include <unordered_set>
 
 #include <mysql/components/component_implementation.h>
@@ -36,6 +39,7 @@
 #include <mysql/components/services/mysql_library.h>
 #include <mysql/components/services/mysql_runtime_error_service.h>
 #include <mysql/components/services/mysql_runtime_warning.h>
+#include <mysql/components/services/mysql_string.h>
 #include <mysql/components/services/mysql_system_variable.h>
 #include <mysql/components/services/dynamic_privilege.h>
 #include <mysql/components/services/mysql_thd_attributes.h>
@@ -53,6 +57,8 @@ extern REQUIRES_SERVICE_PLACEHOLDER(mysql_library);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_current_thread_reader);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_store);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_string_factory);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_string_converter);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_security_context);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_options);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_factory);
@@ -74,6 +80,21 @@ using mle::Value;
 namespace {
 
 std::atomic<uint64_t> g_library_epoch{1};
+
+/** The session's current schema in UTF-8 (§9.2: <eval>'s schema); empty without one. The server
+    gives it as a String of its own, which is freed here. */
+std::string current_schema(MYSQL_THD thd) {
+  my_h_string handle = nullptr;
+  if (mysql_service_mysql_thd_attributes->get(thd, "schema", &handle) || handle == nullptr) return {};
+  const std::unique_ptr<std::remove_pointer_t<my_h_string>, void (*)(my_h_string)> owned(
+      handle, [](my_h_string h) { mysql_service_mysql_string_factory->destroy(h); });
+  // A name has at most 64 characters, 4 bytes each in utf8mb4.
+  std::array<char, 4 * 64 + 1> buf{};
+  if (mysql_service_mysql_string_converter->convert_to_buffer(handle, buf.data(), buf.size(), "utf8mb4"))
+    return {};
+  std::string schema(buf.data());
+  return mle::is_valid_utf8(schema) ? schema : std::string();
+}
 
 /** What the end of a statement of a command means here. */
 enum Command : uint8_t {
@@ -1636,11 +1657,7 @@ std::optional<std::string> Session::eval(unsigned language,
   m.source = code;
   // The session's current schema while it runs; empty for a session
   // without one (§9.2).
-  mysql_cstring_with_length schema{nullptr, 0};
-  if (!mysql_service_mysql_thd_attributes->get(m_thd, "schema", &schema) &&
-      schema.str != nullptr && schema.length > 0)
-    m.schema.assign(schema.str, schema.length);
-  if (!mle::is_valid_utf8(m.schema)) m.schema.clear();
+  m.schema = current_schema(m_thd);
   routine.schema = m.schema;
   mle::ParamType text;
   text.tag = mle::Tag::kString;

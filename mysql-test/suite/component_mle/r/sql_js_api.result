@@ -383,7 +383,7 @@ $mle$|
 CALL tx(@r);
 SELECT @r;
 @r
-TxSp1 mine 1
+TxSp1_<tag> mine 1
 TypeError: the savepoint name must not be empty
 1305 SAVEPOINT mine does not exist
 autocommit 1 0 1

@@ -1,0 +1,98 @@
+#
+# component_mle: regressions for the MVP code review (exp note 65). The
+# JavaScript is also run on the V8 worker (v8_review_mvp.test); Python runs
+# beside it on the JVM worker.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+SET time_zone = '-05:00';
+CREATE TABLE sp (id INT PRIMARY KEY) ENGINE=InnoDB;
+#
+# JVML-1: generated savepoint names differ between the languages and the
+# workers of one transaction (SAVEPOINT replaces one of the same name).
+#
+CREATE PROCEDURE py_inner_sp() LANGUAGE PYTHON AS $$
+session.set_savepoint()
+session.run_sql('INSERT INTO sp VALUES (2)')
+$$;
+CREATE PROCEDURE js_outer_sp(OUT r TEXT) LANGUAGE JS AS $$
+session.startTransaction()
+const sp = session.setSavepoint()
+session.runSql('INSERT INTO sp VALUES (1)')
+session.runSql('CALL py_inner_sp()')
+session.rollbackTo(sp)
+r = 'rows after rollbackTo: ' + session.runSql('SELECT COUNT(*) FROM sp').fetchOne()[0]
+session.rollback()
+$$;
+CALL js_outer_sp(@r);
+SELECT @r;
+@r
+rows after rollbackTo: 0
+#
+# JVML-4: a string returned for DATE, DATETIME or TIMESTAMP is cast to a
+# Date, the literal forms of MySQL as local time; for YEAR a Date gives its
+# year and a string its 4-digit year (Table 27.3 of Oracle).
+#
+CREATE FUNCTION js_date_str() RETURNS DATE LANGUAGE JS AS $$ return '2024-01-31' $$;
+CREATE FUNCTION js_datetime_str() RETURNS DATETIME(3) LANGUAGE JS AS $$ return '2024-01-31 10:20:30.456' $$;
+CREATE FUNCTION js_timestamp_str() RETURNS TIMESTAMP LANGUAGE JS AS $$ return '2024-01-31T10:20:30Z' $$;
+CREATE FUNCTION js_year_date() RETURNS YEAR LANGUAGE JS AS $$ return new Date(2031, 5, 1) $$;
+CREATE FUNCTION js_year_str() RETURNS YEAR LANGUAGE JS AS $$ return 'class of 2027' $$;
+CREATE FUNCTION js_date_bad() RETURNS DATE LANGUAGE JS AS $$ return 'not a date' $$;
+SELECT js_date_str(), js_datetime_str(), js_timestamp_str(), js_year_date(), js_year_str();
+js_date_str()	js_datetime_str()	js_timestamp_str()	js_year_date()	js_year_str()
+2024-01-31	2024-01-31 10:20:30.456	2024-01-31 05:20:30	2031	2027
+SELECT js_date_bad();
+ERROR HY000: MLE-Type> Cannot convert value 'not a date' to DATE from MLE in 'js_date_bad()'
+#
+# V8-2: fetchColumns() by the column, also for labels that are array
+# indexes or length.
+#
+CREATE PROCEDURE js_columns(OUT r TEXT) LANGUAGE JS AS $$
+const a = session.runSql('SELECT 1, 2').fetchColumns()
+const b = session.runSql("SELECT 'x' AS id, 7 AS length").fetchColumns('length')
+r = JSON.stringify(a) + ' ' + JSON.stringify(b)
+$$;
+CALL js_columns(@r);
+SELECT @r;
+@r
+{"1":[1],"2":[2]} {"length":[7]}
+#
+# COMP-3: a language removed from mle.languages is refused also for a
+# routine that the session holds in its cache.
+#
+CREATE FUNCTION js_cached() RETURNS INT LANGUAGE JS AS $$ return 7 $$;
+SELECT js_cached();
+js_cached()
+7
+SET GLOBAL mle.languages = 'Python';
+SELECT js_cached();
+ERROR HY000: Language component: Unsupported language 'JS'
+SET GLOBAL mle.languages = DEFAULT;
+SELECT js_cached();
+js_cached()
+7
+#
+# COMP-1: mle_eval() frees the String of the current schema that the
+# server makes (one per call before).
+#
+CREATE TABLE ten (n INT);
+INSERT INTO ten VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9);
+SELECT mle_eval('js', '1') AS warm;
+warm
+1
+SELECT mle_eval('js', '1') FROM ten a, ten b, ten c;
+include/assert.inc [mle_eval() leaves no server String behind]
+DROP PROCEDURE py_inner_sp;
+DROP PROCEDURE js_outer_sp;
+DROP FUNCTION js_date_str;
+DROP FUNCTION js_datetime_str;
+DROP FUNCTION js_timestamp_str;
+DROP FUNCTION js_year_date;
+DROP FUNCTION js_year_str;
+DROP FUNCTION js_date_bad;
+DROP PROCEDURE js_columns;
+DROP FUNCTION js_cached;
+DROP TABLE sp, ten;
+REVOKE CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

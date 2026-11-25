@@ -55,7 +55,17 @@ public final class Session {
     int depth = SqlBridge.callDepth();
     return depth < callOptions.length && callOptionsScope[depth] == SqlBridge.callScope() ? callOptions[depth] : null;
   }
-  private long savepoints;
+  /**
+   * Generated savepoint names: one counter for the worker's three languages and a tag of the
+   * process (pid and clock), so that the names of other workers in the same transaction differ too
+   * (MySQL's SAVEPOINT replaces a savepoint of the same name).
+   */
+  private static final java.util.concurrent.atomic.AtomicLong savepoints = new java.util.concurrent.atomic.AtomicLong();
+
+  private static final class SavepointTag {
+    static final String TAG =
+        Long.toHexString(ProcessHandle.current().pid()) + String.format("%08x", (int) System.nanoTime());
+  }
 
   public Session(ValueMapper mapper) {
     this.mapper = mapper;
@@ -322,9 +332,9 @@ public final class Session {
     exec("ROLLBACK");
   }
 
-  /** A savepoint with a generated name (TxSp1, TxSp2, ...); returns the name. */
+  /** A savepoint with a generated name (TxSp1_<tag>, TxSp2_<tag>, ...); returns the name. */
   public String setSavepoint() {
-    return setSavepoint("TxSp" + ++savepoints);
+    return setSavepoint("TxSp" + savepoints.incrementAndGet() + "_" + SavepointTag.TAG);
   }
 
   public String setSavepoint(String name) {

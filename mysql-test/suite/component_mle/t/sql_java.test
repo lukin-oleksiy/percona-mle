@@ -99,6 +99,8 @@ b.append('\n').append(sp).append(": ").append(ks.toString().trim()).append(", au
 r[0] = b.toString();
 $$;
 CALL j_errors(@r);
+# A generated savepoint name ends with a tag of the worker (MVP review JVML-1).
+--replace_regex /TxSp([0-9]+)_[0-9a-f]+/TxSp\1_<tag>/
 SELECT @r;
 CREATE PROCEDURE j_uncaught() LANGUAGE JAVA AS $$ Mle.session().runSql("SELECT * FROM bogus"); $$;
 --error ER_NO_SUCH_TABLE

@@ -191,7 +191,11 @@ v8::MaybeLocal<v8::Module> Worker::library_module(const LibraryName &root) {
                   " library: the V8 worker runs JavaScript libraries only");
     }
     ModuleEntry &entry = m_modules[key];
-    if ((entry.module.IsEmpty() || entry.version != body->version) && !lib_compile(lib, *body, entry)) return {};
+    // A module whose evaluation failed (an exception, or an interrupt: V8 then records null) is
+    // compiled anew, as a fresh import: kept, it would throw that exception on every import.
+    const bool errored = !entry.module.IsEmpty() && entry.module.Get(m_isolate)->GetStatus() == v8::Module::kErrored;
+    if ((entry.module.IsEmpty() || entry.version != body->version || errored) && !lib_compile(lib, *body, entry))
+      return {};
     reached.insert(key);
     for (const LibraryName &import : entry.imports) todo.push_back(import);
   }
@@ -258,13 +262,23 @@ v8::MaybeLocal<v8::Module> Worker::package_module(Local<v8::Context> ctx, const 
   Local<Value> args[] = {v8_string(m_isolate, spec), v8_string(m_isolate, in_packages ? from : "")};
   Local<Value> found;
   if (!fn.As<v8::Function>()->Call(ctx, api, 2, args).ToLocal(&found) || !found->IsArray()) return {};
+  // Guest code that escapes its wrapper can replace the resolver: its array may have getters.
   const Local<v8::Array> a = found.As<v8::Array>();
-  const std::string path = utf8(m_isolate, a->Get(ctx, 0).ToLocalChecked());
-  const std::string kind = utf8(m_isolate, a->Get(ctx, 1).ToLocalChecked());
-  if (const auto hit = m_package_modules.find(path); hit != m_package_modules.end()) return hit->second.Get(m_isolate);
+  Local<Value> path_v, kind_v;
+  if (!a->Get(ctx, 0).ToLocal(&path_v) || !a->Get(ctx, 1).ToLocal(&kind_v)) return {};
+  const std::string path = utf8(m_isolate, path_v);
+  const std::string kind = utf8(m_isolate, kind_v);
+  if (const auto hit = m_package_modules.find(path); hit != m_package_modules.end()) {
+    const Local<v8::Module> cached = hit->second.Get(m_isolate);
+    if (cached->GetStatus() != v8::Module::kErrored) return cached;
+    m_module_paths.erase(cached->GetIdentityHash());  // failed: compiled anew, as a library is
+    m_package_modules.erase(hit);
+  }
   Local<v8::Module> m;
   if (kind == "esm") {
-    if (!compile_module(utf8(m_isolate, a->Get(ctx, 2).ToLocalChecked()), path, path).ToLocal(&m)) return {};
+    Local<Value> source;
+    if (!a->Get(ctx, 2).ToLocal(&source) || !compile_module(utf8(m_isolate, source), path, path).ToLocal(&m))
+      return {};
   } else {
     // CommonJS and JSON: a module whose default export is require()'s value (Node's interop).
     std::vector<Local<v8::String>> names = {v8_string(m_isolate, "default")};

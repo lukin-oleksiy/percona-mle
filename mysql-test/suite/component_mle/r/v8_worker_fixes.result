@@ -1,0 +1,49 @@
+#
+# component_mle: fixes of the V8 worker itself from the MVP code review
+# (exp note 65). Those of the JavaScript API are in v8_review_mvp.test.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE ON *.* TO root@localhost;
+#
+# V8-1: a library whose evaluation the time limit stopped is evaluated
+# anew by the next import in the same worker (V8 keeps such a module
+# errored with the exception null).
+#
+CREATE LIBRARY slow_init LANGUAGE JS AS $$
+if (!globalThis.slowInitSeen) {
+globalThis.slowInitSeen = true
+for (;;) {}
+}
+export const state = 'ready'
+$$;
+CREATE FUNCTION js_slow_init() RETURNS TEXT LANGUAGE JS USING (slow_init) AS $$ return slow_init.state $$;
+CREATE FUNCTION js_pid() RETURNS INT LANGUAGE JS AS $$ return 0 $$;
+SELECT js_pid();
+js_pid()
+0
+SELECT /*+ MAX_EXECUTION_TIME(500) */ js_slow_init();
+ERROR HY000: Query execution was interrupted, maximum statement execution time exceeded
+SELECT js_slow_init() AS after_interrupt;
+after_interrupt
+ready
+include/assert.inc [The same worker imports the library again]
+#
+# V8-5: a body that leaves its wrapper and returns an array with a
+# throwing getter where the OUT values are read fails the call; the
+# worker goes on.
+#
+CREATE PROCEDURE js_getter_outs(OUT x INT) LANGUAGE JS AS $$
+return 0 })(); return Object.defineProperty([0], 1, { get() { throw new Error('from a getter') } }); (() => {
+$$;
+CALL js_getter_outs(@x);
+ERROR HY000: JavaScript> Error: from a getter (js_getter_outs, line 2, in get)
+SELECT js_pid();
+js_pid()
+0
+include/assert.inc [The worker survives the getter]
+DROP FUNCTION js_slow_init;
+DROP LIBRARY slow_init;
+DROP FUNCTION js_pid;
+DROP PROCEDURE js_getter_outs;
+REVOKE CREATE_JS_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

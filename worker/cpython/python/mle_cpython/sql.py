@@ -348,7 +348,7 @@ class _Msg:
         w = Writer()
         w.b += bytes(9)  # action, statement id
         try:
-            e = text.encode('utf-8')
+            e = str.encode(text, 'utf-8')  # not text.encode: a str subclass may define its own
         except UnicodeEncodeError:
             # The text is code: it is never repaired (§7.1).
             raise TypeError('the SQL statement is not well-formed Unicode (an unpaired surrogate)') from None
@@ -1388,6 +1388,10 @@ def _mysql():
 
 # ---------------------------------------------------------------------------- session
 
+# Generated savepoint names carry a tag of this worker (taken before guest code runs), so that the
+# names of other workers in the same transaction differ (SAVEPOINT replaces one of the same name).
+_SAVEPOINT_TAG = '%012x' % _random.getrandbits(48)
+
 _SESSION_SLOTS = ('_api', '_savepoints', '_innodb_cache', '_call_options')
 
 
@@ -1632,11 +1636,11 @@ class Session:
         self._exec('ROLLBACK')
 
     def set_savepoint(self, *a):
-        """A savepoint, by default with a generated name (TxSp1, TxSp2, ...); returns the name."""
+        """A savepoint, by default with a generated name (TxSp1_<tag>, TxSp2_<tag>, ...); returns the name."""
         if _arg(a, 0) is None:
             n = self._savepoints + 1
             object.__setattr__(self, '_savepoints', n)
-            name = 'TxSp%d' % n
+            name = 'TxSp%d_%s' % (n, _SAVEPOINT_TAG)
         else:
             name = _str(a, 0)
         self._exec('SAVEPOINT ' + quote_name(_savepoint_name(name)))

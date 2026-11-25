@@ -1,0 +1,62 @@
+--echo #
+--echo # component_mle: fixes of the V8 worker itself from the MVP code review
+--echo # (exp note 65). Those of the JavaScript API are in v8_review_mvp.test.
+--echo #
+--source ../include/have_mle_component.inc
+--source ../include/have_mle_v8.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+
+--echo #
+--echo # V8-1: a library whose evaluation the time limit stopped is evaluated
+--echo # anew by the next import in the same worker (V8 keeps such a module
+--echo # errored with the exception null).
+--echo #
+CREATE LIBRARY slow_init LANGUAGE JS AS $$
+  if (!globalThis.slowInitSeen) {
+    globalThis.slowInitSeen = true
+    for (;;) {}
+  }
+  export const state = 'ready'
+$$;
+CREATE FUNCTION js_slow_init() RETURNS TEXT LANGUAGE JS USING (slow_init) AS $$ return slow_init.state $$;
+CREATE FUNCTION js_pid() RETURNS INT LANGUAGE JS AS $$ return 0 $$;
+SELECT js_pid();
+let $pid1 = `SELECT mle_debug_worker_pid()`;
+--error ER_QUERY_TIMEOUT
+SELECT /*+ MAX_EXECUTION_TIME(500) */ js_slow_init();
+SELECT js_slow_init() AS after_interrupt;
+let $pid2 = `SELECT mle_debug_worker_pid()`;
+--let $assert_text = The same worker imports the library again
+--let $assert_cond = $pid1 = $pid2
+--source include/assert.inc
+
+--echo #
+--echo # V8-5: a body that leaves its wrapper and returns an array with a
+--echo # throwing getter where the OUT values are read fails the call; the
+--echo # worker goes on.
+--echo #
+CREATE PROCEDURE js_getter_outs(OUT x INT) LANGUAGE JS AS $$
+  return 0 })(); return Object.defineProperty([0], 1, { get() { throw new Error('from a getter') } }); (() => {
+$$;
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+CALL js_getter_outs(@x);
+SELECT js_pid();
+let $pid3 = `SELECT mle_debug_worker_pid()`;
+--let $assert_text = The worker survives the getter
+--let $assert_cond = $pid1 = $pid3
+--source include/assert.inc
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION js_slow_init;
+DROP LIBRARY slow_init;
+DROP FUNCTION js_pid;
+DROP PROCEDURE js_getter_outs;
+REVOKE CREATE_JS_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

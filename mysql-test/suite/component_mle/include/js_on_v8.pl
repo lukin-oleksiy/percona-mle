@@ -49,6 +49,8 @@ our @KNOWN = (
   # C47: V8 imports the library `lib1.ab` itself (GraalJS fails the import; neither takes lib1).
   ['review_minors', qr/--error ER_LANGUAGE_COMPONENT_RUNTIME,ER_LANGUAGE_COMPONENT\nSELECT dotted\(\);\n/, "SELECT dotted();\n"],
   ['review_minors', qr/SELECT dotted\(\);\nGot one of the listed errors\n/, "SELECT dotted();\ndotted()\n2\n"],
+  # The language's display name in the server's error (mle_languages_supported spelling).
+  ['review_mvp', qr/Unsupported language 'JavaScript'/, "Unsupported language 'JS'"],
   # GraalJS prefixes a failed import: "Error reading module '/other/secret' imported from peek: ".
   # The session holds a V8 worker (JavaScript) and a JVM worker (its Python).
   ['packages', qr/cannot refresh: 1 session workers are in use/, 'cannot refresh: 2 session workers are in use'],

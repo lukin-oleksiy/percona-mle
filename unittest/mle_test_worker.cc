@@ -31,6 +31,7 @@
 //                     sends say (proto_script.h)
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <linux/futex.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -40,6 +41,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <climits>
 #include <csignal>
 #include <cstdlib>
@@ -564,6 +566,17 @@ int main(int argc, char **argv) {
                           atoi(argv[6]),
                           argv[7]};
     post_ready(h, mle_test::format_probes(mle_test::run_escape_probes(a)));
+    wait_for_eof();
+  }
+  if (mode == "read") {
+    // read <path>...: "<path>=OK" or "<path>=<errno name>" per path, after the lockdown.
+    std::string info;
+    for (int i = 2; i < argc; i++) {
+      const int fd = open(argv[i], O_RDONLY | O_CLOEXEC);
+      info += std::string(argv[i]) + '=' + (fd >= 0 ? "OK" : errno == EACCES ? "EACCES" : strerrorname_np(errno)) + '\n';
+      if (fd >= 0) close(fd);
+    }
+    post_ready(h, info);
     wait_for_eof();
   }
   if (mode == "oom") {

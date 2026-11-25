@@ -199,6 +199,8 @@ SELECT i, d, s, HEX(b), j, dt, da, tm, VECTOR_TO_STRING(vec), st, u, bo FROM tp;
 --echo #
 SET @myvar = 27, @dec = 1.5;
 CALL py_rows(@r);
+# A generated savepoint name ends with a tag of the worker (MVP review JVML-1).
+--replace_regex /TxSp([0-9]+)_[0-9a-f]+/TxSp\1_<tag>/
 SELECT @r;
 SELECT @yourvar;
 CALL py_to_client();

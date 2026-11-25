@@ -288,6 +288,8 @@ CREATE PROCEDURE tx(OUT r TEXT) LANGUAGE JAVASCRIPT AS $mle$
 $mle$|
 DELIMITER ;|
 CALL tx(@r);
+# A generated savepoint name ends with a tag of the worker (MVP review JVML-1).
+--replace_regex /TxSp([0-9]+)_[0-9a-f]+/TxSp\1_<tag>/
 SELECT @r;
 SELECT * FROM tx;
 

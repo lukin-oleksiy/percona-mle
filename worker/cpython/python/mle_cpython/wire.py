@@ -88,8 +88,9 @@ _codecs.register_error('mle.surrogate', _replace_surrogates)
 
 def utf8(s):
     """Guest text as well-formed UTF-8 (§7.1): each unpaired surrogate becomes U+FFFD. One pass:
-    the encoder calls the handler only where it finds a surrogate."""
-    return s.encode('utf-8', 'mle.surrogate')
+    the encoder calls the handler only where it finds a surrogate. str's own method, not the
+    instance's: a str subclass of guest code may define its own encode()."""
+    return str.encode(s, 'utf-8', 'mle.surrogate')
 
 
 def cut(b, limit):
@@ -416,7 +417,7 @@ class Writer:
             self.str(v if isinstance(v, str) else _json.dumps(v, separators=(',', ':')))
         elif tag == T_BYTES:
             if isinstance(v, str):
-                v = v.encode('utf-8')
+                v = str.encode(v, 'utf-8')
             elif not isinstance(v, (bytes, bytearray, memoryview)):
                 raise _cannot(v, t)
             b.append(T_BYTES)

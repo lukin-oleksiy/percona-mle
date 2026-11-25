@@ -227,6 +227,11 @@ Ref py_decode_rows(PyObject *args) {
   Ref list = Ref::steal(PyList_New(nrows));
   for (Py_ssize_t i = 0; i < nrows; i++) {
     Ref row = Ref::steal(row_type == Py_None ? PyTuple_New(ncols) : type->tp_alloc(type, ncols));
+#if PY_VERSION_HEX >= 0x030E0000
+    // Since 3.14 a tuple caches its hash, and -1 means "not computed": tp_alloc zero-fills, which
+    // would make every row hash to 0 (tuple_subtype_new sets -1 as well).
+    if (row_type != Py_None) reinterpret_cast<PyTupleObject *>(row.get())->ob_hash = -1;
+#endif
     for (Py_ssize_t c = 0; c < ncols; c++) PyTuple_SET_ITEM(row.get(), c, decode_value(r, body, nullptr).release());
     PyList_SET_ITEM(list.get(), i, row.release());
   }
@@ -452,7 +457,10 @@ bool encode_common(PyObject *buffer, PyObject *v) {
 }  // namespace
 
 Py_ssize_t encode_values(PyObject *buffer, PyObject *values, PyObject *fallback) {
-  Ref seq = Ref::steal(PySequence_Fast(values, "the parameters must be a sequence"));
+  // A list is copied: the fallback runs guest code (__int__, a tzinfo, a dict subclass's items()),
+  // which could change the guest's list and free the item array read here.
+  Ref seq = Ref::steal(PyList_Check(values) ? PyList_AsTuple(values)
+                                            : PySequence_Fast(values, "the parameters must be a sequence"));
   const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq.get());
   PyObject **items = PySequence_Fast_ITEMS(seq.get());
   for (Py_ssize_t i = 0; i < n; i++) {

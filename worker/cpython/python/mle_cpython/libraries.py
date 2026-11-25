@@ -71,6 +71,7 @@ class Libraries:
         self.evaluating = []  # the Modules being evaluated, innermost last
         self.globals = {}     # what a library module starts with (the SQL API ...)
         self.discards = 0     # counts forget() and reset()
+        self.before_send = None  # called before LIBRARY is posted (Api.flush_raw: the arena is written over)
 
     def forget(self, routine_id):
         """A PREPARE of the id begins, or its DROP: its answers are discarded."""
@@ -98,6 +99,8 @@ class Libraries:
         if held is not None and held[0] == epoch and known is not None and known.version == held[1]:
             return known
         schema, name = key
+        if self.before_send is not None:
+            self.before_send()  # rows still in the arena are read before LIBRARY writes over it
         try:
             reply = _mlewire.library(schema, name, 0 if known is None else known.version)
         except ValueError as e:

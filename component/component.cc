@@ -98,6 +98,8 @@ REQUIRES_SERVICE_PLACEHOLDER(mysql_charset);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_current_thread_reader);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_store);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_attributes);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_string_factory);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_string_converter);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_thd_security_context);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_options);
 REQUIRES_SERVICE_PLACEHOLDER(mysql_security_context_factory);
@@ -222,6 +224,15 @@ class Services {
     });
   }
 
+  /** A routine of a language that mle.languages no longer lists is refused, also one that a
+      session's cache still holds from before the change (two atomic loads per call). */
+  static bool disabled(const Routine &routine) {
+    if ((routine.language & mle_component::enabled_languages()) != 0) return false;
+    my_error(ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE, MYF(0),
+             mle_component::language_names(routine.language).c_str());
+    return true;
+  }
+
   /** CREATE, and when a routine enters the cache: the worker of the
       current principal compiles it (syntax errors fail the CREATE). */
   static DEFINE_BOOL_METHOD(parse, (external_program_handle lang_sp,
@@ -232,7 +243,8 @@ class Services {
         my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
         return true;
       }
-      return !session->parse(*routine_of(lang_sp));
+      Routine &routine = *routine_of(lang_sp);
+      return disabled(routine) || !session->parse(routine);
     });
   }
 
@@ -244,7 +256,8 @@ class Services {
         my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));
         return true;
       }
-      return !session->execute(*routine_of(lang_sp));
+      Routine &routine = *routine_of(lang_sp);
+      return disabled(routine) || !session->execute(routine);
     });
   }
 };
@@ -501,6 +514,8 @@ BEGIN_COMPONENT_REQUIRES(mle)
   REQUIRES_SERVICE(mysql_current_thread_reader),
   REQUIRES_SERVICE(mysql_thd_store),
   REQUIRES_SERVICE(mysql_thd_attributes),
+  REQUIRES_SERVICE(mysql_string_factory),
+  REQUIRES_SERVICE(mysql_string_converter),
   REQUIRES_SERVICE(mysql_thd_security_context),
   REQUIRES_SERVICE(mysql_security_context_options),
   REQUIRES_SERVICE(mysql_security_context_factory),

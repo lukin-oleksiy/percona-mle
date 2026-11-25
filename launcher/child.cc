@@ -149,13 +149,17 @@ int apply_landlock(int abi, const ClassConfig &c, const std::string &leaf) {
   for (const std::string &h : c.hidden_paths)
     if (const std::string r = real_path(h); !r.empty()) hidden.push_back(r);
   // Fails closed (independent review C7): a path is allowed whole only
-  // when it is known to hold no hidden path. A symbolic link among the
-  // entries that leads to a directory holding one (back to an ancestor: a
-  // loop) is not followed, and neither is nesting beyond 32 levels: what
-  // is there stays unreadable rather than being allowed with the hidden
-  // path in it.
+  // when it is known to hold no hidden path. An entry that is a symbolic
+  // link adds no rule (MVP review HOST-1): a rule by its real path would
+  // allow its target wherever that is, which the directory allowed whole
+  // would not (Landlock checks the file a path resolves to), so its target
+  // is reachable only where a rule of its own allows it. Nesting beyond 32
+  // levels is not followed either: what is there stays unreadable rather
+  // than being allowed with the hidden path in it.
   std::function<void(const std::string &, uint64_t, int)> allow_hiding =
       [&](const std::string &path, uint64_t access, int depth) {
+        struct stat st;
+        if (depth > 0 && (lstat(path.c_str(), &st) != 0 || S_ISLNK(st.st_mode))) return;
         const std::string r = real_path(path);
         if (r.empty()) return;  // nothing there (a dangling link)
         for (const std::string &h : hidden)
@@ -163,10 +167,7 @@ int apply_landlock(int abi, const ClassConfig &c, const std::string &leaf) {
         bool contains = false;
         for (const std::string &h : hidden) contains = contains || below(h, r);
         if (!contains) return allow(r, access);
-        struct stat st;
-        if (depth > 32 ||
-            (depth > 0 && (lstat(path.c_str(), &st) != 0 || S_ISLNK(st.st_mode))))
-          return;
+        if (depth > 32) return;
         DIR *d = opendir(r.c_str());
         if (d == nullptr) return;
         for (dirent *e = readdir(d); e != nullptr; e = readdir(d)) {

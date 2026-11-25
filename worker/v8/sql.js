@@ -438,7 +438,12 @@
         if (!labels.includes(n)) throw new TypeError("no column '" + n + "' in the result");
       const rows = this.fetchAll();
       const out = {};
-      for (const n of want) out[n] = rows.map((r) => r[n]);
+      // By the label's first column, as getField: a row's own property misses labels that are
+      // array indexes or 'length' (SELECT 1, 2).
+      for (const n of want) {
+        const j = labels.indexOf(n);
+        out[n] = rows.map((r) => r[j]);
+      }
       return out;
     }
   }
@@ -977,7 +982,10 @@
     if (!n) throw new TypeError('the savepoint name must not be empty');
     return n;
   };
+  // Generated savepoint names: a tag of this worker (taken before guest code runs), so that the
+  // names of other workers in the same transaction differ (SAVEPOINT replaces one of the same name).
   let savepoints = 0;
+  const savepointTag = Math.floor(Math.random() * 2 ** 48).toString(16).padStart(12, '0');
   const methods = {
     sql: (...a) => new SqlExecute(session, str(a, 0), effective(optionsOf(arg(a, 1)))),
     runSql: (...a) => {
@@ -1025,7 +1033,7 @@
     commit: () => { exec('COMMIT'); return null; },
     rollback: () => { exec('ROLLBACK'); return null; },
     setSavepoint: (...a) => {
-      const name = arg(a, 0) === null ? 'TxSp' + (++savepoints) : str(a, 0);
+      const name = arg(a, 0) === null ? 'TxSp' + (++savepoints) + '_' + savepointTag : str(a, 0);
       exec('SAVEPOINT ' + quoteName(savepointName(name)));
       return name;
     },

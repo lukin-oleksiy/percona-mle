@@ -1,0 +1,109 @@
+--echo #
+--echo # component_mle: regressions for the MVP code review (exp note 65). The
+--echo # JavaScript is also run on the V8 worker (v8_review_mvp.test); Python runs
+--echo # beside it on the JVM worker.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+# The zone is fixed at the first routine of a session (Oracle): west of UTC, so
+# that a date-only string read as UTC would show the day before.
+SET time_zone = '-05:00';
+CREATE TABLE sp (id INT PRIMARY KEY) ENGINE=InnoDB;
+
+--echo #
+--echo # JVML-1: generated savepoint names differ between the languages and the
+--echo # workers of one transaction (SAVEPOINT replaces one of the same name).
+--echo #
+CREATE PROCEDURE py_inner_sp() LANGUAGE PYTHON AS $$
+    session.set_savepoint()
+    session.run_sql('INSERT INTO sp VALUES (2)')
+$$;
+CREATE PROCEDURE js_outer_sp(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  session.startTransaction()
+  const sp = session.setSavepoint()
+  session.runSql('INSERT INTO sp VALUES (1)')
+  session.runSql('CALL py_inner_sp()')
+  session.rollbackTo(sp)
+  r = 'rows after rollbackTo: ' + session.runSql('SELECT COUNT(*) FROM sp').fetchOne()[0]
+  session.rollback()
+$$;
+CALL js_outer_sp(@r);
+SELECT @r;
+
+--echo #
+--echo # JVML-4: a string returned for DATE, DATETIME or TIMESTAMP is cast to a
+--echo # Date, the literal forms of MySQL as local time; for YEAR a Date gives its
+--echo # year and a string its 4-digit year (Table 27.3 of Oracle).
+--echo #
+CREATE FUNCTION js_date_str() RETURNS DATE LANGUAGE JAVASCRIPT AS $$ return '2024-01-31' $$;
+CREATE FUNCTION js_datetime_str() RETURNS DATETIME(3) LANGUAGE JAVASCRIPT AS $$ return '2024-01-31 10:20:30.456' $$;
+CREATE FUNCTION js_timestamp_str() RETURNS TIMESTAMP LANGUAGE JAVASCRIPT AS $$ return '2024-01-31T10:20:30Z' $$;
+CREATE FUNCTION js_year_date() RETURNS YEAR LANGUAGE JAVASCRIPT AS $$ return new Date(2031, 5, 1) $$;
+CREATE FUNCTION js_year_str() RETURNS YEAR LANGUAGE JAVASCRIPT AS $$ return 'class of 2027' $$;
+CREATE FUNCTION js_date_bad() RETURNS DATE LANGUAGE JAVASCRIPT AS $$ return 'not a date' $$;
+SELECT js_date_str(), js_datetime_str(), js_timestamp_str(), js_year_date(), js_year_str();
+--error ER_LANGUAGE_COMPONENT
+SELECT js_date_bad();
+
+--echo #
+--echo # V8-2: fetchColumns() by the column, also for labels that are array
+--echo # indexes or length.
+--echo #
+CREATE PROCEDURE js_columns(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const a = session.runSql('SELECT 1, 2').fetchColumns()
+  const b = session.runSql("SELECT 'x' AS id, 7 AS length").fetchColumns('length')
+  r = JSON.stringify(a) + ' ' + JSON.stringify(b)
+$$;
+CALL js_columns(@r);
+SELECT @r;
+
+--echo #
+--echo # COMP-3: a language removed from mle.languages is refused also for a
+--echo # routine that the session holds in its cache.
+--echo #
+CREATE FUNCTION js_cached() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 7 $$;
+SELECT js_cached();
+SET GLOBAL mle.languages = 'Python';
+--error ER_LANGUAGE_COMPONENT_UNSUPPORTED_LANGUAGE
+SELECT js_cached();
+SET GLOBAL mle.languages = DEFAULT;
+SELECT js_cached();
+
+--echo #
+--echo # COMP-1: mle_eval() frees the String of the current schema that the
+--echo # server makes (one per call before).
+--echo #
+CREATE TABLE ten (n INT);
+INSERT INTO ten VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9);
+SELECT mle_eval('javascript', '1') AS warm;
+let $held = SELECT COUNT_ALLOC - COUNT_FREE FROM performance_schema.memory_summary_by_thread_by_event_name
+  WHERE THREAD_ID = PS_CURRENT_THREAD_ID() AND EVENT_NAME = 'memory/sql/String::value';
+let $before = `$held`;
+--disable_result_log
+SELECT mle_eval('javascript', '1') FROM ten a, ten b, ten c;
+--enable_result_log
+let $after = `$held`;
+--let $assert_text = mle_eval() leaves no server String behind
+--let $assert_cond = $after - $before < 100
+--source include/assert.inc
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP PROCEDURE py_inner_sp;
+DROP PROCEDURE js_outer_sp;
+DROP FUNCTION js_date_str;
+DROP FUNCTION js_datetime_str;
+DROP FUNCTION js_timestamp_str;
+DROP FUNCTION js_year_date;
+DROP FUNCTION js_year_str;
+DROP FUNCTION js_date_bad;
+DROP PROCEDURE js_columns;
+DROP FUNCTION js_cached;
+DROP TABLE sp, ten;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
