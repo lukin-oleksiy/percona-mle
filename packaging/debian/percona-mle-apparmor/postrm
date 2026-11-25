@@ -15,15 +15,18 @@ case "$1" in
 			if [ -f /etc/apparmor.d/usr.sbin.mysqld ]; then
 				apparmor_parser -r -T -W /etc/apparmor.d/usr.sbin.mysqld || true
 			fi
-			if [ -d /sys/kernel/security/apparmor/policy/profiles ] &&
-				ls /sys/kernel/security/apparmor/policy/profiles | grep -q '^percona-mle\.'; then
-				echo -n percona-mle > /sys/kernel/security/apparmor/.remove 2>/dev/null || true
-			fi
+			# Both profiles of the file: the launcher's and the workers' (stacked on it).
+			for profile in percona-mle percona-mle-worker; do
+				if [ -d /sys/kernel/security/apparmor/policy/profiles ] &&
+					ls /sys/kernel/security/apparmor/policy/profiles | grep -q "^$profile\."; then
+					echo -n $profile > /sys/kernel/security/apparmor/.remove 2>/dev/null || true
+				fi
+			done
 		fi
 		;;
 esac
 if [ "$1" = purge ]; then
-	rm -f /etc/apparmor.d/local/percona-mle
+	rm -f /etc/apparmor.d/local/percona-mle /etc/apparmor.d/local/percona-mle-worker
 fi
 
 # (no debhelper: packages built with CPack, cmake/packaging.cmake)

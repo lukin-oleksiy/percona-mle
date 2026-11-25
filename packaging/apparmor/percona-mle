@@ -2,11 +2,17 @@
 # starts, and the workers that run the routines. mysqld's own profile gets the
 # few rules it needs from abstractions/percona-mle-mysqld.
 #
-# Workers are confined by Landlock and seccomp whatever AppArmor does; this
-# profile keeps them out of mysqld's files (the data directory, the keyring,
-# the configuration) at this layer too. They stay in the launcher's profile:
-# the launcher sets no_new_privs before it starts a worker, and AppArmor then
-# allows no change to another profile.
+# Workers are confined by Landlock and seccomp whatever AppArmor does; these
+# profiles keep them out of mysqld's files (the data directory, the keyring,
+# the configuration) at this layer too. A worker runs in the launcher's
+# profile stacked with percona-mle-worker: the launcher sets no_new_privs
+# before it starts a worker, and AppArmor then allows only a change to a
+# stack that keeps the current profile (px -> percona-mle//&percona-mle-worker,
+# label "percona-mle//&percona-mle-worker"), whose rules are both profiles' at
+# once. So a worker can read but not write the cgroup files the launcher
+# writes (memory.max of its own leaf; MVP review OPS-8). Paths added in
+# local/percona-mle for workers (another mle.dir or mle.package_dir) go into
+# local/percona-mle-worker too.
 #
 # The profile follows the mode of the server's profile as the package ships it
 # (complain); `aa-enforce /etc/apparmor.d/percona-mle` enforces it. Other
@@ -25,9 +31,12 @@ profile percona-mle flags=(complain) {
 
   # The launcher and the worker bootstrap.
   @{MLE_DIR}/mle_launcher mr,
-  @{MLE_DIR}/mle_worker mrix,
-  @{MLE_DIR}/cpython/mle_cpython_worker mrix,
-  @{MLE_DIR}/v8/mle_v8_worker mrix,
+  @{MLE_DIR}/mle_worker mr,
+  @{MLE_DIR}/cpython/mle_cpython_worker mr,
+  @{MLE_DIR}/v8/mle_v8_worker mr,
+  @{MLE_DIR}/mle_worker px -> percona-mle//&percona-mle-worker,
+  @{MLE_DIR}/cpython/mle_cpython_worker px -> percona-mle//&percona-mle-worker,
+  @{MLE_DIR}/v8/mle_v8_worker px -> percona-mle//&percona-mle-worker,
 
   # MLE's files: the JDK, the jars, the AOT cache, Python and numpy.
   @{MLE_DIR}/ r,
@@ -54,13 +63,16 @@ profile percona-mle flags=(complain) {
   @{PROC}/@{pid}/oom_score_adj w,
   @{PROC}/@{pid}/statm r,
 
-  # The workers' cgroups, below mysqld's delegated cgroup.
+  # The workers' cgroups, below mysqld's delegated cgroup: the launcher makes
+  # and limits them.
   @{PROC}/@{pid}/cgroup r,
   @{sys}/fs/cgroup/** rw,
 
   signal (send, receive) peer=percona-mle,
+  signal (send, receive) peer=percona-mle-worker,
   signal (receive) peer=/usr/sbin/mysqld,
   unix (send, receive) type=seqpacket peer=(label=/usr/sbin/mysqld),
+  unix (send, receive) type=seqpacket peer=(label=percona-mle-worker),
 
   # What the launcher and the workers report goes to mysqld's error log,
   # which they inherit. "w" and not "a": AppArmor checks mysqld's own later
@@ -71,4 +83,36 @@ profile percona-mle flags=(complain) {
 
   # Site-specific additions and overrides.
   include if exists <local/percona-mle>
+}
+
+# The workers: what they need of the launcher's rules, and the cgroup files
+# only to read. Stacked on percona-mle (above), so a rule must be in both.
+profile percona-mle-worker flags=(complain) {
+  include <abstractions/base>
+
+  @{MLE_DIR}/mle_worker mr,
+  @{MLE_DIR}/cpython/mle_cpython_worker mr,
+  @{MLE_DIR}/v8/mle_v8_worker mr,
+  @{MLE_DIR}/ r,
+  @{MLE_DIR}/** mr,
+  /usr/lib{,64}/python3*/ r,
+  /usr/lib{,64}/python3*/** mr,
+  @{MLE_PACKAGES}/ r,
+  @{MLE_PACKAGES}/** mr,
+
+  @{PROC}/@{pid}/oom_score_adj w,
+  @{PROC}/@{pid}/statm r,
+  @{PROC}/@{pid}/cgroup r,
+  @{sys}/fs/cgroup/** r,
+
+  signal (send, receive) peer=percona-mle,
+  signal (send, receive) peer=percona-mle-worker,
+  signal (receive) peer=/usr/sbin/mysqld,
+  unix (send, receive) type=seqpacket peer=(label=/usr/sbin/mysqld),
+  unix (send, receive) type=seqpacket peer=(label=percona-mle),
+
+  # The inherited error log: "w", as above.
+  /var/log/mysql/** w,
+
+  include if exists <local/percona-mle-worker>
 }

@@ -16,6 +16,9 @@
 
   signal (send) peer=percona-mle,
   unix (send, receive) type=seqpacket peer=(label=percona-mle),
+  # The workers: the launcher's profile stacked with percona-mle-worker.
+  signal (send) peer=percona-mle-worker,
+  unix (send, receive) type=seqpacket peer=(label=percona-mle-worker),
 
   # The cgroup mysqld runs in: the workers' cgroups go below it.
   @{PROC}/@{pid}/cgroup r,

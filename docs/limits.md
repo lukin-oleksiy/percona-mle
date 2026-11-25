@@ -68,9 +68,10 @@ values map to each language is in its Appendix B.
 * **`mle_package`** installs into the live package directory: a worker
   that imports a package while it is being installed can see it half
   written. (Two `mle_package` runs wait for each other.)
-* **AppArmor.** Workers run in the launcher's profile, which may write
-  cgroup files: within it, only Landlock keeps a worker from its own
-  cgroup's limits (the SELinux policy gives workers read access only).
+* **AppArmor.** Workers run in the launcher's profile stacked with
+  `percona-mle-worker`; paths added for workers in `local/percona-mle`
+  (another `mle.dir` or `mle.package_dir`) go into
+  `local/percona-mle-worker` too.
 * **Settings while sessions end.** `SET GLOBAL mle.<setting> = DEFAULT`
   of a setting that shapes workers does not wait for sessions that are
   ending: right after a disconnect it can leave the value with a warning
