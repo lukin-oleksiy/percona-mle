@@ -32,7 +32,7 @@
     <maven.compiler.release>25</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <mle.build.dir>${project.basedir}/target</mle.build.dir>
-    <graalvm.version>25.5.5.0.3</graalvm.version>
+    <graalvm.version>25.6.5.1</graalvm.version>
   </properties>
 
   <!-- GraalJS and GraalPy on the worker's JVM (one polyglot Context with

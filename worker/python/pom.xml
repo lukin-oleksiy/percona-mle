@@ -29,7 +29,7 @@
   <packaging>pom</packaging>
 
   <properties>
-    <graalvm.version>25.5.5.0.3</graalvm.version>
+    <graalvm.version>25.6.5.1</graalvm.version>
     <mle.build.dir>${project.basedir}/target</mle.build.dir>
     <mle.venv.dir>${mle.build.dir}/python-venv</mle.venv.dir>
   </properties>

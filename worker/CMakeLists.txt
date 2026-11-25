@@ -24,6 +24,15 @@ IF(NOT EXISTS "${MLE_JAVA_HOME}/include/jni.h" OR
     "MLE: MLE_JAVA_HOME (${MLE_JAVA_HOME}) must be a GraalVM JDK 25 "
     "with include/jni.h and lib/server/libjvm.so")
 ENDIF()
+# What the JDK is, for the outputs it makes (the AOT cache, the trimmed runtime): a copy of its
+# release file, rewritten only when that differs. MLE_JAVA_HOME is often a link (SDKMAN's
+# java/current) that a JDK upgrade points elsewhere, which changes no file time CMake sees.
+SET(MLE_JDK_IDENTITY ${CMAKE_CURRENT_BINARY_DIR}/jdk-identity)
+ADD_CUSTOM_TARGET(mle_jdk_identity ALL
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${MLE_JAVA_HOME}/release ${MLE_JDK_IDENTITY}
+  BYPRODUCTS ${MLE_JDK_IDENTITY}
+  VERBATIM)
+
 FIND_PROGRAM(MLE_MAVEN mvn)
 IF(NOT MLE_MAVEN)
   MESSAGE(FATAL_ERROR "MLE: Maven (mvn) is needed to build mle-worker.jar")
@@ -45,7 +54,10 @@ FILE(GLOB_RECURSE MLE_WORKER_JAVA_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/main/java/*.java
   ${CMAKE_CURRENT_SOURCE_DIR}/src/main/resources/*)
 SET(MLE_WORKER_JAR ${CMAKE_CURRENT_BINARY_DIR}/maven/mle-worker.jar)
+# deps/ is emptied first: copy-dependencies only adds, and the jars of a previous GraalVM version
+# would stay and be installed with the new ones.
 ADD_CUSTOM_COMMAND(OUTPUT ${MLE_WORKER_JAR}
+  COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_CURRENT_BINARY_DIR}/maven/deps
   COMMAND ${CMAKE_COMMAND} -E env JAVA_HOME=${MLE_JAVA_HOME}
     ${MLE_MAVEN} -q -B -f ${CMAKE_CURRENT_SOURCE_DIR}/pom.xml
     -Dmle.build.dir=${CMAKE_CURRENT_BINARY_DIR}/maven package
@@ -61,7 +73,9 @@ ADD_CUSTOM_COMMAND(OUTPUT ${MLE_WORKER_JAR}
 # (-Dpolyglot.engine.userResourceCache).
 SET(MLE_RESOURCE_CACHE ${CMAKE_CURRENT_BINARY_DIR}/resources)
 SET(MLE_RESOURCE_STAMP ${MLE_RESOURCE_CACHE}/.mle-setup-done)
+# Emptied first, likewise: each GraalVM version extracts into directories of its own.
 ADD_CUSTOM_COMMAND(OUTPUT ${MLE_RESOURCE_STAMP}
+  COMMAND ${CMAKE_COMMAND} -E rm -rf ${MLE_RESOURCE_CACHE}
   COMMAND ${MLE_JAVA_HOME}/bin/java
     -Dpolyglot.engine.userResourceCache=${MLE_RESOURCE_CACHE}
     --enable-native-access=ALL-UNNAMED
@@ -106,7 +120,7 @@ ADD_CUSTOM_COMMAND(OUTPUT ${MLE_AOT_CACHE}
   COMMAND ${MLE_JAVA_HOME}/bin/java -XX:AOTMode=create
     -XX:AOTConfiguration=${CMAKE_CURRENT_BINARY_DIR}/mle.aotconf
     -XX:AOTCache=${MLE_AOT_CACHE} ${MLE_AOT_JVM_OPTIONS}
-  DEPENDS ${MLE_WORKER_JAR} ${MLE_RESOURCE_STAMP} ${MLE_PYTHON_VENV_STAMP}
+  DEPENDS ${MLE_WORKER_JAR} ${MLE_RESOURCE_STAMP} ${MLE_PYTHON_VENV_STAMP} ${MLE_JDK_IDENTITY}
   COMMENT "Training and creating the JDK AOT cache for MLE workers"
   VERBATIM
   )
@@ -191,6 +205,7 @@ IF(MLE_BUILD_JDK)
     # jlink writes with the builder's umask, and the install keeps the modes
     # (programs stay programs): readable by all, writable by the owner only.
     COMMAND chmod -R u+rwX,go+rX,go-w ${MLE_JDK_DIR}
+    DEPENDS ${MLE_JDK_IDENTITY}
     COMMENT "Linking a trimmed GraalVM runtime for MLE"
     VERBATIM
     )
