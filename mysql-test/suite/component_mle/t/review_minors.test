@@ -326,6 +326,7 @@ DROP FUNCTION js_line1;
 --disconnect con2
 --connect (con4, localhost, root,,test)
 SET GLOBAL mle.heap_max = 268435456;
+SET GLOBAL mle.pool_prewarm = 'none';
 --connect (con3, localhost, root,,test)
 SELECT js_one();
 --connection con4
@@ -334,9 +335,17 @@ SET GLOBAL mle.heap_max = DEFAULT;
 --error ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
 SET GLOBAL mle.heap_max = 300000000;
 SELECT @@GLOBAL.mle.heap_max AS unchanged;
+--echo # MVP review COMP-2: mle.pool_prewarm alike (it restarted the engine and took the value).
+SET GLOBAL mle.pool_prewarm = DEFAULT;
+SELECT @@GLOBAL.mle.pool_prewarm AS unchanged;
 --disconnect con3
+# The update does not wait for ending sessions under the server's lock (MVP review COMP-4).
+let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers';
+--source include/wait_condition.inc
 SET GLOBAL mle.heap_max = DEFAULT;
 SELECT @@GLOBAL.mle.heap_max = 536870912 AS the_default;
+SET GLOBAL mle.pool_prewarm = DEFAULT;
+SELECT @@GLOBAL.mle.pool_prewarm AS the_default;
 --echo # C124: fetchColumns() with names, a NULL and a column that is not there.
 CREATE PROCEDURE js_columns(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
   const q = "SELECT 1 AS a, NULL AS b, 'x' AS c UNION ALL SELECT 2, 5, 'y'"

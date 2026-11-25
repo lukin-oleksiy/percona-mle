@@ -521,7 +521,7 @@
       if (rows.length >= BATCH_MIN_ROWS && s.options.rewrite) {
         if (!s.formChecked) { s.formChecked = true; s.form = batchForm(s.sql, s.count); }
         const f = s.form;
-        if (f !== null && innodb(f.schema, f.table, false)) return this.$executeRewritten(rows, f);
+        if (f !== null && strictMode() && innodb(f.schema, f.table, false)) return this.$executeRewritten(rows, f);
       }
       return this.$result(...this.$executeRows(rows, 0));
     }
@@ -828,6 +828,10 @@
     return new PreparedStatement(scopeOf(t), idOf(t), sql, o, t[5]);
   };
   const innodbCache = new Map();
+  // A multi-row INSERT fails like its rows one by one only in a strict sql_mode: without one it
+  // writes implicit defaults where a single-row INSERT fails (NULL in a NOT NULL column), so the
+  // rewrite is used only then (MVP review JVML-3). A routine runs in the mode it was created with.
+  const strictMode = () => /STRICT_(TRANS|ALL)_TABLES/.test(String(column('SELECT @@SESSION.sql_mode')[0]));
   const innodb = (schema, table, fresh) => {
     const s = schema !== null ? schema : state()[2];
     const key = s === null ? null : s + '\u0000' + table;
@@ -1048,7 +1052,10 @@
   methods.executemany = methods.executeMany;
   const METHODS = new Set(Object.keys(methods));
   // The session object: its methods, and the user variables as other members (x <-> @x).
-  const session = new Proxy(Object.freeze(Object.create(null)), {
+  // An extensible target: the traps report the methods as own properties, which a frozen target
+  // forbids (Object.keys(session) threw); preventExtensions and setPrototypeOf are refused so that
+  // it stays so (MVP review V8-3).
+  const session = new Proxy(Object.create(null), {
     get: (t, k) => {
       if (typeof k === 'symbol') return undefined;
       if (METHODS.has(k)) return methods[k];
@@ -1067,6 +1074,8 @@
       METHODS.has(k) ? { value: methods[k], writable: false, enumerable: true, configurable: true } : undefined,
     defineProperty: () => false,
     deleteProperty: () => false,
+    preventExtensions: () => false,
+    setPrototypeOf: () => false,
   });
 
   for (const [k, v] of [['session', session], ['mysql', mysql], ['SqlError', SqlError]])

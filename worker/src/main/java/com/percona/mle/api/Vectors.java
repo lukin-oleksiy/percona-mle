@@ -353,16 +353,20 @@ public final class Vectors {
   }
 
   /**
-   * {@link #normalize(float[])} for a JavaScript or Python vector: a normalized copy (the argument
-   * is not changed, also when it is a Java float[] the routine got from this helper).
+   * {@link #normalize(float[])} for a JavaScript or Python vector: a normalized copy, the argument
+   * is not changed. A Java float[] that JavaScript or Python got from this helper
+   * (VectorSet.vector, Clusters.centroid) selects {@link #normalize(float[])} instead, which scales
+   * it in place (MVP review API-4).
    */
   public static float[] normalize(Object v) {
     return normalize(GuestVectors.vector(v, "the vector").clone());
   }
 
   /**
-   * {@link #normalizeAll(float[][])} for JavaScript or Python rows: normalized copies (the rows
-   * passed are not changed, also when they are Java float[] the routine got from this helper).
+   * {@link #normalizeAll(float[][])} for JavaScript or Python rows: normalized copies, the rows
+   * passed are not changed (also a JavaScript or Python list of Java float[] rows). A Java
+   * float[][] itself selects {@link #normalizeAll(float[][])}, which scales its rows in place (MVP
+   * review API-4).
    */
   public static float[][] normalizeAll(Object rows) {
     float[][] m = GuestVectors.matrix(rows, "the rows");

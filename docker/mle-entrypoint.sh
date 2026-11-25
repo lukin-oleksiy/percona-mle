@@ -91,6 +91,9 @@ first_start() {
   # --binary-mode: the client passes the bytes on as they are (no \r\n to
   # \n). The first SQL error ends the batch and, with set -e, this script.
   {
+    # This container's own setup: not in its binary log, which a replica of it would replay
+    # (CREATE USER root@'%' fails there; MVP review OPS-3).
+    printf '%s\n' "SET @@SESSION.sql_log_bin = 0;"
     printf '%s\n' "SET @@SESSION.sql_mode = '';"
     printf '%s\n' "INSTALL COMPONENT 'file://component_mle';"
     printf '%s\n' "INSTALL COMPONENT 'file://component_lang_router';"

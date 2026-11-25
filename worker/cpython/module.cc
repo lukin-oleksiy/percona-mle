@@ -17,6 +17,8 @@
 
 #include "module.hpp"
 
+#include <malloc.h>
+
 #include <array>
 #include <cmath>
 #include <memory>
@@ -408,9 +410,23 @@ void dispatch(const Message &m, Ref &assembled) {
     Interrupts::begin(g_seq, interruptible);
   }
   g_request = &q;
+  // g_request is the outer request's again however this one ends (MVP review CPY-7).
+  struct Restore {
+    Request *outer;
+    ~Restore() { g_request = outer; }
+  } restore{q.outer};
   if (!(op == w::Op::kCall && top && !m.discarded && fast_call(q, m, assembled))) {
     PyObject *ctx = PyList_New(0);
-    PyObject *body = ctx == nullptr ? nullptr : m.discarded ? Py_NewRef(Py_None) : body_object(m, assembled).release();
+    PyObject *body = nullptr;
+    if (ctx != nullptr) {
+      // A body that cannot be made (MemoryError) is this request's INTERNAL below, not an
+      // exception out of the request loop with no RESULT (MVP review CPY-7).
+      try {
+        body = m.discarded ? Py_NewRef(Py_None) : body_object(m, assembled).release();
+      } catch (const PyErrorSet &) {
+        body = nullptr;
+      }
+    }
     PyObject *outcome = nullptr;
     if (body != nullptr) {
       q.guest = guest_op && !m.discarded;
@@ -434,7 +450,6 @@ void dispatch(const Message &m, Ref &assembled) {
     Py_XDECREF(body);
     Py_XDECREF(ctx);
   }
-  g_request = q.outer;
 }
 
 /** serve(handle, finish, convert, failed, vector_arg): the worker's request loop; never returns. */
@@ -497,6 +512,50 @@ Ref py_mark(PyObject *) {
 
 Ref py_printed(PyObject *) {
   g_console = true;
+  return Ref::borrow(Py_None);
+}
+
+/** interrupt_due() -> whether the worker's SIGUSR1 handler raises KeyboardInterrupt (D11). */
+Ref py_interrupt_due(PyObject *) { return Ref::borrow(interrupt_due() ? Py_True : Py_False); }
+
+/** interrupt_signal(installed): installed() tells whether the worker's SIGUSR1 handler is set. */
+Ref py_interrupt_signal(PyObject *args) {
+  PyObject *installed = nullptr;
+  if (!PyArg_ParseTuple(args, "O", &installed)) throw PyErrorSet{};
+  interrupt_signal(installed == Py_None ? nullptr : installed);
+  return Ref::borrow(Py_None);
+}
+
+/** guest_pause() -> whether guest code was running: the worker's own bookkeeping follows, where
+    no KeyboardInterrupt may land (MVP review CPY-6); guest_unpause(was) ends it. */
+Ref py_guest_pause(PyObject *) {
+  const bool was = guest_running();
+  if (was) guest_leave();
+  return Ref::borrow(was ? Py_True : Py_False);
+}
+
+Ref py_guest_unpause(PyObject *args) {
+  int was = 0;
+  if (!PyArg_ParseTuple(args, "p", &was)) throw PyErrorSet{};
+  if (was) guest_resume();
+  return Ref::borrow(Py_None);
+}
+
+/** guest_exec(code, globals, guest): exec of a library's code as guest code when guest is true,
+    between paused bookkeeping: interrupts only inside it (MVP review CPY-6). */
+Ref py_guest_exec(PyObject *args) {
+  PyObject *code = nullptr, *globals = nullptr;
+  int guest = 0;
+  if (!PyArg_ParseTuple(args, "OO!p", &code, &PyDict_Type, &globals, &guest)) throw PyErrorSet{};
+  if (guest) guest_resume();
+  PyObject *r = PyEval_EvalCode(code, globals, globals);
+  if (guest) guest_leave();
+  return Ref::steal(r);
+}
+
+/** trim(): free memory back to the system after RESET (§9.7 SHOULD; MVP review CPY-11). */
+Ref py_trim(PyObject *) {
+  malloc_trim(0);
   return Ref::borrow(Py_None);
 }
 
@@ -965,6 +1024,12 @@ PyMethodDef kMethods[] = {
     {"mark", boundary<py_mark>, METH_NOARGS, "the running call needs Python's tail"},
     {"printed", boundary<py_printed>, METH_NOARGS, "console output waits for a RESULT"},
     {"taint", boundary<py_taint>, METH_NOARGS, "the worker asks to be retired"},
+    {"interrupt_due", boundary<py_interrupt_due>, METH_NOARGS, "whether SIGUSR1's handler raises KeyboardInterrupt"},
+    {"interrupt_signal", boundary<py_interrupt_signal>, METH_VARARGS, "interrupt_signal(installed)"},
+    {"guest_pause", boundary<py_guest_pause>, METH_NOARGS, "guest_pause() -> was: the worker's bookkeeping"},
+    {"guest_unpause", boundary<py_guest_unpause>, METH_VARARGS, "guest_unpause(was)"},
+    {"guest_exec", boundary<py_guest_exec>, METH_VARARGS, "guest_exec(code, globals, guest)"},
+    {"trim", boundary<py_trim>, METH_NOARGS, "malloc_trim after RESET"},
     {"request", boundary<py_request>, METH_NOARGS, "the request being served, or None"},
     {"epoch", boundary<py_epoch>, METH_VARARGS, "epoch(library_epoch): of the PREPARE being served"},
     {"sql", boundary<py_sql>, METH_VARARGS, "sql(action, scope, id, message, count, flags, width) -> reply"},

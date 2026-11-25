@@ -213,6 +213,7 @@ TypeError: Cannot read properties of null (reading 'oops')
 DROP FUNCTION js_line1;
 # C86: SET ... = DEFAULT of a setting that shapes workers, while a session holds one.
 SET GLOBAL mle.heap_max = 268435456;
+SET GLOBAL mle.pool_prewarm = 'none';
 SELECT js_one();
 js_one()
 1
@@ -225,10 +226,21 @@ ERROR HY000: Language component: System variable 'mle.heap_max' cannot be config
 SELECT @@GLOBAL.mle.heap_max AS unchanged;
 unchanged
 268435456
+# MVP review COMP-2: mle.pool_prewarm alike (it restarted the engine and took the value).
+SET GLOBAL mle.pool_prewarm = DEFAULT;
+Warnings:
+Warning	6000	MLE: mle.pool_prewarm is not changed: a session holds a worker
+SELECT @@GLOBAL.mle.pool_prewarm AS unchanged;
+unchanged
+none
 SET GLOBAL mle.heap_max = DEFAULT;
 SELECT @@GLOBAL.mle.heap_max = 536870912 AS the_default;
 the_default
 1
+SET GLOBAL mle.pool_prewarm = DEFAULT;
+SELECT @@GLOBAL.mle.pool_prewarm AS the_default;
+the_default
+vectors
 # C124: fetchColumns() with names, a NULL and a column that is not there.
 CREATE PROCEDURE js_columns(OUT r TEXT) LANGUAGE JS AS $$
 const q = "SELECT 1 AS a, NULL AS b, 'x' AS c UNION ALL SELECT 2, 5, 'y'"

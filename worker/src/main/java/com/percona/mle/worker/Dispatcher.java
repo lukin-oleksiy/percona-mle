@@ -1034,6 +1034,12 @@ final class Dispatcher {
           break;
         } catch (Values.ConversionException e) {
           instead = guest(Wire.LANGUAGE_TYPE, e.getMessage());
+        } catch (OutOfMemoryError e) {
+          // A value too large for the heap (§9.4, Appendix B.5): EXHAUSTED, and the worker is
+          // retired (MVP review JVMP-1).
+          tainted = true;
+          instead = guest(Wire.LANGUAGE_TYPE, "out of memory while the routine's result was written");
+          if (status == Wire.OK) status = Wire.EXHAUSTED;
         } catch (MessageWriter.TooLarge e) {
           // The console output is cut first; the RESULT without any of it is measured for that.
           try {
@@ -1049,10 +1055,16 @@ final class Dispatcher {
             instead = guest(Wire.LANGUAGE_TYPE, c.getMessage());
           } catch (MessageWriter.TooLarge t) {
             instead = guest(Wire.LANGUAGE_TYPE, tooLarge("the routine's result"));
+          } catch (RuntimeException r) {
+            instead = guest(Wire.LANGUAGE_TYPE, "cannot write the routine's result: " + r);
           }
+        } catch (RuntimeException e) {
+          // What a value of guest code makes the writer throw (a closed arena's segment, an
+          // MleJson without text): an error of guest code, not INTERNAL (§10.6; MVP review JVMP-1).
+          instead = guest(Wire.LANGUAGE_TYPE, "cannot write the routine's result: " + e);
         }
         // Only an OK RESULT has values, and an Error fits: this is reached once.
-        status = Wire.GUEST_ERROR;
+        if (status != Wire.EXHAUSTED) status = Wire.GUEST_ERROR;
         error = fit(q, status, instead);
         ret = null;
         retType = null;

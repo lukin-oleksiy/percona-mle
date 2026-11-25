@@ -27,6 +27,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -250,6 +251,30 @@ TEST(MleLauncher, WorkerEnvironment) {
   EXPECT_EQ(r["stdin"], "/dev/null");
   EXPECT_EQ(r["ppid"], std::to_string(l->info().pid));
   EXPECT_EQ(w->header()->stats.reserved, 0u);
+}
+
+TEST(MleLauncher, OpenFilesLimitAtMostTheInheritedHardOne) {
+  // A mysqld started with a hard limit below the class's (LimitNOFILE=128): the worker gets
+  // the inherited limit, not a failed spawn (MVP review HOST-4). In a child process: a hard
+  // limit cannot be raised again.
+  const pid_t child = fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    rlimit low{128, 128};
+    if (setrlimit(RLIMIT_NOFILE, &low) != 0) _exit(10);
+    auto l = start(config({test_class("t")}));
+    if (l == nullptr) _exit(11);
+    std::string error;
+    auto w = l->acquire("t", &error);
+    if (w == nullptr) _exit(12);
+    ReadyMsg ready;
+    if (!wait_ready(*w, &ready, &error)) _exit(13);
+    _exit(parse_report(ready.info)["nofile"] == "128" ? 0 : 14);
+  }
+  int status = 0;
+  ASSERT_EQ(waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status)) << status;
+  EXPECT_EQ(WEXITSTATUS(status), 0) << "10 setrlimit, 11 launcher, 12 acquire, 13 READY, 14 nofile";
 }
 
 TEST(MleLauncher, ReleaseKillsTheWorker) {

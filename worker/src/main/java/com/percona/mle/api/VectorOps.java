@@ -414,7 +414,12 @@ final class VectorOps {
             for (int i = 0; i < d; i++) v[i] *= s;
           }
           cent[c] = v;
-        } else {  // empty: restart at the worst-fitting row of a cluster with others in it
+        }
+      }
+      // Empty clusters after every centroid was made (MVP review API-1: a donor made after the
+      // count changed was scaled by count / (count - 1)).
+      for (int c = 0; c < k; c++) {
+        if (count[c] == 0) {  // empty: restart at the worst-fitting row of a cluster with others in it
           int worst = -1;
           for (int j = 0; j < n; j++) {
             if (taken[j] || count[assign[j]] < 2) continue;

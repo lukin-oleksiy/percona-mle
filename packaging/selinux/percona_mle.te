@@ -120,8 +120,14 @@ kernel_read_system_state(mle_worker_t)
 kernel_read_kernel_sysctls(mle_worker_t)
 kernel_read_vm_sysctls(mle_worker_t)
 fs_getattr_cgroup(mle_worker_t)
+# Packages of mle_package (mle.package_dir): their files, the links of a venv or node_modules, and
+# the shared objects of a wheel (dlopen maps them executable); the directory below /var/lib (MVP
+# review D10, OPS-1).
 read_files_pattern(mle_worker_t, mle_packages_t, mle_packages_t)
 list_dirs_pattern(mle_worker_t, mle_packages_t, mle_packages_t)
+read_lnk_files_pattern(mle_worker_t, mle_packages_t, mle_packages_t)
+mmap_exec_files_pattern(mle_worker_t, mle_packages_t, mle_packages_t)
+files_search_var_lib(mle_worker_t)
 dev_read_sysfs(mle_worker_t)
 dev_read_urand(mle_worker_t)
 dev_read_rand(mle_worker_t)

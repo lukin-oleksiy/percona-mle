@@ -81,6 +81,7 @@ class Libraries:
     def reset(self):
         """RESET: no answer is held. Bodies and modules stay (Appendix B.6)."""
         self.answers.clear()
+        self.evaluating.clear()  # none is being evaluated between requests (MVP review CPY-6)
         self.discards += 1
 
     def resolve(self, key):
@@ -157,22 +158,29 @@ class Libraries:
         m = types.ModuleType(dotted)
         m.__dict__.update(self.globals)
         entry = Module(body.version, m, q[1])
-        # Kept before it runs: libraries that import each other get the partly initialised module
-        # instead of recursing.
-        former = self.modules.get(key)
-        self.modules[key] = entry
-        self.evaluating.append(entry)
+        code = compile(body.text, dotted, 'exec')
+        # The worker's bookkeeping runs where no KeyboardInterrupt lands; only the library's own code
+        # can be interrupted (guest_exec; MVP review CPY-6).
+        was = _mlewire.guest_pause()
         try:
-            exec(compile(body.text, dotted, 'exec'), m.__dict__)
-        except BaseException:
-            if self.modules.get(key) is entry:
-                if former is None:
-                    del self.modules[key]
-                else:
-                    self.modules[key] = former
-            raise
+            # Kept before it runs: libraries that import each other get the partly initialised
+            # module instead of recursing.
+            former = self.modules.get(key)
+            self.modules[key] = entry
+            self.evaluating.append(entry)
+            try:
+                _mlewire.guest_exec(code, m.__dict__, was)
+            except BaseException:
+                if self.modules.get(key) is entry:
+                    if former is None:
+                        del self.modules[key]
+                    else:
+                        self.modules[key] = former
+                raise
+            finally:
+                self.evaluating.remove(entry)
         finally:
-            self.evaluating.remove(entry)
+            _mlewire.guest_unpause(was)
         return m
 
     def import_library(self, path):

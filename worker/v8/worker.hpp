@@ -115,6 +115,7 @@ class Worker {
   /** N.readFile / N.isDir for api.js's require(): only below the DBA's package directory. */
   std::optional<std::string> package_file(const std::string &path);
   bool package_dir_exists(const std::string &path);
+  bool package_file_exists(const std::string &path);
   const std::string &packages() const { return m_config.packages; }
 
   static Worker *current() { return s_current; }
@@ -326,7 +327,10 @@ class Worker {
   Options m_options;
   /** Local time of guest code's Dates (Appendix B.4): ICU's default zone as the zone of OPTIONS
       (+00:00 without options). The zone text set last; empty: not set yet. */
-  void set_local_zone(std::string_view zone);
+  /** The platform's foreground tasks that are due, run now. */
+  void run_platform_tasks();
+  /** False if ICU does not know the zone (it is not set then). */
+  bool set_local_zone(std::string_view zone);
   std::string m_local_zone;
   std::unique_ptr<Values> m_values;
   std::unordered_map<uint64_t, std::shared_ptr<Routine>> m_routines;

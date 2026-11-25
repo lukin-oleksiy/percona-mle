@@ -147,6 +147,9 @@ final class MessageWriter {
    * before they get here, so for them this changes nothing.
    */
   void str(String s) {
+    // UTF-8 has at least one byte per UTF-16 unit: text longer than the room left is refused
+    // before it is encoded (a huge string would otherwise exhaust the heap there; MVP review JVMP-1).
+    if (s.length() > limit - pos) throw new TooLarge();
     bytes(Text.utf8(s));
   }
 

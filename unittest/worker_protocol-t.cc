@@ -2192,10 +2192,14 @@ TEST_F(MleWorkerProtocol, NestedViolations) {
     EXPECT_NE(e.find("wrong request"), std::string::npos) << e;
     r->kind = SqlResultKind::kOk;
   };
-  EXPECT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kDied);
+  // The outer request reports the nested one's outcome, not kDied; the loss is reported once
+  // (MVP review HOST-2).
+  EXPECT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kViolation);
   EXPECT_NE(err.find("wrong request"), std::string::npos) << err;
   EXPECT_FALSE(w->usable());
   EXPECT_EQ(w->depth(), 0u);
+  EXPECT_TRUE(w->first_report_of_failure());
+  EXPECT_FALSE(w->first_report_of_failure());
 }
 
 // ---------------------------------------------------------------- death
@@ -2324,7 +2328,8 @@ TEST_F(MleWorkerProtocol, DeadlineCannotBeStretched) {
   };
   ResultMsg res;
   std::string err;
-  EXPECT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kDied);
+  // The top-level request reports the nested one's outcome (MVP review HOST-2).
+  EXPECT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kTimedOut);
   EXPECT_NE(err.find("did not answer DROP"), std::string::npos) << err;
 }
 
@@ -2758,7 +2763,7 @@ TEST_F(MleWorkerProtocol, GraceLongStatement) {
     r->kind = SqlResultKind::kOk;
   };
   killer = kill_after(50);
-  EXPECT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kDied);
+  EXPECT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kKilled);  // the nested outcome (HOST-2)
   killer.join();
   EXPECT_NE(err.find("did not stop within 300 ms"), std::string::npos) << err;
   EXPECT_FALSE(w->usable());

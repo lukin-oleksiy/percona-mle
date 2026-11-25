@@ -1,0 +1,63 @@
+#
+# component_mle: fixes of the CPython worker from step 3 of the MVP code
+# review (exp note 65).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_CPYTHON_ROUTINE ON *.* TO root@localhost;
+SET @old_max_allowed_packet = @@GLOBAL.max_allowed_packet;
+SET GLOBAL max_allowed_packet = 134217728;
+SELECT cpy_pid();
+cpy_pid()
+0
+#
+# D11 (CPY-5): an interrupt wakes guest code that sleeps or waits: it ends
+# INTERRUPTED and the worker goes on (it was killed after the grace period).
+#
+SELECT /*+ MAX_EXECUTION_TIME(300) */ cpy_nap();
+ERROR HY000: Query execution was interrupted, maximum statement execution time exceeded
+SELECT /*+ MAX_EXECUTION_TIME(300) */ cpy_wait();
+ERROR HY000: Query execution was interrupted, maximum statement execution time exceeded
+SELECT cpy_pid();
+cpy_pid()
+0
+include/assert.inc [The worker that slept still serves]
+#
+# CPY-8: console output is cut to its end while it is written: at most
+# twice the RESULT's 1 MiB is held.
+#
+SELECT cpy_printed() <= 2 * 1048576 AS held_bounded;
+held_bounded
+1
+#
+# CPY-9: a host message beyond a quarter of the worker's memory is not held
+# (protocol 5.3): EXHAUSTED, and the worker goes on.
+#
+SET GLOBAL mle.cpython_memory_max = 268435456;
+SELECT cpy_len(REPEAT('a', 70000000));
+ERROR HY000: Python> the request is larger than this MLE worker can hold
+SELECT cpy_len(REPEAT('a', 1000)) AS still_serves;
+still_serves
+1000
+#
+# CPY-10: RESET puts back the signal handlers and interval timers guest
+# code changed, and drops profile hooks: the next session that gets the
+# worker (kept for the account, RESET in between) finds them as they were.
+#
+SELECT cpy_set_alarm();
+cpy_set_alarm()
+set
+SELECT cpy_alarm();
+cpy_alarm()
+0 0.0 None
+include/assert.inc [The session got the worker that was RESET]
+SET GLOBAL mle.cpython_memory_max = DEFAULT;
+SET GLOBAL max_allowed_packet = @old_max_allowed_packet;
+DROP FUNCTION cpy_pid;
+DROP FUNCTION cpy_nap;
+DROP FUNCTION cpy_wait;
+DROP FUNCTION cpy_printed;
+DROP FUNCTION cpy_len;
+DROP FUNCTION cpy_set_alarm;
+DROP FUNCTION cpy_alarm;
+REVOKE CREATE_CPYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

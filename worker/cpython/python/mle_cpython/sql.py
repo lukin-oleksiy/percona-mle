@@ -973,8 +973,10 @@ class PreparedStatement:
                                   % (len(values), self._count))
             values += self._values[len(values):]
         self._drop_last()
-        msg = _msg(None, values)
+        # Taken before they are encoded: a value that does not encode is not pending afterwards,
+        # and the statement stays usable (MVP review JVML-2).
         self._pending.clear()
+        msg = _msg(None, values)
         reply = self._api._send(EXECUTE_PREPARED, self._scope, self._id, msg)
         self._values = values
         if self._options.to_client:
@@ -1006,7 +1008,7 @@ class PreparedStatement:
                 self._form_checked = True
                 self._form = sql_batch.parse(self._sql, self._count)
             f = self._form
-            if f is not None and self._session._innodb(f.schema, f.table, False):
+            if f is not None and self._session._strict_mode() and self._session._innodb(f.schema, f.table, False):
                 return self._execute_rewritten(rows, f)
         return self._result(*self._execute_rows(rows, 0))
 
@@ -1544,6 +1546,12 @@ class Session:
     executemany = execute_many
 
     # -- execute_many's engine lookups (exp note 52)
+
+    def _strict_mode(self):
+        """Whether the sql_mode is strict: only then a multi-row INSERT fails like its rows one by one
+        (without it, implicit defaults where a single-row INSERT fails; MVP review JVML-3)."""
+        m = str(self._column('SELECT @@SESSION.sql_mode')[0])
+        return 'STRICT_TRANS_TABLES' in m or 'STRICT_ALL_TABLES' in m
 
     def _innodb(self, schema, table, fresh):
         """Whether schema.table (schema None: the current database, the running routine's schema)

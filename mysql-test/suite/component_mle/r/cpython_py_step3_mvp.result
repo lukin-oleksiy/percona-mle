@@ -1,0 +1,48 @@
+#
+# component_mle: fixes of step 3 of the MVP code review (exp note 65),
+# Python. Also run on the CPython worker (cpython_py_step3_mvp.test).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_CPYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE many (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;
+CREATE DATABASE s1;
+CREATE DATABASE s2;
+#
+# JVML-2: a value that does not bind leaves the prepared statement usable.
+#
+CALL py_bind_again(@r);
+SELECT @r;
+@r
+TypeError 2
+#
+# JVML-3: without a strict sql_mode a multi-row INSERT writes implicit
+# defaults where a row alone fails: execute_many then runs row by row.
+#
+CALL py_many(@r);
+SELECT @r;
+@r
+row 149: SqlError: Error code: 1048 Error state: 23000 Error message: Column 'v' cannot be null; rows: 149
+#
+# JVML-7: two routines of one name in two schemas keep their own lines in
+# tracebacks.
+#
+SELECT s1.py_same();
+ERROR HY000: Python> ValueError: from s1 (py_same, line 3)
+SELECT s2.py_same();
+ERROR HY000: Python> ValueError: from s2 (py_same, line 4)
+SELECT s1.py_same();
+ERROR HY000: Python> ValueError: from s1 (py_same, line 3)
+SELECT mle_session_state('traceback') AS traceback;
+traceback
+Traceback (most recent call last):
+  File "py_same", line 3, in <routine>
+    raise ValueError('from s1')
+ValueError: from s1
+
+DROP PROCEDURE py_bind_again;
+DROP PROCEDURE py_many;
+DROP DATABASE s1;
+DROP DATABASE s2;
+DROP TABLE many;
+REVOKE CREATE_CPYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

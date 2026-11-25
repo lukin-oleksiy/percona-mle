@@ -199,6 +199,11 @@ void native_is_dir(const v8::FunctionCallbackInfo<Value> &info) {
   info.GetReturnValue().Set(Worker::current()->package_dir_exists(utf8(info.GetIsolate(), info[0])));
 }
 
+/** N.isFile(path): whether a package file exists, without reading it (MVP review V8-9). */
+void native_is_file(const v8::FunctionCallbackInfo<Value> &info) {
+  info.GetReturnValue().Set(Worker::current()->package_file_exists(utf8(info.GetIsolate(), info[0])));
+}
+
 /** N.compileFunction(text, filename, params): a CommonJS module's function (line numbers as in the file). */
 void native_compile_function(const v8::FunctionCallbackInfo<Value> &info) {
   v8::Isolate *iso = info.GetIsolate();
@@ -271,6 +276,15 @@ SetDefaultZone icu_set_default_zone() {
   return reinterpret_cast<SetDefaultZone>(dlsym(RTLD_DEFAULT, "ucal_setDefaultTimeZone"));
 }
 
+/** ICU's ucal_getDefaultTimeZone(UChar *result, int32_t capacity, UErrorCode *status). */
+using GetDefaultZone = int32_t (*)(char16_t *, int32_t, int *);
+GetDefaultZone icu_get_default_zone() {
+  for (int v = 99; v >= 60; v--)
+    if (void *f = dlsym(RTLD_DEFAULT, ("ucal_getDefaultTimeZone_" + std::to_string(v)).c_str()); f != nullptr)
+      return reinterpret_cast<GetDefaultZone>(f);
+  return reinterpret_cast<GetDefaultZone>(dlsym(RTLD_DEFAULT, "ucal_getDefaultTimeZone"));
+}
+
 /** ICU's id of a zone of OPTIONS, named as the launcher's TZ named it before (Date.toString()
     unchanged): +00:00 is UTC, a whole hour Etc/GMT with IANA's sign (west positive), another
     offset (and -13:00) ICU's custom id GMT+05:30; an IANA name as it is. */
@@ -292,17 +306,32 @@ std::u16string icu_zone_id(std::string_view zone) {
 
 }  // namespace
 
-void Worker::set_local_zone(std::string_view zone) {
-  if (zone == m_local_zone) return;
+bool Worker::set_local_zone(std::string_view zone) {
+  if (zone == m_local_zone) return true;
   static const SetDefaultZone set_default = icu_set_default_zone();
-  if (set_default == nullptr) return;  // V8 without ICU: the process's zone
+  static const GetDefaultZone get_default = icu_get_default_zone();
+  if (set_default == nullptr) return true;  // V8 without ICU: the process's zone
   const std::u16string id = icu_zone_id(zone);
   int status = 0;
   set_default(id.c_str(), &status);
-  if (status > 0) return;  // U_FAILURE: the zone stays as it was
+  if (status > 0) return false;  // U_FAILURE: the zone stays as it was
+  // ICU takes a zone it does not know as GMT ("Etc/Unknown") without an error: its data and the
+  // worker's conversions (the system's) would disagree on local time (MVP review V8-6).
+  if (get_default != nullptr) {
+    char16_t now[64];
+    status = 0;
+    const int32_t n = get_default(now, 64, &status);
+    if (status <= 0 && n >= 0 && std::u16string_view(now, static_cast<size_t>(std::min(n, int32_t{64}))) == u"Etc/Unknown") {
+      const std::u16string before = icu_zone_id(m_local_zone.empty() ? "+00:00" : m_local_zone);
+      status = 0;
+      set_default(before.c_str(), &status);
+      return false;
+    }
+  }
   m_local_zone = zone;
   // V8 drops its cached zone and dates and asks ICU's default again (no redetection of the host's).
   m_isolate->DateTimeConfigurationChangeNotification(v8::Isolate::TimeZoneDetection::kSkip);
+  return true;
 }
 
 Worker::Worker(const Config &config) : m_config(config) {
@@ -353,6 +382,7 @@ Worker::Worker(const Config &config) : m_config(config) {
   fn("nap", native_nap);
   fn("readFile", native_read_file);
   fn("isDir", native_is_dir);
+  fn("isFile", native_is_file);
   fn("compileFunction", native_compile_function);
   (void)natives->Set(ctx, v8_string(m_isolate, "packages"), v8_string(m_isolate, m_config.packages));
   v8::TryCatch tc(m_isolate);
@@ -443,6 +473,11 @@ const char *Worker::host_unavailable() const {
   return nullptr;
 }
 
+void Worker::run_platform_tasks() {
+  while (v8::platform::PumpMessageLoop(m_platform.get(), m_isolate, v8::platform::MessageLoopBehavior::kDoNotWait)) {
+  }
+}
+
 void Worker::discard_microtasks() {
   // V8 empties the queue when a termination stops it; a job that enters JavaScript is stopped at
   // once, so no guest code runs here.
@@ -528,6 +563,10 @@ void Worker::handle(const Message &m) {
   if (!q.statements.empty()) q.statements.clear();
   q.routine.reset();
   m_request = outer;
+  // The platform's foreground tasks (FinalizationRegistry cleanup, the end of an async
+  // WebAssembly compile) run between requests, when no message waits: never on the way of a
+  // request (MVP review V8-12). Guest code they run is outside a request (§10.6).
+  if (top && !Mailbox::pending()) run_platform_tasks();
   if (top && (m_heap_changed || op == w::Op::kReset)) write_stats();
 }
 
@@ -591,9 +630,13 @@ void Worker::options(const Message &m, Reply *reply) {
     reply->fail(w::Status::kGuestError, w::kLanguageTimeZone, "unknown time zone '" + shown + "'");
   } else if (!refused.empty()) {
     reply->fail(w::Status::kGuestError, w::kLanguageOption, refused);
+  } else if (!set_local_zone(zone)) {  // options change only while nothing is prepared (§9.8)
+    std::string shown = zone;
+    cut(shown, 2 * w::kMaxTimeZone);
+    reply->fail(w::Status::kGuestError, w::kLanguageTimeZone,
+                "unknown time zone '" + shown + "' (to the ICU data that JavaScript's Date uses)");
   } else {
     m_options = o;
-    set_local_zone(zone);  // options change only while nothing is prepared (§9.8)
   }
 }
 
@@ -902,8 +945,22 @@ void Worker::call(const Message &m, Request &q, Reply *reply) {
     thrown_message = tc.Message();
     tc.Reset();
   }
-  // What the routine queued (promise jobs) runs within its request, also after it threw.
+  // What the routine queued (promise jobs) runs within its request, also after it threw; an async
+  // routine's promise may wait for the platform's tasks too (WebAssembly.instantiate), run here
+  // while they make progress.
   m_isolate->PerformMicrotaskCheckpoint();
+  if (ok && routine.async && ret->IsPromise()) {
+    using v8::platform::MessageLoopBehavior;
+    while (!tc.HasTerminated() && ret.As<v8::Promise>()->State() == v8::Promise::kPending) {
+      // A task that is due runs now; background work that will post one (an asynchronous
+      // WebAssembly compile) is waited for. Nothing else can settle the promise.
+      if (!v8::platform::PumpMessageLoop(m_platform.get(), m_isolate, MessageLoopBehavior::kDoNotWait)) {
+        if (!m_isolate->HasPendingBackgroundTasks()) break;
+        v8::platform::PumpMessageLoop(m_platform.get(), m_isolate, MessageLoopBehavior::kWaitForWork);
+      }
+      m_isolate->PerformMicrotaskCheckpoint();
+    }
+  }
   if (tc.HasTerminated()) {
     failed(tc, reply);
     return;
@@ -984,6 +1041,11 @@ void Worker::call(const Message &m, Request &q, Reply *reply) {
   } catch (const TooLarge &) {
     reply->fail(w::Status::kGuestError, w::kLanguageType, "the routine's result is larger than MLE allows (64 MiB)");
   }
+  // Promise jobs the conversion queued (a toJSON or getter of guest code) run within this request,
+  // as the routine's own did above, not at the next request's checkpoint (MVP review V8-7). Only
+  // a value that is an object can run guest code while it is converted.
+  if (reply->status == w::Status::kOk && !tc.HasTerminated() && (ret->IsObject() || !outs.IsEmpty()))
+    m_isolate->PerformMicrotaskCheckpoint();
   if (tc.HasTerminated()) failed(tc, reply);
 }
 

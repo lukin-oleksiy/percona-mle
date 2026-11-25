@@ -159,6 +159,14 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
   return c;
 }
 
+/** --message-mb of a native worker: a host message of more than a quarter of
+    the class's memory is not held but failed where it belongs (§5.3); the
+    worker holds it once as bytes and once decoded (MVP review CPY-9). */
+static void bound_messages(ClassConfig &c, const JvmClassOptions &o) {
+  if (o.memory_max == 0) return;
+  c.args.push_back("--message-mb=" + std::to_string(std::max<uint64_t>(o.memory_max / 4 >> 20, 16)));
+}
+
 ClassConfig cpython_worker_class(const Layout &layout, const JvmClassOptions &o) {
   ClassConfig c = jvm_worker_class(layout, o);  // limits, environment, hidden paths
   c.executable = layout.cpython_exe;
@@ -179,6 +187,7 @@ ClassConfig cpython_worker_class(const Layout &layout, const JvmClassOptions &o)
   if (!layout.package_dir.empty() && exists(layout.package_dir + "/cpython/site-packages"))
     site(resolve(layout.package_dir + "/cpython/site-packages"));
   if (o.prewarm.find("numpy") != std::string::npos) c.env.push_back("MLE_PREWARM_NUMPY=1");
+  bound_messages(c, o);
   return c;
 }
 
@@ -205,6 +214,7 @@ ClassConfig v8_worker_class(const Layout &layout, const JvmClassOptions &o, uint
   }
   // The JVM's environment (BLAS threads, malloc tunables) means nothing to V8.
   c.env.clear();
+  bound_messages(c, o);
   return c;
 }
 

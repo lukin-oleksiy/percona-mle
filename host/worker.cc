@@ -243,6 +243,7 @@ Outcome Worker::fail(Outcome outcome, const std::string &why,
   m_process->kill();
   m_usable = false;
   m_failure = why;
+  m_failure_outcome = outcome;
   if (error != nullptr) *error = why;
   return outcome;
 }
@@ -250,6 +251,7 @@ Outcome Worker::fail(Outcome outcome, const std::string &why,
 Outcome Worker::died(std::string *error) {
   if (m_usable) {
     m_usable = false;
+    m_failure_outcome = Outcome::kDied;
     m_failure = "the MLE worker died: " +
                 m_process->exit_info(kExitReportMs).describe();
   }
@@ -976,8 +978,12 @@ Outcome Worker::request(const Request &q, CallHooks &hooks, ResultMsg *result,
         fail(Outcome::kDied, m_retire_why, nullptr);
       return outcome;
     }
-    // A nested request that failed has ended the worker already.
-    if (!m_usable) return died(error);
+    // A nested request that failed has ended the worker already: this
+    // level reports how (a violation stays one).
+    if (!m_usable) {
+      died(error);
+      return m_failure_outcome;
+    }
     if (w != Wait::kMessage) return lost(w, q.op, why, error);
   }
 }

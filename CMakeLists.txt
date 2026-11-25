@@ -31,6 +31,12 @@ ENABLE_TESTING()
 SET(CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
   OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE
   WORLD_READ WORLD_EXECUTE)
+# Which optional packages a build makes depends on the build host (Python's headers, libnode,
+# selinux-policy-devel, /etc/apparmor.d): each says so in a status line. A release build sets this
+# on, so that a worker that cannot be built fails it instead of leaving its package out (MVP
+# review OPS-6).
+OPTION(MLE_REQUIRE_ALL_WORKERS "Fail when the CPython or the V8 worker cannot be built" OFF)
+
 ADD_SUBDIRECTORY(host)
 ADD_SUBDIRECTORY(launcher)
 ADD_SUBDIRECTORY(worker)
@@ -102,6 +108,9 @@ ELSE()
 ENDIF()
 OPTION(MLE_SELINUX "Build the SELinux policy module (selinux-policy-devel)"
   ${MLE_SELINUX_DEFAULT})
+IF(NOT MLE_SELINUX)
+  MESSAGE(STATUS "MLE SELinux policy: off (no ${MLE_SELINUX_MAKEFILE}): no percona-mle-selinux package")
+ENDIF()
 IF(MLE_SELINUX)
   IF(NOT EXISTS ${MLE_SELINUX_MAKEFILE})
     MESSAGE(FATAL_ERROR "MLE_SELINUX needs ${MLE_SELINUX_MAKEFILE} (selinux-policy-devel)")
@@ -132,6 +141,9 @@ ELSE()
   SET(MLE_APPARMOR_DEFAULT OFF)
 ENDIF()
 OPTION(MLE_APPARMOR "Install the AppArmor profile (/etc/apparmor.d)" ${MLE_APPARMOR_DEFAULT})
+IF(NOT MLE_APPARMOR)
+  MESSAGE(STATUS "MLE AppArmor profile: off (no /etc/apparmor.d): no percona-mle-apparmor package")
+ENDIF()
 IF(MLE_APPARMOR)
   INSTALL(FILES packaging/apparmor/percona-mle
     DESTINATION /etc/apparmor.d COMPONENT MleApparmor)

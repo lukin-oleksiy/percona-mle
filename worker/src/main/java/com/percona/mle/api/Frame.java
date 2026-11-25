@@ -257,7 +257,10 @@ public final class Frame {
     return new Frame(n2, num2, t2, columns.length);
   }
 
-  /** Rows grouped by the values of a column (NULL is a group), groups in ascending order. */
+  /**
+   * Rows grouped by the values of a column (NULL is a group), groups in ascending order. Text keys
+   * are compared exactly, not by the column's collation ({@link Grouped}).
+   */
   public Grouped groupBy(String key) {
     return new Grouped(this, index(key));
   }

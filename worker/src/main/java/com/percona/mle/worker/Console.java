@@ -35,6 +35,21 @@ final class Console {
   private final Capture err = new Capture();
   private final PrintStream originalErr = System.err;
 
+  /** The process's stderr, before any capture: for the worker's own threads. */
+  private static final PrintStream PROCESS_ERR = System.err;
+
+  /**
+   * What a thread of the worker's own (mle-control, mle-memory) failed with: to the process's
+   * stderr, never to a routine's console (MVP review JVMP-2).
+   */
+  static void workerFailure(String thread, Throwable t) {
+    try {
+      PROCESS_ERR.println("MLE worker: " + thread + ": " + t);
+    } catch (Throwable ignored) {
+      // nothing more to do
+    }
+  }
+
   void install() {
     System.setOut(new PrintStream(out, true, StandardCharsets.UTF_8));
     System.setErr(new PrintStream(err, true, StandardCharsets.UTF_8));

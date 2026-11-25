@@ -87,18 +87,22 @@ public final class Matches {
 
   /**
    * Reciprocal rank fusion (Cormack et al. 2009): each id scores the sum of 1 / (k + rank) over
-   * the lists it is in (rank from 1), by id; only ranks count, so lists with scores on different
+   * the lists it is in (rank from 1; an id twice in a list counts once there, at its first rank),
+   * by id; only ranks count, so lists with scores on different
    * scales (cosine, full-text relevance, distance) combine. Best first; ties: the better best rank,
    * then the lower id. A small k favours the top ranks, a large one spreads the weight.
    */
   public static Matches fuse(int k, Matches... lists) {
     if (k < 0) throw new IllegalArgumentException("k must not be negative, not " + k);
     java.util.Map<Long, double[]> by = merge(lists);  // id -> {score, best rank}
-    for (Matches m : lists)
+    for (Matches m : lists) {
+      java.util.Set<Long> seen = new java.util.HashSet<>();
       for (int i = 0; i < m.size(); i++) {
+        if (!seen.add(m.id(i))) continue;  // once per list (MVP review API-5)
         double[] e = by.get(m.id(i));
         e[0] += 1.0 / ((double) k + i + 1);  // in double: k + i + 1 overflows int for a huge k
       }
+    }
     return ranked(by);
   }
 
@@ -109,8 +113,8 @@ public final class Matches {
 
   /**
    * Weighted sum of normalized scores, by id: each list's scores are scaled to [0, 1] (min-max;
-   * distances flipped, so 1 is the best of the list; all equal: 1), missing ids count 0. Best first;
-   * ties as in {@link #fuse}. weights: one per list, finite and not negative.
+   * distances flipped, so 1 is the best of the list; all equal: 1), missing ids count 0; an id twice
+   * in a list counts once there, at its first place. Best first; ties as in {@link #fuse}. weights: one per list, finite and not negative.
    */
   public static Matches blend(Matches[] lists, double[] weights) {
     if (lists == null || weights == null) throw new IllegalArgumentException("lists and weights must not be null");
@@ -128,9 +132,10 @@ public final class Matches {
           lo = Math.min(lo, s);
           hi = Math.max(hi, s);
         }
+      java.util.Set<Long> seen = new java.util.HashSet<>();
       for (int i = 0; i < m.size(); i++) {
         float s = m.score[i];
-        if (!Float.isFinite(s)) continue;
+        if (!Float.isFinite(s) || !seen.add(m.id(i))) continue;  // once per list (MVP review API-5)
         double x = hi > lo ? (m.distance ? hi - s : s - lo) / (hi - lo) : 1;
         by.get(m.id(i))[0] += weights[l] * x;
       }

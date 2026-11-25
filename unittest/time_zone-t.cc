@@ -220,6 +220,18 @@ TEST(MleTimeZone, NamedZonesAgreeWithTheZoneData) {
   EXPECT_FALSE(unknown.set("Nowhere/Atlantis"));
 }
 
+TEST(MleTimeZone, NamesInAnyLetterCase) {
+  // MySQL takes a zone name in any letter case; the host sends the zone database's spelling
+  // (§9.8) and converts with it (MVP review JVMP-3). Links keep their own name.
+  EXPECT_EQ(mle_component::options_time_zone("europe/BERLIN"), "Europe/Berlin");
+  EXPECT_EQ(mle_component::options_time_zone("Europe/Berlin"), "Europe/Berlin");
+  EXPECT_EQ(mle_component::options_time_zone("europe/kiev"), "Europe/Kiev");
+  EXPECT_EQ(mle_component::options_time_zone("nowhere/atlantis"), "nowhere/atlantis");
+  TimeZone zone;
+  EXPECT_TRUE(zone.set("EUROPE/vilnius"));
+  vilnius_2024(zone);
+}
+
 /** SYSTEM without an IANA name: the C library's local time, by a POSIX rule
     that is Vilnius's since 1997. */
 class MleSystemZone : public ::testing::Test {
@@ -255,6 +267,29 @@ TEST_F(MleSystemZone, TransitionsFromTheCLibrary) {
   TimeZone instants;
   ASSERT_TRUE(instants.set("SYSTEM"));
   vilnius_local(instants);
+}
+
+TEST_F(MleSystemZone, ZoneDatabasePaths) {
+  // posix/ is the zone itself; right/ and leap/ count leap seconds: no name, the offset instead
+  // (MVP review COMP-6). options_time_zone checks SYSTEM's result like any name.
+  setenv("TZ", "posix/Europe/Berlin", 1);
+  tzset();
+  EXPECT_EQ(mle_component::system_time_zone(), "Europe/Berlin");
+  EXPECT_EQ(mle_component::options_time_zone("SYSTEM"), "Europe/Berlin");
+  setenv("TZ", ":/usr/share/zoneinfo/posix/Europe/Berlin", 1);
+  tzset();
+  EXPECT_EQ(mle_component::system_time_zone(), "Europe/Berlin");
+  for (const char *tz : {"right/Europe/Berlin", ":/usr/share/zoneinfo/right/Europe/Berlin"}) {
+    setenv("TZ", tz, 1);
+    tzset();
+    const std::string system = mle_component::system_time_zone();
+    EXPECT_TRUE(system == "+01:00" || system == "+02:00") << tz << ": " << system;
+    EXPECT_EQ(mle_component::options_time_zone("SYSTEM"), system) << tz;
+  }
+  EXPECT_EQ(mle_component::options_time_zone("right/Europe/Berlin"), "");
+  setenv("TZ", (std::string(70, 'A') + "/B").c_str(), 1);  // a name longer than the wire allows
+  tzset();
+  EXPECT_EQ(mle_component::options_time_zone("SYSTEM"), "");
 }
 
 }  // namespace mle_time_zone_unittest

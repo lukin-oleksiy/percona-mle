@@ -95,6 +95,7 @@ final class MemoryWatch implements Runnable {
     this.mailbox = mailbox;
     this.thread = new Thread(this, "mle-memory");
     thread.setDaemon(true);
+    thread.setUncaughtExceptionHandler((t, e) -> Console.workerFailure(t.getName(), e));
   }
 
   /**
@@ -171,9 +172,15 @@ final class MemoryWatch implements Runnable {
       } catch (InterruptedException e) {
         Thread.interrupted();  // nothing interrupts this thread on purpose; go on
       }
-      if ((state & 1) != 0) {
-        if (limit > 0) check();
-        statistics(phase);
+      // A failure here (an OutOfMemoryError of a nudge while a routine fills the heap) must not
+      // end the watcher: it is logged, and the next period tries again (MVP review JVMP-2).
+      try {
+        if ((state & 1) != 0) {
+          if (limit > 0) check();
+          statistics(phase);
+        }
+      } catch (Throwable t) {
+        Console.workerFailure("mle-memory", t);
       }
     }
   }

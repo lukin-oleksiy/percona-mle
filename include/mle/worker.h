@@ -327,6 +327,14 @@ class Worker {
   bool usable() const { return m_usable; }
   /** Why the worker is no longer usable. */
   const std::string &failure() const { return m_failure; }
+  /** True only the first time it is asked once the worker is no longer
+      usable: a loss that every level of a nested request sees is counted
+      and logged once. */
+  bool first_report_of_failure() {
+    if (m_usable || m_failure_reported) return false;
+    m_failure_reported = true;
+    return true;
+  }
 
   WorkerStats stats() const;
   WorkerProcess &process() { return *m_process; }
@@ -462,6 +470,10 @@ class Worker {
   bool m_ready = false;
   bool m_usable = true;
   std::string m_failure;
+  /** How the worker ended (fail()'s outcome, or kDied): what the outer
+      levels of a nested request that ended it report too. */
+  Outcome m_failure_outcome = Outcome::kDied;
+  bool m_failure_reported = false;
   std::vector<std::string> m_languages;
   uint32_t m_minor = 0;
   bool m_options_in_force = false;

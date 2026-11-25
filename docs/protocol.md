@@ -1094,7 +1094,9 @@ str time_zone, list of (str name, str value) settings (≤ 256)
 
 What a worker needs to know of the session.
 
-* `time_zone`: a time zone, 1 to 64 bytes: an IANA name or an offset
+* `time_zone`: a time zone, 1 to 64 bytes: an IANA name, spelled as the
+  zone database spells it (the host maps a name the server takes in any
+  letter case to that spelling), or an offset
   `+hh:mm` / `-hh:mm` from −13:59 to +14:00. A worker uses it wherever a
   language shows local time.
 * `settings`: names and values. The protocol defines none; the names in

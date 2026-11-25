@@ -70,6 +70,8 @@ final class GuestVectors {
     if (shape != null) {
       if (shape.length != 2)
         throw new IllegalArgumentException(what + " must be an array of 2 dimensions, not " + shape.length);
+      float[][] rows = numpyRows(v, shape[0], shape[1]);
+      if (rows != null) return rows;
       float[] all = numpyFloats(v, elements(shape[0], shape[1], what));
       float[][] m = new float[shape[0]][];
       for (int i = 0; i < m.length; i++) m[i] = java.util.Arrays.copyOfRange(all, i * shape[1], (i + 1) * shape[1]);
@@ -209,6 +211,31 @@ final class GuestVectors {
       shape[i] = x.asInt();
     }
     return shape;
+  }
+
+  /**
+   * A 2-D numpy array's rows as float32, read from its buffer about 1 MiB at a time straight into
+   * the rows: no flat copy of the whole array, and no 2 GiB limit (MVP review API-3). Null without
+   * a buffer of the expected size.
+   */
+  private static float[][] numpyRows(Value v, int rows, int cols) {
+    if (rows < 0 || cols < 0) return null;
+    Value a = v.getMember("dtype").getMember("str").asString().equals("<f4") ? v : v.invokeMember("astype", "<f4");
+    Value bytes = a.invokeMember("tobytes");
+    long rowBytes = 4L * cols;
+    if (!bytes.hasBufferElements() || bytes.getBufferSize() != rowBytes * rows) return null;
+    float[][] m = new float[rows][cols];
+    if (rowBytes == 0) return m;
+    int per = (int) Math.max(1, Math.min(rows, (1L << 20) / rowBytes));
+    byte[] chunk = new byte[(int) (per * rowBytes)];
+    for (int r = 0; r < rows; r += per) {
+      int nr = Math.min(per, rows - r);
+      int len = (int) (nr * rowBytes);
+      bytes.readBuffer(r * rowBytes, chunk, 0, len);
+      java.nio.FloatBuffer fb = ByteBuffer.wrap(chunk, 0, len).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer();
+      for (int i = 0; i < nr; i++) fb.get(m[r + i]);
+    }
+    return m;
   }
 
   /** A numpy array's n elements as float32, in C order. */

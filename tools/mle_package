@@ -43,6 +43,7 @@ version is in <mle dir>/cpython/python-version (--cpython to give another).
 import argparse
 import csv
 import datetime
+import fcntl
 import glob
 import json
 import os
@@ -185,30 +186,37 @@ def install_python(d, specs, args, language="python"):
     # a replaced version, and the files the new version no longer has. So pip
     # installs into an empty directory beside it; then what it installed
     # replaces the versions site-packages has.
-    with tempfile.TemporaryDirectory(prefix=".stage.", dir=os.path.dirname(site)) as stage:
+    # The worker's own site-packages (numpy) is on its path too (GraalPy's venv, the CPython
+    # worker's site-packages): pip must resolve against those versions, and need not install them
+    # again (pip --target does not see them by itself); a copy in the package directory would
+    # shadow them (MVP review OPS-2).
+    if language == "python":
+        bundled = {}
+        for venv_site in glob.glob(os.path.join(HERE, "python-venv", "venv", "lib", "python*", "site-packages")):
+            bundled.update(python_dists(venv_site))
+    else:
+        bundled = python_dists(os.path.join(HERE, "cpython", "site-packages"))
+    with tempfile.TemporaryDirectory(prefix=".stage.", dir=os.path.dirname(site)) as stage, \
+            tempfile.TemporaryDirectory(prefix="mle-pip.") as work:
+        constraints = os.path.join(work, "bundled.txt")
+        with open(constraints, "w") as f:
+            f.writelines("%s==%s\n" % (name, dists[0][1]) for name, dists in bundled.items())
         if language == "python":
             run([graalpy(args), "-m", "pip", "install", "--disable-pip-version-check",
-                 *binary, "--target", stage,
+                 *binary, "--target", stage, "--constraint", constraints,
                  "--extra-index-url", GRAALPY_WHEELS,
                  *specs])
         else:
-            # The worker's own site-packages (numpy) comes first on its path:
-            # pip must resolve against those versions, and need not install
-            # them again (pip --target does not see them by itself).
-            bundled = python_dists(os.path.join(HERE, "cpython", "site-packages"))
             # The distribution's pip refuses to install for its Python (PEP 668):
             # a throw-away venv's pip, into the stage directory.
-            with tempfile.TemporaryDirectory(prefix="mle-pip.") as venv:
-                constraints = os.path.join(venv, "bundled.txt")
-                with open(constraints, "w") as f:
-                    f.writelines("%s==%s\n" % (name, dists[0][1]) for name, dists in bundled.items())
-                run([cpython(args), "-m", "venv", venv])
-                run([os.path.join(venv, "bin", "pip"), "install", "--disable-pip-version-check",
-                     *binary, "--target", stage, "--constraint", constraints, *specs])
-            shutil.rmtree(os.path.join(stage, "bin"), ignore_errors=True)  # scripts name the venv
-            for name, dists in python_dists(stage).items():
-                if name in bundled:
-                    remove_python(stage, name, [info for info, _ in dists])
+            venv = os.path.join(work, "venv")
+            run([cpython(args), "-m", "venv", venv])
+            run([os.path.join(venv, "bin", "pip"), "install", "--disable-pip-version-check",
+                 *binary, "--target", stage, "--constraint", constraints, *specs])
+        shutil.rmtree(os.path.join(stage, "bin"), ignore_errors=True)  # scripts name pip's interpreter
+        for name, dists in python_dists(stage).items():
+            if name in bundled:
+                remove_python(stage, name, [info for info, _ in dists])
         have = python_dists(site)
         for name in python_dists(stage):
             if name in have:
@@ -462,6 +470,14 @@ def main():
     elif not os.path.isdir(d):
         sys.exit("mle_package: no package directory " + d)
     require_safe(d, "nothing was changed")
+    # One install or remove at a time: each rewrites the records and the java/ tree from what it
+    # read (MVP review OPS-11). The lock is held until the process ends.
+    lock = os.open(os.path.join(d, ".mle_package.lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("mle_package: another mle_package runs on %s; waiting for it" % d, file=sys.stderr)
+        fcntl.flock(lock, fcntl.LOCK_EX)
     try:
         if args.cmd == "install":
             {"js": lambda: install_js(d, args.names, args),

@@ -28,6 +28,10 @@ values map to each language is in its Appendix B.
 * **Python parameter names** are ASCII identifiers (Python would accept
   more, but normalises them, so a name could change). JavaScript
   parameter names may be any JavaScript identifier.
+* **Python, KILL in the CPython worker.** An interrupt wakes guest code that sleeps or waits
+  (`time.sleep`, locks, `Event.wait`) through the worker's own SIGUSR1 handler. Guest code that
+  replaces that handler, or a long call into native code that does not return to Python, is
+  ended only when the grace period (`mle.interrupt_grace_ms`) ends the worker.
 * **Python, zero dates.** A zero or partial date and the zero TIMESTAMP
   are `None` in Python (B.4), which guest code cannot tell from NULL.
 
@@ -63,4 +67,11 @@ values map to each language is in its Appendix B.
   created while the component was not installed were not checked.
 * **`mle_package`** installs into the live package directory: a worker
   that imports a package while it is being installed can see it half
-  written.
+  written. (Two `mle_package` runs wait for each other.)
+* **AppArmor.** Workers run in the launcher's profile, which may write
+  cgroup files: within it, only Landlock keeps a worker from its own
+  cgroup's limits (the SELinux policy gives workers read access only).
+* **Settings while sessions end.** `SET GLOBAL mle.<setting> = DEFAULT`
+  of a setting that shapes workers does not wait for sessions that are
+  ending: right after a disconnect it can leave the value with a warning
+  (a value that is set, not DEFAULT, waits up to a second).

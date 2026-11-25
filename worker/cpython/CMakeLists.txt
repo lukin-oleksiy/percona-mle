@@ -28,6 +28,12 @@ ENDIF()
 OPTION(MLE_CPYTHON "Build the CPython worker (Python 3.12 or later with its headers)"
   ${MLE_CPYTHON_DEFAULT})
 IF(NOT MLE_CPYTHON)
+  IF(MLE_REQUIRE_ALL_WORKERS)
+    MESSAGE(FATAL_ERROR "MLE_REQUIRE_ALL_WORKERS: the CPython worker needs Python 3.12 or later "
+      "with its development files (python3-dev, python3-devel)")
+  ENDIF()
+  MESSAGE(STATUS "MLE CPython worker: off (no Python 3.12 or later with its development files): "
+    "no percona-mle-cpython package")
   RETURN()
 ENDIF()
 IF(NOT Python3_FOUND)

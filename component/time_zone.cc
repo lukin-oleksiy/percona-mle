@@ -21,6 +21,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -62,12 +64,21 @@ std::string offset_name(int32_t seconds) {
   return b;
 }
 
+/** An IANA name of the zone database's path: posix/ is the same zone; the
+    zones of right/ and leap/ count leap seconds and have no IANA name the
+    protocol can carry (""). */
+std::string iana_name(std::string zone) {
+  if (zone.rfind("posix/", 0) == 0) zone.erase(0, 6);
+  if (zone.rfind("right/", 0) == 0 || zone.rfind("leap/", 0) == 0) return "";
+  return zone;
+}
+
 /** The zone name of a tzfile path ("/usr/share/zoneinfo/Europe/Berlin", or a
     link to one such as /etc/localtime), or "". */
 std::string zone_of_file(const std::string &file) {
   const auto zone_in = [](const std::string &path) {
     const size_t at = path.find("zoneinfo/");
-    return at == std::string::npos ? std::string() : path.substr(at + 9);
+    return at == std::string::npos ? std::string() : iana_name(path.substr(at + 9));
   };
   // The name as configured first (TZ=:/usr/share/zoneinfo/US/Eastern),
   // then the link's target (/etc/localtime), then the file itself (a
@@ -82,6 +93,33 @@ std::string zone_of_file(const std::string &file) {
   if (char real[PATH_MAX]; realpath(file.c_str(), real) != nullptr)
     return zone_in(real);
   return "";
+}
+
+/** The zone database's spelling of a zone or link name (§9.8): the server
+    takes a name in any letter case (europe/berlin), the workers' databases
+    do not (MVP review JVMP-3). A name the database lacks stays as it is. */
+std::string database_spelling(std::string_view zone) {
+  try {
+    const std::chrono::tzdb &db = std::chrono::get_tzdb();
+    (void)db.locate_zone(zone);
+    return std::string(zone);
+  } catch (const std::exception &) {
+  }
+  const auto same = [zone](std::string_view name) {
+    return name.size() == zone.size() &&
+           std::equal(name.begin(), name.end(), zone.begin(), [](char a, char b) {
+             return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+           });
+  };
+  try {
+    const std::chrono::tzdb &db = std::chrono::get_tzdb();
+    for (const auto &z : db.zones)
+      if (same(z.name())) return std::string(z.name());
+    for (const auto &l : db.links)
+      if (same(l.name())) return std::string(l.name());
+  } catch (const std::exception &) {
+  }
+  return std::string(zone);
 }
 
 std::atomic<uint64_t> g_zone_ids{0};
@@ -128,8 +166,9 @@ std::string system_time_zone() {
       // Area/City; a POSIX rule has a ',' before any '/'
       // (EET-2EEST,M3.5.0/3,M10.5.0/4).
       if (zone.find('/') != std::string::npos &&
-          zone.find(',') == std::string::npos)
-        return zone;
+          zone.find(',') == std::string::npos) {
+        if (std::string name = iana_name(zone); !name.empty()) return name;
+      }
       file.clear();  // a POSIX rule such as CET-1CEST: the offset below
     } else {
       file = zone;  // TZ=:/etc/localtime (systemd units, containers)
@@ -148,15 +187,17 @@ std::string system_time_zone() {
   return b;
 }
 
-std::string options_time_zone(std::string_view zone) {
-  if (zone == "SYSTEM") return system_time_zone();
+std::string options_time_zone(std::string_view name) {
+  // SYSTEM is checked as a name too (a TZ setting can be anything).
+  const std::string system = name == "SYSTEM" ? system_time_zone() : std::string();
+  const std::string_view zone = name == "SYSTEM" ? std::string_view(system) : name;
   if (int32_t offset = 0; parse_offset(zone, &offset)) return offset_name(offset);
   // Zones that count leap seconds have no instants the protocol can carry.
   if (zone.empty() || zone.size() > mle::wire::kMaxTimeZone ||
       zone.rfind("leap/", 0) == 0 || zone.rfind("right/", 0) == 0 ||
       !mle::is_valid_utf8(zone))
     return "";
-  return std::string(zone);
+  return database_spelling(zone);
 }
 
 bool TimeZone::set(std::string_view name) {
@@ -186,7 +227,7 @@ bool TimeZone::set(std::string_view name) {
     name = system;
   }
   try {
-    m_zone = std::chrono::locate_zone(name);
+    m_zone = std::chrono::locate_zone(database_spelling(name));  // a name in any letter case
   } catch (const std::runtime_error &) {
     // No such zone, or no zone data on this host: for SYSTEM the C library
     // still converts.

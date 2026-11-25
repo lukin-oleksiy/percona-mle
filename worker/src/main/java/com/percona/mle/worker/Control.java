@@ -81,6 +81,7 @@ final class Control implements Runnable {
   void start() {
     Thread t = new Thread(this, "mle-control");
     t.setDaemon(true);
+    t.setUncaughtExceptionHandler((th, e) -> Console.workerFailure(th.getName(), e));
     t.start();
   }
 
@@ -91,8 +92,15 @@ final class Control implements Runnable {
     while (true) {
       long n = Native.read(Wire.CONTROL_FD, buf);
       if (n <= 0) Runtime.getRuntime().halt(0);  // the host closed its end or died
-      if (n == Wire.CTL_INTERRUPT_SIZE && buf.get(ValueLayout.JAVA_BYTE, 0) == Wire.CTL_INTERRUPT)
-        interrupt(buf.get(ValueLayout.JAVA_LONG_UNALIGNED, 1));
+      if (n == Wire.CTL_INTERRUPT_SIZE && buf.get(ValueLayout.JAVA_BYTE, 0) == Wire.CTL_INTERRUPT) {
+        try {
+          interrupt(buf.get(ValueLayout.JAVA_LONG_UNALIGNED, 1));
+        } catch (Throwable t) {
+          // No thread left to start (a routine used up pids_max), no memory: the host's grace
+          // period still ends the request; this thread goes on (MVP review JVMP-2).
+          Console.workerFailure("mle-control", t);
+        }
+      }
     }
   }
 
@@ -120,7 +128,16 @@ final class Control implements Runnable {
     if ((s & DELIVERED) != 0) return true;
     synchronized (this) {
       // Under the lock, so that the request's end finds the interrupter it has to wait for.
-      if (state.compareAndSet(s, s | DELIVERED)) stop(seq, guest);
+      if (state.compareAndSet(s, s | DELIVERED)) {
+        try {
+          stop(seq, guest);
+        } catch (Throwable t) {
+          // No interrupter started: not delivered, so that the host's next INTERRUPT tries again
+          // (MVP review JVMP-2).
+          state.compareAndSet(s | DELIVERED, s);
+          throw t;
+        }
+      }
       return true;
     }
   }
@@ -144,15 +161,24 @@ final class Control implements Runnable {
         if (interruptMain(seq)) interruptContext(ctx, 4500);
       } else {
         if (!interruptMain(seq)) return;
-        if (stillRunning(seq, 500)) {
-          if (ctx == null) ctx = polyglot.contextIfCreated();  // made by the Java code meanwhile
-          if (ctx != null) interruptContext(ctx, 4500);
+        // A routine that catches the InterruptedException and goes on is interrupted again while
+        // its flag is clear (§11.1: raised again until the code stops; MVP review JVMP-4); after
+        // 500 ms its JavaScript or Python (Mle.context()) is interrupted too.
+        long contextAt = System.currentTimeMillis() + 500;
+        boolean contextTried = false;
+        while (stillRunning(seq, 50)) {
+          if (!main.isInterrupted()) interruptMain(seq);
+          if (!contextTried && System.currentTimeMillis() >= contextAt) {
+            contextTried = true;
+            if (ctx == null) ctx = polyglot.contextIfCreated();  // made by the Java code meanwhile
+            if (ctx != null) interruptContext(ctx, 4500);
+          }
         }
       }
     }, "mle-interrupt");
     t.setDaemon(true);
-    interrupter = t;
     t.start();
+    interrupter = t;
   }
 
   /** The interrupt of request seq is acted on now, if that request still runs. */

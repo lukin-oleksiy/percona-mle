@@ -178,7 +178,7 @@ final class PySql implements GuestSql.Lang {
               # partly initialised module instead of recursing.
               cache[key] = (h, m)
               try:
-                  exec(_mle_compile(_mle_ast.parse(src, key), key), m.__dict__)
+                  exec(_mle_compile(_mle_ast.parse(src, key), key, key), m.__dict__)
               except BaseException:
                   del cache[key]
                   raise

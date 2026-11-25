@@ -1,0 +1,61 @@
+--echo #
+--echo # component_mle: fixes of the V8 worker from step 3 of the MVP code review
+--echo # (exp note 65).
+--echo #
+--source ../include/have_mle_component.inc
+--source ../include/have_mle_v8.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+CREATE TABLE jobs (n INT, request TEXT);
+
+--echo #
+--echo # V8-3: the session object keeps the Proxy invariants: its keys can be
+--echo # listed, and it cannot be made non-extensible.
+--echo #
+CREATE FUNCTION js_session_keys() RETURNS TEXT LANGUAGE JS AS $$
+  const out = [Object.keys(session).includes('runSql'), typeof Object.getOwnPropertyDescriptor(session, 'sql').value]
+  try { Object.preventExtensions(session); out.push('prevented') } catch (e) { out.push(e.constructor.name) }
+  out.push(Object.keys(session).length > 10)
+  return out.join(' ')
+$$;
+SELECT js_session_keys();
+
+--echo #
+--echo # V8-7: a promise job queued while the result is converted (a toJSON) runs
+--echo # within its request, not at the next request's checkpoint.
+--echo #
+CREATE PROCEDURE js_queues(OUT r JSON) LANGUAGE JS AS $$
+  r = { toJSON() { Promise.resolve().then(() => session.runSql("INSERT INTO jobs VALUES (1, 'js_queues')")); return {} } }
+$$;
+CREATE FUNCTION js_other() RETURNS INT LANGUAGE JS AS $$ return 2 $$;
+CALL js_queues(@r);
+SELECT * FROM jobs;
+SELECT js_other();
+SELECT * FROM jobs;
+
+--echo #
+--echo # V8-12: an async routine that waits for an asynchronous WebAssembly compile
+--echo # settles: the platform's tasks run while it waits.
+--echo #
+CREATE FUNCTION js_wasm() RETURNS INT LANGUAGE JS AS $$
+  // (module (func (export "answer") (result i32) i32.const 42))
+  const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 127, 3, 2, 1, 0, 7, 10, 1, 6,
+    97, 110, 115, 119, 101, 114, 0, 0, 10, 6, 1, 4, 0, 65, 42, 11])
+  const { instance } = await WebAssembly.instantiate(bytes)
+  return instance.exports.answer()
+$$;
+SELECT js_wasm();
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION js_session_keys;
+DROP PROCEDURE js_queues;
+DROP FUNCTION js_other;
+DROP FUNCTION js_wasm;
+DROP TABLE jobs;
+REVOKE CREATE_JS_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

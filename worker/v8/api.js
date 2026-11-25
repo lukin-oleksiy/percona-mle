@@ -57,14 +57,21 @@
     return '/' + out.join('/');
   };
   const dirname = (path) => path.slice(0, path.lastIndexOf('/')) || '/';
+  // Packages do not change during the worker's life (mle_package refresh starts new workers):
+  // package.json files, resolutions and module kinds are kept, and existence is a stat, not a
+  // read of the whole file (MVP review V8-9).
+  const jsonCache = new Map();
   const readJson = (path) => {
+    if (jsonCache.has(path)) return jsonCache.get(path);
     const t = N.readFile(path);
-    if (t === null) return null;
-    try { return JSON.parse(t); } catch (e) { return null; }
+    let v = null;
+    if (t !== null) try { v = JSON.parse(t); } catch (e) { v = null; }
+    jsonCache.set(path, v);
+    return v;
   };
   const asFile = (path) => {
     for (const p of [path, path + '.js', path + '.json', path + '.cjs', path + '.mjs'])
-      if (N.readFile(p) !== null) return p;
+      if (N.isFile(p)) return p;
     return null;
   };
   // A package.json's entry for require ('require') or import ('import').
@@ -99,8 +106,17 @@
     e.code = 'MODULE_NOT_FOUND';
     return e;
   };
-  // An absolute path below ROOT, or throws.
+  // An absolute path below ROOT, or throws; kept by (spec, from, condition).
+  const resolved = new Map();
   const resolveFile = (spec, from, condition) => {
+    const key = condition + '\0' + (from || '') + '\0' + spec;
+    const hit = resolved.get(key);
+    if (hit !== undefined) return hit;
+    const path = resolveUncached(spec, from, condition);
+    resolved.set(key, path);
+    return path;
+  };
+  const resolveUncached = (spec, from, condition) => {
     if (!ROOT) throw notFound(spec);
     const fromDir = from ? dirname(from) : ROOT;
     if (spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/')) {
@@ -122,7 +138,13 @@
     }
     throw notFound(spec);
   };
+  const kinds = new Map();
   const kindOf = (path) => {
+    let k = kinds.get(path);
+    if (k === undefined) kinds.set(path, k = kindUncached(path));
+    return k;
+  };
+  const kindUncached = (path) => {
     if (path.endsWith('.json')) return 'json';
     if (path.endsWith('.mjs')) return 'esm';
     if (path.endsWith('.cjs')) return 'cjs';

@@ -392,4 +392,11 @@ bool Worker::package_dir_exists(const std::string &path) {
   return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+bool Worker::package_file_exists(const std::string &path) {
+  if (m_config.packages.empty() || !path.starts_with(m_config.packages) || path.find("/../") != std::string::npos)
+    return false;
+  struct stat st;
+  return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
 }  // namespace mle::v8w

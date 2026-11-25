@@ -23,6 +23,7 @@ import io
 import os
 import platform
 import re
+import signal
 import struct
 import sys
 import textwrap
@@ -66,15 +67,26 @@ class Routine(Source):
 
 class _Output(io.StringIO):
     """sys.stdout/stderr of routines: a write tells the C++ call loop that output waits for a
-    RESULT, which Python then writes."""
+    RESULT, which Python then writes. A RESULT carries the last Console.LIMIT bytes at most, so
+    more than twice that in characters is cut to its end while it is written (as the V8 worker
+    does): a request that prints without end does not hold all of it (MVP review CPY-8)."""
 
     def write(self, s):
         _mlewire.printed()
-        return io.StringIO.write(self, s)
+        n = io.StringIO.write(self, s)
+        if self.tell() > 2 * Console.LIMIT:
+            self._keep_end()
+        return n
 
     def writelines(self, lines):
-        _mlewire.printed()
-        return io.StringIO.writelines(self, lines)
+        for line in lines:
+            self.write(line)
+
+    def _keep_end(self):
+        v = self.getvalue()[-Console.LIMIT:]
+        self.seek(0)
+        self.truncate()
+        io.StringIO.write(self, v)
 
 
 class Console:
@@ -348,7 +360,9 @@ class Dispatcher:
         self.sql.reset()
         Console.take(self.console.out)
         Console.take(self.console.err)
+        _restore_process_state()
         gc.collect()
+        _mlewire.trim()  # malloc'ed memory back to the system (§9.7; MVP review CPY-11)
         # Guest threads left running: the worker cannot be reused safely.
         if threading.active_count() > 1:
             _mlewire.taint()
@@ -699,6 +713,52 @@ def _language(language):
         _mlewire.protocol_failure('a request for a language the worker did not announce')
 
 
+# --------------------------------------------------------------- signals (D11, CPY-10)
+
+def _on_interrupt(signum, frame):
+    """SIGUSR1, the worker's own: an interrupt (§11.1) wakes a blocking call of guest code
+    (time.sleep, a lock, a wait) with it, and it raises KeyboardInterrupt only while guest code of
+    the interrupted request runs; elsewhere it returns, and the call goes on (MVP review D11)."""
+    if _mlewire.interrupt_due():
+        raise KeyboardInterrupt
+
+
+def _interrupt_handler_installed():
+    return signal.getsignal(signal.SIGUSR1) is _on_interrupt
+
+
+# The process's signal handlers and interval timers as the worker set them up (start()): RESET
+# puts back any that guest code changed, and drops trace and profile hooks (MVP review CPY-10).
+_handlers = {}
+_ITIMERS = (signal.ITIMER_REAL, signal.ITIMER_VIRTUAL, signal.ITIMER_PROF)
+
+
+def _install_signals():
+    signal.signal(signal.SIGUSR1, _on_interrupt)
+    _mlewire.interrupt_signal(_interrupt_handler_installed)
+    _handlers.clear()
+    for s in signal.valid_signals():
+        try:
+            _handlers[s] = signal.getsignal(s)
+        except (OSError, ValueError):
+            pass
+
+
+def _restore_process_state():
+    for t in _ITIMERS:
+        signal.setitimer(t, 0)
+    for s, h in _handlers.items():
+        try:
+            if signal.getsignal(s) is not h and h is not None:
+                signal.signal(s, h)
+        except (OSError, ValueError, TypeError):
+            pass
+    sys.settrace(None)
+    sys.setprofile(None)
+    threading.settrace(None)
+    threading.setprofile(None)
+
+
 def _no_js(name):
     raise ImportError('import_js(%r): this worker runs Python only' % (name,))
 
@@ -714,6 +774,7 @@ def start():
     _mlewire.setup(decimal.Decimal, json.loads, wire.temporal, wire.new_vector, wire.demote, sql._row_temporal,
                    float, wire.timestamp)
     d = Dispatcher(_mlewire.arena_size())
+    _install_signals()
     sys.stdout = d.console.out
     sys.stderr = d.console.err
     _ban_threads()

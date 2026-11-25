@@ -1,0 +1,107 @@
+--echo #
+--echo # component_mle: fixes of the JVM worker from step 3 of the MVP code review
+--echo # (exp note 65): Java, the vector helper, JavaScript libraries.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+CREATE FUNCTION j_pid() RETURNS INT LANGUAGE JAVA AS $$ return 0; $$;
+SELECT j_pid();
+let $pid1 = `SELECT mle_debug_worker_pid()`;
+
+--echo #
+--echo # JVMP-1: a result too large for a message is refused before it is
+--echo # encoded (150 M characters took the heap, and the worker, before): the
+--echo # routine's MLE-Type error; the worker goes on.
+--echo #
+CREATE FUNCTION j_huge() RETURNS LONGTEXT LANGUAGE JAVA AS $$ return "\u00e9".repeat(150_000_000); $$;
+--error ER_LANGUAGE_COMPONENT
+SELECT j_huge();
+SELECT j_pid();
+let $pid2 = `SELECT mle_debug_worker_pid()`;
+--let $assert_text = The worker is not retired for it
+--let $assert_cond = $pid1 = $pid2
+--source include/assert.inc
+
+--echo #
+--echo # JVMP-4: a Java routine that catches its InterruptedException and waits
+--echo # again is interrupted again: the time limit stops it, not the end of the
+--echo # worker.
+--echo #
+CREATE FUNCTION j_sleepy() RETURNS INT LANGUAGE JAVA AS $$
+try { Thread.sleep(60000); } catch (InterruptedException e) { }
+try { Thread.sleep(60000); } catch (InterruptedException e) { }
+try { Thread.sleep(60000); } catch (InterruptedException e) { throw new RuntimeException("interrupted again"); }
+return 1;
+$$;
+--error ER_QUERY_TIMEOUT
+SELECT /*+ MAX_EXECUTION_TIME(300) */ j_sleepy();
+SELECT j_pid();
+let $pid3 = `SELECT mle_debug_worker_pid()`;
+--let $assert_text = The worker that ran it still serves
+--let $assert_cond = $pid1 = $pid3
+--source include/assert.inc
+
+--echo #
+--echo # API-5: an id twice in one list counts once in rank fusion. API-2: a
+--echo # large k orders as a sort does; a batch beyond the bound is refused.
+--echo #
+CREATE FUNCTION j_vectors() RETURNS TEXT LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+Matches a = Matches.of(new long[] {1, 1, 2}, new float[] {0.9f, 0.8f, 0.7f});
+Matches c = Matches.of(new long[] {2}, new float[] {0.9f});
+Matches f = Matches.fuse(a, c);
+b.append("fuse:");
+for (int i = 0; i < f.size(); i++) b.append(' ').append(f.id(i));
+Random r = new Random(3);
+float[][] rows = new float[2000][4];
+for (float[] v : rows) for (int i = 0; i < 4; i++) v[i] = (float) r.nextGaussian();
+float[] q = rows[0];
+Matches m = Vectors.nearest(q, rows, 500, "dot");
+Integer[] order = new Integer[rows.length];
+float[] dots = new float[rows.length];
+for (int j = 0; j < rows.length; j++) {
+  order[j] = j;
+  for (int i = 0; i < 4; i++) dots[j] += q[i] * rows[j][i];
+}
+java.util.Arrays.sort(order, (x, y) -> dots[x] != dots[y] ? Float.compare(dots[y], dots[x]) : Integer.compare(x, y));
+int same = 0;
+for (int i = 0; i < m.size(); i++) if (m.id(i) == order[i]) same++;
+b.append(", k 500: ").append(m.size()).append(' ').append(same == m.size() ? "as sorted" : same + " as sorted");
+try {
+  Vectors.related(new float[6000][2], 6000, "dot");
+  b.append(", related: done");
+} catch (IllegalArgumentException e) {
+  b.append(", related: ").append(e.getMessage());
+}
+return b.toString();
+$$;
+SELECT j_vectors();
+
+--echo #
+--echo # JVML-8: an import of /schema/name finds the library when a directory of
+--echo # the schema's name exists (/tmp) but no such module file.
+--echo #
+CREATE DATABASE tmp;
+CREATE LIBRARY tmp.util LANGUAGE JAVASCRIPT AS $$ export const where = 'the library tmp.util' $$;
+CREATE FUNCTION js_import_tmp() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  const m = await import('/tmp/util')
+  return m.where
+$$;
+SELECT js_import_tmp();
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION j_pid;
+DROP FUNCTION j_huge;
+DROP FUNCTION j_sleepy;
+DROP FUNCTION j_vectors;
+DROP FUNCTION js_import_tmp;
+DROP DATABASE tmp;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

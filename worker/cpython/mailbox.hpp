@@ -28,6 +28,8 @@
 
 #include <cstdint>
 
+typedef struct _object PyObject;
+
 #include "common/mailbox.hpp"
 
 namespace mle::cpython {
@@ -54,6 +56,18 @@ void guest_resume();
 /** Guest code stops (it returned, or it waits for the host): a KeyboardInterrupt that was set and
     not raised yet is dropped, and none is set until guest_enter(). With the GIL. */
 void guest_leave();
+
+/** Whether guest code of the request being served may run now. With the GIL. */
+bool guest_running();
+
+/** Whether a KeyboardInterrupt is due now: guest code of the request being served runs and that
+    request's interrupt was delivered. For the worker's SIGUSR1 handler (D11). With the GIL. */
+bool interrupt_due();
+/** The worker's SIGUSR1 handler (a Python function that raises KeyboardInterrupt when
+    interrupt_due()), and a callable that tells whether it is still installed: while it is, an
+    interrupt also signals the serving thread, which wakes it from a blocking call (time.sleep, a
+    lock, a wait) with EINTR. With the GIL. */
+void interrupt_signal(PyObject *installed);
 
 }  // namespace mle::cpython
 

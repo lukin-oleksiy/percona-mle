@@ -1,0 +1,53 @@
+--echo #
+--echo # component_mle: the SQL API fixes of step 3 of the MVP code review (exp
+--echo # note 65), JavaScript. Also run on the V8 worker (v8_js_step3_mvp.test).
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+CREATE TABLE many (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;
+
+--echo #
+--echo # JVML-2: a value that does not bind leaves the prepared statement usable.
+--echo #
+CREATE PROCEDURE js_bind_again(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const p = session.prepare('SELECT ? + 1')
+  const out = []
+  try { p.bind(NaN).execute(); out.push('executed') } catch (e) { out.push(e.constructor.name) }
+  out.push(String(p.bind(1).execute().fetchOne()[0]))
+  r = out.join(' ')
+$$;
+CALL js_bind_again(@r);
+SELECT @r;
+
+--echo #
+--echo # JVML-3: without a strict sql_mode a multi-row INSERT writes implicit
+--echo # defaults where a row alone fails: executeMany then runs row by row.
+--echo #
+SET sql_mode = '';
+CREATE PROCEDURE js_many(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const rows = []
+  for (let i = 1; i <= 300; i++) rows.push([i, i === 150 ? null : i])
+  try {
+    session.prepare('INSERT INTO many (id, v) VALUES (?, ?)').executeMany(rows)
+    r = 'all written'
+  } catch (e) {
+    r = 'row ' + e.row + ': ' + e.message
+  }
+  r += '; rows: ' + session.runSql('SELECT COUNT(*) FROM many').fetchOne()[0]
+$$;
+SET sql_mode = DEFAULT;
+CALL js_many(@r);
+SELECT @r;
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP PROCEDURE js_bind_again;
+DROP PROCEDURE js_many;
+DROP TABLE many;
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

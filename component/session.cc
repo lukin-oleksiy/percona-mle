@@ -1201,16 +1201,20 @@ void Session::report(const std::string &key, mle::Worker *worker,
       !error.empty() ? error : e != nullptr ? e->message : "no details";
   // The worker's part first: one that is lost or was retired leaves its
   // slot, whatever the client is told.
+  // Each level of a nested request reports the loss; it is counted and
+  // logged once.
   if (lost) {
-    ++g_counters.worker_failures;
-    if (why.find("out-of-memory") != std::string::npos) ++g_counters.oom_errors;
-    if (outcome == Outcome::kViolation)
-      log_error("The worker of " + display_key(key) +
-                " broke the protocol during " + log_safe(routine.qualified_name) +
-                " and was ended: " + log_safe(why));
-    else
-      log_warning("The worker of " + display_key(key) + " was lost during " +
-                  log_safe(routine.qualified_name) + ": " + log_safe(why));
+    if (worker->first_report_of_failure()) {
+      ++g_counters.worker_failures;
+      if (why.find("out-of-memory") != std::string::npos) ++g_counters.oom_errors;
+      if (outcome == Outcome::kViolation)
+        log_error("The worker of " + display_key(key) +
+                  " broke the protocol during " + log_safe(routine.qualified_name) +
+                  " and was ended: " + log_safe(why));
+      else
+        log_warning("The worker of " + display_key(key) + " was lost during " +
+                    log_safe(routine.qualified_name) + ": " + log_safe(why));
+    }
   } else if (!worker->usable()) {
     // Retired after the request: it reported that it must not be used
     // again (out of heap or stack, damaged state).

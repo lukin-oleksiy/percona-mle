@@ -1,4 +1,11 @@
 # percona-mle-selinux posttrans: label MLE's files (installed before the module was, or with it).
+# The package directory the packages suggest (mle.package_dir) is made here, so that it gets its
+# label now: one mle_package made later would inherit var_lib_t, which workers cannot use (MVP
+# review D10, OPS-1). Owned by mysql, which runs mle_package, if that user exists.
+if [ ! -d /var/lib/mysql-mle-packages ]; then
+  install -d -m 0755 -o mysql -g mysql /var/lib/mysql-mle-packages 2>/dev/null ||
+    install -d -m 0755 /var/lib/mysql-mle-packages || :
+fi
 if /usr/sbin/selinuxenabled; then
   /usr/sbin/restorecon -iR /usr/lib64/mysql/plugin/mle /usr/lib64/mysql/plugin/debug/mle \
     /var/lib/mysql-mle-packages || :

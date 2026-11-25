@@ -30,6 +30,12 @@ import java.util.Map;
  * Column names stay distinct: a statistic of the key column itself is named after the statistic
  * too ({@code groupBy("price").median("price")}: price, price_median), and any other statistic
  * named like the key gets a trailing underscore (a key called count: count, count_).
+ *
+ * <p>Text keys are compared exactly, as Java strings: case, accents and trailing spaces make
+ * different groups, and groups are in code-unit order. GROUP BY follows the column's collation
+ * (under utf8mb4_0900_ai_ci 'North', 'north' and 'Nörth' are one group). To group as SQL does,
+ * load the key as SQL computes it: {@code LOWER(region)}, or a column of the key collated in the
+ * query (MVP review API-6).
  */
 public final class Grouped {
   private final Frame t;

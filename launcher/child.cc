@@ -28,6 +28,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cstddef>
@@ -272,9 +273,16 @@ const char *child_step_name(int32_t step) {
 
   if (chdir("/") != 0) fail(err_pipe, kStepChdir, errno);
 
-  rlimit lim{c.nofile, c.nofile};
-  if (c.nofile > 0 && setrlimit(RLIMIT_NOFILE, &lim) != 0)
-    fail(err_pipe, kStepRlimit, errno);
+  // At most the inherited hard limit: raising it needs CAP_SYS_RESOURCE, and
+  // a mysqld started with a lower one (LimitNOFILE=1024) could start no
+  // worker (MVP review HOST-4).
+  if (c.nofile > 0) {
+    rlimit lim{};
+    if (getrlimit(RLIMIT_NOFILE, &lim) != 0) fail(err_pipe, kStepRlimit, errno);
+    const rlim_t n = std::min<rlim_t>(c.nofile, lim.rlim_max);
+    lim = {n, n};
+    if (setrlimit(RLIMIT_NOFILE, &lim) != 0) fail(err_pipe, kStepRlimit, errno);
+  }
   if (!c.core_dumps) {
     rlimit zero{0, 0};
     if (setrlimit(RLIMIT_CORE, &zero) != 0) fail(err_pipe, kStepRlimit, errno);

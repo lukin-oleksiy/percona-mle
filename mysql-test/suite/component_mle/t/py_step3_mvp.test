@@ -1,0 +1,86 @@
+--echo #
+--echo # component_mle: fixes of step 3 of the MVP code review (exp note 65),
+--echo # Python. Also run on the CPython worker (cpython_py_step3_mvp.test).
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE many (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;
+CREATE DATABASE s1;
+CREATE DATABASE s2;
+
+# Through the client: mysqltest takes the indentation off the lines of a body.
+--write_file $MYSQLTEST_VARDIR/tmp/py_step3_mvp.sql
+CREATE PROCEDURE py_bind_again(OUT r TEXT) LANGUAGE PYTHON AS $$
+    p = session.prepare('SELECT ? + 1')
+    out = []
+    try:
+        p.bind(float('nan')).execute()
+        out.append('executed')
+    except Exception as e:
+        out.append(type(e).__name__)
+    out.append(str(p.bind(1).execute().fetch_one()[0]))
+    r = ' '.join(out)
+$$;
+SET sql_mode = '';
+CREATE PROCEDURE py_many(OUT r TEXT) LANGUAGE PYTHON AS $$
+    rows = [[i, None if i == 150 else i] for i in range(1, 301)]
+    try:
+        session.prepare('INSERT INTO many (id, v) VALUES (?, ?)').execute_many(rows)
+        r = 'all written'
+    except Exception as e:
+        r = 'row %s: %s' % (getattr(e, 'row', None), e)
+    r += '; rows: %s' % session.run_sql('SELECT COUNT(*) FROM many').fetch_one()[0]
+$$;
+SET sql_mode = DEFAULT;
+CREATE FUNCTION s1.py_same() RETURNS INT LANGUAGE PYTHON AS $$
+    x = 1
+    raise ValueError('from s1')
+$$;
+CREATE FUNCTION s2.py_same() RETURNS INT LANGUAGE PYTHON AS $$
+    a = 1
+    b = 2
+    raise ValueError('from s2')
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/py_step3_mvp.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/py_step3_mvp.sql
+
+--connect (con1, localhost, root,,test)
+--echo #
+--echo # JVML-2: a value that does not bind leaves the prepared statement usable.
+--echo #
+CALL py_bind_again(@r);
+SELECT @r;
+
+--echo #
+--echo # JVML-3: without a strict sql_mode a multi-row INSERT writes implicit
+--echo # defaults where a row alone fails: execute_many then runs row by row.
+--echo #
+CALL py_many(@r);
+SELECT @r;
+
+--echo #
+--echo # JVML-7: two routines of one name in two schemas keep their own lines in
+--echo # tracebacks.
+--echo #
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT s1.py_same();
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT s2.py_same();
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT s1.py_same();
+SELECT mle_session_state('traceback') AS traceback;
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP PROCEDURE py_bind_again;
+DROP PROCEDURE py_many;
+DROP DATABASE s1;
+DROP DATABASE s2;
+DROP TABLE many;
+REVOKE CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

@@ -265,8 +265,12 @@ final class VectorEngine {
         scan(q, rows, rowTerm, (int) ((long) n * p / parts), (int) ((long) n * (p + 1) / parts), self, metric,
             qInv, ps[p], px[p], kk);
       });
-      for (int p = 0; p < parts; p++)  // in row order: the result does not depend on the parts
-        for (int c = 0; c < k && px[p][c] >= 0; c++) offer(s, x, ps[p][c], px[p][c]);
+      for (int p = 0; p < parts; p++) {  // in row order: the result does not depend on the parts
+        for (int c = 0; c < k && px[p][c] >= 0; c++) {
+          if ((c & 4095) == 0) stopIfKilled();  // a large k: KILL is seen here too (MVP review API-2)
+          offer(s, x, ps[p][c], px[p][c]);
+        }
+      }
     } else {
       final int slices = (n + SLICE - 1) / SLICE, kk = k;
       run(slices, false, sl -> scan(q, rows, rowTerm, sl * SLICE, Math.min(n, (sl + 1) * SLICE), self, metric, qInv,
@@ -305,6 +309,10 @@ final class VectorEngine {
   private static void offer(float[] s, int[] x, float key, int j) {
     int k = s.length;
     if (!(key > s[k - 1] || key == s[k - 1] && (x[k - 1] < 0 || j < x[k - 1]))) return;
+    if (k > OFFER_LINEAR_MAX) {
+      offerLarge(s, x, key, j);
+      return;
+    }
     int p = k - 1;
     while (p > 0 && (s[p - 1] < key || s[p - 1] == key && (x[p - 1] < 0 || x[p - 1] > j))) {
       s[p] = s[p - 1];
@@ -314,6 +322,44 @@ final class VectorEngine {
     s[p] = key;
     x[p] = j;
   }
+
+  /** Up to this k, offer() moves entries one by one; above, it searches and moves only filled ones. */
+  private static final int OFFER_LINEAR_MAX = 64;
+
+  /**
+   * offer() for a large k: the filled slots (x >= 0) come first; a binary search finds the place
+   * and only the filled slots after it move. The linear way moved the empty ones too: k²/2 moves
+   * for the first k offers (MVP review API-2).
+   */
+  private static void offerLarge(float[] s, int[] x, float key, int j) {
+    int k = s.length;
+    int lo = 0;
+    int hi = k;
+    while (lo < hi) {  // filled = the first empty slot
+      int mid = (lo + hi) >>> 1;
+      if (x[mid] >= 0) lo = mid + 1;
+      else hi = mid;
+    }
+    int filled = lo;
+    lo = 0;
+    hi = filled;
+    while (lo < hi) {  // the first filled slot that (key, j) goes before
+      int mid = (lo + hi) >>> 1;
+      if (s[mid] > key || s[mid] == key && x[mid] < j) lo = mid + 1;
+      else hi = mid;
+    }
+    int p = lo;
+    int moved = Math.min(filled, k - 1) - p;
+    if (moved > 0) {
+      System.arraycopy(s, p, s, p + 1, moved);
+      System.arraycopy(x, p, x, p + 1, moved);
+    }
+    s[p] = key;
+    x[p] = j;
+  }
+
+  /** At most this many slots of top-k results for a batch (scores and rows): about 200 MB. */
+  static final long TOP_K_MAX = 25_000_000;
 
   // ------------------------------------------------------- several queries
 
@@ -330,6 +376,11 @@ final class VectorEngine {
       return out;
     }
     final int d = rows[0].length, kk = Math.min(k, n);
+    // The top k of every query is held at once (MVP review API-2: related() with a large k asked
+    // for n x k arrays without a bound).
+    if ((long) (related ? n : nq) * kk > TOP_K_MAX)
+      throw new IllegalArgumentException((related ? n : nq) + " x " + kk + " best matches is more than " + TOP_K_MAX
+          + ": ask for fewer (k) or fewer queries at once");
     final float[] rt = rowTerm != null ? rowTerm : rowTerms(rows, metric);
     if (related) return related(rows, rt, kk, metric, ids);
     final float[] qInv = new float[nq], lanes = new float[L];

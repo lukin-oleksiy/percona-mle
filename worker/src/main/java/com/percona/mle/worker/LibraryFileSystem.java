@@ -30,6 +30,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.ReadOnlyFileSystemException;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.FileTime;
 import java.util.HashMap;
@@ -300,6 +301,37 @@ final class LibraryFileSystem implements FileSystem {
     return virtual(m.group(1), m.group(2));
   }
 
+  /**
+   * For a read: a disk path /schema/name that oracle() left to the disk (a directory of the
+   * schema's name exists: /app, /data, /tmp) but where neither it nor a form module resolution
+   * tries for it exists: the library's virtual path, else null (MVP review JVML-8). Writes and
+   * files that exist stay on the disk.
+   */
+  private Path missingOracle(Path p) {
+    String s = p.toString();
+    Matcher m = ORACLE_PATH.matcher(s);
+    if (!m.matches() || VIRTUAL.matcher(s).matches()) return null;
+    for (String f : new String[] {s, s + ".js", s + ".mjs", s + ".cjs", s + ".json"}) {
+      try {
+        delegate.readAttributes(delegate.parsePath(f), "isRegularFile");
+        return null;  // on disk
+      } catch (IOException | SecurityException | UnsupportedOperationException e) {
+        // not there
+      }
+    }
+    return virtual(m.group(1), m.group(2));
+  }
+
+  /** virtualOf(p), or for a read the library a missing /schema/name stands for (missingOracle). */
+  private Matcher readableVirtual(Path p) {
+    Matcher m = virtualOf(p);
+    if (m != null) return m;
+    Path v = missingOracle(p);
+    if (v == null) return null;
+    m = VIRTUAL.matcher(v.toString());
+    return m.matches() ? m : null;
+  }
+
   /** A library path: virtual, or an Oracle module path made by resolving against another path. */
   private Matcher virtualOf(Path p) {
     Matcher m = VIRTUAL.matcher(p.toString());
@@ -311,7 +343,7 @@ final class LibraryFileSystem implements FileSystem {
   }
 
   private Library body(Path p) throws IOException {
-    Matcher m = virtualOf(p);
+    Matcher m = readableVirtual(p);
     if (m == null) return null;
     // Every access, versioned path or not, is resolved for the importing routine and its request.
     Library l = fetch(m.group(1), m.group(2));
@@ -335,7 +367,8 @@ final class LibraryFileSystem implements FileSystem {
 
   @Override
   public void checkAccess(Path path, Set<? extends AccessMode> modes, LinkOption... options) throws IOException {
-    if (virtualOf(path) == null) {
+    boolean read = !modes.contains(AccessMode.WRITE) && !modes.contains(AccessMode.EXECUTE);
+    if (virtualOf(path) == null && (!read || missingOracle(path) == null)) {
       delegate.checkAccess(path, modes, options);
       return;
     }
@@ -359,7 +392,9 @@ final class LibraryFileSystem implements FileSystem {
   @Override
   public SeekableByteChannel newByteChannel(Path path, Set<? extends OpenOption> options,
       FileAttribute<?>... attrs) throws IOException {
-    Library l = body(path);
+    // A write never goes to a library (missingOracle is for reads).
+    boolean read = options.stream().allMatch(o -> o == StandardOpenOption.READ || o instanceof LinkOption);
+    Library l = read || virtualOf(path) != null ? body(path) : null;
     if (l == null) return delegate.newByteChannel(path, options, attrs);
     return new BytesChannel(l.body());
   }
@@ -378,7 +413,7 @@ final class LibraryFileSystem implements FileSystem {
 
   @Override
   public Path toRealPath(Path path, LinkOption... options) throws IOException {
-    Matcher m = virtualOf(path);
+    Matcher m = readableVirtual(path);
     if (m == null) return delegate.toRealPath(path, options);
     Library l = body(path);
     return Path.of(ROOT, m.group(1), m.group(2) + "." + Long.toHexString(l.stamp()) + ".mjs");
@@ -431,12 +466,12 @@ final class LibraryFileSystem implements FileSystem {
 
   @Override
   public String getMimeType(Path path) {
-    return virtualOf(path) != null ? "application/javascript+module" : delegate.getMimeType(path);
+    return readableVirtual(path) != null ? "application/javascript+module" : delegate.getMimeType(path);
   }
 
   @Override
   public java.nio.charset.Charset getEncoding(Path path) {
-    return virtualOf(path) != null ? StandardCharsets.UTF_8 : delegate.getEncoding(path);
+    return readableVirtual(path) != null ? StandardCharsets.UTF_8 : delegate.getEncoding(path);
   }
 
   /** A read-only channel over a library body. */

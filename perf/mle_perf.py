@@ -231,6 +231,7 @@ class Session:
     """One mysql client session kept open: statements in, lines out."""
 
     def __init__(self, server, db, user='root'):
+        self._history = None  # whether performance_schema keeps statement history (time())
         self.p = subprocess.Popen(server.client('-n', '--force', db, user=user), stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
@@ -256,9 +257,21 @@ class Session:
         return lines[-1] if lines else ''
 
     def time(self, stmt):
-        """One statement's time in microseconds, measured inside the server."""
-        return int(self.value('SET @perf_t0 = SYSDATE(6); %s; '
-                              'SELECT TIMESTAMPDIFF(MICROSECOND, @perf_t0, SYSDATE(6))' % stmt))
+        """One statement's time in microseconds, measured inside the server: the statement's own
+        timer in performance_schema's history (no client round trip in it; MVP review OPS-10), or,
+        without that history, SYSDATE(6) around it (which counts two round trips of the client)."""
+        if self._history is None:
+            self._history = self.value(
+                "SELECT COUNT(*) FROM performance_schema.setup_consumers WHERE ENABLED = 'YES' "
+                "AND NAME IN ('events_statements_history', 'thread_instrumentation', 'global_instrumentation')") == '3'
+        if not self._history:
+            return int(self.value('SET @perf_t0 = SYSDATE(6); %s; '
+                                  'SELECT TIMESTAMPDIFF(MICROSECOND, @perf_t0, SYSDATE(6))' % stmt))
+        # The session's last top-level statement that ended (a CALL's own statements are nested
+        # and start after it).
+        return int(self.value('%s; SELECT TIMER_WAIT DIV 1000000 FROM performance_schema.events_statements_history '
+                              'WHERE THREAD_ID = PS_CURRENT_THREAD_ID() AND NESTING_EVENT_ID IS NULL '
+                              'ORDER BY EVENT_ID DESC LIMIT 1' % stmt))
 
     def warm_and_time(self, stmt, max_warm, runs):
         """Runs stmt until two runs in a row are within 3 % (at most max_warm), then times it runs

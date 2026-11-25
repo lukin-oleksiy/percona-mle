@@ -1,0 +1,121 @@
+--echo #
+--echo # component_mle: fixes of the CPython worker from step 3 of the MVP code
+--echo # review (exp note 65).
+--echo #
+--source ../include/have_mle_component.inc
+--source ../include/have_mle_cpython.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_CPYTHON_ROUTINE ON *.* TO root@localhost;
+SET @old_max_allowed_packet = @@GLOBAL.max_allowed_packet;
+SET GLOBAL max_allowed_packet = 134217728;
+
+# Through the client: mysqltest takes the indentation off the lines of a body.
+--write_file $MYSQLTEST_VARDIR/tmp/cpython_step3_mvp.sql
+CREATE FUNCTION cpy_pid() RETURNS INT LANGUAGE CPYTHON AS $$ return 0 $$;
+CREATE FUNCTION cpy_nap() RETURNS INT LANGUAGE CPYTHON AS $$
+    import time
+    time.sleep(30)
+    return 1
+$$;
+CREATE FUNCTION cpy_wait() RETURNS INT LANGUAGE CPYTHON AS $$
+    import threading
+    threading.Event().wait(30)
+    return 1
+$$;
+CREATE FUNCTION cpy_printed() RETURNS INT LANGUAGE CPYTHON AS $$
+    import sys
+    for i in range(50):
+        print('x' * 100000)
+    return sys.stdout.tell()
+$$;
+CREATE FUNCTION cpy_len(s LONGTEXT) RETURNS BIGINT LANGUAGE CPYTHON AS $$ return len(s) $$;
+CREATE FUNCTION cpy_set_alarm() RETURNS TEXT LANGUAGE CPYTHON AS $$
+    import signal, sys
+    signal.signal(signal.SIGALRM, lambda s, f: None)
+    signal.setitimer(signal.ITIMER_REAL, 3600)
+    sys.setprofile(lambda *a: None)
+    return 'set'
+$$;
+CREATE FUNCTION cpy_alarm() RETURNS TEXT LANGUAGE CPYTHON AS $$
+    import signal, sys
+    return '%s %s %s' % (signal.getsignal(signal.SIGALRM), signal.getitimer(signal.ITIMER_REAL)[0], sys.getprofile())
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/cpython_step3_mvp.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/cpython_step3_mvp.sql
+
+--connect (con1, localhost, root,,test)
+SELECT cpy_pid();
+let $pid1 = `SELECT mle_debug_worker_pid()`;
+
+--echo #
+--echo # D11 (CPY-5): an interrupt wakes guest code that sleeps or waits: it ends
+--echo # INTERRUPTED and the worker goes on (it was killed after the grace period).
+--echo #
+--error ER_QUERY_TIMEOUT
+SELECT /*+ MAX_EXECUTION_TIME(300) */ cpy_nap();
+--error ER_QUERY_TIMEOUT
+SELECT /*+ MAX_EXECUTION_TIME(300) */ cpy_wait();
+SELECT cpy_pid();
+let $pid2 = `SELECT mle_debug_worker_pid()`;
+--let $assert_text = The worker that slept still serves
+--let $assert_cond = $pid1 = $pid2
+--source include/assert.inc
+
+--echo #
+--echo # CPY-8: console output is cut to its end while it is written: at most
+--echo # twice the RESULT's 1 MiB is held.
+--echo #
+--disable_warnings
+SELECT cpy_printed() <= 2 * 1048576 AS held_bounded;
+--enable_warnings
+
+--echo #
+--echo # CPY-9: a host message beyond a quarter of the worker's memory is not held
+--echo # (protocol 5.3): EXHAUSTED, and the worker goes on.
+--echo #
+--disconnect con1
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers';
+--source include/wait_condition.inc
+SET GLOBAL mle.cpython_memory_max = 268435456;
+--connect (con1, localhost, root,,test)
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT cpy_len(REPEAT('a', 70000000));
+SELECT cpy_len(REPEAT('a', 1000)) AS still_serves;
+
+--echo #
+--echo # CPY-10: RESET puts back the signal handlers and interval timers guest
+--echo # code changed, and drops profile hooks: the next session that gets the
+--echo # worker (kept for the account, RESET in between) finds them as they were.
+--echo #
+SELECT cpy_set_alarm();
+let $pid3 = `SELECT mle_debug_worker_pid()`;
+--disconnect con1
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers';
+--source include/wait_condition.inc
+--connect (con1, localhost, root,,test)
+SELECT cpy_alarm();
+let $pid4 = `SELECT mle_debug_worker_pid()`;
+--let $assert_text = The session got the worker that was RESET
+--let $assert_cond = $pid3 = $pid4
+--source include/assert.inc
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.cpython_memory_max = DEFAULT;
+SET GLOBAL max_allowed_packet = @old_max_allowed_packet;
+DROP FUNCTION cpy_pid;
+DROP FUNCTION cpy_nap;
+DROP FUNCTION cpy_wait;
+DROP FUNCTION cpy_printed;
+DROP FUNCTION cpy_len;
+DROP FUNCTION cpy_set_alarm;
+DROP FUNCTION cpy_alarm;
+REVOKE CREATE_CPYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

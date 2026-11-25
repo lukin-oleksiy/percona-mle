@@ -745,3 +745,16 @@ Tests: `js_spec_mvp` (and on V8), `py_spec_mvp` (and on CPython), `java_spec_mvp
 Each case fails on the code before the round (`f2177ef`), except where a worker already did what the
 text now says (V8 and CPython for §10.8, CPython for the out-of-range instant, V8 for a nested async
 routine).
+
+## 24. The MVP code review: step 3 (25 Nov)
+
+One change of the text: §9.8 says that `time_zone` is an IANA name spelled as the zone database
+spells it; the host maps a name the server takes in any letter case (`europe/berlin`) to that
+spelling, which the workers' zone databases need (review JVMP-3). The host also checks the name
+`SYSTEM` stands for as any other: `posix/` is the zone itself, `right/` and `leap/` (leap seconds)
+have no IANA name and go as the current offset (COMP-6).
+
+Host behaviour within the text: a request whose nested request ended the worker reports the
+nested outcome (violation, timed out, killed), not "died", and the loss is counted and logged once
+(HOST-2); a native worker gets `--message-mb` of a quarter of its class's memory, so that a host
+message it cannot hold is answered as §5.3 says instead of ending in the kernel's OOM kill (CPY-9).

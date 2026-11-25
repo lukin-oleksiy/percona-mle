@@ -60,7 +60,10 @@ public final class PreparedStatement {
     if (pending.size() + values.length > parameterCount)
       throw new MleSqlException(1210, "HY000", "Incorrect arguments to bind: " + (pending.size() + values.length)
           + " values for " + parameterCount + " parameter markers");
-    for (Object v : values) pending.add(v);
+    // Converted here, where Oracle rejects a value of a wrong type: one that does not convert is
+    // never pending, and the statement stays usable (MVP review JVML-2).
+    Object[] converted = session.params(values);
+    if (converted != null) for (Object v : converted) pending.add(v);
     return this;
   }
 
@@ -72,7 +75,7 @@ public final class PreparedStatement {
           + parameterCount + " parameter markers bound");
     if (last != null) last.replace();
     last = null;
-    Object[] params = session.params(pending.toArray());
+    Object[] params = pending.isEmpty() ? null : pending.toArray();  // converted by bind()
     pending.clear();
     MleSql.Reply r = session.request(Session.EXECUTE_PREPARED, id, null, params, 0, 0);
     executed = true;
@@ -107,7 +110,8 @@ public final class PreparedStatement {
           + "parameter markers");
     if (rows.size() >= BATCH_MIN_ROWS && options.batchRewrite()) {
       BatchRewrite.Form f = form();
-      if (f != null && session.innodb(f.schema(), f.table(), false)) return executeRewritten(rows, f);
+      if (f != null && session.strictMode() && session.innodb(f.schema(), f.table(), false))
+        return executeRewritten(rows, f);
     }
     return executeRows(rows, 0);
   }

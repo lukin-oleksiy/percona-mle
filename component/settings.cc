@@ -134,6 +134,14 @@ bool workers_held(MYSQL_THD thd) {
   return engine_workers_in_use() > 0;
 }
 
+/** Whether a session holds a worker now, without waiting: for an update,
+    which runs under the system variables' lock (its check already waited;
+    SET ... = DEFAULT has no check, and then a worker held is held). */
+bool workers_held_now(MYSQL_THD thd) {
+  const Session *own = Session::of(thd);
+  return (own != nullptr && own->holds_worker()) || engine_workers_in_use() > 0;
+}
+
 /** Check of an integer setting that shapes workers: refused while a
     session holds a worker; range checked here (a custom check replaces the
     server's range check; the server rejects non-integers before). */
@@ -162,7 +170,7 @@ void update_shaping(MYSQL_THD thd, SYS_VAR *, void *val_ptr,
   if (value == before) return;  // nothing to restart for
   // SET ... = DEFAULT comes here without the check above: an update cannot
   // refuse, so the value stays and a warning says why.
-  if (workers_held(thd)) {
+  if (workers_held_now(thd)) {
     const std::string message =
         std::string("MLE: mle.") + Name +
         " is not changed: a session holds a worker";
@@ -238,9 +246,35 @@ void update_timing(MYSQL_THD, SYS_VAR *, void *val_ptr, const void *save) {
   g_timing_generation.fetch_add(1, std::memory_order_release);
 }
 
+/** mle.pool_prewarm's text as set (not PLUGIN_VAR_MEMALLOC: the server
+    frees a MEMALLOC variable's old text after the update, so an update
+    could not keep it). Changed only under the system variables' lock. */
+std::string g_pool_prewarm_text;
+
+/** As update_shaping: nothing for an unchanged setting; the value stays,
+    with a warning, while a session holds a worker (SET ... = DEFAULT has
+    no check) or when the engine cannot start with the new one. */
 void update_prewarm(MYSQL_THD thd, SYS_VAR *, void *val_ptr, const void *save) {
-  *static_cast<char **>(val_ptr) = *static_cast<char *const *>(save);
-  restart_engine(thd, "pool_prewarm");
+  char *&variable = *static_cast<char **>(val_ptr);
+  const std::string before = text(variable), value = text(*static_cast<char *const *>(save));
+  std::string normal_before, normal_value;
+  if (!parse_prewarm(before, &normal_before)) normal_before = kPoolPrewarm;
+  if (!parse_prewarm(value, &normal_value)) normal_value = kPoolPrewarm;
+  const auto set = [&variable](const std::string &v) {
+    g_pool_prewarm_text = v;
+    variable = g_pool_prewarm_text.data();
+  };
+  if (normal_value == normal_before) {
+    set(value);  // the same setting as written now: nothing to restart for
+    return;
+  }
+  if (workers_held_now(thd)) {
+    mysql_service_mysql_runtime_warning->emit(
+        thd, ER_LANGUAGE_COMPONENT, "MLE: mle.pool_prewarm is not changed: a session holds a worker");
+    return;
+  }
+  set(value);
+  if (!restart_engine(thd, "pool_prewarm")) set(before);
 }
 
 void update_languages(MYSQL_THD, SYS_VAR *, void *val_ptr, const void *save) {
@@ -459,7 +493,7 @@ bool register_settings() {
 
   STR_CHECK_ARG(pool_prewarm) pool_prewarm;
   pool_prewarm.def_val = const_cast<char *>(kPoolPrewarm);
-  if (reg("pool_prewarm", PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC,
+  if (reg("pool_prewarm", PLUGIN_VAR_STR,
           "What pool workers prepare before a session needs them: none, or a "
           "comma list of python (GraalPy started, ~1-5 s and ~195 MB per idle "
           "worker), numpy (Python and numpy) and vectors (the vector helper's "

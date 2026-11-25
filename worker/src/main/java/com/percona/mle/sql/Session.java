@@ -186,6 +186,17 @@ public final class Session {
     }
   }
 
+  /**
+   * Whether the sql_mode is strict: only then a multi-row INSERT fails like its rows one by one
+   * (without it, it writes implicit defaults where a single-row INSERT fails, NULL in a NOT NULL
+   * column; MVP review JVML-3). A routine runs in the mode it was created with. Once per batch.
+   */
+  boolean strictMode() {
+    List<Object> m = column("SELECT @@SESSION.sql_mode");
+    String v = m.isEmpty() ? "" : String.valueOf(m.get(0));
+    return v.contains("STRICT_TRANS_TABLES") || v.contains("STRICT_ALL_TABLES");
+  }
+
   /** Engine lookups of exp note 52, by schema and table: kept for the worker (a lookup costs ~0.3 ms). */
   private final java.util.Map<String, Boolean> innodb = new java.util.HashMap<>();
 

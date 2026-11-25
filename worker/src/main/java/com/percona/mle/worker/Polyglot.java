@@ -754,24 +754,28 @@ final class Polyglot {
                     node.type.elts.append(extra)
                 return node
 
-        def _mle_compile(tree, name):
+        def _mle_compile(tree, name, filename):
             # A tree with `except Exception` catching foreign errors, compiled. A SyntaxError found
             # after parsing (import * in a function, a misplaced nonlocal) is raised again with its
             # location: GraalPy fails (UnsupportedOperationException) to pass one of a compiled
-            # tree to Java.
+            # tree to Java. filename: the routine's own (name#id), for its traceback lines.
             tree = _mle_ast.fix_missing_locations(_MleCatchForeign().visit(tree))
             try:
-                return compile(tree, name, 'exec')
+                return compile(tree, filename, 'exec')
             except SyntaxError as e:
                 raise SyntaxError(e.msg, (name, e.lineno, e.offset, e.text, e.end_lineno, e.end_offset)) from None
 
-        def _load(src, name, entry, mle):
+        def _load(src, name, entry, mle, filename):
             ns = {'__name__': name, 'Mle': mle}
             ns.update(_mle_globals)
-            exec(compile(src, name + '.py', 'exec'), ns)
+            try:
+                code = compile(src, filename, 'exec')
+            except SyntaxError as e:
+                raise SyntaxError(e.msg, (name + '.py', e.lineno, e.offset, e.text, e.end_lineno, e.end_offset)) from None
+            exec(code, ns)
             return ns[entry]
 
-        def _load_body(src, name, params, has_outs, mle):
+        def _load_body(src, name, params, has_outs, mle, filename):
             # The body becomes the function body; ast keeps its line numbers. With OUT
             # parameters it runs in an inner function (it may return early) that declares all
             # parameters nonlocal, and the function returns (result, *parameters).
@@ -804,7 +808,7 @@ final class Polyglot {
                 body = [inner, call, ret]
             mod = ast.Module(body=[fn('__mle_routine', list(params), body)], type_ignores=[])
             ast.fix_missing_locations(mod)
-            code = _mle_compile(mod, name)
+            code = _mle_compile(mod, name, filename)
             ns = {'__name__': name, 'Mle': mle}
             ns.update(_mle_globals)
             exec(code, ns)
@@ -870,7 +874,7 @@ final class Polyglot {
             tail = None
             if tree.body and isinstance(tree.body[-1], ast.Expr):
                 tail = compile(ast.Expression(tree.body.pop().value), 'mle_eval', 'eval')
-            body = _mle_compile(tree, 'mle_eval')
+            body = _mle_compile(tree, 'mle_eval', 'mle_eval')
             def run():
                 ns = {'__name__': 'mle_eval', 'Mle': mle}
                 ns.update(_mle_globals)
@@ -1379,8 +1383,23 @@ final class Polyglot {
           }
         }""").execute(name);
     if (!required.isNull()) return required;
-    return jsModule(name);
+    // An ES module's namespace is kept per specifier (packages do not change during the worker's
+    // life): without it, each call evaluated a new wrapper module (MVP review JVML-12).
+    if (esModulesOf != c) {
+      esModules.clear();
+      esModulesOf = c;
+    }
+    Value ns = esModules.get(name);
+    if (ns == null) {
+      ns = jsModule(name);
+      esModules.put(name, ns);
+    }
+    return ns;
   }
+
+  /** importJs's ES module namespaces, of the context esModulesOf. */
+  private final Map<String, Value> esModules = new HashMap<>();
+  private Context esModulesOf;
 
   /** Python's helpers and SQL API, made when the first Python routine is loaded. */
   private void pythonReady() {
@@ -1417,6 +1436,36 @@ final class Polyglot {
   void drop(long id) {
     routines.remove(id);
     prefixes.remove(routineUri(id));
+    String file = pythonFiles.remove(id);
+    if (file != null) forgetPython(file);
+  }
+
+  /**
+   * The file name a Python routine is compiled under: its name and id (name#id), so that two
+   * routines of one name (in two schemas) keep their own traceback lines (MVP review JVML-7).
+   * Frames show it without the id (frameFile).
+   */
+  private String pythonFile(long id, String name, String source) {
+    String file = name + "#" + id;
+    String old = pythonFiles.put(id, file);
+    if (old != null) forgetPython(old);
+    pythonSources.add(file);
+    SOURCE_LINES.put(file, source.split("\n", -1));
+    return file;
+  }
+
+  private static void forgetPython(String file) {
+    pythonSources.remove(file);
+    SOURCE_LINES.remove(file);
+  }
+
+  /** The Python file names of the prepared routines, by id. */
+  private final Map<Long, String> pythonFiles = new java.util.HashMap<>();
+
+  /** A frame's file as guest code named it: a Python routine's without its "#id" (pythonFile). */
+  static String frameFile(String file) {
+    int at = file.lastIndexOf('#');
+    return at > 0 && pythonSources.contains(file) ? file.substring(0, at) : file;
   }
 
   void reset() {
@@ -1424,6 +1473,7 @@ final class Polyglot {
     prefixes.clear();
     pythonSources.clear();
     SOURCE_LINES.clear();
+    pythonFiles.clear();
     vectorBuffers.clear();
   }
 
@@ -1462,15 +1512,12 @@ final class Polyglot {
         prefixes.put(uri, "(function(){".length());
         fn = c.eval(Source.newBuilder("js", wrapped, name + ".js").uri(uri).buildLiteral());
       } else if (bodyForm) {
-        pythonSources.add(name);
-        SOURCE_LINES.put(name, source.split("\n", -1));
+        String file = pythonFile(id, name, source);
         String[] names = params.stream().map(JavaRoutines.Param::name).toArray(String[]::new);
-        fn = pythonBodyLoader().execute(source, name, names, outs.length > 0, mleApi);
+        fn = pythonBodyLoader().execute(source, name, names, outs.length > 0, mleApi, file);
         if (check) checkPython(source, params, imports);
       } else {
-        pythonSources.add(name + ".py");
-        SOURCE_LINES.put(name + ".py", source.split("\n", -1));
-        fn = h.loader().execute(source, name, entry, mleApi);
+        fn = h.loader().execute(source, name, entry, mleApi, pythonFile(id, name + ".py", source));
         if (check) checkPython(source, List.of(), imports);
       }
     } catch (PolyglotException e) {
@@ -1833,7 +1880,7 @@ final class Polyglot {
       var loc = e.getSourceLocation();
       var src = loc.getSource();
       int line = loc.getStartLine();
-      return src.getName() + ":" + line + ":" + bodyColumn(src, line, loc.getStartColumn()) + ": " + msg;
+      return frameFile(src.getName()) + ":" + line + ":" + bodyColumn(src, line, loc.getStartColumn()) + ": " + msg;
     }
     return msg;
   }
@@ -1905,7 +1952,7 @@ final class Polyglot {
         String[] lines = SOURCE_LINES.get(src.getName());
         if (lines != null && line >= 1 && line <= lines.length) text = lines[line - 1];
       }
-      frames.add(new Dispatcher.Frame(root, src.getName(), line, bodyColumn(src, line, loc.getStartColumn()),
+      frames.add(new Dispatcher.Frame(root, frameFile(src.getName()), line, bodyColumn(src, line, loc.getStartColumn()),
           loc.getEndLine() == line ? bodyColumn(src, line, loc.getEndColumn()) : loc.getEndColumn(),
           Dispatcher.Frame.line(text)));
       if (frames.size() == Wire.MAX_STACK_FRAMES) break;
