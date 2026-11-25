@@ -32,21 +32,31 @@ design notes by name (e.g. `14-phase6-libraries.md`); those notes are not publis
 
 ## Layout
 
+mysqld loads `component_mle`, which uses the host library to talk to workers; the workers themselves are started by
+`mle_launcher`, a process of its own that sandboxes them (mysqld is not forked).
+
 | Directory | What |
 |---|---|
-| `component/` | `component_mle`: the server side (language service, sessions, SQL for routines, UDFs, variables) |
-| `host/`, `include/mle/` | the host library: wire protocol and codec, launcher and worker clients, the installed layout |
-| `launcher/` | `mle_launcher`: starts and sandboxes workers (clone, Landlock, seccomp, cgroups) |
-| `worker/` | `mle_worker` (a JNI launcher of the JVM) and `mle-worker.jar` (GraalJS, GraalPy, Java routines, the SQL API); Maven; the numpy venv; the AOT cache; `cpython/`: the CPython worker; `v8/`: the V8 worker; `common/`: their shared C++ |
-| `tools/` | `mle_package` (the DBA's npm/PyPI/Maven tool), `mle_aot_cache` (makes the AOT cache at install) |
-| `harness/` | a command-line driver for workers (development) |
-| `unittest/` | GoogleTest unit tests (12 binaries) |
-| `mysql-test/suite/component_mle` | the MTR suite |
+| `component/` | `component_mle`, the part inside mysqld: the language service (routines, libraries), sessions and their workers, SQL from routines, the UDFs (`mle_eval`, `mle_session_state`, ...), the `mle.*` system and status variables, accounts and time zones |
+| `host/` | `mle_host`, the host library linked into the component (also the tests and the harness): the host side of the host–worker protocol (`worker.cc`), its codec, the client of the launcher and the launcher's own protocol, the default set-up of each worker class (`defaults.cc`) |
+| `include/mle/` | the host library's headers: the protocol's constants (`protocol.h`), messages and values, workers, the launcher, the installed layout |
+| `launcher/` | `mle_launcher`, the process that starts every worker: mailbox and socket per worker, warm pools, clone, Landlock, rlimits, the cgroup leaf with its limits (`cgroup.cc`), exits and OOM kills reported to mysqld |
+| `worker/` | the workers. Its own files build the JVM worker's Java part (Maven, `pom.xml`): `mle-worker.jar`, the AOT cache, the GraalPy venv with numpy (`python/pom.xml`) |
+| `worker/bootstrap/` | `mle_worker`, the JVM worker's executable: the seccomp filter (every worker kind installs it), then the JVM through JNI on a thread with a known stack |
+| `worker/src/main/java/com/percona/mle/` | the JVM worker's Java code: `worker/` (protocol, dispatcher, GraalJS, GraalPy and Java routines, libraries, Oracle's JavaScript rules), `sql/` (the SQL API of routines), `api/` (the vector and statistics library) |
+| `worker/cpython/` | `mle_cpython_worker`, the CPython worker: the embedding and the `_mlewire` extension in C++, the dispatcher and SQL API in Python (`python/mle_cpython/`) |
+| `worker/v8/` | `mle_v8_worker`, the V8 worker on the distribution's libnode: C++ (values, modules, the worker) and the JavaScript it embeds (`api.js`, `sql.js`) |
+| `worker/common/` | C++ shared by the native workers (CPython, V8): the mailbox, the wire reader and writer, the statements of §10.1, the RESULT writer |
+| `tools/` | `mle_package` (the DBA's tool for npm, PyPI and Maven packages), `mle_aot_cache` (makes the AOT cache at install) |
+| `harness/` | `mle_harness`, a command-line driver for workers without mysqld (development: start-up, calls, memory) |
+| `unittest/` | GoogleTest tests (13 binaries: codec, launcher, protocol, conformance of all workers, failures, each worker kind), `mle_test_worker` (a scripted worker for protocol tests), `mle_proto_scripts` |
+| `mysql-test/suite/component_mle/` | the MTR suite: `t/` and `r/`; `include/` (requirements, and the scripts that run JavaScript tests on V8 and Python tests on CPython); `std_data/` (a package directory) |
 | `docs/` | `protocol.md`: the host–worker protocol, specification 1.0; `protocol-review.md`: its reviews, the differences from the code before it, the measurements; `limits.md`: known limits |
-| `perf/` | performance tools: the regression test (two builds side by side), the benchmark of one build (every runtime), the end-to-end benchmark against an application |; `perf/results/`: published runs (JSON) |
-| `docker/` | the server + MLE image, the DBA tools image, compose |
-| `packaging/`, `cmake/packaging.cmake` | packages (CPack, deb and rpm) and their scripts |
-| `cmake/server.cmake` | building against a configured Percona Server tree |
+| `perf/` | `regression.py` (two builds side by side), `bench.py` (every runtime of one build), `mle_perf.py` (what they share), their SQL; `e2e/`: against the same logic in an application over a network; `results/`: published runs (JSON) |
+| `docker/` | the server + MLE image (`Dockerfile`), the DBA tools image (`Dockerfile.tools`, with a GraalPy launcher), compose, `run.sh` (start, SQL, status), `demo/` (the recorded demos' SQL) |
+| `packaging/` | the packages' scripts: `debian/`, `rpm/`, the AppArmor profiles (`apparmor/`), the SELinux policy (`selinux/`) |
+| `cmake/` | `packaging.cmake` (the packages: CPack, deb and rpm), `server.cmake` (building against a configured Percona Server tree), `mtr.sh.in` (the `mtr` wrapper of a build) |
+| `ci.sh` | builds and runs every test, with cgroups, Landlock and all workers required |
 
 ## Build
 
