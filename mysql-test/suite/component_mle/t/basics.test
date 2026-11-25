@@ -17,8 +17,9 @@ SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status
 --source ../include/wait_for_pool.inc
 
 --echo # System variables (paths differ per build).
+# mle.debug_test_worker exists in debug builds only (design note 66).
 SHOW GLOBAL VARIABLES WHERE Variable_name LIKE 'mle.%'
-  AND Variable_name NOT IN ('mle.dir', 'mle.java_home');
+  AND Variable_name NOT IN ('mle.dir', 'mle.java_home', 'mle.debug_test_worker');
 # Defaults: <plugin dir>/mle; empty, i.e. <mle.dir>/jdk if installed (package
 # percona-mle-jdk), else the JDK of the build.
 SELECT @@mle.dir = CONCAT(TRIM(TRAILING '/' FROM @@plugin_dir), '/mle') AS default_dir,
@@ -27,7 +28,10 @@ SELECT @@mle.dir = CONCAT(TRIM(TRAILING '/' FROM @@plugin_dir), '/mle') AS defau
 --echo # Status variables.
 --replace_column 2 #
 SHOW GLOBAL STATUS LIKE 'mle%';
-SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
+# The languages and the pool depend on the workers this build has (MVP review TEST-6).
+--replace_regex /JavaScript,Python,Java[,A-Za-z]*/JavaScript,Python,Java<,native workers>/
+SELECT VARIABLE_NAME, IF(VARIABLE_NAME = 'mle_pool_idle', VARIABLE_VALUE > 0, VARIABLE_VALUE) AS VARIABLE_VALUE
+  FROM performance_schema.global_status
   WHERE VARIABLE_NAME IN ('mle_status', 'mle_heap_status',
     'mle_languages_supported', 'mle_pool_idle', 'mle_workers',
     'mle_stored_programs')

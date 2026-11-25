@@ -5,6 +5,7 @@
 --echo # from Java, JavaScript and Python; KILL; results independent of threads.
 --echo #
 --source ../include/have_mle_component.inc
+--source include/have_debug.inc
 --source include/count_sessions.inc
 
 INSTALL COMPONENT "file://component_mle";
@@ -212,13 +213,13 @@ CREATE FUNCTION js_redefined_array() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
   return `norm ${V.norm(a)} ${V.norm(b)} median ${S.median(c)}`;
 $$;
 -- Long enough to be killed: all pairs of 50000 x 768 (several seconds even with threads).
-CREATE FUNCTION vec_long() RETURNS TEXT LANGUAGE JAVA AS $$
-Random r = new Random(1);
+CREATE PROCEDURE vec_long_running(OUT r TEXT) LANGUAGE JAVA AS $$
+Random rnd = new Random(1);
 float[][] m = new float[50000][768];
-// Made quickly (nextFloat): the KILL is meant for related(), not for this
-// loop, which does not look for interrupts.
-for (float[] v : m) for (int i = 0; i < v.length; i++) v[i] = r.nextFloat() - 0.5f;
-return "finished: " + Vectors.related(m, 10, Vectors.Metric.COSINE).length;
+for (float[] v : m) for (int i = 0; i < v.length; i++) v[i] = rnd.nextFloat() - 0.5f;
+// related() runs: the test's KILL waits for this lock (include/kill_when_running.inc).
+Mle.session().runSql("DO GET_LOCK('vec_long', 0)");
+r[0] = "finished: " + Vectors.related(m, 10, Vectors.Metric.COSINE).length;
 $$;
 CREATE FUNCTION vec_pool() RETURNS TEXT LANGUAGE JAVA AS $$
 int n = 0;
@@ -286,16 +287,14 @@ SELECT @r AS java;
 --echo # 5. KILL QUERY stops the work; the worker stays, and has no extra threads.
 --let $con1_id = `SELECT CONNECTION_ID()`
 --let $pid0 = `SELECT mle_debug_worker_pid()`
---send SELECT vec_long()
---connection default
---let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE id = $con1_id AND info LIKE 'SELECT vec_long%'
---source include/wait_condition.inc
---sleep 1
---replace_result $con1_id CON1
---eval KILL QUERY $con1_id
+--send CALL vec_long_running(@r)
+--let $kill_con_id = $con1_id
+--let $kill_lock = vec_long
+--source ../include/kill_when_running.inc
 --connection con1
 --error ER_QUERY_INTERRUPTED
 --reap
+DO RELEASE_ALL_LOCKS();
 SELECT vec_pool();
 --let $pid1 = `SELECT mle_debug_worker_pid()`
 --let $assert_text = The same worker after KILL QUERY
@@ -360,7 +359,7 @@ DROP FUNCTION js_bad_metric;
 DROP PROCEDURE java_errors;
 DROP PROCEDURE java_load_ids;
 DROP FUNCTION js_redefined_array;
-DROP FUNCTION vec_long;
+DROP PROCEDURE vec_long_running;
 DROP FUNCTION vec_pool;
 DROP FUNCTION vec_warm;
 REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;

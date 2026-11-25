@@ -26,11 +26,11 @@ $$;
 CREATE FUNCTION js_slow_init() RETURNS TEXT LANGUAGE JS USING (slow_init) AS $$ return slow_init.state $$;
 CREATE FUNCTION js_pid() RETURNS INT LANGUAGE JS AS $$ return 0 $$;
 SELECT js_pid();
-let $pid1 = `SELECT mle_debug_worker_pid()`;
+let $pid1 = `SELECT mle_debug_worker_pid('v8')`;
 --error ER_QUERY_TIMEOUT
 SELECT /*+ MAX_EXECUTION_TIME(500) */ js_slow_init();
 SELECT js_slow_init() AS after_interrupt;
-let $pid2 = `SELECT mle_debug_worker_pid()`;
+let $pid2 = `SELECT mle_debug_worker_pid('v8')`;
 --let $assert_text = The same worker imports the library again
 --let $assert_cond = $pid1 = $pid2
 --source include/assert.inc
@@ -46,7 +46,7 @@ $$;
 --error ER_LANGUAGE_COMPONENT_RUNTIME
 CALL js_getter_outs(@x);
 SELECT js_pid();
-let $pid3 = `SELECT mle_debug_worker_pid()`;
+let $pid3 = `SELECT mle_debug_worker_pid('v8')`;
 --let $assert_text = The worker survives the getter
 --let $assert_cond = $pid1 = $pid3
 --source include/assert.inc

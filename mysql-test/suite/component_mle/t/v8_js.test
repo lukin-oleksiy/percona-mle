@@ -96,14 +96,18 @@ CREATE FUNCTION js_hog() RETURNS INT LANGUAGE JS AS $$
   const a = []
   for (;;) a.push(new Array(100000).fill(1))
 $$;
-let $pid1 = `SELECT mle_debug_worker_pid()`;
+let $pid1 = `SELECT mle_debug_worker_pid('v8')`;
 --error ER_LANGUAGE_COMPONENT_RUNTIME
 SELECT js_hog();
 SELECT js_double(4) AS after_heap;
+let $pid2 = `SELECT mle_debug_worker_pid('v8')`;
+--let $assert_text = The V8 worker that ran out of heap was retired (MVP review TEST-4)
+--let $assert_cond = $pid1 != $pid2
+--source include/assert.inc
 
 --echo #
---echo # 6. Memory outside the heap (ArrayBuffers) is the cgroup's (mle.v8_memory_max):
---echo #    the kernel ends the worker, mysqld goes on.
+--echo # 6. Memory outside the heap (ArrayBuffers) is the cgroup's (mle.v8_memory_max);
+--echo #    within it the worker goes on (beyond it: v8_memory_limit.test).
 --echo #
 --disconnect con1
 --connection default
@@ -116,16 +120,8 @@ CREATE FUNCTION js_buffers(mib INT) RETURNS INT LANGUAGE JS AS $$
   return keep.length
 $$;
 SELECT js_buffers(64) AS mib;
-let $cgroups = `SELECT VARIABLE_VALUE = 'ON' FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_cgroup'`;
-if ($cgroups) {
-  --replace_regex /the worker died: .*/the worker died: <reason>/
-  --error ER_LANGUAGE_COMPONENT
-  SELECT js_buffers(1024);
-}
-if (!$cgroups) {
-  --echo ERROR HY000: MLE> the worker died: <reason>
-}
-SELECT js_double(5) AS after_oom;
+# Beyond the limit: v8_memory_limit.test (it needs a delegated cgroup).
+SELECT js_double(5) AS after_buffers;
 
 --echo #
 --echo # 7. Rows: an array with the labels as properties (made in sql.js, from the

@@ -188,6 +188,12 @@ bool installed(const mle::Layout &l, WorkerKind kind) {
       return !l.cpython_exe.empty();
     case WorkerKind::kV8:
       return !l.v8_exe.empty();
+    case WorkerKind::kTest:
+#if !defined(NDEBUG) && defined(MLE_TEST_WORKER_EXE)
+      return test_worker_enabled() && access(MLE_TEST_WORKER_EXE, X_OK) == 0;
+#else
+      return false;
+#endif
   }
   return false;
 }
@@ -202,7 +208,7 @@ std::string kind_problem(const mle::Layout &l, const Settings &s, WorkerKind kin
     int mode;
     const char *what;
   };
-  if (kind == WorkerKind::kV8) return "";
+  if (kind == WorkerKind::kV8 || kind == WorkerKind::kTest) return "";
   if (kind == WorkerKind::kCPython) {
     if (access(l.cpython_code.c_str(), R_OK | X_OK) != 0)
       return "the CPython worker's Python code (" + l.cpython_code + ") is missing or not accessible";
@@ -269,7 +275,7 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   // installed but cannot run (a wrong mle.java_home) is an error, as before:
   // the DBA sees it at INSTALL, not as a language gone missing.
   std::vector<WorkerKind> kinds;
-  for (const WorkerKind kind : {WorkerKind::kJvm, WorkerKind::kCPython, WorkerKind::kV8}) {
+  for (const WorkerKind kind : {WorkerKind::kJvm, WorkerKind::kCPython, WorkerKind::kV8, WorkerKind::kTest}) {
     if (!installed(layout, kind)) continue;
     if (std::string why = kind_problem(layout, s, kind); !why.empty()) return fail(why);
     kinds.push_back(kind);
@@ -368,6 +374,23 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
         config.classes.push_back(std::move(c));
         break;
       }
+      case WorkerKind::kTest: {
+#if !defined(NDEBUG) && defined(MLE_TEST_WORKER_EXE)
+        // The scripted worker: each routine's body is its script (unittest/proto_script.h).
+        mle::ClassConfig c;
+        c.name = o.name;
+        c.executable = MLE_TEST_WORKER_EXE;
+        c.args = {"proto"};
+        c.env = {"LANG=C"};
+        const std::string exe = MLE_TEST_WORKER_EXE;
+        c.exec_paths = {exe.substr(0, exe.rfind('/'))};
+        c.memory_max = o.memory_max;
+        c.nofile = 256;
+        c.inherit_stderr = o.inherit_stderr;
+        config.classes.push_back(std::move(c));
+#endif
+        break;
+      }
     }
   }
 
@@ -408,6 +431,9 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
         break;
       case WorkerKind::kV8:
         what = "V8 worker (" + layout.v8_exe + ", V8 heap " + mib(s.v8_heap_max) + ")";
+        break;
+      case WorkerKind::kTest:
+        what = "the scripted test worker (mle.debug_test_worker)";
         break;
     }
     running += (running.empty() ? "" : ", ") + what;
@@ -765,6 +791,8 @@ const char *kind_name(WorkerKind kind) {
       return "cpython";
     case WorkerKind::kV8:
       return "v8";
+    case WorkerKind::kTest:
+      return "test";
   }
   return "";
 }

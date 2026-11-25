@@ -1,0 +1,211 @@
+#
+# component_mle, JVM worker: values by protocol-1.0 Appendix B.4 and B.5.
+# JavaScript's local time is the zone of OPTIONS (not the worker's process);
+# Python's TIMESTAMP is an aware datetime in that zone, and goes back as
+# TIMESTAMP; Java's TIMESTAMP is an Instant; catchable language limits
+# (RangeError, RecursionError) do not retire the worker; each JavaScript
+# routine runs in a scope of its own.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE tz (id INT PRIMARY KEY, ts TIMESTAMP(6) NULL, dt DATETIME(6) NULL);
+SET sql_mode = 'ALLOW_INVALID_DATES';
+SET time_zone = '+05:30';
+#
+# 1. JavaScript: local time in the zone of OPTIONS; years 0 to 99 keep
+#    their value, an impossible day rolls over, a zero date is an Invalid
+#    Date; a Date for DATE is rounded to the second, then its local date.
+#
+CREATE FUNCTION js_local(dt DATETIME, ts TIMESTAMP) RETURNS TEXT LANGUAGE JS AS $$
+const f = (v) => v === null ? 'null' : isNaN(v) ? 'Invalid Date'
+      : v.getFullYear() + '-' + (v.getMonth() + 1) + '-' + v.getDate() + ' ' + v.getHours() + ':'
+        + v.getMinutes() + ' offset ' + v.getTimezoneOffset()
+return f(dt) + ' | ' + f(ts) + ' | ' + new Date(2024, 6, 1, 12).toISOString()
+$$;
+CREATE FUNCTION js_strings(dt DATETIME) RETURNS TEXT LANGUAGE JS AS $$
+return [String(dt), dt.toTimeString(), dt.toDateString(), new Date(NaN).toString()].join(' | ')
+$$;
+CREATE FUNCTION js_date(dt DATETIME(3)) RETURNS DATE LANGUAGE JS AS $$ return dt $$;
+SELECT js_local('2024-07-01 12:00:00', '2024-07-01 12:00:00') AS plus_0530;
+plus_0530
+2024-7-1 12:0 offset -330 | 2024-7-1 12:0 offset -330 | 2024-07-01T06:30:00.000Z
+SELECT js_strings('2024-07-01 12:00:00') AS plus_0530;
+plus_0530
+Mon Jul 01 2024 12:00:00 GMT+0530 (GMT+05:30) | 12:00:00 GMT+0530 (GMT+05:30) | Mon Jul 01 2024 | Invalid Date
+SELECT js_local('0050-02-30 01:00:00', NULL) AS year_50_feb_30;
+year_50_feb_30
+50-3-2 1:0 offset -330 | null | 2024-07-01T06:30:00.000Z
+SELECT js_local('0000-00-00 00:00:00', '0000-00-00 00:00:00') AS zero;
+zero
+Invalid Date | Invalid Date | 2024-07-01T06:30:00.000Z
+SELECT js_date('2024-07-01 23:59:59.499') AS same_day, js_date('2024-07-01 23:59:59.500') AS next_day;
+same_day	next_day
+2024-07-01	2024-07-02
+SET time_zone = '-03:00';
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+SELECT js_local('2024-07-01 12:00:00', '2024-07-01 12:00:00') AS minus_0300;
+minus_0300
+2024-7-1 12:0 offset 180 | 2024-7-1 12:0 offset 180 | 2024-07-01T15:00:00.000Z
+SELECT js_strings('2024-07-01 12:00:00') AS minus_0300;
+minus_0300
+Mon Jul 01 2024 12:00:00 GMT-0300 (GMT-03:00) | 12:00:00 GMT-0300 (GMT-03:00) | Mon Jul 01 2024 | Invalid Date
+SET time_zone = '-13:00';
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+SELECT js_strings('2024-07-01 12:00:00') AS minus_1300;
+minus_1300
+Mon Jul 01 2024 12:00:00 GMT-1300 (GMT-13:00) | 12:00:00 GMT-1300 (GMT-13:00) | Mon Jul 01 2024 | Invalid Date
+SET time_zone = '+00:00';
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+SELECT js_local('2024-07-01 12:00:00', '2024-07-01 12:00:00') AS utc;
+utc
+2024-7-1 12:0 offset 0 | 2024-7-1 12:0 offset 0 | 2024-07-01T12:00:00.000Z
+SELECT js_strings('0050-02-01 00:00:00') AS utc;
+utc
+Tue Feb 01 0050 00:00:00 GMT+0000 (Coordinated Universal Time) | 00:00:00 GMT+0000 (Coordinated Universal Time) | Tue Feb 01 0050 | Invalid Date
+SET time_zone = '+05:30';
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+#
+# 2. Python: TIMESTAMP as an aware datetime in the zone of OPTIONS
+#    (datetime.timezone for an offset), as an argument and in a result; it
+#    goes back as TIMESTAMP. A naive datetime goes as DATETIME. DECIMAL
+#    arguments are Decimal whatever decimal_type says (it is for results).
+#
+CREATE FUNCTION py_ts(ts TIMESTAMP(6), dt DATETIME) RETURNS TEXT LANGUAGE PYTHON AS $$
+return str(ts) + ' | ' + repr(ts) + ' | ' + repr(dt)
+$$;
+CREATE FUNCTION py_ts_back(ts TIMESTAMP(6)) RETURNS TIMESTAMP(6) LANGUAGE PYTHON AS $$
+return ts
+$$;
+CREATE FUNCTION py_aware_as_datetime(ts TIMESTAMP) RETURNS DATETIME LANGUAGE PYTHON AS $$
+return ts
+$$;
+CREATE FUNCTION py_dec(d DECIMAL(5,2)) RETURNS TEXT LANGUAGE PYTHON AS $$
+return repr(d)
+$$;
+CREATE PROCEDURE py_rows(OUT o TEXT) LANGUAGE PYTHON AS $$
+import datetime
+aware = datetime.datetime(2024, 7, 1, 12, tzinfo=datetime.timezone.utc)
+naive = datetime.datetime(2024, 7, 1, 12)
+session.run_sql("INSERT INTO test.tz VALUES (1, ?, ?), (2, ?, ?)", [aware, aware, naive, naive])
+rows = session.run_sql("SELECT id, ts, dt, CAST(1.5 AS DECIMAL(3,1)) FROM test.tz ORDER BY id").fetch_all()
+o = ' / '.join(repr(tuple(r)) for r in rows)
+$$;
+SELECT py_ts('2024-07-01 12:00:00.123456', '2024-07-01 12:00:00') AS plus_0530;
+plus_0530
+2024-07-01 12:00:00.123456+05:30 | datetime.datetime(2024, 7, 1, 12, 0, 0, 123456, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800))) | datetime.datetime(2024, 7, 1, 12, 0)
+SELECT py_ts(NULL, '2024-02-29 23:59:59') AS null_ts;
+null_ts
+None | None | datetime.datetime(2024, 2, 29, 23, 59, 59)
+SELECT py_ts_back('2024-07-01 12:00:00.123456') AS back, py_aware_as_datetime('2024-07-01 12:00:00') AS as_datetime;
+back	as_datetime
+2024-07-01 12:00:00.123456	2024-07-01 12:00:00
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+SELECT mle_set_session_state('{"decimal_type":"NUMBER"}');
+mle_set_session_state('{"decimal_type":"NUMBER"}')
+1
+SELECT py_dec(1.25) AS argument_stays_decimal;
+argument_stays_decimal
+Decimal('1.25')
+CALL py_rows(@o);
+SELECT @o AS rows_with_number;
+rows_with_number
+(1, datetime.datetime(2024, 7, 1, 17, 30, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800))), datetime.datetime(2024, 7, 1, 17, 30), 1.5) / (2, datetime.datetime(2024, 7, 1, 12, 0, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800))), datetime.datetime(2024, 7, 1, 12, 0), 1.5)
+SELECT id, ts, dt FROM tz ORDER BY id;
+id	ts	dt
+1	2024-07-01 17:30:00.000000	2024-07-01 17:30:00.000000
+2	2024-07-01 12:00:00.000000	2024-07-01 12:00:00.000000
+SET time_zone = '+00:00';
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+SELECT py_ts('2024-07-01 12:00:00', '2024-07-01 12:00:00') AS utc;
+utc
+2024-07-01 12:00:00+00:00 | datetime.datetime(2024, 7, 1, 12, 0, tzinfo=datetime.timezone.utc) | datetime.datetime(2024, 7, 1, 12, 0)
+#
+# 3. Java: TIMESTAMP is an Instant (arguments, results, rows).
+#
+CREATE FUNCTION j_ts(ts TIMESTAMP(3)) RETURNS TEXT LANGUAGE JAVA AS $$
+return ts.getClass().getSimpleName() + " " + ts;
+$$;
+CREATE FUNCTION j_ts_back(ts TIMESTAMP) RETURNS TIMESTAMP LANGUAGE JAVA AS $$
+return ts.plusSeconds(60);
+$$;
+CREATE PROCEDURE j_rows(OUT r TEXT) LANGUAGE JAVA AS $$
+Row row = Mle.session().runSql("SELECT ts, dt FROM test.tz WHERE id = 1").fetchOne();
+r[0] = row.get(0).getClass().getSimpleName() + " " + row.get(0) + " | " + row.get(1).getClass().getSimpleName() + " " + row.get(1);
+$$;
+SELECT j_ts('2024-07-01 12:00:00.250') AS arg, j_ts_back('2024-07-01 12:00:00') AS back;
+arg	back
+Instant 2024-07-01T12:00:00.250Z	2024-07-01 12:01:00
+CALL j_rows(@r);
+SELECT @r AS row_values;
+row_values
+Instant 2024-07-01T12:00:00Z | LocalDateTime 2024-07-01T17:30
+#
+# 4. Language limits that guest code can catch end the request with
+#    GUEST_ERROR and leave the worker in service (Appendix B.5).
+#
+CREATE LIBRARY deep LANGUAGE JS AS $$
+export function deep(n) { return n === 0 ? 0 : 1 + deep(n - 1) }
+$$;
+CREATE FUNCTION js_deep(n INT) RETURNS TEXT LANGUAGE JS USING (deep AS d) AS $$
+try { return String(d.deep(n)) } catch (e) { return 'caught ' + e.name + ' ' + (e instanceof RangeError) }
+$$;
+CREATE FUNCTION js_deep_uncaught(n INT) RETURNS INT LANGUAGE JS USING (deep AS d) AS $$ return d.deep(n) $$;
+SELECT py_rec(100000);
+ERROR HY000: Python> RecursionError: maximum recursion depth exceeded (py_rec, line 3, in f)
+SELECT py_rec(10), py_rec_caught(100000);
+py_rec(10)	py_rec_caught(100000)
+10	caught RecursionError
+SELECT js_deep(10), js_deep(10000000);
+js_deep(10)	js_deep(10000000)
+10	caught RangeError true
+SELECT js_deep_uncaught(10000000);
+ERROR HY000: JavaScript> RangeError: Maximum call stack size exceeded
+SELECT js_deep_uncaught(5);
+js_deep_uncaught(5)
+5
+include/assert.inc [No worker was retired for RecursionError or RangeError]
+#
+# 5. Each JavaScript routine's code has a scope of its own.
+#
+CREATE FUNCTION js_scope1() RETURNS INT LANGUAGE JS AS $$
+const x = 1; class A {}; function g() { return 1 } let y = 2; return x + y + g()
+$$;
+CREATE FUNCTION js_scope2() RETURNS INT LANGUAGE JS AS $$
+const x = 10; class A {}; function g() { return 10 } let y = 20; return x + y + g()
+$$;
+SELECT js_scope1(), js_scope2(), js_scope1(), js_scope2();
+js_scope1()	js_scope2()	js_scope1()	js_scope2()
+4	40	4	40
+DROP FUNCTION js_local;
+DROP FUNCTION js_date;
+DROP FUNCTION js_strings;
+DROP FUNCTION py_ts;
+DROP FUNCTION py_ts_back;
+DROP FUNCTION py_aware_as_datetime;
+DROP FUNCTION py_dec;
+DROP PROCEDURE py_rows;
+DROP FUNCTION j_ts;
+DROP FUNCTION j_ts_back;
+DROP PROCEDURE j_rows;
+DROP FUNCTION py_rec;
+DROP FUNCTION py_rec_caught;
+DROP FUNCTION js_deep;
+DROP FUNCTION js_deep_uncaught;
+DROP LIBRARY deep;
+DROP FUNCTION js_scope1;
+DROP FUNCTION js_scope2;
+DROP TABLE tz;
+REVOKE CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

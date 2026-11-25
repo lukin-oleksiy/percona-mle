@@ -92,6 +92,10 @@ char *g_dir = nullptr;
 char *g_java_home = nullptr;
 char *g_package_dir = nullptr;
 char *g_pool_prewarm = nullptr;
+#ifndef NDEBUG
+/** mle.debug_test_worker (debug builds, read-only): the language TEST. */
+bool g_debug_test_worker = false;
+#endif
 
 std::atomic<unsigned> g_language_bits{kAllLanguages};
 /** What is installed (Python is an optional package): set at engine start. */
@@ -302,7 +306,7 @@ Registered g_registered[] = {
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
     {"package_dir", false}, {"pool_prewarm", false},
     {"vector_threads", false}, {"console", false},
-    {"malloc_mmap_threshold", false}};
+    {"malloc_mmap_threshold", false}, {"debug_test_worker", false}};
 
 /** mle.console (session): OFF, or WARNINGS (exp note 39). */
 const char *g_console_values[] = {"OFF", "WARNINGS", nullptr};
@@ -620,6 +624,20 @@ bool register_settings() {
           nullptr, nullptr, &exec_time, &g_sql_exec_time))
     return true;
 
+#ifndef NDEBUG
+  {  // a scope of its own: BOOL_CHECK_ARG defines a type
+  BOOL_CHECK_ARG(bool) test_worker;
+  test_worker.def_val = false;
+  if (reg("debug_test_worker", PLUGIN_VAR_BOOL | PLUGIN_VAR_READONLY,
+          "Debug builds: the language TEST, whose routines' bodies are message "
+          "scripts of the scripted test worker (unittest/mle_test_worker), for "
+          "tests of how MLE handles a worker that breaks the protocol. Set at "
+          "startup only.",
+          nullptr, nullptr, &test_worker, &g_debug_test_worker))
+    return true;
+  }
+#endif
+
   STR_CHECK_ARG(languages) languages;
   languages.def_val = const_cast<char *>(kAllLanguageNames);
   if (reg("languages", PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC,
@@ -735,7 +753,16 @@ Settings current_settings() {
 }
 
 unsigned enabled_languages() {
-  return g_language_bits.load() & g_installed_bits.load();
+  // TEST is not one of mle.languages: mle.debug_test_worker enables it.
+  return (g_language_bits.load() | (test_worker_enabled() ? unsigned{kTest} : 0u)) & g_installed_bits.load();
+}
+
+bool test_worker_enabled() {
+#ifndef NDEBUG
+  return g_debug_test_worker;
+#else
+  return false;
+#endif
 }
 
 void set_installed_languages(unsigned bits) { g_installed_bits = bits; }
@@ -769,6 +796,7 @@ unsigned language_bit(std::string_view name) {
   if (is("JAVA")) return kJava;
   if (is("JS")) return kJs;
   if (is("CPYTHON")) return kCPython;
+  if (is("TEST") && test_worker_enabled()) return kTest;
   return 0;
 }
 
@@ -784,6 +812,8 @@ const char *language_sql_name(unsigned bit) {
       return "JS";
     case kCPython:
       return "CPYTHON";
+    case kTest:
+      return "TEST";
     default:
       return "";
   }
@@ -853,6 +883,7 @@ std::string language_names(unsigned bits) {
   add(kJava, "Java");
   add(kJs, "JS");
   add(kCPython, "CPython");
+  add(kTest, "Test");
   return names;
 }
 

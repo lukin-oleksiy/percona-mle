@@ -51,7 +51,7 @@ INSERT INTO items VALUES (1, 'apple', 0.50, STRING_TO_VECTOR('[1, 0, 0]')),
 (2, 'pear', 0.75, STRING_TO_VECTOR('[0.9, 0.1, 0]')), (3, 'car', 9000, STRING_TO_VECTOR('[0, 0, 1]'));
 SELECT py_add(2, 3), py_np(), py_runtime();
 py_add(2, 3)	py_np()	py_runtime()
-5	[[5.0, 14.0], [14.0, 50.0]] 5.0	CPython 3.14, numpy 2.x
+5	[[5.0, 14.0], [14.0, 50.0]] 5.0	CPython 3.x, numpy 2.x
 SELECT py_types(18446744073709551615, 12.345, 'héllo', '2026-11-19 12:34:56', '-838:59:59', '{"a": [1, 2]}',
 0x41ff, 1.5) AS t;
 t
@@ -176,9 +176,10 @@ DROP FUNCTION py_typo;
 #
 SELECT /*+ MAX_EXECUTION_TIME(500) */ py_loop();
 ERROR HY000: Query execution was interrupted, maximum statement execution time exceeded
-SELECT py_loop();
-KILL QUERY CON1;
+CALL py_loop_running();
+KILL QUERY CON;
 ERROR 70100: Query execution was interrupted
+DO RELEASE_ALL_LOCKS();
 SELECT py_add(1, 1);
 py_add(1, 1)
 2
@@ -211,12 +212,6 @@ SELECT py_hog(256) + py_hog(256) + py_hog(256) + py_hog(256) + py_hog(256) + py_
 + py_hog(256) + py_hog(256) + py_hog(256) AS many;
 many
 335544320
-SELECT py_hog(4096);
-ERROR HY000: MLE> the worker died: killed by the out-of-memory killer (cgroup memory limit)
-SELECT VARIABLE_VALUE >= 1 AS oom_counted FROM performance_schema.global_status
-WHERE VARIABLE_NAME = 'mle_oom_errors';
-oom_counted
-1
 SELECT py_add(40, 2);
 py_add(40, 2)
 42
@@ -241,6 +236,7 @@ DROP FUNCTION py_print;
 DROP FUNCTION py_err;
 DROP FUNCTION py_range;
 DROP FUNCTION py_loop;
+DROP PROCEDURE py_loop_running;
 DROP FUNCTION py_nap;
 DROP PROCEDURE py_catches;
 DROP FUNCTION py_probe;

@@ -79,8 +79,17 @@ The build type follows the server build's (a debug server gives a debug MLE). Fo
 
 ## Test
 
-    BUILD-mle/mtr --parallel=4                           # the MTR suite on the server build
+    ./ci.sh BUILD-mle                                    # build, every gtest and the MTR suite
+
+`ci.sh` runs the tests in a delegated cgroup v2 (`systemd-run --user --scope -p Delegate=yes`), which the
+workers' memory and process limits need, and turns the skips of a test that cannot run (no cgroup, no Landlock,
+a worker kind not built) into failures. By hand:
+
+    systemd-run --user --scope -q -p Delegate=yes BUILD-mle/mtr --parallel=4   # the MTR suite
     systemd-run --user --scope -q -p Delegate=yes BUILD-mle/runtime_output_directory/mle_codec-t   # each gtest
+
+Without a delegated cgroup the memory-limit tests skip (`have_mle_cgroup.inc`). The benchmarks among the gtests
+are disabled; `--gtest_also_run_disabled_tests` runs them.
 
 Performance, a change against the commit before it (release builds, a quiet machine, the CPU governor
 `performance`; about 25 minutes for 5 rounds):

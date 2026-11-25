@@ -94,9 +94,10 @@ ERROR HY000: JavaScript> RangeError: out of memory (the V8 heap limit, mle.v8_he
 SELECT js_double(4) AS after_heap;
 after_heap
 8
+include/assert.inc [The V8 worker that ran out of heap was retired (MVP review TEST-4)]
 #
-# 6. Memory outside the heap (ArrayBuffers) is the cgroup's (mle.v8_memory_max):
-#    the kernel ends the worker, mysqld goes on.
+# 6. Memory outside the heap (ArrayBuffers) is the cgroup's (mle.v8_memory_max);
+#    within it the worker goes on (beyond it: v8_memory_limit.test).
 #
 SET GLOBAL mle.v8_memory_max = 256 * 1024 * 1024;
 CREATE FUNCTION js_buffers(mib INT) RETURNS INT LANGUAGE JS AS $$
@@ -107,10 +108,8 @@ $$;
 SELECT js_buffers(64) AS mib;
 mib
 64
-SELECT js_buffers(1024);
-ERROR HY000: MLE> the worker died: <reason>
-SELECT js_double(5) AS after_oom;
-after_oom
+SELECT js_double(5) AS after_buffers;
+after_buffers
 10
 #
 # 7. Rows: an array with the labels as properties (made in sql.js, from the

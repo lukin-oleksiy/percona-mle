@@ -342,18 +342,29 @@ class mle_eval_impl {
 
 #ifndef NDEBUG
 /** Debug builds: the pid of the session's worker for the current user
-    (failure tests kill it from outside). NULL without a worker. */
+    (failure tests kill it from outside): of the kind named ('jvm',
+    'cpython', 'v8'), or without an argument the JVM worker's, else any.
+    NULL without such a worker (MVP review TEST-4). */
 class mle_debug_worker_pid_impl {
  public:
   explicit mle_debug_worker_pid_impl(mysqlpp::udf_context &ctx) {
-    if (ctx.get_number_of_args() != 0)
-      throw std::invalid_argument("Wrong argument list: should be ()");
+    if (ctx.get_number_of_args() > 1)
+      throw std::invalid_argument("Wrong argument list: should be ([kind])");
+    if (ctx.get_number_of_args() == 1) ctx.set_arg_type(0, STRING_RESULT);
     ctx.mark_result_nullable(true);
     ctx.mark_result_const(false);
   }
-  mysqlpp::udf_result_t<INT_RESULT> calculate(const mysqlpp::udf_context &) {
+  mysqlpp::udf_result_t<INT_RESULT> calculate(const mysqlpp::udf_context &ctx) {
+    using mle_component::WorkerKind;
+    std::optional<WorkerKind> kind;
+    if (ctx.get_number_of_args() == 1) {
+      const auto name = ctx.get_arg<STRING_RESULT>(0);
+      for (const WorkerKind k : {WorkerKind::kJvm, WorkerKind::kCPython, WorkerKind::kV8})
+        if (name == mle_component::kind_name(k)) kind = k;
+      if (!kind) return std::nullopt;
+    }
     Session *s = Session::current(false);
-    const long pid = s == nullptr ? -1 : s->worker_pid();
+    const long pid = s == nullptr ? -1 : s->worker_pid(kind);
     if (pid < 0) return std::nullopt;
     return pid;
   }

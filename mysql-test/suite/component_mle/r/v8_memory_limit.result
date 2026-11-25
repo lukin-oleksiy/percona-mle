@@ -1,0 +1,26 @@
+#
+# component_mle: memory outside the V8 heap (ArrayBuffers) is the cgroup's
+# (mle.v8_memory_max): the kernel ends the worker, mysqld and the session
+# go on (from v8_js.test, MVP review TEST-5).
+#
+call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE ON *.* TO root@localhost;
+SET GLOBAL mle.v8_memory_max = 256 * 1024 * 1024;
+CREATE FUNCTION js_buffers(mib INT) RETURNS INT LANGUAGE JS AS $$
+const keep = []
+for (let i = 0; i < mib; i++) { const b = new Uint8Array(1 << 20); b.fill(1); keep.push(b) }
+return keep.length
+$$;
+SELECT js_buffers(64) AS mib;
+mib
+64
+SELECT js_buffers(1024);
+ERROR HY000: MLE> the worker died: <reason>
+SELECT js_buffers(1) AS after_oom;
+after_oom
+1
+SET GLOBAL mle.v8_memory_max = DEFAULT;
+DROP FUNCTION js_buffers;
+REVOKE CREATE_JS_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

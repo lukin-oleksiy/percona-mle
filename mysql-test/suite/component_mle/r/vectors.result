@@ -85,9 +85,10 @@ the first column must be an integer id (row 0 has 1.5: not a whole number in the
 the first column must be an integer id (row 0 has 18446744073709551615: not a whole number in the BIGINT range)
 the query has 1 dimensions, the rows have 0
 # 5. KILL QUERY stops the work; the worker stays, and has no extra threads.
-SELECT vec_long();
-KILL QUERY CON1;
+CALL vec_long_running(@r);
+KILL QUERY CON;
 ERROR 70100: Query execution was interrupted
+DO RELEASE_ALL_LOCKS();
 SELECT vec_pool();
 vec_pool()
 helper threads within mle.vector_threads
@@ -135,7 +136,7 @@ DROP FUNCTION js_bad_metric;
 DROP PROCEDURE java_errors;
 DROP PROCEDURE java_load_ids;
 DROP FUNCTION js_redefined_array;
-DROP FUNCTION vec_long;
+DROP PROCEDURE vec_long_running;
 DROP FUNCTION vec_pool;
 DROP FUNCTION vec_warm;
 REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;

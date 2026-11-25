@@ -5,6 +5,7 @@
 --echo # tracebacks only for those who may see the code).
 --echo #
 --source ../include/have_mle_component.inc
+--source include/have_debug.inc
 --source include/count_sessions.inc
 
 INSTALL COMPONENT "file://component_mle";

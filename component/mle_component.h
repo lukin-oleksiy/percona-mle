@@ -52,25 +52,34 @@ enum Language : unsigned {
   kJava = 4,
   kJs = 8,
   kCPython = 16,
-  kAllLanguages = 31
+  kAllLanguages = 31,
+  /** Debug builds with mle.debug_test_worker only: the scripted test worker
+      (unittest/mle_test_worker proto), whose routine bodies are scripts of
+      messages, for the component's handling of a misbehaving worker (MVP
+      review TEST-1, exp design note 66). Never in kAllLanguages. */
+  kTest = 32
 };
 
 /** The kind that runs a language bit. */
 constexpr WorkerKind kind_of(unsigned bit) {
-  return bit == kJs ? WorkerKind::kV8 : bit == kCPython ? WorkerKind::kCPython : WorkerKind::kJvm;
+  return bit == kJs ? WorkerKind::kV8
+         : bit == kCPython ? WorkerKind::kCPython
+         : bit == kTest    ? WorkerKind::kTest
+                           : WorkerKind::kJvm;
 }
 
 /** The language a bit is written in, as the workers and the rules for names
     and values see it: JS is JavaScript (Oracle's), CPYTHON is Python. */
 constexpr unsigned family(unsigned bit) {
-  return bit == kJs ? kJavaScript : bit == kCPython ? kPython : bit;
+  return bit == kJs ? kJavaScript : bit == kCPython ? kPython : bit == kTest ? kJava : bit;
 }
 
 /** Language bits a kind runs. */
 constexpr unsigned kind_languages(WorkerKind kind) {
   return kind == WorkerKind::kV8 ? unsigned{kJs}
          : kind == WorkerKind::kCPython ? unsigned{kCPython}
-                                  : unsigned{kJavaScript | kPython | kJava};
+         : kind == WorkerKind::kTest    ? unsigned{kTest}
+                                        : unsigned{kJavaScript | kPython | kJava};
 }
 
 /** Bit of a LANGUAGE name (case-insensitive), 0 if it is not ours. */
@@ -81,6 +90,8 @@ const char *language_sql_name(unsigned bit);
 
 /** "JAVASCRIPT, python" -> bits. False on an unknown name. */
 bool parse_languages(std::string_view text, unsigned *bits);
+/** Debug builds with mle.debug_test_worker ON: the language TEST and its worker. */
+bool test_worker_enabled();
 
 /** Parses mle.pool_prewarm: "none", or a comma list of python, numpy and
     vectors (any case, spaces around items). On success *normalized is

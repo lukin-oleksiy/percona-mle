@@ -1,0 +1,34 @@
+--echo #
+--echo # component_mle: memory outside the V8 heap (ArrayBuffers) is the cgroup's
+--echo # (mle.v8_memory_max): the kernel ends the worker, mysqld and the session
+--echo # go on (from v8_js.test, MVP review TEST-5).
+--echo #
+--source ../include/have_mle_component.inc
+--source ../include/have_mle_v8.inc
+--source ../include/have_mle_cgroup.inc
+--source include/count_sessions.inc
+
+call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE ON *.* TO root@localhost;
+SET GLOBAL mle.v8_memory_max = 256 * 1024 * 1024;
+--connect (con1, localhost, root,,test)
+CREATE FUNCTION js_buffers(mib INT) RETURNS INT LANGUAGE JS AS $$
+  const keep = []
+  for (let i = 0; i < mib; i++) { const b = new Uint8Array(1 << 20); b.fill(1); keep.push(b) }
+  return keep.length
+$$;
+SELECT js_buffers(64) AS mib;
+--replace_regex /the worker died: .*/the worker died: <reason>/
+--error ER_LANGUAGE_COMPONENT
+SELECT js_buffers(1024);
+SELECT js_buffers(1) AS after_oom;
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.v8_memory_max = DEFAULT;
+DROP FUNCTION js_buffers;
+REVOKE CREATE_JS_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

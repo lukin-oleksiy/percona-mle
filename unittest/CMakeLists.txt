@@ -133,3 +133,33 @@ IF(TARGET mle_v8_worker)
   TARGET_INCLUDE_DIRECTORIES(mle_v8_values-t PRIVATE ${v8w} ${PROJECT_SOURCE_DIR}/worker ${PROJECT_SOURCE_DIR}/include)
   TARGET_INCLUDE_DIRECTORIES(mle_v8_values-t SYSTEM PRIVATE ${MLE_V8_INCLUDE_DIR})
 ENDIF()
+
+# The worker conformance suite (exp design note 66): every worker kind of this build, from its
+# installed layout (plugin_output_directory/mle), through the real launcher.
+MYSQL_ADD_EXECUTABLE(mle_worker_conformance-t worker_conformance-t.cc
+  ADD_TEST mle_worker_conformance
+  LINK_LIBRARIES mle_host ${MLE_GMOCK_LIB} ${MLE_GTEST_MAIN_LIB} ${MLE_GTEST_LIB} Threads::Threads
+  )
+TARGET_COMPILE_DEFINITIONS(mle_worker_conformance-t PRIVATE
+  MLE_DIR="${CMAKE_BINARY_DIR}/plugin_output_directory/mle"
+  MLE_JAVA_HOME="${MLE_JAVA_HOME}"
+  MLE_LAUNCHER_EXE="$<TARGET_FILE:mle_launcher>"
+  MLE_WORKER_EXE="$<TARGET_FILE:mle_worker>"
+  MLE_WORKER_JAR="${MLE_WORKER_JAR}"
+  MLE_RESOURCE_CACHE="${MLE_RESOURCE_CACHE}"
+  MLE_TEST_PYTHON_VENV="${MLE_TESTS_VENV}"
+  MLE_AOT_CACHE="${MLE_AOT_CACHE}"
+  )
+ADD_DEPENDENCIES(mle_worker_conformance-t mle_build_layout)
+SET_TESTS_PROPERTIES(mle_worker_conformance PROPERTIES TIMEOUT 600)
+
+# Debug builds: the component runs the scripted test worker for the language TEST
+# (mle.debug_test_worker; exp design note 66, MVP review TEST-1), and MTR gets the message scripts
+# from mle_proto_scripts.
+TARGET_COMPILE_DEFINITIONS(component_mle PRIVATE
+  $<$<CONFIG:Debug>:MLE_TEST_WORKER_EXE="$<TARGET_FILE:mle_test_worker>">)
+ADD_DEPENDENCIES(component_mle mle_test_worker)
+MYSQL_ADD_EXECUTABLE(mle_proto_scripts proto_scripts.cc
+  LINK_LIBRARIES mle_host
+  SKIP_INSTALL
+  )

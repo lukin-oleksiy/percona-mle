@@ -606,7 +606,8 @@ void measure(TestHost &h, uint64_t id, const std::vector<Value> &args,
             << ns[ns.size() * 9 / 10] / 1000 << " us\n";
 }
 
-TEST_F(MlePolyglotWorker, CallRoundTrip) {
+// A benchmark (MVP review TEST-13): --gtest_also_run_disabled_tests runs it.
+TEST_F(MlePolyglotWorker, DISABLED_CallRoundTrip) {
   TestHost *h = new_host();
   ASSERT_NE(h, nullptr);
   ResultMsg res;

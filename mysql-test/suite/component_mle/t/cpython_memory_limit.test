@@ -1,0 +1,33 @@
+--echo #
+--echo # component_mle: the CPython worker's cgroup memory limit
+--echo # (mle.cpython_memory_max) ends a worker that goes beyond it; the session
+--echo # goes on with a new one (from cpython_python.test, MVP review TEST-5).
+--echo #
+--source ../include/have_mle_component.inc
+--source ../include/have_mle_cpython.inc
+--source ../include/have_mle_cgroup.inc
+--source include/count_sessions.inc
+
+call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_CPYTHON_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+CREATE FUNCTION py_hog(mib INT) RETURNS INT LANGUAGE CPYTHON AS 'import numpy as np
+return int(np.ones(mib * 1024 * 1024 // 8).sum())';
+CREATE FUNCTION py_add(a INT, b INT) RETURNS INT LANGUAGE CPYTHON AS 'return a + b';
+SELECT py_hog(256) AS ones;
+--replace_regex /\(cgroup memory limit\).*/(cgroup memory limit)/
+--error ER_LANGUAGE_COMPONENT
+SELECT py_hog(4096);
+SELECT VARIABLE_VALUE >= 1 AS oom_counted FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_oom_errors';
+SELECT py_add(40, 2);
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION py_hog;
+DROP FUNCTION py_add;
+REVOKE CREATE_CPYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

@@ -1,0 +1,86 @@
+--echo #
+--echo # component_mle: a worker that breaks the protocol (exp design note 66, MVP
+--echo # review TEST-1). Debug builds run the scripted test worker for the language
+--echo # TEST (mle.debug_test_worker, set at startup): a routine's body is the
+--echo # script of the messages the worker sends. Each case: what the client gets,
+--echo # the worker counted as lost, and the session serving on.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+if (!$MLE_PROTO_SCRIPTS) {
+  --skip Needs the build's mle_proto_scripts (BUILD-mle/mtr sets MLE_PROTO_SCRIPTS)
+}
+
+call mtr.add_suppression("Component mle reported: 'The worker of .* (was lost|broke the protocol)");
+
+--exec $MLE_PROTO_SCRIPTS > $MYSQLTEST_VARDIR/tmp/proto_scripts.inc
+--source $MYSQLTEST_VARDIR/tmp/proto_scripts.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/proto_scripts.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+SELECT FIND_IN_SET('Test', VARIABLE_VALUE) > 0 AS test_language FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_languages_supported';
+--connect (con1, localhost, root,,test)
+CREATE FUNCTION js_one() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+--disable_query_log
+eval CREATE FUNCTION t_ok() RETURNS INT LANGUAGE TEST AS '$script_ok';
+eval CREATE FUNCTION t_bad_status() RETURNS INT LANGUAGE TEST AS '$script_bad_status';
+eval CREATE FUNCTION t_bad_domain() RETURNS DATE LANGUAGE TEST AS '$script_bad_domain';
+eval CREATE FUNCTION t_wrong_depth() RETURNS INT LANGUAGE TEST AS '$script_wrong_depth';
+eval CREATE FUNCTION t_exits() RETURNS INT LANGUAGE TEST AS '$script_exits';
+eval CREATE FUNCTION t_sleeps() RETURNS INT LANGUAGE TEST AS '$script_sleeps';
+--enable_query_log
+let $failures = SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_worker_failures';
+
+--echo # A worker that does what it should.
+SELECT t_ok();
+
+--echo # A RESULT with a status no worker may send (protocol 9.4).
+let $before = `$failures`;
+# A violation: the client gets the internal error; the log says why.
+--error ER_LANGUAGE_COMPONENT_INTERNAL
+SELECT t_bad_status();
+let $after = `$failures`;
+--let $assert_text = The worker that broke the protocol is counted once
+--let $assert_cond = $after - $before = 1
+--source include/assert.inc
+SELECT js_one() AS other_language, t_ok() AS new_test_worker;
+
+--echo # A value outside its domain (protocol 7.2: a DATE of month 13).
+# A violation: the client gets the internal error; the log says why.
+--error ER_LANGUAGE_COMPONENT_INTERNAL
+SELECT t_bad_domain();
+SELECT t_ok() AS after_domain;
+
+--echo # An SQL message at the wrong depth (protocol 8.1).
+# A violation: the client gets the internal error; the log says why.
+--error ER_LANGUAGE_COMPONENT_INTERNAL
+SELECT t_wrong_depth();
+SELECT t_ok() AS after_depth;
+
+--echo # A worker that exits during a call (protocol 11.4).
+--error ER_LANGUAGE_COMPONENT
+SELECT t_exits();
+SELECT t_ok() AS after_exit;
+
+--echo # A worker that does not stop when interrupted: ended after the grace period.
+--error ER_QUERY_TIMEOUT
+SELECT /*+ MAX_EXECUTION_TIME(300) */ t_sleeps();
+SELECT t_ok() AS after_kill;
+SELECT VARIABLE_VALUE >= 5 AS failures_counted FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'mle_worker_failures';
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP FUNCTION js_one;
+DROP FUNCTION t_ok;
+DROP FUNCTION t_bad_status;
+DROP FUNCTION t_bad_domain;
+DROP FUNCTION t_wrong_depth;
+DROP FUNCTION t_exits;
+DROP FUNCTION t_sleeps;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

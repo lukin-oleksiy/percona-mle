@@ -1395,13 +1395,14 @@ std::optional<std::string> Session::state(const Session *s,
   return std::nullopt;
 }
 
-long Session::worker_pid() {
+long Session::worker_pid(std::optional<WorkerKind> kind) {
   // The current principal's worker (the JVM worker's first, if it has several).
   const std::string who = principal(nullptr, kJavaScript).principal;
   long pid = -1;
-  for (const auto &[key, slot] : m_workers)
-    if (slot.principal == who && slot.worker && (pid == -1 || slot.kind == WorkerKind::kJvm))
-      pid = slot.worker->process().pid();
+  for (const auto &[key, slot] : m_workers) {
+    if (slot.principal != who || !slot.worker || (kind && slot.kind != *kind)) continue;
+    if (pid == -1 || slot.kind == WorkerKind::kJvm) pid = slot.worker->process().pid();
+  }
   return pid;
 }
 
@@ -1556,7 +1557,7 @@ const char *privilege_of(const Routine &r) {
       return kPrivileges[3];
     case kCPython:
       return kPrivileges[4];
-    default:
+    default:  // JAVA; and TEST (debug builds), which registers no privilege of its own
       return kPrivileges[2];
   }
 }

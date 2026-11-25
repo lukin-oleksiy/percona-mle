@@ -11,6 +11,14 @@ GRANT CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO ro
 CREATE FUNCTION js_loop() RETURNS INT LANGUAGE JS AS $$ for (;;) {} $$;
 CREATE FUNCTION java_loop() RETURNS INT LANGUAGE JAVA
 AS $$ long x = 0; while (x >= 0) { x = (x + 1) % 1000; } return 0; $$;
+CREATE PROCEDURE js_loop_running() LANGUAGE JS AS $$
+session.runSql("DO GET_LOCK('js_loop', 0)")
+for (;;) {}
+$$;
+CREATE PROCEDURE java_loop_running() LANGUAGE JAVA AS $$
+Mle.session().runSql("DO GET_LOCK('java_loop', 0)");
+long x = 0; while (x >= 0) { x = (x + 1) % 1000; }
+$$;
 CREATE FUNCTION js_ok() RETURNS INT LANGUAGE JS AS $$ return 7 $$;
 CREATE FUNCTION js_hog() RETURNS INT LANGUAGE JS AS $$
 const keep = [];
@@ -22,9 +30,10 @@ js_ok()
 #
 # 1. KILL QUERY of a JavaScript loop: the worker stops the call and stays.
 #
-SELECT js_loop();
-KILL QUERY CON1;
+CALL js_loop_running();
+KILL QUERY CON;
 ERROR 70100: Query execution was interrupted
+DO RELEASE_ALL_LOCKS();
 SELECT js_ok();
 js_ok()
 7
@@ -43,9 +52,10 @@ js_ok()
 #    call); the next call gets a fresh one.
 #
 SET GLOBAL mle.interrupt_grace_ms = 300;
-SELECT java_loop();
-KILL QUERY CON1;
+CALL java_loop_running();
+KILL QUERY CON;
 ERROR 70100: Query execution was interrupted
+DO RELEASE_ALL_LOCKS();
 SELECT js_ok();
 js_ok()
 7
@@ -112,6 +122,8 @@ alive
 1
 DROP FUNCTION js_loop;
 DROP FUNCTION java_loop;
+DROP PROCEDURE js_loop_running;
+DROP PROCEDURE java_loop_running;
 DROP FUNCTION js_ok;
 DROP FUNCTION js_hog;
 DROP FUNCTION u2_py;

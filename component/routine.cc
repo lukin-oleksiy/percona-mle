@@ -79,7 +79,7 @@ const char *worker_language(unsigned bit) {
     case kPython:
       return "python";
     case kJava:
-      return "java";
+      return bit == kTest ? "none" : "java";  // the scripted test worker's READY language
     default:
       return "";
   }
@@ -627,6 +627,7 @@ const char *display_language(const std::string &l) {
   if (l == "js") return "JavaScript";
   if (l == "python") return "Python";
   if (l == "java") return "Java";
+  if (l == "none") return "Test";
   return l.c_str();
 }
 

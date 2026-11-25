@@ -10,6 +10,10 @@
 --error 0,1
 --file_exists $mle_plugin_dir/mle/cpython/mle_cpython_worker
 if ($__error) {
+  # ci.sh requires every worker (MVP review TEST-7): no skip then.
+  if ($MLE_TEST_REQUIRE_WORKERS) {
+    --die The CPython worker is not installed, and MLE_TEST_REQUIRE_WORKERS is set
+  }
   --skip The CPython worker is not installed (build percona-mle with -DMLE_CPYTHON=ON)
 }
 --enable_query_log

@@ -49,7 +49,7 @@ EOF
 
 --connect (con1, localhost, root,,test)
 SELECT cpy_pid();
-let $pid1 = `SELECT mle_debug_worker_pid()`;
+let $pid1 = `SELECT mle_debug_worker_pid('cpython')`;
 
 --echo #
 --echo # D11 (CPY-5): an interrupt wakes guest code that sleeps or waits: it ends
@@ -60,7 +60,7 @@ SELECT /*+ MAX_EXECUTION_TIME(300) */ cpy_nap();
 --error ER_QUERY_TIMEOUT
 SELECT /*+ MAX_EXECUTION_TIME(300) */ cpy_wait();
 SELECT cpy_pid();
-let $pid2 = `SELECT mle_debug_worker_pid()`;
+let $pid2 = `SELECT mle_debug_worker_pid('cpython')`;
 --let $assert_text = The worker that slept still serves
 --let $assert_cond = $pid1 = $pid2
 --source include/assert.inc
@@ -93,14 +93,14 @@ SELECT cpy_len(REPEAT('a', 1000)) AS still_serves;
 --echo # worker (kept for the account, RESET in between) finds them as they were.
 --echo #
 SELECT cpy_set_alarm();
-let $pid3 = `SELECT mle_debug_worker_pid()`;
+let $pid3 = `SELECT mle_debug_worker_pid('cpython')`;
 --disconnect con1
 --connection default
 let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers';
 --source include/wait_condition.inc
 --connect (con1, localhost, root,,test)
 SELECT cpy_alarm();
-let $pid4 = `SELECT mle_debug_worker_pid()`;
+let $pid4 = `SELECT mle_debug_worker_pid('cpython')`;
 --let $assert_text = The session got the worker that was RESET
 --let $assert_cond = $pid3 = $pid4
 --source include/assert.inc

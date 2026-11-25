@@ -1,0 +1,63 @@
+#
+# component_mle: a worker that breaks the protocol (exp design note 66, MVP
+# review TEST-1). Debug builds run the scripted test worker for the language
+# TEST (mle.debug_test_worker, set at startup): a routine's body is the
+# script of the messages the worker sends. Each case: what the client gets,
+# the worker counted as lost, and the session serving on.
+#
+call mtr.add_suppression("Component mle reported: 'The worker of .* (was lost|broke the protocol)");
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+SELECT FIND_IN_SET('Test', VARIABLE_VALUE) > 0 AS test_language FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_languages_supported';
+test_language
+1
+CREATE FUNCTION js_one() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+# A worker that does what it should.
+SELECT t_ok();
+t_ok()
+7
+# A RESULT with a status no worker may send (protocol 9.4).
+SELECT t_bad_status();
+ERROR HY000: Language component: Internal error.
+include/assert.inc [The worker that broke the protocol is counted once]
+SELECT js_one() AS other_language, t_ok() AS new_test_worker;
+other_language	new_test_worker
+1	7
+# A value outside its domain (protocol 7.2: a DATE of month 13).
+SELECT t_bad_domain();
+ERROR HY000: Language component: Internal error.
+SELECT t_ok() AS after_domain;
+after_domain
+7
+# An SQL message at the wrong depth (protocol 8.1).
+SELECT t_wrong_depth();
+ERROR HY000: Language component: Internal error.
+SELECT t_ok() AS after_depth;
+after_depth
+7
+# A worker that exits during a call (protocol 11.4).
+SELECT t_exits();
+ERROR HY000: MLE> the worker died: exited with status 7
+SELECT t_ok() AS after_exit;
+after_exit
+7
+# A worker that does not stop when interrupted: ended after the grace period.
+SELECT /*+ MAX_EXECUTION_TIME(300) */ t_sleeps();
+ERROR HY000: Query execution was interrupted, maximum statement execution time exceeded
+SELECT t_ok() AS after_kill;
+after_kill
+7
+SELECT VARIABLE_VALUE >= 5 AS failures_counted FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'mle_worker_failures';
+failures_counted
+1
+DROP FUNCTION js_one;
+DROP FUNCTION t_ok;
+DROP FUNCTION t_bad_status;
+DROP FUNCTION t_bad_domain;
+DROP FUNCTION t_wrong_depth;
+DROP FUNCTION t_exits;
+DROP FUNCTION t_sleeps;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

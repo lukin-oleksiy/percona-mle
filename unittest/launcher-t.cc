@@ -26,7 +26,11 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <poll.h>
+#include <stddef.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -178,8 +182,8 @@ TEST(MleLauncher, StartReportsCapabilities) {
   ASSERT_NE(l, nullptr);
   EXPECT_GT(l->info().pid, 0);
   if (l->info().landlock_abi < launcher::kMinLandlockAbi)
-    GTEST_SKIP() << "Landlock ABI " << l->info().landlock_abi
-                 << ": this kernel (or container) cannot isolate workers";
+    MLE_SKIP_OR_FAIL("MLE_TEST_REQUIRE_LANDLOCK", "Landlock ABI " << l->info().landlock_abi
+                     << ": this kernel (or container) cannot isolate workers");
   ASSERT_EQ(l->info().class_errors.size(), 1u);
   EXPECT_EQ(l->info().class_errors[0], "");
   EXPECT_FALSE(l->info().cgroup_enabled);
@@ -694,6 +698,41 @@ TEST(MleLauncherCgroup, WorkersRunInTheirOwnLeaf) {
   while (count_leaves(base) != 0 && Clock::now() < deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   EXPECT_EQ(count_leaves(base), 0) << "leaf not removed";
+}
+
+TEST(MleLauncherCgroup, CloneFallbackJoinsTheLeaf) {
+  // Where clone3 is refused (the default seccomp profiles of container runtimes: ENOSYS), the
+  // launcher starts a worker with clone() and the worker joins its cgroup leaf itself (MVP review
+  // HOST-7: the Docker path). In a child process, whose filter the launcher inherits.
+  NEED_CGROUP(base);
+  const pid_t child = fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    sock_fprog prog{static_cast<unsigned short>(sizeof filter / sizeof filter[0]), filter};
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0)
+      _exit(10);
+    if (syscall(SYS_clone3, nullptr, 0) != -1 || errno != ENOSYS) _exit(11);
+    auto l = start(config({test_class("t")}, base));
+    if (l == nullptr || !l->info().cgroup_enabled) _exit(12);
+    std::string error;
+    auto w = l->acquire("t", &error);
+    if (w == nullptr) _exit(13);
+    ReadyMsg ready;
+    if (!wait_ready(*w, &ready, &error)) _exit(14);
+    const std::string leaf = "/mle-" + std::to_string(l->info().pid) + "-w" + std::to_string(w->id());
+    _exit(parse_report(ready.info)["cgroup"].find(leaf) != std::string::npos ? 0 : 15);
+  }
+  int status = 0;
+  ASSERT_EQ(waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status)) << status;
+  EXPECT_EQ(WEXITSTATUS(status), 0)
+      << "10 seccomp, 11 clone3 not refused, 12 launcher, 13 acquire, 14 READY, 15 not in its leaf";
 }
 
 TEST(MleLauncherCgroup, LaunchersShareABase) {

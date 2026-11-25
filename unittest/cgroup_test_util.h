@@ -28,9 +28,24 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
+
+/**
+  A test that cannot run here skips, or fails when the environment variable env is 1: ci.sh sets
+  MLE_TEST_REQUIRE_CGROUP and MLE_TEST_REQUIRE_LANDLOCK, so that what it means to test is not
+  skipped silently (MVP review TEST-7).
+*/
+#define MLE_SKIP_OR_FAIL(env, message)                                       \
+  do {                                                                       \
+    const char *mle_required = std::getenv(env);                             \
+    if (mle_required != nullptr && std::string(mle_required) == "1")         \
+      GTEST_FAIL() << message << " (required: " env "=1)";                   \
+    else                                                                     \
+      GTEST_SKIP() << message;                                               \
+  } while (false)
 
 namespace mle_test {
 
@@ -72,7 +87,8 @@ inline std::string test_cgroup(std::string *why) {
   std::string why;                                  \
   const std::string base = test_cgroup(&why);       \
   if (base.empty()) {                               \
-    GTEST_SKIP() << "no delegated cgroup: " << why; \
+    MLE_SKIP_OR_FAIL("MLE_TEST_REQUIRE_CGROUP",      \
+                     "no delegated cgroup: " << why); \
   }                                                 \
   static_assert(true)
 

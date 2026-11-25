@@ -1,0 +1,88 @@
+#
+# component_mle: executeMany (exp note 51): a prepared statement executed
+# once per row of values, without a round trip per row; JavaScript,
+# Python (execute_many, executemany) and Java. Stops at the first failing
+# row (error.row / getRow()), the rows before it stay; statements that
+# return rows are refused after the first row.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE b (id INT PRIMARY KEY, name VARCHAR(20), x DOUBLE, v VECTOR(3), d DATE);
+CREATE TABLE rw (id INT PRIMARY KEY, a VARCHAR(20), x DOUBLE,
+ts DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)) ENGINE=InnoDB;
+CREATE TABLE rw_my (id INT PRIMARY KEY, a VARCHAR(20), x DOUBLE) ENGINE=MyISAM;
+# 1. JavaScript: types, NULLs, VECTORs, dates; an error at row 1 keeps
+#    row 0 (id 10); a wrong row width; an empty batch; a SELECT is
+#    refused after its first row; UPDATE counts; errors that are not
+#    about a batch row have row null.
+CALL js_batch(@r);
+SELECT @r;
+@r
+affected 3 | error 1062 23000 row 1 true | ids 1,2,3,10 | width 1210 row 0 | empty 0 | select: executeMany runs statements that return no rows; this one returned a result set (the row was executed), row 0 | not rows: executeMany takes a list of rows, each a list of values | update 2 | plain error row null
+SELECT id, name, x, VECTOR_TO_STRING(v) AS v, d FROM b ORDER BY id;
+id	name	x	v	d
+1	a	2.5	[1.00000e+00,2.00000e+00,3.00000e+00]	2024-01-02
+2	NULL	NULL	NULL	NULL
+3	c	-1	[0.00000e+00,0.00000e+00,1.00000e+00]	2024-01-03
+10	x	0	NULL	NULL
+# 2. Python: execute_many and executemany; an error at row 1; a rollback
+#    in a transaction undoes the batch's rows.
+CALL py_batch(@r);
+SELECT @r;
+@r
+affected 5 | executemany 2 | error 1062 row 1 | rolled back at row 2 | 100,101,102,103,104,200,201,202 | [3.00000e+00,4.00000e+00,5.00000e+00] | not rows: TypeError
+# 3. Java: 12,000 rows over two messages; an error at row 10,000 of a
+#    second batch (in its second message; the earlier 10,000 rows stay); a
+#    deallocated statement.
+CALL java_batch(@r);
+SELECT @r;
+@r
+affected 12000 | count 12000 sum 7.1994E7 | error 1062 row 10000 | kept 10000 | deallocated: the prepared statement was deallocated
+# 4. Multi-row statements (exp note 52): an INSERT or REPLACE of one row of
+#    values into an InnoDB table, 16 rows or more, runs in statements of
+#    up to 1,000 rows (Com_insert + Com_replace count the statements),
+#    for 256 rows or more; not for smaller batches, batch_rewrite off, MyISAM, expressions in the
+#    row, ? outside the row, several rows, the SET form, a backslash. An
+#    error at row 1500 of a 2000-row batch: the row's index, rows 0-1499
+#    written (the failing chunk replayed row by row), nothing after.
+CALL py_rewrite(@r);
+SELECT @r;
+@r
+2500 rows: affected 2500, statements 3
+255 rows: affected 255, statements 255
+256 rows: affected 256, statements 1
+1001 rows: affected 1001, statements 2
+batch_rewrite off: affected 300, statements 300
+MyISAM: affected 300, statements 300
+NOW() in the row: affected 300, statements 300
+? in the update: affected 598, statements 300
+alias update: affected 598, statements 1
+comments, strings: affected 300, statements 1
+quoted names: affected 300, statements 1
+REPLACE: affected 300, statements 1
+INSERT IGNORE: affected 200, statements 1
+two rows already: affected 600, statements 300
+SET form: affected 300, statements 300
+backslash: affected 300, statements 300
+error at row 1500: error 1062 row 1500, statements 503
+kept 1500 rows, up to id 51499
+distinct timestamps of the 2500 rows <= 3: True
+rw2 InnoDB: affected 300, statements 1
+rw2 now MyISAM, error at row 400: error 1062 row 0, statements 1
+rw2 kept 400 rows
+CALL js_rewrite_off(@r);
+SELECT @r;
+@r
+statements 300
+# 5. In a function SQL is refused, executeMany too.
+SELECT js_batch_f();
+ERROR HY000: JavaScript> SQL statements are not allowed in stored functions and triggers: use a stored procedure (js_batch_f, line 2)
+DROP PROCEDURE js_batch;
+DROP PROCEDURE py_batch;
+DROP PROCEDURE java_batch;
+DROP FUNCTION js_batch_f;
+DROP PROCEDURE py_rewrite;
+DROP PROCEDURE js_rewrite_off;
+DROP TABLE b, rw, rw_my;
+REVOKE CREATE_JS_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

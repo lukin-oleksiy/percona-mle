@@ -3,6 +3,7 @@
 --echo # multi-model review (exp notes 60 and 61).
 --echo #
 --source ../include/have_mle_component.inc
+--source include/have_debug.inc
 --source include/count_sessions.inc
 
 # C60: a worker whose context a routine closed is retired.

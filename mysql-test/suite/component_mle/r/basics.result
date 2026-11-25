@@ -14,7 +14,7 @@ Active
 # The pool fills: one JVM worker with Java, JavaScript and Python.
 # System variables (paths differ per build).
 SHOW GLOBAL VARIABLES WHERE Variable_name LIKE 'mle.%'
-  AND Variable_name NOT IN ('mle.dir', 'mle.java_home');
+  AND Variable_name NOT IN ('mle.dir', 'mle.java_home', 'mle.debug_test_worker');
 Variable_name	Value
 mle.cgroup_base	AUTO
 mle.console	OFF
@@ -72,15 +72,16 @@ mle_worker_reuses	#
 mle_workers	#
 mle_workers_cached	#
 mle_workers_spawned	#
-SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
+SELECT VARIABLE_NAME, IF(VARIABLE_NAME = 'mle_pool_idle', VARIABLE_VALUE > 0, VARIABLE_VALUE) AS VARIABLE_VALUE
+FROM performance_schema.global_status
 WHERE VARIABLE_NAME IN ('mle_status', 'mle_heap_status',
 'mle_languages_supported', 'mle_pool_idle', 'mle_workers',
 'mle_stored_programs')
 ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	VARIABLE_VALUE
 mle_heap_status	Allocated
-mle_languages_supported	JavaScript,Python,Java,JS,CPython
-mle_pool_idle	6
+mle_languages_supported	JavaScript,Python,Java<,native workers>
+mle_pool_idle	1
 mle_status	Active
 mle_stored_programs	0
 mle_workers	0

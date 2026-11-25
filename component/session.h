@@ -139,7 +139,8 @@ class Session {
   /** Programs prepared in this session's workers (Oracle: "active"). */
   bool has_programs() const { return !m_programs.empty(); }
   /** The pid of the current principal's worker, or -1 (debug UDF). */
-  long worker_pid();
+  /** The current principal's worker of kind (none: the JVM worker's, else any); -1 if none. */
+  long worker_pid(std::optional<WorkerKind> kind = std::nullopt);
   /** Whether mle_set_session_state() may replace the session's options
       now (protocol §9.8, Appendix A): no request of it in progress, no
       program cached, and no id prepared in its workers once the ids of

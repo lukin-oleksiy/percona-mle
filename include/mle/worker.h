@@ -232,6 +232,10 @@ struct HeldError {
 };
 
 class Worker {
+  /** The conformance tests' access to post() (unittest/worker_conformance-t.cc): a malformed
+      message, which this class never sends. Defined only there. */
+  friend struct WorkerTestAccess;
+
  public:
   explicit Worker(std::unique_ptr<WorkerProcess> process,
                   const WorkerOptions &options = {});

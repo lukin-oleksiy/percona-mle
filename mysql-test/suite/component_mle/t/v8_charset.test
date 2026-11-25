@@ -1,2 +1,2 @@
---let $v8_test = sql_core
+--let $v8_test = charset
 --source ../include/js_on_v8.inc

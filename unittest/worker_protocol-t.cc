@@ -2247,6 +2247,37 @@ TEST_F(MleWorkerProtocol, Death) {
   EXPECT_TRUE(w->interrupted());
 }
 
+// §11.4: a worker that dies in the middle of a chunked transfer, either way: the request fails as
+// died; only a last chunk is processed after the death (MVP review TEST-10).
+TEST_F(MleWorkerProtocol, DeathMidChunk) {
+  ResultMsg res;
+  std::string err;
+  {
+    // The worker's RESULT: its first chunk, then the worker ends instead of sending the next.
+    auto w = start();
+    ASSERT_NE(w, nullptr);
+    prepare(*w, 1, raw_result(std::string(kArena, 'x'), 0, kMore, kArena, 2 * kArena).exit(9));
+    EXPECT_EQ(w->call(1, 0, {}, hooks, &res, &err), Outcome::kDied);
+    EXPECT_EQ(err, "the MLE worker died: exited with status 9");
+    EXPECT_FALSE(w->usable());
+  }
+  {
+    // The host's CALL of several chunks: the worker ends instead of asking for the second.
+    auto w = start();
+    ASSERT_NE(w, nullptr);
+    const Script arm = Script().arm(Op::kContinue, Script().exit(9)).answer();
+    PrepareMsg p = routine(1, "prepare:" + arm.hex());
+    ParamType text;
+    text.tag = Tag::kString;
+    text.type_name = "LONGTEXT";
+    p.params.push_back({"a", wire::ParamMode::kIn, text});
+    ASSERT_EQ(w->prepare(p, hooks, &res, &err), Outcome::kOk) << err;
+    EXPECT_EQ(w->call(1, 0, {Value::string(std::string(5 << 20, 'a'))}, hooks, &res, &err), Outcome::kDied);
+    EXPECT_EQ(err, "the MLE worker died: exited with status 9");
+    EXPECT_FALSE(w->usable());
+  }
+}
+
 // ---------------------------------------------------------------- deadlines
 
 // §11.2: DROP, RESET and OPTIONS have one deadline for the whole exchange.

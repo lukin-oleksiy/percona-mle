@@ -46,8 +46,9 @@ class CallHooks;
 namespace mle_component {
 
 /** The worker kinds: a launcher class each (defaults.h; exp design note 63). */
-enum class WorkerKind : unsigned { kJvm = 0, kCPython = 1, kV8 = 2 };
-constexpr size_t kKinds = 3;
+/** kTest: debug builds only (mle.debug_test_worker; mle_component.h kTest). */
+enum class WorkerKind : unsigned { kJvm = 0, kCPython = 1, kV8 = 2, kTest = 3 };
+constexpr size_t kKinds = 4;
 
 /** The launcher class name of a kind ("jvm", "cpython", "v8"). */
 const char *kind_name(WorkerKind kind);

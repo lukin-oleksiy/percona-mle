@@ -1083,7 +1083,26 @@ TEST_F(MleJavaWorker, NestingLimit) {
 // A dedicated worker: the shared one is busy JIT-compiling javac and the
 // other tests' routines. The worker's own code needs many calls to reach
 // steady state, so warm up long.
-TEST_F(MleJavaWorker, CallRoundTrip) {
+// Repeated calls give the same result each time (the benchmarks below are DISABLED_: run them
+// with --gtest_also_run_disabled_tests; MVP review TEST-13).
+TEST_F(MleJavaWorker, ManyCalls) {
+  TestHost *h = new_host("jvm");
+  ASSERT_NE(h, nullptr);
+  ResultMsg res;
+  ASSERT_EQ(prepare(*h, 1, "P.f",
+                    "public class P { public static long f(long a, String b, "
+                    "double c) { return a + b.length() + (long) c; } }",
+                    {type(Tag::kI64), type(Tag::kString), type(Tag::kF64)},
+                    type(Tag::kI64), &res),
+            0u);
+  for (int i = 0; i < 2000; i++) {
+    ASSERT_EQ(h->call(1, {Value::i64(i), Value::string("hello"), Value::f64(2.0)}, &res), 0u) << error_of(res);
+    ASSERT_EQ(*res.ret, Value::i64(i + 7));
+  }
+  delete h;
+}
+
+TEST_F(MleJavaWorker, DISABLED_CallRoundTrip) {
   TestHost *h = new_host("jvm");
   ASSERT_NE(h, nullptr);
   ResultMsg res;
@@ -1119,7 +1138,7 @@ TEST_F(MleJavaWorker, CallRoundTrip) {
 
 // The same call when the host does not spin and sleeps on the futex at
 // once: the cost of a sleep and a wake on both sides.
-TEST_F(MleJavaWorker, CallRoundTripWithoutSpinning) {
+TEST_F(MleJavaWorker, DISABLED_CallRoundTripWithoutSpinning) {
   WorkerOptions o;
   o.spin_us = 0;
   TestHost *h = new_host("jvm", nullptr, o);
@@ -1149,7 +1168,7 @@ TEST_F(MleJavaWorker, CallRoundTripWithoutSpinning) {
 
 // How much JIT warm-up matters: one worker, a compute-heavy routine (cosine
 // of two VECTOR(768) arguments, 8 times), latency of call 1, 10, 100, ...
-TEST_F(MleJavaWorker, JitWarmup) {
+TEST_F(MleJavaWorker, DISABLED_JitWarmup) {
   TestHost *h = new_host("jvm");
   ASSERT_NE(h, nullptr);
   ResultMsg res;

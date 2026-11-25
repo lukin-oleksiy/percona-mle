@@ -5,4 +5,6 @@
 export MLE_COMPONENT=component_mle.so
 export MLE_COMPONENT_OPT="--plugin-dir=@MYSQL_BUILD_DIR@/plugin_output_directory"
 export MLE_SUITE_DIR="@CMAKE_SOURCE_DIR@/mysql-test/suite/component_mle"
+# Debug builds: the message scripts of test_worker_violations.test (unittest/proto_scripts.cc).
+export MLE_PROTO_SCRIPTS="@CMAKE_BINARY_DIR@/runtime_output_directory/mle_proto_scripts"
 cd "@MYSQL_BUILD_DIR@/mysql-test" && exec ./mysql-test-run.pl --suite="$MLE_SUITE_DIR" "$@"
