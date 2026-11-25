@@ -325,6 +325,7 @@ final class Dispatcher {
       FrameLimit.reset();
       LibraryFileSystem.requestStart();
       sqlErrors.clear();
+      topRequest++;
     }
     try {
       // OPTIONS, DROP and RESET are at most 64 KiB: a worker that cannot hold even these is in
@@ -740,7 +741,7 @@ final class Dispatcher {
       result(q, Wire.EXHAUSTED, new ErrorInfo("java", t.toString(), userFrames(t), 0, "", 0));
     } else if (t instanceof MleSqlException e) {
       result(q, Wire.GUEST_ERROR, sqlInfo("java", e.getMessage(), userFrames(t), e.getErrorCode(), e.getSqlState(),
-          e.getErrorId()));
+          heldId(e)));
     } else if (t instanceof Values.ConversionException) {
       result(q, Wire.GUEST_ERROR, new ErrorInfo(Wire.LANGUAGE_TYPE, t.getMessage(), userFrames(t), 0, "", 0));
     } else if (t instanceof JavaRoutines.CompileException) {
@@ -798,7 +799,7 @@ final class Dispatcher {
       }
       if (h instanceof MleSqlException sql) {
         result(q, Wire.GUEST_ERROR, sqlInfo(language, sql.getMessage(), frames, sql.getErrorCode(), sql.getSqlState(),
-            sql.getErrorId()));
+            heldId(sql)));
         return;
       }
       if (h instanceof Values.ConversionException c) {
@@ -830,8 +831,22 @@ final class Dispatcher {
   }
 
   /**
+   * The number of the top-level request (one more for each): a guest SqlError's $mle$id is
+   * "topRequest:error_id", so that one kept from an earlier request is not taken for an ERROR of
+   * this one (§10.8).
+   */
+  static long topRequest;
+
+  /** The $mle$id of a guest SqlError made from e in this top-level request; null without an id. */
+  static String guestErrorId(MleSqlException e) {
+    return e.getErrorId() == 0 ? null : topRequest + ":" + Long.toUnsignedString(e.getErrorId());
+  }
+
+  /**
    * The ERRORs of SQL_RESULTs of the top-level request by their error_id (§10.4), the most recent
-   * ones: a routine that ends with one of them hands it back by its id (§10.8).
+   * ones: a routine that ends with one of them hands it back by its id (§10.8); one from an earlier
+   * top-level request is not handed back (Java: not the same object; JS, Python: $mle$id of
+   * another request).
    */
   private final java.util.Map<Long, MleSqlException> sqlErrors = new java.util.LinkedHashMap<>() {
     @java.io.Serial private static final long serialVersionUID = 1L;
@@ -854,6 +869,12 @@ final class Dispatcher {
     return new ErrorInfo(language, message, frames, code, state, 0);
   }
 
+  /** e's error_id if e is the ERROR held under it in this top-level request, else 0. */
+  private long heldId(MleSqlException e) {
+    long id = e.getErrorId();
+    return id != 0 && sqlErrors.get(id) == e ? id : 0;
+  }
+
   /**
    * A guest SqlError (the SQL API's error class of JS and Python: marked with $mle$sql, with code
    * and sqlState, and $mle$id when it came from an SQL statement): an inner statement's error, or
@@ -872,9 +893,10 @@ final class Dispatcher {
           : message.toString();
       String st = state != null && state.isString() ? state.asString() : "";
       long id = 0;
-      if (sent != null && sent.isString()) {
+      String prefix = topRequest + ":";
+      if (sent != null && sent.isString() && sent.asString().startsWith(prefix)) {
         try {
-          id = Long.parseUnsignedLong(sent.asString());
+          id = Long.parseUnsignedLong(sent.asString().substring(prefix.length()));
         } catch (NumberFormatException e) {
           id = 0;
         }

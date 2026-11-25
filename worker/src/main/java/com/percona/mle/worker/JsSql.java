@@ -188,7 +188,7 @@ final class JsSql implements GuestSql.Lang {
   public RuntimeException sqlError(MleSqlException e) {
     try {
       h.getMember("throwSql").execute(e.getErrorCode(), e.getSqlState(), e.getMessage(), e.getRow(),
-          e.getErrorId() == 0 ? null : Long.toUnsignedString(e.getErrorId()));
+          Dispatcher.guestErrorId(e));
     } catch (PolyglotException p) {
       return p;
     }

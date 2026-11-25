@@ -135,16 +135,14 @@ _MICROSECOND = _dt.timedelta(microseconds=1)
 def timestamp(us, rows):
     """A TIMESTAMP of the host (helper of the C++ codec): an aware datetime in the zone of OPTIONS
     (ZoneInfo keeps the offset intervals of its zone). The zero timestamp, and what Python's
-    datetime cannot hold, is None in a row and a conversion error as a routine argument (as zero
-    dates are)."""
+    datetime cannot hold, is None, as a routine argument and in a row (Appendix B.4). (rows: unused,
+    the codec's signature.)"""
     try:
         if us != ZERO_TIMESTAMP:
             return (_EPOCH + _dt.timedelta(microseconds=us)).astimezone(ZONE)
     except OverflowError:
         pass
-    if rows:
-        return None
-    raise ConversionError('the TIMESTAMP value has no Python equivalent (zero timestamp?)')
+    return None
 
 
 def aware(v):
@@ -552,7 +550,11 @@ def _decimal_text(v, t):
 # ------------------------------------------------------------------ helpers of the C++ codec
 
 def temporal(tag, year, month, day, hour, minute, second, micro, neg):
-    """A temporal value Python's types cannot hold: raise the conversion error (zero dates)."""
+    """A temporal value of a routine argument that Python's types cannot hold: a DATE or DATETIME
+    (a zero date, a zero month or day, an impossible date, year 0) is None, as in rows (Appendix
+    B.4); a TIME out of range is a conversion error."""
+    if tag != T_TIME:
+        return None
     raise ConversionError('the %s value %04d-%02d-%02d %s%d:%02d:%02d.%06d has no Python equivalent (zero date?)'
                           % (TAG_NAMES[tag], year, month, day, '-' if neg else '', hour, minute, second, micro))
 

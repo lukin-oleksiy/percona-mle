@@ -65,6 +65,60 @@ final class JsOracle {
 
   private static final Pattern AWAIT = Pattern.compile("\\bawait\\b");
 
+  /** The wrapper's argument names ($a0, $a1, ...). */
+  private static final Pattern WRAPPER_ARGUMENT = Pattern.compile("\\$a[0-9]+");
+
+  /** Reserved words of strict code, and await (an async body), arguments and eval (not bindable). */
+  private static final java.util.Set<String> RESERVED = java.util.Set.of(
+      "arguments", "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default",
+      "delete", "do", "else", "enum", "eval", "export", "extends", "false", "finally", "for", "function", "if",
+      "implements", "import", "in", "instanceof", "interface", "let", "new", "null", "package", "private",
+      "protected", "public", "return", "static", "super", "switch", "this", "throw", "true", "try", "typeof",
+      "var", "void", "while", "with", "yield");
+
+  /**
+   * Why name cannot be a parameter of a body-form routine (§9.2), or null if it can: the wrapper's
+   * own names, reserved words, and what is not an identifier (Unicode ID_Start and ID_Continue,
+   * with $ and _). Never decided by compiling: names are spliced into the wrapper's source.
+   */
+  static String badParameterName(String name) {
+    if (name.equals("$c") || name.equals("$G") || name.equals("$r") || name.equals("globalThis")
+        || WRAPPER_ARGUMENT.matcher(name).matches() || RESERVED.contains(name))
+      return "'" + name + "' cannot be the name of a JavaScript parameter";
+    return identifier(name) ? null : "'" + name + "' is not a JavaScript identifier";
+  }
+
+  static boolean identifier(String s) {
+    if (s.isEmpty()) return false;
+    for (int i = 0; i < s.length(); ) {
+      int cp = s.codePointAt(i);
+      boolean ok = cp == '$' || cp == '_' || (i == 0 ? Character.isUnicodeIdentifierStart(cp)
+          : cp == 0x200C || cp == 0x200D
+              || (Character.isUnicodeIdentifierPart(cp) && !Character.isIdentifierIgnorable(cp)));
+      if (!ok) return false;
+      i += Character.charCount(cp);
+    }
+    return true;
+  }
+
+  /**
+   * Whether a body uses await at its top level (Appendix B.7): a regex pre-filter, then a parse of
+   * the body as a plain function in a module, where await is reserved, so that only an await
+   * outside async functions fails. A body that fails to parse for another reason is taken as async,
+   * as before; its compile reports the error.
+   */
+  static boolean topLevelAwait(Context c, String body) {
+    if (!AWAIT.matcher(body).find()) return false;
+    try {
+      c.parse(Source.newBuilder("js", "function f(){" + body + "\n}", "await-check.mjs")
+          .mimeType("application/javascript+module").buildLiteral());
+      return false;
+    } catch (org.graalvm.polyglot.PolyglotException e) {
+      if (e.isInterrupted() || e.isCancelled() || e.isResourceExhausted()) throw e;
+      return true;
+    }
+  }
+
   /** Name of the wrapper function around the body's arrow function; its frame
       is not counted against the frame limit (the arrow is the routine's). */
   static final String WRAPPER = "$mle$routine";
@@ -183,7 +237,7 @@ final class JsOracle {
     StringBuilder pre = new StringBuilder("(function($c){const $G=globalThis;return ");
     // USING (Phase 6): each library is bound to its name or alias, loaded synchronously (once per
     // version and worker, see LibraryFileSystem); only a body with await is async.
-    boolean async = AWAIT.matcher(body).find();
+    boolean async = topLevelAwait(c, body);
     if (async) pre.append("async ");
     pre.append("function " + WRAPPER + "(");
     for (int i = 0; i < n; i++) pre.append(i == 0 ? "" : ",").append("$a").append(i);

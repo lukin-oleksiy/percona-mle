@@ -193,16 +193,14 @@ assert v[13] == 'V' and seen == [(3, 0)], seen
 }
 
 TEST(CpythonCodec, ZeroDate) {
+  // Appendix B.4: a date Python cannot hold and the zero timestamp are None, as routine
+  // arguments and in rows (MVP review D1).
   set_bytes("body", call_body({Value::temporal(Tag::kDatetime, mle::Temporal{})}));
   set_bytes("body2", call_body({Value::timestamp(mle::wire::kZeroTimestamp)}));
   EXPECT_TRUE(py(R"(
-for b, what in ((body, 'zero date'), (body2, 'zero timestamp')):
-    try:
-        _mlewire.decode(b, ARGS, 1)
-        raise AssertionError('no error')
-    except wire.ConversionError as e:
-        assert what in str(e), e
-# In a row a zero timestamp is None.
+for b in (body, body2):
+    v, _ = _mlewire.decode(b, ARGS, 1)
+    assert v == [None], v
 assert wire.timestamp(wire.ZERO_TIMESTAMP, 1) is None
 )"));
 }

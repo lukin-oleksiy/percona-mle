@@ -547,6 +547,72 @@ TEST_F(MleBodyForms, JsCompileErrors) {
   EXPECT_NE(err.find("not a JavaScript identifier"), std::string::npos) << err;
 }
 
+TEST_F(MleBodyForms, JsParameterNames) {
+  // §9.2: any JavaScript identifier (Unicode ID_Start, ID_Continue), refused only when it is not
+  // one, is a reserved word, or is a name of the wrapper's code (MVP review JVML-13, CONF-6).
+  std::string err;
+  const uint64_t ok = prepare("js", "uni", "return gr\xC3\xB6\xC3\x9F" "e + \xC2\xB5 + a\xE2\x80\xBF" "b;",
+                              {{"gr\xC3\xB6\xC3\x9F" "e", ParamMode::kIn, kInt},
+                               {"\xC2\xB5", ParamMode::kIn, kInt},
+                               {"a\xE2\x80\xBF" "b", ParamMode::kIn, kInt}},
+                              kInt, &err);
+  ASSERT_NE(ok, 0u) << err;
+  EXPECT_EQ(ret(ok, {Value::i64(1), Value::i64(2), Value::i64(3)}), Value::i64(6));
+  for (const std::string name : {"$c", "$G", "$r", "$a0", "$a12", "globalThis", "let", "eval", "await"}) {
+    EXPECT_EQ(prepare("js", "w", "return 1;", {{name, ParamMode::kIn, kInt}}, kInt, &err), 0u) << name;
+    EXPECT_NE(err.find("cannot be the name of a JavaScript parameter"), std::string::npos) << name << ": " << err;
+  }
+  for (const std::string name : {"a=f()", "a\xE2\x82\xAC" "b", "1a", "a b", "a\xE2\x80\xA8" "b"}) {
+    EXPECT_EQ(prepare("js", "n", "return 1;", {{name, ParamMode::kIn, kInt}}, kInt, &err), 0u) << name;
+    EXPECT_NE(err.find("is not a JavaScript identifier"), std::string::npos) << name << ": " << err;
+  }
+  // Wrapper-like names that are not the wrapper's: ordinary parameters.
+  const uint64_t near = prepare("js", "near", "return $a + $ab + $c1;",
+                                {{"$a", ParamMode::kIn, kInt}, {"$ab", ParamMode::kIn, kInt},
+                                 {"$c1", ParamMode::kIn, kInt}},
+                                kInt, &err);
+  ASSERT_NE(near, 0u) << err;
+  EXPECT_EQ(ret(near, {Value::i64(1), Value::i64(2), Value::i64(3)}), Value::i64(6));
+}
+
+TEST_F(MleBodyForms, JsAwaitOnlyAtTheTopLevel) {
+  // Appendix B.7: await in a comment, a string or a nested async function leaves the body a
+  // plain function (a returned promise is not awaited); await at its top level makes it async.
+  std::string err;
+  const uint64_t plain = prepare("js", "plain",
+                                 "// await\nconst f = async () => { await null };\n"
+                                 "return Promise.resolve('await ' + typeof f);",
+                                 {}, kVarchar, &err);
+  ASSERT_NE(plain, 0u) << err;
+  EXPECT_EQ(ret(plain, {}), Value::string("[object Promise]"));
+  const uint64_t top = prepare("js", "top", "if (true) { return await Promise.resolve('x'); }", {}, kVarchar, &err);
+  ASSERT_NE(top, 0u) << err;
+  EXPECT_EQ(ret(top, {}), Value::string("x"));
+}
+
+TEST_F(MleBodyForms, JsIllFormedStringArgumentRepaired) {
+  // §7.1: each maximal subpart of ill-formed UTF-8 becomes one U+FFFD, also for an encoded
+  // surrogate, which Java's own decoder makes one U+FFFD of (MVP review CONF-4).
+  std::string err;
+  const uint64_t f = prepare("js", "cps", "return [...s].map((c) => c.codePointAt(0).toString(16)).join(' ');",
+                             {{"s", ParamMode::kIn, kVarchar}}, kVarchar, &err);
+  ASSERT_NE(f, 0u) << err;
+  struct Case {
+    std::string bytes, want;
+  };
+  for (const Case &c : std::vector<Case>{
+           {"a\xED\xA0\x80" "b", "61 fffd fffd fffd 62"},
+           {"\xED\xA0\xBD\xED\xB8\x80", "fffd fffd fffd fffd fffd fffd"},
+           {"\xED\xA0" "A", "fffd fffd 41"},
+           {"\xED\x9F\xBF", "d7ff"},
+           {"\xF0\x80\x80", "fffd fffd fffd"},
+           {"\xE1\x80" "A", "fffd 41"},
+           {"\xC3\xA9\xF0\x9F\x98\x80\xFF", "e9 1f600 fffd"},
+           {"plain", "70 6c 61 69 6e"}}) {
+    EXPECT_EQ(ret(f, {Value::string(c.bytes)}), Value::string(c.want)) << c.want;
+  }
+}
+
 TEST_F(MleBodyForms, JsBodyDeclarationsShadowParameters) {
   // Oracle's myfunc: "var x" in the body hides the parameter x (NaN).
   const uint64_t id = prepare("js", "myfunc", "\n  var x\n\n  return 2*x\n",

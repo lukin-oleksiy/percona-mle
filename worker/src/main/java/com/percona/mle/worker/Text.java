@@ -210,10 +210,72 @@ final class Text {
 
   /**
    * The text of bytes that may be ill-formed UTF-8 (an lstr of the host): each maximal subpart of
-   * an ill-formed sequence becomes U+FFFD, which is what Java's decoder does.
+   * an ill-formed sequence becomes U+FFFD (§7.1). Java's decoder does that except for an encoded
+   * surrogate (ED A0..BF): it gives one U+FFFD for ED A0 80, not three (JDK 25). Text where each
+   * byte became one char has no such sequence (it would have shrunk); other text is scanned for
+   * one and only then decoded again by hand.
    */
   static String decodeRepairing(byte[] b) {
-    return new String(b, StandardCharsets.UTF_8);
+    String s = new String(b, StandardCharsets.UTF_8);
+    if (s.length() == b.length) return s;
+    for (int i = 0, n = b.length - 1; i < n; i++)
+      if (b[i] == (byte) 0xED && (b[i + 1] & 0xE0) == 0xA0) return decodeMaximalSubparts(b);
+    return s;
+  }
+
+  /** UTF-8 decoding with U+FFFD for each maximal subpart (the WHATWG "UTF-8 decode"). */
+  static String decodeMaximalSubparts(byte[] b) {
+    StringBuilder o = new StringBuilder(b.length);
+    int i = 0;
+    int n = b.length;
+    while (i < n) {
+      int c = b[i] & 0xFF;
+      if (c < 0x80) {
+        o.append((char) c);
+        i++;
+        continue;
+      }
+      int need;
+      int cp;
+      int lo = 0x80;
+      int hi = 0xBF;
+      if (c >= 0xC2 && c <= 0xDF) {
+        need = 1;
+        cp = c & 0x1F;
+      } else if (c >= 0xE0 && c <= 0xEF) {
+        need = 2;
+        cp = c & 0x0F;
+        if (c == 0xE0) lo = 0xA0;
+        else if (c == 0xED) hi = 0x9F;
+      } else if (c >= 0xF0 && c <= 0xF4) {
+        need = 3;
+        cp = c & 0x07;
+        if (c == 0xF0) lo = 0x90;
+        else if (c == 0xF4) hi = 0x8F;
+      } else {
+        o.append(REPLACEMENT);
+        i++;
+        continue;
+      }
+      int j = i + 1;
+      boolean bad = false;
+      for (int k = 0; k < need; k++, j++) {
+        int d = j < n ? b[j] & 0xFF : -1;
+        if (d < lo || d > hi) {
+          bad = true;
+          break;
+        }
+        lo = 0x80;
+        hi = 0xBF;
+        cp = (cp << 6) | (d & 0x3F);
+      }
+      // A maximal subpart (the lead and the continuations that fitted) is one U+FFFD; the byte
+      // that did not fit starts the next sequence.
+      if (bad) o.append(REPLACEMENT);
+      else o.appendCodePoint(cp);
+      i = j;
+    }
+    return o.toString();
   }
 
   /** A language identifier or worker class (§9.1): 1 to 32 characters of [a-z0-9_]. */

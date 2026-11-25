@@ -15,6 +15,9 @@ our @KNOWN = (
   ['sql_py', qr/nul: BYTES: ForeignNone None/, 'nul: BYTES: NoneType None'],
   # GraalPy's java module (host access, closed for routines) does not exist in CPython.
   ['python_semantics', qr/\| java: KeyError/, '| java: ModuleNotFoundError'],
+  # The words of a conversion error.
+  ['py_spec_mvp', qr/MLE-Type> TIMESTAMP value out of range: 1965-03-01T12:00:00Z/,
+   'MLE-Type> value 1965-03-01 12:00:00+00:00 is out of range for TIMESTAMP'],
 );
 
 sub py_on_cpython {

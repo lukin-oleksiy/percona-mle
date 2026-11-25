@@ -206,10 +206,13 @@ bool valid_name(const std::string &name, unsigned bit) {
   if (language == kJavaScript && (name == "$c" || name == "$G" || name == "$r"))
     return false;  // the wrapper's own names
   const bool dollar = language != kPython;
+  // JavaScript identifiers go beyond ASCII (Unicode ID_Start, ID_Continue): the worker checks
+  // those code points (§9.2); here they need only be well-formed.
+  const bool unicode = language == kJavaScript && mle::is_valid_utf8(name);
   for (size_t i = 0; i < name.size(); i++) {
     const auto c = static_cast<unsigned char>(name[i]);
     const bool ok = isalpha(c) || c == '_' || (dollar && c == '$') ||
-                    (i > 0 && isdigit(c));
+                    (i > 0 && isdigit(c)) || (unicode && c >= 0x80);
     if (!ok) return false;
   }
   return true;

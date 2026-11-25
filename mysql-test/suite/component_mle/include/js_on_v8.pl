@@ -51,6 +51,11 @@ our @KNOWN = (
   ['review_minors', qr/SELECT dotted\(\);\nGot one of the listed errors\n/, "SELECT dotted();\ndotted()\n2\n"],
   # The language's display name in the server's error (mle_languages_supported spelling).
   ['review_mvp', qr/Unsupported language 'JavaScript'/, "Unsupported language 'JS'"],
+  # Appendix B.7: a nested call runs the pending promise jobs on V8, so an async routine called
+  # from another routine settles; GraalJS cannot settle it.
+  ['js_spec_mvp', qr/--error ER_LANGUAGE_COMPONENT\nCALL js_calls_await_top\(\@r\);/, 'CALL js_calls_await_top(@r);'],
+  ['js_spec_mvp', qr/CALL js_calls_await_top\(\@r\);\nERROR HY000: MLE-Type> an async [^\n]*\nSELECT \@r;\n\@r\nNULL/,
+   "CALL js_calls_await_top(\@r);\nSELECT \@r;\n\@r\nawaited"],
   # GraalJS prefixes a failed import: "Error reading module '/other/secret' imported from peek: ".
   # The session holds a V8 worker (JavaScript) and a JVM worker (its Python).
   ['packages', qr/cannot refresh: 1 session workers are in use/, 'cannot refresh: 2 session workers are in use'],

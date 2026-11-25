@@ -1449,9 +1449,10 @@ final class Polyglot {
     JsOracle.Routine jsRoutine = null;
     try {
       if (language.equals("js") && bodyForm) {
-        for (JavaRoutines.Param p : params)
-          if (!IDENTIFIER.matcher(p.name()).matches())
-            throw new JavaRoutines.CompileException("'" + p.name() + "' is not a JavaScript identifier");
+        for (JavaRoutines.Param p : params) {
+          String why = JsOracle.badParameterName(p.name());
+          if (why != null) throw new JavaRoutines.CompileException(why);
+        }
         jsRoutine = JsOracle.prepare(c, jsOracle, name, source, params, ret, uri, imports);
         fn = jsRoutine.fn();
       } else if (language.equals("js")) {
@@ -1528,10 +1529,10 @@ final class Polyglot {
               continue;
             }
           }
-          // A date or naive datetime, or an aware datetime in the zone of OPTIONS (None for the
-          // zero timestamp), built from its fields.
+          // A date or naive datetime, or an aware datetime in the zone of OPTIONS, built from its
+          // fields; None for one Python cannot hold and for the zero timestamp (Appendix B.4).
           case Values.Temporal t when t.tag() != Wire.T_TIME -> {
-            args[i] = pySql.civil(t, true);
+            args[i] = pySql.civil(t);
             continue;
           }
           case Values.Timestamp t -> {

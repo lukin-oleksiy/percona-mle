@@ -1,0 +1,50 @@
+#
+# component_mle: the specification round of the MVP code review (exp
+# note 65, step 2), Java.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+SET time_zone = '+02:00';
+CREATE TABLE t1 (id INT PRIMARY KEY);
+INSERT INTO t1 VALUES (1);
+#
+# D2 (protocol 10.8): an MleSqlException kept from an earlier call and
+# thrown again is raised with its own number, not as the current call's
+# error that has the same id.
+#
+CREATE PROCEDURE j_kept(IN step INT) LANGUAGE JAVA AS $$
+class Box { static RuntimeException kept; }
+if (step == 1) {
+try { Mle.session().runSql("SELECT * FROM no_such_table"); } catch (MleSqlException e) { Box.kept = e; }
+return;
+}
+try { Mle.session().runSql("INSERT INTO t1 VALUES (1)"); } catch (MleSqlException e) { }
+throw Box.kept;
+$$;
+CALL j_kept(1);
+CALL j_kept(2);
+ERROR 42S02: Table 'test.no_such_table' doesn't exist
+#
+# D1 (protocol 7.2): an instant outside TIMESTAMP's range goes as the
+# DATETIME of its local time in the session's zone (+02:00); for a
+# declared TIMESTAMP (Java: an Instant) it is a conversion error.
+#
+CREATE PROCEDURE j_old_instant(OUT r TEXT) LANGUAGE JAVA AS $$
+java.time.Instant i = java.time.Instant.parse("1965-03-01T12:00:00Z");
+r[0] = String.valueOf(Mle.session().runSql("SELECT CAST(? AS CHAR)", i).fetchOne().get(0));
+$$;
+CREATE FUNCTION j_old_timestamp() RETURNS TIMESTAMP LANGUAGE JAVA AS $$
+return java.time.Instant.parse("1965-03-01T12:00:00Z");
+$$;
+CALL j_old_instant(@r);
+SELECT @r;
+@r
+1965-03-01 14:00:00.000000
+SELECT j_old_timestamp();
+ERROR HY000: MLE-Type> TIMESTAMP value out of range: 1965-03-01T12:00:00Z in 'j_old_timestamp()'
+DROP PROCEDURE j_kept;
+DROP PROCEDURE j_old_instant;
+DROP FUNCTION j_old_timestamp;
+DROP TABLE t1;
+REVOKE CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

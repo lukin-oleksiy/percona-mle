@@ -210,6 +210,10 @@ class Worker {
   std::byte *allocate(std::vector<std::byte> &buffer, size_t total);
 
   /** Compiles a routine; on a compile error *error says it (and the function is empty). */
+  /** Why name cannot be a parameter of a body-form routine (§9.2), or empty if it can. */
+  std::string bad_parameter_name(const std::string &name);
+  /** Whether a body uses await at its top level (Appendix B.7): parsed, after a regex pre-filter. */
+  bool top_level_await(const std::string &body);
   void compile(const std::string &name, const std::string &entry, const std::string &source, Routine &r,
                const std::vector<std::string> &param_names, const std::vector<uint8_t> &modes,
                const std::vector<std::string> &usings, std::string *error);
@@ -315,6 +319,7 @@ class Worker {
   v8::Global<v8::Context> m_context;
   v8::Global<v8::Object> m_api;      // api.js's helpers
   v8::Global<v8::Function> m_show;   // <eval>: the text of a value
+  v8::Global<v8::RegExp> m_identifier;  // a JavaScript identifier (Unicode ID_Start, ID_Continue)
   /** On a SqlError made from an SQL_RESULT ERROR: [error_id, call_seq, errno, sqlstate, message].
       Guest code cannot read or forge it. */
   v8::Global<v8::Private> m_handed;

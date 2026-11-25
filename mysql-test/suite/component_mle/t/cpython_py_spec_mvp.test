@@ -1,0 +1,2 @@
+--let $cpython_test = py_spec_mvp
+--source ../include/py_on_cpython.inc

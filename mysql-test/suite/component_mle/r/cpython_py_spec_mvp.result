@@ -1,0 +1,59 @@
+#
+# component_mle: the specification round of the MVP code review (exp
+# note 65, step 2), Python. Also run on the CPython worker
+# (cpython_py_spec_mvp.test).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_CPYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t1 (id INT PRIMARY KEY);
+INSERT INTO t1 VALUES (1);
+SET time_zone = '+02:00';
+#
+# D2 (protocol 10.8): an SQL error kept from an earlier call and raised
+# again is raised with its own number, not as the current call's error
+# that has the same id.
+#
+CALL py_keep();
+CALL py_rethrow();
+ERROR 42S02: Table 'test.no_such_table' doesn't exist
+#
+# D5: set_options() replaces the options of an earlier call; options not
+# given take their defaults (Oracle).
+#
+CALL py_set_options(@r);
+SELECT @r;
+@r
+NUMBER then STRING
+#
+# D1 (protocol 7.2): an instant outside TIMESTAMP's range goes as the
+# DATETIME of its local time in the session's zone (+02:00); for a
+# declared TIMESTAMP it is a conversion error.
+#
+CALL py_old_instant(@r);
+SELECT @r;
+@r
+1965-03-01 14:00:00.000000
+SELECT py_old_datetime();
+py_old_datetime()
+1965-03-01 14:00:00
+SELECT py_old_timestamp();
+ERROR HY000: MLE-Type> value 1965-03-01 12:00:00+00:00 is out of range for TIMESTAMP in 'py_old_timestamp()'
+#
+# D1 (Appendix B.4): a date Python cannot hold and the zero TIMESTAMP are
+# None as routine arguments, as in rows.
+#
+SET sql_mode = '';
+SELECT py_zero('0000-00-00', '2024-00-10 10:00:00', '0000-00-00 00:00:00') AS zero;
+zero
+(None, None, None)
+SET sql_mode = DEFAULT;
+DROP PROCEDURE py_keep;
+DROP PROCEDURE py_rethrow;
+DROP PROCEDURE py_set_options;
+DROP PROCEDURE py_old_instant;
+DROP FUNCTION py_old_datetime;
+DROP FUNCTION py_old_timestamp;
+DROP FUNCTION py_zero;
+DROP TABLE t1;
+REVOKE CREATE_CPYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

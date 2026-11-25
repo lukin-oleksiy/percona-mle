@@ -254,15 +254,17 @@ public final class Session {
     return new PreparedStatement(this, id, sql, o, r.parameterCount());
   }
 
-  /** Sets defaults for the statements of the rest of this routine call (unset ones are kept). */
+  /**
+   * Sets defaults for the statements of the rest of this routine call. Oracle: "Options not
+   * specified assume their default values": they replace an earlier call's (no merge).
+   */
   public void setOptions(SqlOptions options) {
-    SqlOptions base = callOptions();
     int depth = SqlBridge.callDepth();
     if (depth >= callOptions.length) {
       callOptions = java.util.Arrays.copyOf(callOptions, depth + 4);
       callOptionsScope = java.util.Arrays.copyOf(callOptionsScope, depth + 4);
     }
-    callOptions[depth] = options.over(base);
+    callOptions[depth] = options;
     callOptionsScope[depth] = SqlBridge.callScope();
   }
 

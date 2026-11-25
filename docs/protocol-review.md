@@ -717,3 +717,31 @@ call, so its identity changes once.
 
 **Tests:** unit tests pass on the JVM-only and all-worker debug builds; MySQL tests 40 of 41 on the
 JVM-only build (`basics` needs the native workers).
+
+## 23. The MVP code review: specification round (25 Nov)
+
+The code review of the MVP (exp note 65) found places where the text and the three workers
+disagreed. The decisions (note 65, D1–D8) changed the text first, then every worker. The wire is
+unchanged: still 1.0.
+
+| Where | Change | Workers |
+|---|---|---|
+| §7.2, §7.3 | An instant goes as TIMESTAMP and a zoneless value as DATETIME, whichever of the two is declared; the declared-tag rule of §7.3 names this exception. An instant outside TIMESTAMP's range goes as DATETIME of its local time in the zone of OPTIONS (a declared TIMESTAMP: conversion error). A language may map its instant type to local time (JavaScript's `Date`, B.4). Oracle's rule for a session that changes `time_zone`: `mle_session_reset()`. | JVM (Java, GraalPy): the out-of-range rule (CPython had it); JavaScript unchanged |
+| §9.2 | Parameter names: refused only if not an identifier, a reserved word, or a name of the worker's wrapper; never decided by compiling the name (it is spliced into source). JavaScript identifiers are Unicode `ID_Start`/`ID_Continue`. | both JavaScript workers (V8 with V8's own RegExp tables, GraalJS with Java's); the component lets non-ASCII JavaScript names through to them |
+| §10.8 | `sql_error_id` only for an error of this top-level request; an older one copies number, SQLSTATE and message with id 0. | JVM: a guest SqlError's `$mle$id` carries the request; a Java `MleSqlException` must be the one held |
+| §11.2 | The launcher does not bound a pooled worker's start; the host's READY deadline is the bound. | none (text followed the code) |
+| §11.4 | The last chunk of a RESULT posted before the worker died is processed. | none (text followed the code) |
+| B.4 | JavaScript: a `Date` as parameter or for a declared DATETIME is local time; a string for DATE/DATETIME/TIMESTAMP is cast to a `Date`, for YEAR its year. Python: a date Python cannot hold and the zero TIMESTAMP are `None`, as arguments and in rows. Java: they stay errors. | JVM (GraalPy) and CPython: `None` for arguments too |
+| B.5 | Python raises `TypeError` (was: `ValueError`) for a value with no wire form. | none (text followed the code) |
+| B.7 | `setOptions()` row removed: Oracle's page says options not given take their defaults, so the workers now replace an earlier call's options. New rows: MySQL's date literal forms as local time; YEAR from a string; a body is async only for a top-level `await` (both JavaScript workers parse the body as a function in a module after the regex). New table of the two JavaScript workers' difference: a nested async routine settles on V8 (a nested call runs pending promise jobs, the outer routine's too) and fails on GraalJS. | all three: `setOptions` replaces; CPython also merges a call's options over the session's defaults (it did not, which the replace made visible) |
+| §7.1 (code only) | The JVM worker's repair gave one U+FFFD for an encoded surrogate (`ED A0 80`); now each maximal subpart, as V8 and CPython. Text where each byte became one char is returned as before; other text is scanned for `ED A0..BF` and only then decoded again by hand. | JVM |
+| §10.6 (code only) | V8 sent 1644 for an invalid `SqlError` code; now 0, as GraalJS and CPython. | V8 |
+
+`docs/limits.md` (new) lists the known limits that triage C29 and its 13 companions decided to
+document, updated for this round.
+
+Tests: `js_spec_mvp` (and on V8), `py_spec_mvp` (and on CPython), `java_spec_mvp`; unit tests
+`MleBodyForms.JsParameterNames`, `JsAwaitOnlyAtTheTopLevel`, `JsIllFormedStringArgumentRepaired`.
+Each case fails on the code before the round (`f2177ef`), except where a worker already did what the
+text now says (V8 and CPython for §10.8, CPython for the out-of-range instant, V8 for a nested async
+routine).

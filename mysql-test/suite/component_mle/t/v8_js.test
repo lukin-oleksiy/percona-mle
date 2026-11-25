@@ -179,8 +179,9 @@ SELECT js_huge_int();
 SELECT js_huge_dec();
 CREATE FUNCTION js_surrogate() RETURNS TEXT LANGUAGE JS AS $$ return 'a\uD800b' $$;
 SELECT HEX(js_surrogate()) AS replaced;
+# A code that is not one (NaN here) is 0 (protocol 10.6): the routine's error, as on GraalJS.
 CREATE PROCEDURE js_bad_code() LANGUAGE JS AS $$ throw new SqlError('45000', 'bad code', 'x') $$;
---error 1644
+--error ER_LANGUAGE_COMPONENT_RUNTIME
 CALL js_bad_code();
 
 --echo #

@@ -615,11 +615,24 @@ is sent, and a returned value fails as a conversion error. Wire value 0
 is 1970-01-01 00:00:00 UTC.
 
 A worker sends a language value that is an instant as TIMESTAMP and one
-without a zone as DATETIME. DATETIME has no zone on the wire: a worker
+without a zone as DATETIME, whichever of the two is declared (§7.3), with
+two exceptions:
+
+* an instant outside TIMESTAMP's wire range (before 1970, or after 9999)
+  goes as DATETIME of its local time in the zone of OPTIONS; for a
+  declared TIMESTAMP it is a conversion error (§9.4);
+* a language may map its instant type to local time in the zone of
+  OPTIONS, as Appendix B.4 says: JavaScript's `Date` goes as DATETIME of
+  its local time except for a declared TIMESTAMP.
+
+DATETIME has no zone on the wire: a worker
 that maps it to an instant type uses the zone of OPTIONS, which is the
 session's zone only as long as the session has not changed it since its
 options were fixed (Appendix A); after such a change, DATETIME values the
-server computes in the new zone are read in the old one. The
+server computes in the new zone are read in the old one, and DATETIME
+values a worker sends are local times of the old one. (Oracle's rule for
+JavaScript: a session that changes `time_zone` calls
+`mle_session_reset()`, which lets the host fix the new zone.) The
 wire's range is wider than what a TIMESTAMP column stores; a value the
 server does not accept is an error (§9.4, §10.4).
 
@@ -680,7 +693,10 @@ vector gets a copy.)
 * **From a worker**, a value (a return value, an OUT parameter, an SQL
   parameter) may have any tag: the host converts it to the target type
   with the server's assignment rules, and a failed conversion is an error
-  (§9.4, §10.4). A worker SHOULD send the tag of the declared type.
+  (§9.4, §10.4). A worker SHOULD send the tag of the declared type,
+  except for DATETIME and TIMESTAMP: those it sends by §7.2 (by the kind
+  of the language value), and the host converts one to the other as the
+  server assigns it.
 
 ### 7.4 Structures
 
@@ -920,8 +936,13 @@ empty (except for `<eval>`); with `<eval>` there are no Params and
 
 RESULT: OK; GUEST_ERROR with the compile error; others per the table.
 What the language cannot take as it is (parameter names that are not its
-identifiers, more parameters than it allows, a source it does not
-support) gives GUEST_ERROR.
+identifiers or are its reserved words, more parameters than it allows, a
+source it does not support) gives GUEST_ERROR. A worker that wraps a body
+in code of its own refuses, with GUEST_ERROR at PREPARE, a parameter name
+that the wrapper's code uses, or renames its own; it MUST NOT refuse any
+other identifier of the language (in JavaScript: Unicode `ID_Start` and
+`ID_Continue`, with `$` and `_`). It MUST NOT decide by compiling the
+name: names are spliced into the wrapper's source.
 PREPARE may run guest code (in languages where loading code executes
 it): it is interruptible
 and may print.
@@ -1494,10 +1515,14 @@ client gets:
    routines with `language` and `message`.
 
 With any other status the three SQL fields are ignored. When guest code
-fails with an error object that came from an ERROR reply, a worker MUST
-set `sql_error_id` and also copy that ERROR's number, SQLSTATE and message
-into the Error, so that rule 2 gives nearly the same result if the host
-no longer holds the error. Otherwise `sql_error_id` is 0.
+fails with an error object that came from an ERROR reply of this
+top-level request, a worker MUST set `sql_error_id` and also copy that
+ERROR's number, SQLSTATE and message into the Error, so that rule 2 gives
+nearly the same result if the host no longer holds the error. For an
+error object from an earlier top-level request (guest code kept it and
+throws it again) the worker sets `sql_error_id` 0 and still copies the
+number, SQLSTATE and message (rule 2 applies). Otherwise `sql_error_id`
+is 0.
 
 ## 11. Interruption, deadlines, failure and retirement
 
@@ -1645,7 +1670,7 @@ is.
 
 | Wait | Deadline |
 |---|---|
-| READY | for the host: one, from the moment it takes the worker (the launcher bounds a pooled worker's start by its own) |
+| READY | for the host: one, from the moment it takes the worker |
 | DROP (also nested), RESET, OPTIONS | one per request |
 | PREPARE, CALL, PARSE_LIBRARY | none; they end by RESULT, by interruption (§11.1), or by the worker's death |
 
@@ -1665,9 +1690,10 @@ host ended it after the grace period), **violation** (§1),
 
 The host MUST notice within a bounded time (its bounded sleeps) that the
 worker process ended. It then looks once more for a post: a message the
-worker posted before it ended is processed normally if it is a READY or a
-RESULT complete in one chunk (so a failed READY or a last RESULT is not
-lost); any other message is dropped. If there is no such message, the
+worker posted before it ended is processed normally if it is a READY, a
+RESULT complete in one chunk, or the last chunk of a RESULT (none of them
+needs a CONTINUE; so a failed READY or a last RESULT is not lost); any
+other message is dropped. If there is no such message, the
 request in progress fails as died — or as killed if an interrupt was
 requested, since some runtimes exit on interruption.
 
@@ -2290,6 +2316,15 @@ a reading was needed:
   (they are not taken as 1900–1999).
 * A `Date` given for DATE is rounded to the nearest second, then its
   local date is taken (Oracle's conversion table for DATE).
+* A `Date` goes as DATETIME of its local time, as a statement parameter
+  and for a declared DATETIME; for a declared TIMESTAMP it goes as
+  TIMESTAMP (§7.2). This is Oracle's model of a zone fixed at the
+  session's first routine: after `SET time_zone` a session calls
+  `mle_session_reset()`.
+* A string given for DATE, DATETIME or TIMESTAMP is cast to a `Date`, and
+  for YEAR a `Date` gives its local year and a string its year (Oracle's
+  conversion table); B.7 says how. A string that gives an Invalid Date is
+  `MLE-Type`.
 * Local time is that of the zone in OPTIONS, not the zone of the worker's
   process: in conversions and in every local-time method guest code calls
   on a `Date` (`getHours()`, `toString()`, …). Options change only while
@@ -2299,16 +2334,21 @@ a reading was needed:
 Python: TIMESTAMP is an aware `datetime` in the zone of OPTIONS
 (`zoneinfo.ZoneInfo`, or a fixed `timezone` for an offset): it shows the
 local fields and keeps the instant, so it goes back as TIMESTAMP; a naive
-`datetime` (DATETIME) goes back as DATETIME. `decimal_type` applies to
+`datetime` (DATETIME) goes back as DATETIME. A DATE or DATETIME that
+Python cannot hold (a zero date, a zero month or day, an impossible date
+such as 31 February, year 0) and the zero timestamp are `None`, as routine
+arguments and in SQL results (Oracle's model makes them an Invalid Date,
+not an error; `None` is Python's nearest, though guest code cannot tell
+it from NULL). `decimal_type` applies to
 SQL results; routine arguments are always `Decimal`. Java: DATE `LocalDate`, TIME `Duration`,
 DATETIME `LocalDateTime`, TIMESTAMP `Instant`, DECIMAL
-`BigDecimal`.
+`BigDecimal`; a zero date or the zero timestamp is a conversion error.
 
 ### B.5 Errors a worker raises itself
 
 A value guest code gives that has no wire form (NaN as a parameter, a
 number outside the declared type, an unsupported object) is a conversion
-error in the language (`TypeError` in JavaScript, `ValueError` in Python)
+error in the language (`TypeError` in JavaScript and Python)
 for SQL parameters, and GUEST_ERROR / `MLE-Type` for results.
 
 Limits of the language (§9.4):
@@ -2334,10 +2374,21 @@ Both JavaScript workers make these choices alike:
 |---|---|
 | A BigInt as a statement parameter | I64 if it fits, else U64, else DECIMAL |
 | A string given for a DOUBLE | parsed as `Number()` parses decimal notation; hexadecimal, octal and binary forms are refused |
-| Successive `setOptions()` | an option not given keeps the value an earlier call set |
+| A string given for DATE, DATETIME or TIMESTAMP | MySQL's literal forms (`YYYY-MM-DD`, with ` hh:mm`, `:ss`, `.f` up to 9 digits, `T` for the space) are local time in the zone of OPTIONS (ECMAScript reads a date-only string as UTC, which shows the day before west of UTC); any other string goes to the `Date` constructor |
+| A string given for YEAR | its first run of four digits |
+| A routine body that uses `await` | an async function only if `await` stands at its top level (not in a nested function, a string or a comment) |
 | Session variables (`session.x = v`) | bound as an ordinary parameter; an object as JSON text |
 | `getOption()` default for `integer_type` | `UNSAFE_STRING` (the session state page) |
 | A `Set` as a JSON result | `{}` (no `toJSON`) |
 | A plain `Array` for VECTOR; `ArrayBuffer` or `DataView` for BLOB | accepted |
 | Call stack exceeded | a `RangeError` in guest code (§9.4: GUEST_ERROR when uncaught) |
 | A BigInt returned for DOUBLE / for JSON | its nearest double / `MLE-Type` (as `JSON.stringify` refuses it) |
+
+Where the two JavaScript workers differ:
+
+| Question | `jvm` (GraalJS) | `v8` |
+|---|---|---|
+| An async routine (one with a top-level `await`) called from another routine of the same worker | fails: "its promise did not settle"; pending promise jobs run only when the top-level request returns | settles: a nested call runs the pending promise jobs before it returns, the outer routine's included (so an outer routine's job can run in the middle of its synchronous code, against ECMAScript's run-to-completion) |
+
+Known limits of the workers, as seen by guest code and administrators, are
+listed in `limits.md`.

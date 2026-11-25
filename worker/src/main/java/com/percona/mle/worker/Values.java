@@ -143,17 +143,15 @@ final class Values {
     }
   }
 
-  /** The wire value of an instant; out of the TIMESTAMP range is a conversion error. */
+  /** The wire value of an instant, or -1 outside the TIMESTAMP range. */
   static long timestampMicros(Instant i) {
     long micros;
     try {
       micros = Math.addExact(Math.multiplyExact(i.getEpochSecond(), 1_000_000L), i.getNano() / 1000);
     } catch (ArithmeticException e) {
-      micros = -1;
+      return -1;
     }
-    if (micros < 0 || micros > Wire.MAX_TIMESTAMP)
-      throw new ConversionException("TIMESTAMP value out of range: " + i);
-    return micros;
+    return micros < 0 || micros > Wire.MAX_TIMESTAMP ? -1 : micros;
   }
 
   /** A VECTOR in the message body; valid only until the next message is posted. */
@@ -273,10 +271,25 @@ final class Values {
     w.u8(neg ? 1 : 0);
   }
 
-  private static void writeTimestamp(MessageWriter w, Instant i) {
+  /**
+   * An instant (§7.2): a TIMESTAMP; outside the wire's range, a DATETIME of its local time in the
+   * zone of OPTIONS, or for a declared TIMESTAMP a conversion error.
+   */
+  private static void writeTimestamp(MessageWriter w, Instant i, boolean declared) {
     long micros = timestampMicros(i);
-    w.u8(Wire.T_TIMESTAMP);
-    w.u64(micros);
+    if (micros >= 0) {
+      w.u8(Wire.T_TIMESTAMP);
+      w.u64(micros);
+      return;
+    }
+    if (declared) throw new ConversionException("TIMESTAMP value out of range: " + i);
+    LocalDateTime local;
+    try {
+      local = options.times.localDateTime(i.getEpochSecond(), i.getNano());
+    } catch (java.time.DateTimeException e) {
+      throw new ConversionException("the instant " + i + " is out of range");
+    }
+    writeDateTime(w, Wire.T_DATETIME, local);
   }
 
   private static void writeDate(MessageWriter w, int tag, LocalDate d) {
@@ -364,9 +377,9 @@ final class Values {
       }
       case LocalDate d -> writeDate(w, Wire.T_DATE, d);
       case LocalDateTime t -> writeDateTime(w, Wire.T_DATETIME, t);
-      case Instant i -> writeTimestamp(w, i);
-      case OffsetDateTime t -> writeTimestamp(w, t.toInstant());
-      case ZonedDateTime t -> writeTimestamp(w, t.toInstant());
+      case Instant i -> writeTimestamp(w, i, false);
+      case OffsetDateTime t -> writeTimestamp(w, t.toInstant(), false);
+      case ZonedDateTime t -> writeTimestamp(w, t.toInstant(), false);
       case LocalTime t -> writeTime(w, Duration.ofNanos(t.toNanoOfDay()));
       case Duration d -> writeTime(w, d);
       case float[] f -> writeVector(w, f);
@@ -513,12 +526,13 @@ final class Values {
       // An instant goes as TIMESTAMP and a value without a zone as DATETIME (§7.2), whichever of
       // the two is declared: the host converts it to the declared type as the server assigns it.
       case Wire.T_DATETIME, Wire.T_TIMESTAMP -> {
+        boolean declared = t.tag() == Wire.T_TIMESTAMP;
         switch (v) {
           case LocalDateTime d -> writeDateTime(w, Wire.T_DATETIME, d);
           case LocalDate d -> writeDateTime(w, Wire.T_DATETIME, d.atStartOfDay());
-          case Instant i -> writeTimestamp(w, i);
-          case OffsetDateTime d -> writeTimestamp(w, d.toInstant());
-          case ZonedDateTime d -> writeTimestamp(w, d.toInstant());
+          case Instant i -> writeTimestamp(w, i, declared);
+          case OffsetDateTime d -> writeTimestamp(w, d.toInstant(), declared);
+          case ZonedDateTime d -> writeTimestamp(w, d.toInstant(), declared);
           default -> throw cannot(v, t);
         }
       }

@@ -1,0 +1,59 @@
+--echo #
+--echo # component_mle: the specification round of the MVP code review (exp
+--echo # note 65, step 2), Java.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+SET time_zone = '+02:00';
+CREATE TABLE t1 (id INT PRIMARY KEY);
+INSERT INTO t1 VALUES (1);
+
+--echo #
+--echo # D2 (protocol 10.8): an MleSqlException kept from an earlier call and
+--echo # thrown again is raised with its own number, not as the current call's
+--echo # error that has the same id.
+--echo #
+# A routine's local class keeps its statics between calls (a library's class is loaded per routine).
+CREATE PROCEDURE j_kept(IN step INT) LANGUAGE JAVA AS $$
+class Box { static RuntimeException kept; }
+if (step == 1) {
+try { Mle.session().runSql("SELECT * FROM no_such_table"); } catch (MleSqlException e) { Box.kept = e; }
+return;
+}
+try { Mle.session().runSql("INSERT INTO t1 VALUES (1)"); } catch (MleSqlException e) { }
+throw Box.kept;
+$$;
+CALL j_kept(1);
+--error ER_NO_SUCH_TABLE
+CALL j_kept(2);
+
+--echo #
+--echo # D1 (protocol 7.2): an instant outside TIMESTAMP's range goes as the
+--echo # DATETIME of its local time in the session's zone (+02:00); for a
+--echo # declared TIMESTAMP (Java: an Instant) it is a conversion error.
+--echo #
+CREATE PROCEDURE j_old_instant(OUT r TEXT) LANGUAGE JAVA AS $$
+java.time.Instant i = java.time.Instant.parse("1965-03-01T12:00:00Z");
+r[0] = String.valueOf(Mle.session().runSql("SELECT CAST(? AS CHAR)", i).fetchOne().get(0));
+$$;
+CREATE FUNCTION j_old_timestamp() RETURNS TIMESTAMP LANGUAGE JAVA AS $$
+return java.time.Instant.parse("1965-03-01T12:00:00Z");
+$$;
+CALL j_old_instant(@r);
+SELECT @r;
+--error ER_LANGUAGE_COMPONENT
+SELECT j_old_timestamp();
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP PROCEDURE j_kept;
+DROP PROCEDURE j_old_instant;
+DROP FUNCTION j_old_timestamp;
+DROP TABLE t1;
+REVOKE CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

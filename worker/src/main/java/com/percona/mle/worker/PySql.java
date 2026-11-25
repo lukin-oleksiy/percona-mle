@@ -303,7 +303,7 @@ final class PySql implements GuestSql.Lang {
   public RuntimeException sqlError(MleSqlException e) {
     try {
       throwSql.execute(e.getErrorCode(), e.getSqlState(), e.getMessage(), e.getRow(),
-          e.getErrorId() == 0 ? null : Long.toUnsignedString(e.getErrorId()));
+          Dispatcher.guestErrorId(e));
     } catch (PolyglotException p) {
       return p;
     }
@@ -593,16 +593,15 @@ final class PySql implements GuestSql.Lang {
       long us = ((t.hour() * 60 + t.minute()) * 60 + t.second()) * 1_000_000L + t.micro();
       return timedelta.execute(t.negative() ? -us : us);
     }
-    // A zero date, a date with a zero month or day, an impossible date, and years before 1
-    // (Python's dates start with year 1) are None.
-    return civil(t, false);
+    return civil(t);
   }
 
   /**
-   * A DATE or DATETIME as a Python date or naive datetime, built from its fields. One Python has no
-   * form for: None for a value of a result, a conversion error (MLE-Type) for an argument.
+   * A DATE or DATETIME as a Python date or naive datetime, built from its fields. A zero date, a
+   * date with a zero month or day, an impossible date, and years before 1 (Python's dates start
+   * with year 1) are None, as routine arguments and in rows (Appendix B.4: Oracle's Invalid Date).
    */
-  Object civil(Values.Temporal t, boolean argument) {
+  Object civil(Values.Temporal t) {
     try {
       if (t.year() >= 1) {
         if (t.tag() == Wire.T_DATE) {
@@ -615,8 +614,7 @@ final class PySql implements GuestSql.Lang {
     } catch (java.time.DateTimeException e) {
       // below
     }
-    if (!argument) return null;
-    throw new Values.ConversionException("the " + Wire.TAG_NAMES[t.tag()] + " value " + t + " has no Python equivalent");
+    return null;
   }
 
   /** A TIMESTAMP (not the zero one) as an aware datetime in the zone of OPTIONS. */

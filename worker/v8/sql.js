@@ -1010,7 +1010,7 @@
       const o = optionsOf(arg(a, 0));
       if (o !== null) {
         const [depth, scope] = state();
-        callOptions.set(depth, [scope, o.over(callScopeOptions())]);
+        callOptions.set(depth, [scope, o]);  // replaces an earlier call's (Oracle: no merge)
       }
       return null;
     },

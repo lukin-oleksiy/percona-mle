@@ -303,7 +303,7 @@ def _row_temporal(tag, year, month, day, hour, minute, second, micro, neg):
 
 # The codec's rules for values of rows (PySql.value): DECIMAL as Decimal (as float with the
 # decimalType NUMBER), zero dates as None (_row_temporal). Routine arguments keep the worker's
-# (wire.temporal raises for zero dates, as the JVM kind's arguments). The worker gives the codec
+# (DECIMAL always as Decimal; wire.temporal: zero dates also None). The worker gives the codec
 # both sets of helpers once (worker.main); each decode call says which rules apply.
 _RULES_ROWS, _RULES_ROWS_NUMBER = 1, 2
 
@@ -1454,9 +1454,9 @@ class Session:
 
     def _effective(self, o):
         """The options of a statement: o over this call's session options over the defaults."""
-        base = self._call()
-        if base is None:
-            base = Options(decimal_type=_DECIMAL_TYPES[self._api.decimal_type])
+        defaults = Options(decimal_type=_DECIMAL_TYPES[self._api.decimal_type])
+        call = self._call()
+        base = defaults if call is None else call.over(defaults)
         return base.over(None) if o is None else o.over(base)
 
     def _internal(self):
@@ -1465,11 +1465,12 @@ class Session:
         return self._effective(Options(pass_result=False))
 
     def set_options(self, *a):
-        """Sets defaults for the statements of the rest of this routine call (unset ones are kept)."""
+        """Sets defaults for the statements of the rest of this routine call; options not given take
+        their defaults (Oracle's setOptions: an earlier call's are replaced, not merged)."""
         o = _options(_arg(a, 0))
         q = _mlewire.request()
         if o is not None and q is not None:
-            self._call_options[q[0]] = (q[1], o.over(self._call()))
+            self._call_options[q[0]] = (q[1], o)
 
     def get_option(self, *a):
         return self._effective(None).get(_str(a, 0))

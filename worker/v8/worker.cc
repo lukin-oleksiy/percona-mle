@@ -30,6 +30,7 @@
 #include <new>
 #include <optional>
 #include <regex>
+#include <set>
 
 #include "api_js.h"
 #include "sql_js.h"
@@ -68,6 +69,29 @@ void cut(std::string &s, size_t max) {
 bool identifier(const std::string &s) {
   static const std::regex re("[A-Za-z_$][A-Za-z0-9_$]*");
   return std::regex_match(s, re);
+}
+
+/** Length of UTF-8 text in UTF-16 code units (V8's columns). */
+int utf16_length(std::string_view s) {
+  int n = 0;
+  for (const char c : s) {
+    const auto b = static_cast<unsigned char>(c);
+    if ((b & 0xC0) != 0x80) n += b >= 0xF0 ? 2 : 1;  // a lead byte; 4-byte forms are surrogate pairs
+  }
+  return n;
+}
+
+/** Reserved words of strict code, and await (an async body), arguments and eval (not bindable). */
+bool js_reserved(const std::string &s) {
+  static const std::set<std::string, std::less<>> words = {
+      "arguments", "await",      "break",     "case",    "catch",     "class",   "const",  "continue",
+      "debugger",  "default",    "delete",    "do",      "else",      "enum",    "eval",   "export",
+      "extends",   "false",      "finally",   "for",     "function",  "if",      "implements",
+      "import",    "in",         "instanceof", "interface", "let",    "new",     "null",   "package",
+      "private",   "protected",  "public",    "return",  "static",    "super",   "switch", "this",
+      "throw",     "true",       "try",       "typeof",  "var",       "void",    "while",  "with",
+      "yield"};
+  return words.contains(s);
 }
 
 /** A JavaScript string literal (JsOracle.jsString). */
@@ -671,6 +695,43 @@ v8::MaybeLocal<Value> Worker::run_script(const std::string &text, const std::str
   return script->Run(ctx);
 }
 
+std::string Worker::bad_parameter_name(const std::string &name) {
+  // The wrapper's own names (worker.cc compile) and words a binding cannot be.
+  const bool wrapper = name == "$c" || name == "$G" || name == "$r" || name == "globalThis" ||
+                       (name.size() > 2 && name.starts_with("$a") &&
+                        name.find_first_not_of("0123456789", 2) == std::string::npos);
+  if (wrapper || js_reserved(name)) return "'" + name + "' cannot be the name of a JavaScript parameter";
+  if (identifier(name)) return {};
+  // Beyond ASCII: Unicode ID_Start and ID_Continue, by V8's own tables. The name is the subject
+  // of a match, never source text (it is spliced into the wrapper only once it passed).
+  const Local<v8::Context> ctx = m_context.Get(m_isolate);
+  v8::TryCatch tc(m_isolate);
+  if (m_identifier.IsEmpty()) {
+    Local<v8::RegExp> re;
+    if (!v8::RegExp::New(ctx, v8_string(m_isolate, "^[\\p{ID_Start}$_][\\p{ID_Continue}$\\u200C\\u200D]*$"),
+                         v8::RegExp::kUnicode)
+             .ToLocal(&re))
+      return "'" + name + "' is not a JavaScript identifier";
+    m_identifier.Reset(m_isolate, re);
+  }
+  Local<v8::Object> match;
+  if (m_identifier.Get(m_isolate)->Exec(ctx, v8_string(m_isolate, name)).ToLocal(&match) && !match->IsNull())
+    return {};
+  return "'" + name + "' is not a JavaScript identifier";
+}
+
+bool Worker::top_level_await(const std::string &body) {
+  static const std::regex word("\\bawait\\b");
+  if (!std::regex_search(body, word)) return false;
+  // In a module, await is reserved: the body as a plain function there parses unless await stands
+  // at its top level (outside async functions). A body that fails to parse for another reason is
+  // taken as async, as before; its compile reports the error.
+  v8::TryCatch tc(m_isolate);
+  v8::ScriptOrigin origin(v8_string(m_isolate, "await-check"), 0, 0, false, -1, Local<Value>(), false, false, true);
+  v8::ScriptCompiler::Source src(v8_string(m_isolate, "function f(){" + body + "\n}"), origin);
+  return v8::ScriptCompiler::CompileModule(m_isolate, &src).IsEmpty();
+}
+
 void Worker::compile(const std::string &name, const std::string &entry, const std::string &source, Routine &r,
                      const std::vector<std::string> &names, const std::vector<uint8_t> &modes,
                      const std::vector<std::string> &usings, std::string *error) {
@@ -726,11 +787,11 @@ void Worker::compile(const std::string &name, const std::string &entry, const st
     // Oracle's form: the body in an arrow function inside a wrapper whose parameters are the
     // routine's; globalThis fresh per call; all on the body's first line.
     for (const std::string &p : names)
-      if (!identifier(p)) {
-        *error = "'" + p + "' is not a JavaScript identifier";
+      if (std::string why = bad_parameter_name(p); !why.empty()) {
+        *error = why;
         return;
       }
-    r.async = std::regex_search(source, std::regex("\\bawait\\b"));
+    r.async = top_level_await(source);
     std::string pre = "(function($c){const $G=globalThis;return ";
     if (r.async) pre += "async ";
     pre += std::string("function ") + kWrapper + "(";
@@ -751,7 +812,7 @@ void Worker::compile(const std::string &name, const std::string &entry, const st
       for (const uint32_t i : r.outs) post += "," + names[i];
       post += "];}})";
     }
-    prefix = static_cast<int>(pre.size());
+    prefix = utf16_length(pre);  // V8's columns count UTF-16 units (a name may be non-ASCII)
     text = pre + source + post;
   } else {
     if (!identifier(entry)) {
@@ -995,9 +1056,9 @@ ErrorInfo Worker::error_of(Local<Value> exception, Local<v8::Message> message) {
       Local<Value> code, state, text;
       if (o->Get(ctx, v8_string(m_isolate, "message")).ToLocal(&text)) e.message = m_values->str(text);
       if (o->Get(ctx, v8_string(m_isolate, "code")).ToLocal(&code) && code->IsNumber()) {
-        // SIGNAL's MYSQL_ERRNO range; anything else (NaN from new SqlError(s, m, 'x')): 1644, SIGNAL's own.
+        // At most 65535, else 0 (§10.6; NaN from new SqlError(s, m, 'x') too): rule 3 of §10.8 then.
         const double c = code.As<v8::Number>()->Value();
-        e.sql_errno = c >= 1 && c <= w::kMaxSqlErrno && c == std::floor(c) ? static_cast<uint32_t>(c) : 1644;
+        e.sql_errno = c >= 1 && c <= w::kMaxSqlErrno && c == std::floor(c) ? static_cast<uint32_t>(c) : 0;
       }
       if (o->Get(ctx, v8_string(m_isolate, "sqlState")).ToLocal(&state) && state->IsString()) {
         e.sql_state = utf8(m_isolate, state);

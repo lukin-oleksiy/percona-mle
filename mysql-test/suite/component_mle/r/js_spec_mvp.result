@@ -1,0 +1,99 @@
+#
+# component_mle: the specification round of the MVP code review (exp
+# note 65, step 2), JavaScript. Also run on the V8 worker
+# (v8_js_spec_mvp.test).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t1 (id INT PRIMARY KEY);
+INSERT INTO t1 VALUES (1);
+#
+# D2 (protocol 10.8): an SQL error kept from an earlier call and thrown
+# again is raised with its own number, not as the current call's error
+# that has the same id.
+#
+CREATE LIBRARY box LANGUAGE JAVASCRIPT AS $$ export const kept = {} $$;
+CREATE PROCEDURE js_keep() LANGUAGE JAVASCRIPT USING (box) AS $$
+try { session.runSql('SELECT * FROM no_such_table') } catch (e) { box.kept.e = e }
+$$;
+CREATE PROCEDURE js_rethrow() LANGUAGE JAVASCRIPT USING (box) AS $$
+try { session.runSql('INSERT INTO t1 VALUES (1)') } catch (e) { }
+throw box.kept.e
+$$;
+CALL js_keep();
+CALL js_rethrow();
+ERROR 42S02: Table 'test.no_such_table' doesn't exist
+#
+# D5: setOptions() replaces the options of an earlier call; options not
+# given take their defaults (Oracle).
+#
+CREATE PROCEDURE js_set_options(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+session.setOptions({ decimalType: 'NUMBER' })
+const first = session.getOption('integerType') + '/' + session.getOption('decimalType')
+session.setOptions({ integerType: 'BIGINT' })
+r = first + ' then ' + session.getOption('integerType') + '/' + session.getOption('decimalType')
+$$;
+CALL js_set_options(@r);
+SELECT @r;
+@r
+UNSAFE_STRING/NUMBER then BIGINT/STRING
+#
+# D7: a body is async only if await stands at its top level: an await in a
+# comment, a string or a nested async function leaves it a plain function
+# (a returned promise is not awaited), also when called nested.
+#
+CREATE FUNCTION js_await_words() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+// await in a comment, and "await" in a string
+const f = async () => { await null }
+return Promise.resolve(typeof f)
+$$;
+CREATE FUNCTION js_await_top() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+return await Promise.resolve('awaited')
+$$;
+SELECT js_await_words(), js_await_top();
+js_await_words()	js_await_top()
+[object Promise]	awaited
+CREATE PROCEDURE js_calls_await_words(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+r = session.runSql('SELECT js_await_words()').fetchOne()[0]
+$$;
+CALL js_calls_await_words(@r);
+SELECT @r;
+@r
+[object Promise]
+#
+# D6 (Appendix B.7): an async routine called from another routine of the
+# same worker: GraalJS cannot settle its promise; V8 runs the pending jobs.
+#
+CREATE PROCEDURE js_calls_await_top(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+r = session.runSql('SELECT js_await_top()').fetchOne()[0]
+$$;
+SET @r = NULL;
+CALL js_calls_await_top(@r);
+ERROR HY000: MLE-Type> an async JavaScript routine (one that uses await) cannot run while another routine of this worker runs (a nested call); its promise did not settle in 'js_await_top()'
+SELECT @r;
+@r
+NULL
+#
+# CONF-6 (protocol 9.2): parameter names are JavaScript identifiers beyond
+# ASCII too; what is not one is refused.
+#
+CREATE FUNCTION js_unicode_names(größe INT, café INT, µ INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$
+return größe + café + µ
+$$;
+SELECT js_unicode_names(1, 2, 3);
+js_unicode_names(1, 2, 3)
+6
+CREATE FUNCTION js_euro_name(`a€b` INT) RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+ERROR HY000: JavaScript> 'a€b' is not a JavaScript identifier
+DROP PROCEDURE js_keep;
+DROP PROCEDURE js_rethrow;
+DROP LIBRARY box;
+DROP PROCEDURE js_set_options;
+DROP FUNCTION js_await_words;
+DROP FUNCTION js_await_top;
+DROP PROCEDURE js_calls_await_words;
+DROP PROCEDURE js_calls_await_top;
+DROP FUNCTION js_unicode_names;
+DROP TABLE t1;
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

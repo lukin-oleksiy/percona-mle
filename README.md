@@ -42,7 +42,7 @@ design notes by name (e.g. `14-phase6-libraries.md`); those notes are not publis
 | `harness/` | a command-line driver for workers (development) |
 | `unittest/` | GoogleTest unit tests (12 binaries) |
 | `mysql-test/suite/component_mle` | the MTR suite |
-| `docs/` | `protocol.md`: the host–worker protocol, specification 1.0; `protocol-review.md`: its reviews, the differences from the code before it, the measurements |
+| `docs/` | `protocol.md`: the host–worker protocol, specification 1.0; `protocol-review.md`: its reviews, the differences from the code before it, the measurements; `limits.md`: known limits |
 | `perf/` | performance tools: the regression test (two builds side by side), the benchmark of one build (every runtime), the end-to-end benchmark against an application |; `perf/results/`: published runs (JSON) |
 | `docker/` | the server + MLE image, the DBA tools image, compose |
 | `packaging/`, `cmake/packaging.cmake` | packages (CPack, deb and rpm) and their scripts |

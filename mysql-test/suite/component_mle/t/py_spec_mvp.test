@@ -1,0 +1,107 @@
+--echo #
+--echo # component_mle: the specification round of the MVP code review (exp
+--echo # note 65, step 2), Python. Also run on the CPython worker
+--echo # (cpython_py_spec_mvp.test).
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE t1 (id INT PRIMARY KEY);
+INSERT INTO t1 VALUES (1);
+
+# Through the client: mysqltest takes the indentation off the lines of a body.
+--write_file $MYSQLTEST_VARDIR/tmp/py_spec_mvp.sql
+CREATE PROCEDURE py_keep() LANGUAGE PYTHON AS $$
+    import sys
+    try:
+        session.run_sql('SELECT * FROM no_such_table')
+    except Exception as e:
+        sys.mle_kept = e
+$$;
+CREATE PROCEDURE py_rethrow() LANGUAGE PYTHON AS $$
+    import sys
+    try:
+        session.run_sql('INSERT INTO t1 VALUES (1)')
+    except Exception:
+        pass
+    raise sys.mle_kept
+$$;
+CREATE PROCEDURE py_set_options(OUT r TEXT) LANGUAGE PYTHON AS $$
+    session.set_options({'decimal_type': 'NUMBER'})
+    first = session.get_option('decimalType')
+    session.set_options({'pass_result_to_client': False})
+    r = '%s then %s' % (first, session.get_option('decimalType'))
+$$;
+CREATE PROCEDURE py_old_instant(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import datetime
+    d = datetime.datetime(1965, 3, 1, 12, 0, tzinfo=datetime.timezone.utc)
+    r = str(session.run_sql('SELECT CAST(? AS CHAR)', [d]).fetch_one()[0])
+$$;
+CREATE FUNCTION py_old_datetime() RETURNS DATETIME LANGUAGE PYTHON AS $$
+    import datetime
+    return datetime.datetime(1965, 3, 1, 12, 0, tzinfo=datetime.timezone.utc)
+$$;
+CREATE FUNCTION py_old_timestamp() RETURNS TIMESTAMP LANGUAGE PYTHON AS $$
+    import datetime
+    return datetime.datetime(1965, 3, 1, 12, 0, tzinfo=datetime.timezone.utc)
+$$;
+CREATE FUNCTION py_zero(d DATE, t DATETIME, ts TIMESTAMP) RETURNS TEXT LANGUAGE PYTHON AS $$
+    return repr((d, t, ts))
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/py_spec_mvp.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/py_spec_mvp.sql
+
+--connect (con1, localhost, root,,test)
+SET time_zone = '+02:00';
+
+--echo #
+--echo # D2 (protocol 10.8): an SQL error kept from an earlier call and raised
+--echo # again is raised with its own number, not as the current call's error
+--echo # that has the same id.
+--echo #
+CALL py_keep();
+--error ER_NO_SUCH_TABLE
+CALL py_rethrow();
+
+--echo #
+--echo # D5: set_options() replaces the options of an earlier call; options not
+--echo # given take their defaults (Oracle).
+--echo #
+CALL py_set_options(@r);
+SELECT @r;
+
+--echo #
+--echo # D1 (protocol 7.2): an instant outside TIMESTAMP's range goes as the
+--echo # DATETIME of its local time in the session's zone (+02:00); for a
+--echo # declared TIMESTAMP it is a conversion error.
+--echo #
+CALL py_old_instant(@r);
+SELECT @r;
+SELECT py_old_datetime();
+--error ER_LANGUAGE_COMPONENT
+SELECT py_old_timestamp();
+
+--echo #
+--echo # D1 (Appendix B.4): a date Python cannot hold and the zero TIMESTAMP are
+--echo # None as routine arguments, as in rows.
+--echo #
+SET sql_mode = '';
+SELECT py_zero('0000-00-00', '2024-00-10 10:00:00', '0000-00-00 00:00:00') AS zero;
+SET sql_mode = DEFAULT;
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP PROCEDURE py_keep;
+DROP PROCEDURE py_rethrow;
+DROP PROCEDURE py_set_options;
+DROP PROCEDURE py_old_instant;
+DROP FUNCTION py_old_datetime;
+DROP FUNCTION py_old_timestamp;
+DROP FUNCTION py_zero;
+DROP TABLE t1;
+REVOKE CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
