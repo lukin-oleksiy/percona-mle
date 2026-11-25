@@ -27,37 +27,23 @@ import codecs as _codecs
 
 import _mlewire
 
-# Operations the dispatcher handles (§9).
-PREPARE, CALL, DROP, RESET, OPTIONS, PARSE_LIBRARY = 2, 3, 8, 9, 11, 12
+# The protocol's constants, from include/mle/protocol.h through _mlewire (MVP review CPY-13):
+# operations the dispatcher handles (§9), RESULT statuses (§9.4), value tags (§7.2), limits (§12),
+# TIMESTAMP's range and zero (§7.2: microseconds since 1970-01-01 00:00:00 UTC).
+from _mlewire import (PREPARE, CALL, DROP, RESET, OPTIONS, PARSE_LIBRARY,
+                      OK, GUEST_ERROR, INTERRUPTED, EXHAUSTED, INTERNAL,
+                      T_NULL, T_I64, T_U64, T_F64, T_F32, T_DECIMAL, T_STRING, T_BYTES, T_DATE, T_TIME,
+                      T_DATETIME, T_TIMESTAMP, T_JSON, T_VECTOR,
+                      MAX_WORKER_MESSAGE, MAX_VALUES, MAX_VECTOR_DIMENSIONS, MAX_TIME_HOUR,
+                      MAX_ERROR_MESSAGE, MAX_FRAME_TEXT, MAX_FRAMES, MAX_FINDING, MAX_FINDINGS,
+                      MAX_SQL_ERRNO, MAX_TIMESTAMP, ZERO_TIMESTAMP,
+                      LANGUAGE_TYPE, LANGUAGE_TIME_ZONE, LANGUAGE_OPTION)
 
-# RESULT status (§9.4).
-OK, GUEST_ERROR, INTERRUPTED, EXHAUSTED, INTERNAL = range(5)
-
-(T_NULL, T_I64, T_U64, T_F64, T_F32, T_DECIMAL, T_STRING, T_BYTES, T_DATE, T_TIME, T_DATETIME,
- T_TIMESTAMP, T_JSON, T_VECTOR) = range(14)
 TAG_NAMES = ('NULL', 'BIGINT', 'BIGINT UNSIGNED', 'DOUBLE', 'FLOAT', 'DECIMAL', 'VARCHAR', 'VARBINARY',
              'DATE', 'TIME', 'DATETIME', 'TIMESTAMP', 'JSON', 'VECTOR')
 
-# Limits (§12).
-MAX_WORKER_MESSAGE = 64 << 20
-MAX_VALUES = 65535
-MAX_VECTOR_DIMENSIONS = 16383
-MAX_TIME_HOUR = 838
-MAX_ERROR_MESSAGE = 16 << 10
-MAX_FRAME_TEXT = 1 << 10
-MAX_FRAMES = 1000
-MAX_FINDING = 4 << 10
-MAX_FINDINGS = 1000
-MAX_SQL_ERRNO = 65535
-# TIMESTAMP (§7.2): microseconds since 1970-01-01 00:00:00 UTC, or MySQL's zero timestamp.
-MAX_TIMESTAMP = 253402300799999999
-ZERO_TIMESTAMP = -2 ** 63
-
-# Error.language (§7.4): the worker's language, and the markers.
+# Error.language (§7.4): the worker's language (the markers are above).
 LANGUAGE = 'python'
-LANGUAGE_TYPE = 'MLE-Type'
-LANGUAGE_TIME_ZONE = 'MLE-TimeZone'
-LANGUAGE_OPTION = 'MLE-Option'
 
 _U32 = _struct.Struct('<I').unpack_from
 _U64 = _struct.Struct('<Q').unpack_from
@@ -121,6 +107,11 @@ class _LazyNumpy:
 
 
 _numpy = _LazyNumpy()
+
+
+def have_numpy():
+    """Whether numpy can be imported (typed columns need it)."""
+    return _numpy.get() is not None
 
 
 # The time zone of OPTIONS (sql.Api.zone sets it; +00:00 without OPTIONS, §1): a TIMESTAMP, which

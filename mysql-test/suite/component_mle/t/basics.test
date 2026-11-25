@@ -20,8 +20,8 @@ SELECT VARIABLE_VALUE AS mle_status FROM performance_schema.global_status
 # mle.debug_test_worker exists in debug builds only (design note 66).
 SHOW GLOBAL VARIABLES WHERE Variable_name LIKE 'mle.%'
   AND Variable_name NOT IN ('mle.dir', 'mle.java_home', 'mle.debug_test_worker');
-# Defaults: <plugin dir>/mle; empty, i.e. <mle.dir>/jdk if installed (package
-# percona-mle-jdk), else the JDK of the build.
+# Defaults: <plugin dir>/mle; empty, i.e. <mle.dir>/jdk (package percona-mle-jdk;
+# in a build tree a link to the build's JDK).
 SELECT @@mle.dir = CONCAT(TRIM(TRAILING '/' FROM @@plugin_dir), '/mle') AS default_dir,
        @@mle.java_home = '' AS default_java_home;
 

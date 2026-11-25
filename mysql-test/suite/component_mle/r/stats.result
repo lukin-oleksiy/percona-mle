@@ -154,7 +154,8 @@ unknown method 'kendall' (pearson or spearman)
 the columns have 3 and 2 values
 a regression needs at least 2 pairs of values, not 1
 all x values are equal: the slope is undefined
-bins must be at least 1, not 0
+bins must be from 1 to 1000000, not 0
+bins must be from 1 to 1000000, not 2147483647
 the edges must increase
 the values span too little for 10 bins (1.0 to 1.0000000000000002): give the edges or fewer bins
 unknown method 'mad' (iqr or zscore)

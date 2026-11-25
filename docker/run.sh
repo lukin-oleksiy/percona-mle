@@ -63,7 +63,9 @@ wait_ready() {
   while [ $i -lt 180 ]; do
     # The first start runs a setup server without networking first: ready is
     # the final server, which answers on TCP.
-    if docker exec "$NAME" mysqladmin --protocol=tcp -h127.0.0.1 -uroot -p"$(label root-password)" ping >/dev/null 2>&1; then
+    # Passwords go through the environment, not docker's command line (other users see that).
+    if MYSQL_PWD="$(label root-password)" docker exec -e MYSQL_PWD "$NAME" \
+         mysqladmin --protocol=tcp -h127.0.0.1 -uroot ping >/dev/null 2>&1; then
       echo ' ready.'
       return 0
     fi
@@ -82,7 +84,7 @@ client() {  # user, password, the client's arguments
   running || die "the server is not running: run.sh start"
   tty=
   [ -t 0 ] && [ -t 1 ] && tty=-t
-  docker exec -i $tty -e MYSQL_PWD="$pass" "$NAME" mysql -u"$user" --table "$@"
+  MYSQL_PWD="$pass" docker exec -i $tty -e MYSQL_PWD "$NAME" mysql -u"$user" --table "$@"
 }
 
 usage() { sed -n '/^# Runs Percona Server/,/^set -eu/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }
@@ -98,11 +100,18 @@ start)
     app_pw=${MLE_APP_PASSWORD:-$(password)}
     privileged=
     [ "${MLE_PRIVILEGED:-no}" = yes ] && privileged=--privileged
-    docker run -d --name "$NAME" $privileged -m "$MEMORY" -p "$BIND:$PORT:3306" \
-      -v "$NAME-data:/var/lib/mysql" \
-      -e MYSQL_ROOT_PASSWORD="$root_pw" -e MLE_APP_USER="$APP_USER" -e MLE_APP_PASSWORD="$app_pw" \
-      --label "mle.root-password=$root_pw" --label "mle.app-user=$APP_USER" --label "mle.app-password=$app_pw" \
-      "$IMAGE" >/dev/null
+    # The passwords reach docker through its environment and a label file, not its command line
+    # (MVP review OPS-4); the labels keep them for status.
+    labels=$(mktemp)
+    trap 'rm -f "$labels"' EXIT
+    printf 'mle.root-password=%s\nmle.app-user=%s\nmle.app-password=%s\n' "$root_pw" "$APP_USER" "$app_pw" >"$labels"
+    MYSQL_ROOT_PASSWORD="$root_pw" MLE_APP_PASSWORD="$app_pw" \
+      docker run -d --name "$NAME" $privileged -m "$MEMORY" -p "$BIND:$PORT:3306" \
+        -v "$NAME-data:/var/lib/mysql" \
+        -e MYSQL_ROOT_PASSWORD -e MLE_APP_USER="$APP_USER" -e MLE_APP_PASSWORD \
+        --label-file "$labels" \
+        "$IMAGE" >/dev/null
+    rm -f "$labels"
   fi
   wait_ready
   "$0" status
@@ -121,7 +130,7 @@ status)
   exists || die "no container $NAME: run.sh start"
   docker ps -a --filter "name=^/$NAME\$" --format '{{.Names}}: {{.Status}}, image {{.Image}}, port {{.Ports}}'
   if running; then
-    docker exec -e MYSQL_PWD="$(label root-password)" "$NAME" mysql -uroot -N -B -e "
+    MYSQL_PWD="$(label root-password)" docker exec -e MYSQL_PWD "$NAME" mysql -uroot -N -B -e "
       SELECT CONCAT('Percona Server ', VERSION(), ', MLE ', s.VARIABLE_VALUE, ', languages: ', l.VARIABLE_VALUE)
         FROM performance_schema.global_status s, performance_schema.global_status l
        WHERE s.VARIABLE_NAME = 'mle_status' AND l.VARIABLE_NAME = 'mle_languages_supported'" 2>/dev/null ||

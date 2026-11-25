@@ -46,14 +46,26 @@ ValueRules &value_rules() {
   return r;
 }
 
+Ref host_text(std::string_view s) {
+  return Ref::steal(PyUnicode_DecodeUTF8(s.data(), static_cast<Py_ssize_t>(s.size()), "replace"));
+}
+
+std::string raised_text() {
+  std::string text;
+  if (PyObject *e = PyErr_GetRaisedException(); e != nullptr) {
+    if (PyObject *shown = PyObject_ASCII(e); shown != nullptr) {
+      if (const char *s = PyUnicode_AsUTF8(shown); s != nullptr) text = s;
+      Py_DECREF(shown);
+    }
+    PyErr_Clear();
+    Py_DECREF(e);
+  }
+  return text;
+}
+
 namespace {
 
 constexpr size_t kCivilSize = 15;  // u16 year, u8 month, u8 day, u32 hour, u8 minute, u8 second, u32 us, bool neg
-
-/** Text of the host as a str; ill-formed UTF-8 is repaired with U+FFFD (§7.1). */
-Ref unicode(std::string_view s) {
-  return Ref::steal(PyUnicode_DecodeUTF8(s.data(), static_cast<Py_ssize_t>(s.size()), "replace"));
-}
 
 Ref call(PyObject *f, PyObject *a) { return Ref::steal(PyObject_CallOneArg(f, a)); }
 
@@ -97,7 +109,7 @@ Ref decode_tagged(Tag tag, Reader &r, PyObject *body, PyObject *vector) {
     case Tag::kF32:
       return Ref::steal(PyFloat_FromDouble(r.get<float>()));
     case Tag::kString:
-      return unicode(r.str());
+      return host_text(r.str());
     case Tag::kBytes: {
       const auto n = r.get<uint32_t>();
       auto s = r.take(n);
@@ -105,9 +117,9 @@ Ref decode_tagged(Tag tag, Reader &r, PyObject *body, PyObject *vector) {
     }
     case Tag::kDecimal:
       return call(value_rules() == ValueRules::kRowsNumber ? helpers().number.get() : helpers().decimal.get(),
-                  unicode(r.str()).get());
+                  host_text(r.str()).get());
     case Tag::kJson:
-      return call(helpers().json_loads.get(), unicode(r.str()).get());
+      return call(helpers().json_loads.get(), host_text(r.str()).get());
     case Tag::kDate:
     case Tag::kTime:
     case Tag::kDatetime:

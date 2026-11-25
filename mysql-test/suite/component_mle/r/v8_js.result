@@ -8,6 +8,7 @@
 # JavaScript tests.
 #
 call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+call mtr.add_suppression("Component mle reported: 'mle.v8_heap_max .* is not below mle.v8_memory_max");
 INSTALL COMPONENT "file://component_mle";
 GRANT CREATE_JS_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
 #

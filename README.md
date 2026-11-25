@@ -112,7 +112,8 @@ Performance, a change against the commit before it (release builds, a quiet mach
 
 It runs each case of `perf/setup.sql` (the call path, values of every kind, SQL from routines read and written,
 libraries, errors, vectors, a new connection's worker) on both builds in alternating order on the same data, and
-exits with status 1 when a case is slower beyond the threshold (5 %) in all rounds but one.
+exits with status 1 when a case is slower: the median over the rounds beyond the threshold (5 %), for the best
+and for the median run of a round, and slower in all rounds but one.
 
 ## Performance
 

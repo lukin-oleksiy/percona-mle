@@ -120,21 +120,13 @@ int landlock_abi() {
   return abi < 0 ? 0 : static_cast<int>(abi);
 }
 
-int apply_landlock(int abi, const ClassConfig &c, const std::string &leaf) {
+int apply_landlock(const ClassConfig &c, const std::string &leaf) {
+  // Called only at kMinLandlockAbi (6) or later: every right below it is there (MVP review HOST-8).
   RulesetAttr attr{};
-  attr.handled_access_fs = kFsAbi1;
-  if (abi >= 2) attr.handled_access_fs |= kFsRefer;
-  if (abi >= 3) attr.handled_access_fs |= kFsTruncate;
-  if (abi >= 5) attr.handled_access_fs |= kFsIoctlDev;
-  size_t size = offsetof(RulesetAttr, handled_access_net);
-  if (abi >= 4) {
-    attr.handled_access_net = kNetBindTcp | kNetConnectTcp;
-    size = offsetof(RulesetAttr, scoped);
-  }
-  if (abi >= 6) {
-    attr.scoped = kScopeAbstractUnix | kScopeSignal;
-    size = sizeof attr;
-  }
+  attr.handled_access_fs = kFsAbi1 | kFsRefer | kFsTruncate | kFsIoctlDev;
+  attr.handled_access_net = kNetBindTcp | kNetConnectTcp;
+  attr.scoped = kScopeAbstractUnix | kScopeSignal;
+  const size_t size = sizeof attr;
   const uint64_t handled = attr.handled_access_fs;
   const int rs =
       static_cast<int>(syscall(SYS_landlock_create_ruleset, &attr, size, 0));
@@ -296,7 +288,7 @@ const char *child_step_name(int32_t step) {
   }
 
   if (r.landlock_abi >= kMinLandlockAbi) {
-    if (const int err = apply_landlock(r.landlock_abi, c, r.leaf); err != 0)
+    if (const int err = apply_landlock(c, r.leaf); err != 0)
       fail(err_pipe, kStepLandlock, err);
   } else if (!c.insecure_without_landlock) {
     fail(err_pipe, kStepLandlock, ENOSYS);  // checked at CONFIG already

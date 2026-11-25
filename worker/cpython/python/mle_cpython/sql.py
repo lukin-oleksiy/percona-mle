@@ -869,10 +869,12 @@ class SqlResult:
                     raise TypeError("no column '%s' in the result" % label) from None
         self._live()
         collectors = [None] * len(labels)
+        # numpy arrays where numpy is there; lists without it (MVP review CPY-14).
+        typed = wire.have_numpy()
         for i in index.values():
             if collectors[i] is None:
-                collectors[i] = wire.Collector(_COLUMN_MODE.get(self._columns.tags[i], wire.MODE_LIST),
-                                               self._total or 0)
+                mode = _COLUMN_MODE.get(self._columns.tags[i], wire.MODE_LIST) if typed else wire.MODE_LIST
+                collectors[i] = wire.Collector(mode, self._total or 0)
         for row in self._rows[self._at:]:  # rows decoded before (fetch_one ...)
             for i, c in enumerate(collectors):
                 if c is not None:

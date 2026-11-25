@@ -448,57 +448,29 @@ final class VectorEngine {
    * of rows in order of their work.
    */
   private static Matches[] related(float[][] rows, float[] rt, int kk, int metric, long[] ids) {
-    final int n = rows.length, d = rows[0].length;
+    final int n = rows.length;
     final float[][] bs = new float[n][kk];
     final int[][] bx = new int[n][kk];
     for (int a = 0; a < n; a++) {
       Arrays.fill(bs[a], Float.NEGATIVE_INFINITY);
       Arrays.fill(bx[a], -1);
     }
-    // Blocks: the first ones have the most rows j > a; small enough to balance the threads.
-    final int rb = Math.max(4, Math.min(128, (n + 4 * THREADS - 1) / (4 * THREADS) + 3 & ~3));
-    final boolean parallel = (long) n * n / 2 * d >= PARALLEL_MIN;
-    final float[][] pk = new float[(Math.min(n, CHUNK) + NR - 1) / NR][d * NR];
-    final float[] zero = new float[d];
-    for (int c0 = 0; c0 < n; c0 += CHUNK) {
-      final int c1 = Math.min(n, c0 + CHUNK), panels = (c1 - c0 + NR - 1) / NR, start = c0;
-      // Blocks with a row below the chunk's last row have pairs in it.
-      final int tasks = Math.min((n + rb - 1) / rb, (c1 - 1 + rb - 1) / rb);
-      if (tasks == 0) continue;
-      run(panels, parallel, p -> pack(rows, start, c1, p, pk[p], d));
-      run(tasks, parallel, t -> {
-        final float[] tile = new float[4 * NR];
-        final int lo = t * rb, hi = Math.min(n, lo + rb);
-        for (int p = Math.max(0, (lo + 1 - start) / NR); p < panels; p++) {
-          stopIfKilled();
-          final float[] panel = pk[p];
-          final int j0 = start + p * NR, cols = Math.min(NR, c1 - j0);
-          for (int a = lo; a < hi; a += 4) {
-            if (j0 + cols - 1 <= a) break;  // no j > a here, nor for the later rows
-            if (metric == EUCLIDEAN)
-              tileDistance(rows[a], a + 1 < hi ? rows[a + 1] : zero, a + 2 < hi ? rows[a + 2] : zero,
-                  a + 3 < hi ? rows[a + 3] : zero, panel, d, tile);
-            else
-              tile(rows[a], a + 1 < hi ? rows[a + 1] : zero, a + 2 < hi ? rows[a + 2] : zero,
-                  a + 3 < hi ? rows[a + 3] : zero, panel, d, tile);
-            for (int r = 0; r < 4 && a + r < hi; r++) {
-              final int qa = a + r;
-              for (int c = Math.max(0, qa + 1 - j0); c < cols; c++) {
-                final int j = j0 + c;
-                final float v = tile[r * NR + c];
-                final float key = switch (metric) {
-                  case COSINE -> v * (rt[qa] * rt[j]);
-                  case EUCLIDEAN -> -v;  // v = |a - j|²
-                  default -> v;
-                };
-                offerShared(bs[qa], bx[qa], key, j);
-                offerShared(bs[j], bx[j], key, qa);
-              }
-            }
-          }
+    upperTiles(rows, metric, t -> (tile, a, hi, j0, cols) -> {
+      for (int r = 0; r < 4 && a + r < hi; r++) {
+        final int qa = a + r;
+        for (int c = Math.max(0, qa + 1 - j0); c < cols; c++) {
+          final int j = j0 + c;
+          final float v = tile[r * NR + c];
+          final float key = switch (metric) {
+            case COSINE -> v * (rt[qa] * rt[j]);
+            case EUCLIDEAN -> -v;  // v = |a - j|²
+            default -> v;
+          };
+          offerShared(bs[qa], bx[qa], key, j);
+          offerShared(bs[j], bx[j], key, qa);
         }
-      });
-    }
+      }
+    });
     final Matches[] out = new Matches[n];
     for (int a = 0; a < n; a++) out[a] = matches(bs[a], bx[a], metric, ids);
     return out;
@@ -721,72 +693,120 @@ final class VectorEngine {
   static void pairs(float[][] rows, float[] rowTerm, int metric, float keyMin, PairSink sink) {
     final int n = rows.length;
     if (n < 2) return;
-    final int d = rows[0].length;
     final float[] rt = rowTerm != null ? rowTerm : rowTerms(rows, metric);
     final float[] cut = {keyMin};  // under the sink's lock; read racily (it only rises)
+    upperTiles(rows, metric, t -> new PairTask(rt, metric, sink, cut));
+  }
+
+  /** One task's consumer of the register tiles of {@link #upperTiles}. */
+  interface UpperTile {
+    /**
+     * tile[r * NR + c] is the dot (EUCLIDEAN: the squared distance) of rows a + r (below hi) and
+     * j0 + c (below cols); only the pairs with j > a + r are new.
+     */
+    void take(float[] tile, int a, int hi, int j0, int cols);
+
+    /** After the task's last tile. */
+    default void end() {}
+  }
+
+  /**
+   * The upper triangle of all pairs, each computed once (related() and pairs(), MVP review API-8):
+   * a task takes a block of rows a and the rows j > a in register tiles, chunk by chunk of packed
+   * panels; the first blocks have the most rows j > a, small enough to balance the threads. Each
+   * task gets its consumer from perTask; one call per tile keeps the per-pair code in it.
+   */
+  private static void upperTiles(float[][] rows, int metric, java.util.function.IntFunction<UpperTile> perTask) {
+    final int n = rows.length, d = rows[0].length;
     final int rb = Math.max(4, Math.min(128, (n + 4 * THREADS - 1) / (4 * THREADS) + 3 & ~3));
     final boolean parallel = (long) n * n / 2 * d >= PARALLEL_MIN;
     final float[][] pk = new float[(Math.min(n, CHUNK) + NR - 1) / NR][d * NR];
     final float[] zero = new float[d];
     for (int c0 = 0; c0 < n; c0 += CHUNK) {
       final int c1 = Math.min(n, c0 + CHUNK), panels = (c1 - c0 + NR - 1) / NR, start = c0;
+      // Blocks with a row below the chunk's last row have pairs in it.
       final int tasks = Math.min((n + rb - 1) / rb, (c1 - 1 + rb - 1) / rb);
       if (tasks == 0) continue;
       run(panels, parallel, p -> pack(rows, start, c1, p, pk[p], d));
       run(tasks, parallel, t -> {
+        final UpperTile consumer = perTask.apply(t);
         final float[] tile = new float[4 * NR];
-        final int cap = 8192;
-        final int[] ba = new int[cap], bb = new int[cap];
-        final float[] bk = new float[cap];
-        int m = 0;
-        float min;
-        synchronized (sink) {
-          min = cut[0];
-        }
         final int lo = t * rb, hi = Math.min(n, lo + rb);
         for (int p = Math.max(0, (lo + 1 - start) / NR); p < panels; p++) {
           stopIfKilled();
           final float[] panel = pk[p];
           final int j0 = start + p * NR, cols = Math.min(NR, c1 - j0);
           for (int a = lo; a < hi; a += 4) {
-            if (j0 + cols - 1 <= a) break;
+            if (j0 + cols - 1 <= a) break;  // no j > a here, nor for the later rows
             if (metric == EUCLIDEAN)
               tileDistance(rows[a], a + 1 < hi ? rows[a + 1] : zero, a + 2 < hi ? rows[a + 2] : zero,
                   a + 3 < hi ? rows[a + 3] : zero, panel, d, tile);
             else
               tile(rows[a], a + 1 < hi ? rows[a + 1] : zero, a + 2 < hi ? rows[a + 2] : zero,
                   a + 3 < hi ? rows[a + 3] : zero, panel, d, tile);
-            for (int r = 0; r < 4 && a + r < hi; r++) {
-              final int qa = a + r;
-              for (int c = Math.max(0, qa + 1 - j0); c < cols; c++) {
-                final int j = j0 + c;
-                final float v = tile[r * NR + c];
-                final float key = switch (metric) {
-                  case COSINE -> v * (rt[qa] * rt[j]);
-                  case EUCLIDEAN -> -v;
-                  default -> v;
-                };
-                if (key >= min) {
-                  ba[m] = qa;
-                  bb[m] = j;
-                  bk[m] = key;
-                  if (++m == cap) {
-                    synchronized (sink) {
-                      cut[0] = Math.max(cut[0], sink.take(ba, bb, bk, m));
-                      min = cut[0];
-                    }
-                    m = 0;
-                  }
-                }
-              }
-            }
+            consumer.take(tile, a, hi, j0, cols);
           }
         }
-        if (m > 0)
-          synchronized (sink) {
-            cut[0] = Math.max(cut[0], sink.take(ba, bb, bk, m));
-          }
+        consumer.end();
       });
+    }
+  }
+
+  /** A pairs() task: buffers the pairs at least the sink's cut and hands them over 8192 at a time. */
+  private static final class PairTask implements UpperTile {
+    private static final int CAP = 8192;
+    private final float[] rt;
+    private final int metric;
+    private final PairSink sink;
+    private final float[] cut;
+    private final int[] ba = new int[CAP], bb = new int[CAP];
+    private final float[] bk = new float[CAP];
+    private int m;
+    private float min;
+
+    PairTask(float[] rt, int metric, PairSink sink, float[] cut) {
+      this.rt = rt;
+      this.metric = metric;
+      this.sink = sink;
+      this.cut = cut;
+      synchronized (sink) {
+        min = cut[0];
+      }
+    }
+
+    @Override
+    public void take(float[] tile, int a, int hi, int j0, int cols) {
+      for (int r = 0; r < 4 && a + r < hi; r++) {
+        final int qa = a + r;
+        for (int c = Math.max(0, qa + 1 - j0); c < cols; c++) {
+          final int j = j0 + c;
+          final float v = tile[r * NR + c];
+          final float key = switch (metric) {
+            case COSINE -> v * (rt[qa] * rt[j]);
+            case EUCLIDEAN -> -v;
+            default -> v;
+          };
+          if (key >= min) {
+            ba[m] = qa;
+            bb[m] = j;
+            bk[m] = key;
+            if (++m == CAP) flush();
+          }
+        }
+      }
+    }
+
+    @Override
+    public void end() {
+      if (m > 0) flush();
+    }
+
+    private void flush() {
+      synchronized (sink) {
+        cut[0] = Math.max(cut[0], sink.take(ba, bb, bk, m));
+        min = cut[0];
+      }
+      m = 0;
     }
   }
 

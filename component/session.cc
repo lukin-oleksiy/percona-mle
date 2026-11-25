@@ -412,14 +412,6 @@ void append_capped(std::string *buffer, const std::string &more) {
 }
 
 
-/**
-  A failure of the engine rather than of the routine's code (a lost worker,
-  the engine not running): ER_LANGUAGE_COMPONENT (6000) with "MLE> " and the
-  reason. Exceptions thrown by routine code are ER_LANGUAGE_COMPONENT_RUNTIME
-  (6113, "<language>> message"), so handlers and retry logic can tell them
-  apart; internal errors are ER_LANGUAGE_COMPONENT_INTERNAL (6111), with the
-  details in the error log only.
-*/
 /** A frame of the routine's body itself, not of a function in it. */
 bool body_frame(const mle::StackFrame &f) {
   // ":=>": the wrapper function around a JavaScript body.
@@ -471,6 +463,14 @@ std::string traceback_text(const mle::Error &e, const std::string &language,
   return t;
 }
 
+/**
+  A failure of the engine rather than of the routine's code (a lost worker,
+  the engine not running): ER_LANGUAGE_COMPONENT (6000) with "MLE> " and the
+  reason. Exceptions thrown by routine code are ER_LANGUAGE_COMPONENT_RUNTIME
+  (6113, "<language>> message"), so handlers and retry logic can tell them
+  apart; internal errors are ER_LANGUAGE_COMPONENT_INTERNAL (6111), with the
+  details in the error log only.
+*/
 void engine_error(std::string why) {
   // The host's reasons name "the MLE worker"; after "MLE> " once is enough.
   constexpr std::string_view kWorker = "the MLE worker";

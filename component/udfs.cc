@@ -330,7 +330,7 @@ class mle_eval_impl {
     const auto code = ctx.get_arg<STRING_RESULT>(1);
     const unsigned bit = mle_component::language_bit(std::string(language));
     if (bit == 0)
-      throw std::invalid_argument("the language must be JAVASCRIPT, PYTHON or JAVA");
+      throw std::invalid_argument("the language must be JAVASCRIPT, PYTHON, JAVA, JS or CPYTHON");
     if ((mle_component::enabled_languages() & bit) == 0)
       throw std::invalid_argument("the language is not enabled (mle.languages)");
     Session *s = Session::current(true);

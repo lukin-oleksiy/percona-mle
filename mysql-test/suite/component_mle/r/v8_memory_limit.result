@@ -4,6 +4,7 @@
 # go on (from v8_js.test, MVP review TEST-5).
 #
 call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+call mtr.add_suppression("Component mle reported: 'mle.v8_heap_max .* is not below mle.v8_memory_max");
 INSTALL COMPONENT "file://component_mle";
 GRANT CREATE_JS_ROUTINE ON *.* TO root@localhost;
 SET GLOBAL mle.v8_memory_max = 256 * 1024 * 1024;

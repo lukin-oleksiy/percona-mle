@@ -1158,7 +1158,6 @@ Worker::Wait Worker::serve_library(Message &m, CallHooks &hooks,
   if (m_noticed) {
     refuse("the statement was interrupted");
   } else {
-    clock_stop(0);
     hooks.library(library, &r);
     if (!m_usable) return Wait::kDied;
     if (const Wait k = tick(nullptr, false, 0, error); k != Wait::kMessage)

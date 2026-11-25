@@ -510,7 +510,7 @@ final class Polyglot {
         jsOracle.putMember("datesBridge", (org.graalvm.polyglot.proxy.ProxyExecutable) a -> dateMethods(c, a));
         // USING in JavaScript routines (Phase 6): $c.lib(...) gets every library's module.
         jsOracle.putMember("libBridge",
-            (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString(), true));
+            (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString()));
         // importPython('numpy'): Python modules from JavaScript.
         c.getBindings("js").putMember("importPython",
             (org.graalvm.polyglot.proxy.ProxyExecutable) a -> importPython(a[0].asString()));
@@ -1136,11 +1136,11 @@ final class Polyglot {
   }
 
   /**
-   * A database library's module for a routine of another language (Phase 6): a Python library as a
-   * Python module (evaluated once per version); a JavaScript library as its module namespace, or
-   * null for JavaScript routines (they import it themselves). Java libraries are for Java routines.
+   * A database library's module for a routine of any language: a Python library as a Python module
+   * (evaluated once per version), a JavaScript library as its module namespace. Java libraries are
+   * for Java routines.
    */
-  Object libraryModule(String schema, String name, boolean forJs) {
+  Object libraryModule(String schema, String name) {
     LibraryFileSystem.Library l;
     try {
       l = LibraryFileSystem.library(schema, name);
@@ -1413,7 +1413,7 @@ final class Polyglot {
         (org.graalvm.polyglot.proxy.ProxyExecutable) a -> bulkArray(a[0]));
     // Python's rows take row['label'] (exp note 41): a Python class registered for their proxy class.
     pythonHelper0(c, "register_row").execute(c.asValue(GuestSql.GPyRow.class).getMember("static"));
-    pySql = new PySql(c, options, a -> libraryModule(a[0].asString(), a[1].asString(), false),
+    pySql = new PySql(c, options, a -> libraryModule(a[0].asString(), a[1].asString()),
         a -> importJs(a[0].asString()));
     pySql.zone(options.zoneName);
     python = h;
@@ -1595,7 +1595,7 @@ final class Polyglot {
     // USING (Phase 6): the libraries' current modules, bound before each call.
     if (r.language().equals("python"))
       for (LibraryFileSystem.Import i : r.imports())
-        pySql.bind.execute(r.fn(), i.binding(), libraryModule(i.schema(), i.name(), false));
+        pySql.bind.execute(r.fn(), i.binding(), libraryModule(i.schema(), i.name()));
     Value result = r.fn().execute(args);
     Helpers h = helpers(r.language());
     if (r.outs().length > 0) {

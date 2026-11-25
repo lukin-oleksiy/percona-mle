@@ -136,13 +136,36 @@ v8::MaybeLocal<v8::Module> Worker::compile_module(const std::string &text, const
   v8::ScriptCompiler::Source src(v8_string(m_isolate, text), origin);
   Local<v8::Module> m;
   if (!v8::ScriptCompiler::CompileModule(m_isolate, &src).ToLocal(&m)) return {};
-  m_module_paths[m->GetIdentityHash()] = path;
+  set_module_path(m, path);
   return m;
+}
+
+void Worker::set_module_path(Local<v8::Module> m, const std::string &path) {
+  forget_module_path(m);
+  // Weak: the entry does not keep a module alive that nothing else holds (one that failed).
+  auto it = m_module_paths.emplace(m->GetIdentityHash(), ModulePath{v8::Global<v8::Module>(m_isolate, m), path});
+  it->second.module.SetWeak();
+}
+
+const std::string *Worker::module_path(Local<v8::Module> m) {
+  const auto [first, last] = m_module_paths.equal_range(m->GetIdentityHash());
+  for (auto it = first; it != last; ++it)
+    if (it->second.module.Get(m_isolate) == m) return &it->second.path;
+  return nullptr;
+}
+
+void Worker::forget_module_path(Local<v8::Module> m) {
+  const auto [first, last] = m_module_paths.equal_range(m->GetIdentityHash());
+  for (auto it = first; it != last; ++it)
+    if (it->second.module.Get(m_isolate) == m) {
+      m_module_paths.erase(it);
+      return;
+    }
 }
 
 bool Worker::lib_compile(const LibraryName &lib, const Library &body, ModuleEntry &entry) {
   const Local<v8::Context> ctx = m_context.Get(m_isolate);
-  if (!entry.module.IsEmpty()) m_module_paths.erase(entry.module.Get(m_isolate)->GetIdentityHash());
+  if (!entry.module.IsEmpty()) forget_module_path(entry.module.Get(m_isolate));
   entry = ModuleEntry();
   Local<v8::Module> m;
   try {
@@ -235,8 +258,7 @@ v8::MaybeLocal<v8::Module> Worker::resolve(Local<v8::Context> ctx, Local<v8::Str
   }
   std::string from;
   if (!referrer.IsEmpty())
-    if (const auto p = self->m_module_paths.find(referrer->GetIdentityHash()); p != self->m_module_paths.end())
-      from = p->second;
+    if (const std::string *p = self->module_path(referrer)) from = *p;
   LibraryName lib;
   // "/schema/name": a database library; anything else: an npm package (api.js resolves it).
   if (spec->starts_with("/") && library_path(*spec, &lib.schema, &lib.name)) {
@@ -271,7 +293,7 @@ v8::MaybeLocal<v8::Module> Worker::package_module(Local<v8::Context> ctx, const 
   if (const auto hit = m_package_modules.find(path); hit != m_package_modules.end()) {
     const Local<v8::Module> cached = hit->second.Get(m_isolate);
     if (cached->GetStatus() != v8::Module::kErrored) return cached;
-    m_module_paths.erase(cached->GetIdentityHash());  // failed: compiled anew, as a library is
+    forget_module_path(cached);  // failed: compiled anew, as a library is
     m_package_modules.erase(hit);
   }
   Local<v8::Module> m;
@@ -287,18 +309,17 @@ v8::MaybeLocal<v8::Module> Worker::package_module(Local<v8::Context> ctx, const 
         [](Local<v8::Context> c, Local<v8::Module> mod) -> v8::MaybeLocal<Value> {
           Worker *self = current();
           v8::Isolate *iso = self->m_isolate;
-          const auto p = self->m_module_paths.find(mod->GetIdentityHash());
+          const std::string *p = self->module_path(mod);
           const Local<v8::Object> api = self->m_api.Get(iso);
           Local<Value> req;
-          if (p == self->m_module_paths.end() || !api->Get(c, v8_string(iso, "requirePath")).ToLocal(&req))
-            return {};
-          Local<Value> arg = v8_string(iso, p->second);
+          if (p == nullptr || !api->Get(c, v8_string(iso, "requirePath")).ToLocal(&req)) return {};
+          Local<Value> arg = v8_string(iso, *p);
           Local<Value> exports;
           if (!req.As<v8::Function>()->Call(c, api, 1, &arg).ToLocal(&exports)) return {};
           if (mod->SetSyntheticModuleExport(iso, v8_string(iso, "default"), exports).IsNothing()) return {};
           return v8::Undefined(iso);
         });
-    m_module_paths[m->GetIdentityHash()] = path;
+    set_module_path(m, path);
   }
   m_package_modules[path] = v8::Global<v8::Module>(m_isolate, m);
   return m;

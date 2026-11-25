@@ -22,7 +22,7 @@
 // processes' memory, signals to other processes, namespaces and mounts,
 // kernel keys, BPF, io_uring, userfaultfd, perf events, modules, reboot.
 
-#include "bootstrap.h"
+#include "bootstrap.hpp"
 
 #include <linux/audit.h>
 #include <linux/filter.h>

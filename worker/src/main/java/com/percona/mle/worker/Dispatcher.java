@@ -249,6 +249,19 @@ final class Dispatcher {
   /** The worker_class of READY: this kind of worker, whatever the host calls its class (§9.1). */
   private static final String WORKER_CLASS = "jvm";
 
+  /**
+   * A failed READY for a region of a major version this worker does not implement (§2 step 3,
+   * §14): before the runtime is set up, so that nothing of it can fail first (MVP review CONF-7).
+   * With INTERNAL the body may end after info (§9.1).
+   */
+  static void readyOtherMajor(Mailbox mb) {
+    MessageWriter w = new MessageWriter(mb.arena);
+    w.reset(Wire.MAX_SMALL_MESSAGE);
+    w.u32(Wire.VERSION);
+    w.str("worker speaks " + Wire.VERSION_MAJOR + ".0, host " + (mb.version >>> 16) + "." + (mb.version & 0xFFFF));
+    mb.send(Wire.READY, Wire.INTERNAL, 0, 0, 0, w);
+  }
+
   /** Posts READY (§9.1): one chunk; with a status other than OK, info is why the worker cannot serve. */
   void ready(int status, String info) {
     w.reset(Wire.MAX_SMALL_MESSAGE);

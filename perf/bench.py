@@ -379,10 +379,14 @@ class Bench:
         key = 'memory.mle.eight.js_lang'
         if not self.has_js_lang or not self.wanted(key):
             return
-        before = mle_perf.read_pss(self.server.proc.pid)['pss']
         self.js_map('js_lang')
         sessions = [self.session() for _ in range(8)]
         try:
+            # After the connections exist: their THDs and threads are not js_lang's (MVP review OPS-9).
+            for s in sessions:
+                s.q('SELECT 1')
+            time.sleep(1)
+            before = mle_perf.read_pss(self.server.proc.pid)['pss']
             for s in sessions:
                 s.q(MEMORY_STATES['v8'][0])
                 s.q(MEMORY_STATES['v8'][1])

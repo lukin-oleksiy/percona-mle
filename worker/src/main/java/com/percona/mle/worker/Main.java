@@ -33,6 +33,11 @@ public final class Main {
     Console console = new Console();
     try {
       Mailbox mb = Mailbox.open(Integer.getInteger("mle.spin", 2000));
+      // A region of a major version this worker does not implement: a failed READY, then exit (§2, §14).
+      if (mb.version >>> 16 != Wire.VERSION_MAJOR) {
+        Dispatcher.readyOtherMajor(mb);
+        Runtime.getRuntime().halt(1);
+      }
       console.install();
       Options options = new Options();
       Values.options = options;
@@ -42,12 +47,6 @@ public final class Main {
       JavaRoutines java = new JavaRoutines();
       Dispatcher d = new Dispatcher(mb, java, polyglot, console, control, options);
       SqlBridge.dispatcher = d;
-      // A region of a major version this worker does not implement: a failed READY, then exit (§14).
-      if (mb.version >>> 16 != Wire.VERSION_MAJOR) {
-        d.ready(Wire.INTERNAL, "worker speaks " + Wire.VERSION_MAJOR + ".0, host " + (mb.version >>> 16) + "."
-            + (mb.version & 0xFFFF));
-        Runtime.getRuntime().halt(1);
-      }
       int status = Wire.OK;
       String info;
       try {

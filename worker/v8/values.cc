@@ -905,16 +905,19 @@ void Values::write_as(Writer &wr, Local<Value> v, const ParamType &t) {
   const Local<v8::Context> ctx = context();
   const bool set_type = t.is("SET") || t.is("ENUM");
   if (set_type) {
-    // A Set is its items' String() joined by commas, anything else its own String().
+    // Oracle's Table 27.7: a string for either, a Set for SET (its items' String() joined by
+    // commas); anything else is a conversion error (MVP review JVML-11).
     std::string joined;
-    if (v->IsSet()) {
+    if (v->IsString()) {
+      joined = text(v);
+    } else if (v->IsSet() && t.is("SET")) {
       const Local<v8::Array> items = v.As<v8::Set>()->AsArray();
       for (uint32_t i = 0; i < items->Length(); i++) {
         if (i > 0) joined += ',';
         joined += text(items->Get(ctx, i).ToLocalChecked());
       }
     } else {
-      joined = text(v);
+      cannot(v, t);
     }
     need(put_tag(wr, w::Tag::kString) && wr.str(joined));
     return;

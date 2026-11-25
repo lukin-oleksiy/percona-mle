@@ -55,16 +55,6 @@ constexpr size_t kConsoleLimit = 1 << 20;
 constexpr const char *kJs = "js";
 /** A CALL with at most this many arguments converts them without an allocation. */
 constexpr uint32_t kInlineArguments = 16;
-/** has_return 0 and no out_params: the values of a RESULT that has none (§9.4). */
-constexpr std::array<std::byte, 5> kNoValues{};
-
-/** Cuts text to at most max bytes at a character boundary (§7.4). */
-void cut(std::string &s, size_t max) {
-  if (s.size() <= max) return;
-  size_t n = max;
-  while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) n--;
-  s.resize(n);
-}
 
 bool identifier(const std::string &s) {
   static const std::regex re("[A-Za-z_$][A-Za-z0-9_$]*");
@@ -130,7 +120,7 @@ std::string frame_line(std::string s) {
   size_t i = 0;
   while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
   s = s.substr(i);
-  cut(s, 200);
+  common::cut(s, 200);
   return s;
 }
 
@@ -626,13 +616,13 @@ void Worker::options(const Message &m, Reply *reply) {
   // On a failure the options in force stay as they are; else these hold until RESET (§9.8).
   if (!o.set_zone(zone)) {
     std::string shown = zone;
-    cut(shown, 2 * w::kMaxTimeZone);
+    common::cut(shown, 2 * w::kMaxTimeZone);
     reply->fail(w::Status::kGuestError, w::kLanguageTimeZone, "unknown time zone '" + shown + "'");
   } else if (!refused.empty()) {
     reply->fail(w::Status::kGuestError, w::kLanguageOption, refused);
   } else if (!set_local_zone(zone)) {  // options change only while nothing is prepared (§9.8)
     std::string shown = zone;
-    cut(shown, 2 * w::kMaxTimeZone);
+    common::cut(shown, 2 * w::kMaxTimeZone);
     reply->fail(w::Status::kGuestError, w::kLanguageTimeZone,
                 "unknown time zone '" + shown + "' (to the ICU data that JavaScript's Date uses)");
   } else {
@@ -667,7 +657,7 @@ void Worker::prepare(const Message &m, Request &q, Reply *reply) {
   const std::string name(r.str()), entry(r.str()), source(r.str());
   const uint32_t n = r.count(w::kMaxParams, 23);
   const std::shared_ptr<Routine> routine(new Routine, [this](Routine *gone) {
-    m_scripts.erase(gone->script_id);  // its frames' source lines
+    release_script(gone->script_id);  // its frames' source lines
     delete gone;
   });
   std::vector<std::string> names;
@@ -733,9 +723,17 @@ v8::MaybeLocal<Value> Worker::run_script(const std::string &text, const std::str
   s.lines = split_lines(text);
   if (!s.lines.empty() && prefix > 0 && static_cast<size_t>(prefix) <= s.lines[0].size())
     s.lines[0] = s.lines[0].substr(prefix);
-  m_scripts[sid] = std::move(s);
+  keep_script(sid, std::move(s));
   if (script_id != nullptr) *script_id = sid;
   return script->Run(ctx);
+}
+
+void Worker::keep_script(int sid, Script s) {
+  ++m_scripts.try_emplace(sid, std::move(s)).first->second.users;
+}
+
+void Worker::release_script(int sid) {
+  if (const auto it = m_scripts.find(sid); it != m_scripts.end() && --it->second.users <= 0) m_scripts.erase(it);
 }
 
 std::string Worker::bad_parameter_name(const std::string &name) {
@@ -806,7 +804,7 @@ void Worker::compile(const std::string &name, const std::string &entry, const st
     s.lines = split_lines(text);
     if (!s.lines.empty() && s.lines[0].size() >= 14) s.lines[0] = s.lines[0].substr(14);
     r.script_id = script->GetUnboundScript()->GetId();
-    m_scripts[r.script_id] = std::move(s);
+    keep_script(r.script_id, std::move(s));
     // A function that runs the bound script: V8 has no handle to keep a Script, so the routine is
     // a native function holding it.
     r.eval_script = std::make_unique<v8::Global<v8::Script>>(m_isolate, script);
@@ -1126,7 +1124,7 @@ ErrorInfo Worker::error_of(Local<Value> exception, Local<v8::Message> message) {
         e.sql_state = utf8(m_isolate, state);
         if (!valid_state(e.sql_state)) {
           std::string shown = e.sql_state;
-          cut(shown, 64);
+          common::cut(shown, 64);
           e.message += " (SqlError with the invalid SQLSTATE '" + shown + "')";
           e.sql_state.clear();
           e.sql_errno = 0;
@@ -1196,32 +1194,15 @@ void Worker::post_result(const Request &q, Reply &reply) {
   // Only the RESULTs of PREPARE and CALL carry console output: all that no RESULT has carried
   // yet, at whatever depth it was printed (§9.4). Other output waits.
   const bool console = op == w::Op::kPrepare || op == w::Op::kCall;
-  ErrorInfo &e = reply.error;
-  const bool has_error = reply.status != w::Status::kOk;
-  const auto error_size = [&e]() {
-    size_t n = 4 + e.language.size() + 4 + e.message.size() + 4 + 4 + 4 + e.sql_state.size() + 8;
-    for (const ErrorInfo::Frame &f : e.frames) n += 4 + f.function.size() + 4 + f.file.size() + 12 + 4 + f.text.size();
-    return n;
-  };
-  if (has_error) {
-    // The caps of §7.4. An Error within them (16 KiB, and no frames outside PREPARE and CALL)
-    // also fits the 64 KiB of a RESULT of DROP, RESET and OPTIONS.
-    cut(e.message, w::kMaxErrorMessage);
-    if (e.frames.size() > w::kMaxStackFrames) e.frames.resize(w::kMaxStackFrames);
-    for (ErrorInfo::Frame &f : e.frames) {
-      cut(f.function, w::kMaxFrameText);
-      cut(f.file, w::kMaxFrameText);
-      cut(f.text, w::kMaxFrameText);
-    }
-  }
+  if (reply.status != w::Status::kOk) common::cap_error(reply.error);
   // has_return, out_params count; stdout and stderr lengths, console_cleared; findings count; has_error.
   constexpr size_t kFixed = 4 + 4 + 1 + 4 + 1;
   if (reply.values.size() + kFixed > w::kMaxWorkerMessage) {
     // The values alone leave no room (§9.4).
     reply.fail(w::Status::kGuestError, w::kLanguageType, "the routine's result is larger than MLE allows (64 MiB)");
   }
-  if (reply.values.empty()) reply.values = kNoValues;
-  const size_t rest = reply.values.size() + kFixed + (reply.status != w::Status::kOk ? error_size() : 0);
+  if (reply.values.empty()) reply.values = common::kNoValues;
+  const size_t rest = reply.values.size() + kFixed + (reply.status != w::Status::kOk ? common::error_size(reply.error) : 0);
   // Console output beyond the message's limit is cut, the end of each stream kept, and dropped.
   if (m_out.size() > kConsoleLimit) m_out.erase(0, m_out.size() - kConsoleLimit);
   if (m_err.size() > kConsoleLimit) m_err.erase(0, m_err.size() - kConsoleLimit);
@@ -1234,19 +1215,9 @@ void Worker::post_result(const Request &q, Reply &reply) {
     err = std::string_view(m_err).substr(m_err.size() - err_room);
   }
   Writer wr(m_result_buf, w::kMaxWorkerMessage);
-  bool fits = wr.bytes(reply.values) && wr.str(out) && wr.str(err) &&
-              wr.put<uint8_t>(console && m_cleared ? 1 : 0) && wr.put<uint32_t>(0);  // no findings
-  if (reply.status == w::Status::kOk) {
-    fits = fits && wr.put<uint8_t>(0);
-  } else {
-    fits = fits && wr.put<uint8_t>(1) && wr.str(e.language) && wr.str(e.message) &&
-           wr.put(static_cast<uint32_t>(e.frames.size()));
-    for (const ErrorInfo::Frame &f : e.frames)
-      fits = fits && wr.str(f.function) && wr.str(f.file) && wr.put(f.line) && wr.put(f.column) &&
-             wr.put(f.end_column) && wr.str(f.text);
-    fits = fits && wr.put(e.sql_errno) && wr.str(e.sql_state) && wr.put(e.sql_error_id);
-  }
-  if (!fits) protocol_failure("worker error: a RESULT over the size limit");
+  if (!common::write_result(wr, reply.values, out, err, console && m_cleared,
+                            reply.status == w::Status::kOk ? nullptr : &reply.error))
+    protocol_failure("worker error: a RESULT over the size limit");
   Mailbox::send(uint32_t(w::Op::kResult), uint32_t(reply.status), q.depth, m_seq, wr.written());
   if (console) {
     m_out.clear();
@@ -1336,75 +1307,28 @@ Message Worker::sql_reply(std::vector<std::byte> &assembled) {
   }
 }
 
-Worker::Found Worker::find_statement(Request &q, uint64_t id) {
+Worker::Statement *Worker::find_statement(Request &q, uint64_t id) {
   if (!q.statements.empty())
-    if (const auto own = q.statements.find(id); own != q.statements.end()) return {&own->second, &q.statements};
-  return {};
+    if (const auto own = q.statements.find(id); own != q.statements.end()) return &own->second;
+  return nullptr;
 }
 
 void Worker::sql_close(Request &q, uint64_t id) {
-  std::array<std::byte, w::kSqlCloseSize> close{};
-  Writer wr(close);
-  (void)(wr.put(uint8_t(w::SqlAction::kClose)) && wr.put(id));  // no text, no params, flags and the rest 0
-  Mailbox::send(uint32_t(w::Op::kSql), 0, q.depth, m_seq, close);
   std::vector<std::byte> assembled;
-  const Message m = sql_reply(assembled);
-  if (m.discarded || m.body.empty() || m.body[0] != std::byte{uint8_t(w::SqlResultKind::kOk)})
-    protocol_failure("a reply to CLOSE that is not OK");
-  if (const Found f = find_statement(q, id); f.st != nullptr) f.in->erase(id);
+  common::close_statement(q.statements, q.depth, m_seq, id, [&] { return sql_reply(assembled); });
 }
 
 v8::MaybeLocal<Value> Worker::sql_result(Request &q, const Sent &sent, const Message &m, const Options &rules) {
-  using State = Statement::State;
   v8::Isolate *iso = m_isolate;
   const Local<v8::Context> ctx = m_context.Get(iso);
   const w::SqlAction action = sent.action;
   const uint64_t id = sent.id;
   Reader r(m.body);
-  const auto kind = static_cast<w::SqlResultKind>(r.get<uint8_t>());
-  Found found = find_statement(q, id);
-  Statement *st = found.st;  // nullptr: CLOSED
-  // §10.1: may this kind answer the action? (The actions sent are allowed in the id's state: the
-  // others are answered without a message, sql().) ROWS never answers for an id whose results go
-  // to the client (§10.5).
-  const bool to_client = st != nullptr ? st->to_client : sent.to_client;
-  bool legal = false;
-  switch (kind) {
-    case w::SqlResultKind::kError:
-      legal = action != w::SqlAction::kClose;
-      break;
-    case w::SqlResultKind::kOk:
-      legal = action != w::SqlAction::kFetch;
-      break;
-    case w::SqlResultKind::kRows:
-      legal = !to_client && (action == w::SqlAction::kExecute || action == w::SqlAction::kExecutePrepared ||
-                             action == w::SqlAction::kFetch || action == w::SqlAction::kNextResult);
-      break;
-    case w::SqlResultKind::kEnd:
-      legal = action == w::SqlAction::kNextResult;
-      break;
-    default:
-      protocol_failure("an unknown SQL_RESULT kind");
-  }
-  if (!legal) protocol_failure("an SQL_RESULT of a kind that cannot answer the action");
-  // The id's home: IDLE for a prepared statement, CLOSED for a direct one.
-  const auto home = [&]() {
-    if (st == nullptr) return;
-    if (st->prepared)
-      st->state = State::kIdle;
-    else
-      found.in->erase(id);
-    st = nullptr;
-  };
-  // The id has a result to read: a direct statement gets its entry now.
-  const auto open = [&]() -> Statement & {
-    if (st == nullptr) {
-      found.in = &q.statements;
-      st = &q.statements[id];
-      st->to_client = sent.to_client;
-    }
-    return *st;
-  };
+  const auto kind_code = r.get<uint8_t>();
+  common::StatementStep<Statement> step(q.statements, id, action, sent.to_client);
+  step.check(kind_code);
+  const auto kind = static_cast<w::SqlResultKind>(kind_code);
+  const Statement *st = step.statement();  // nullptr: CLOSED
   switch (kind) {
     case w::SqlResultKind::kError: {
       const auto code = r.get<uint32_t>();
@@ -1415,7 +1339,7 @@ v8::MaybeLocal<Value> Worker::sql_result(Request &q, const Sent &sent, const Mes
       const bool many = action == w::SqlAction::kExecuteMany;
       if (many && row > sent.rows) protocol_failure("a failed_row beyond the rows sent");
       // Rule 3: the id goes home (a PREPARE's stays CLOSED).
-      home();
+      step.home();
       return error_reply(iso, code, state, message, many ? static_cast<double>(row) : -1.0, error_id);
     }
     case w::SqlResultKind::kOk: {
@@ -1424,18 +1348,7 @@ v8::MaybeLocal<Value> Worker::sql_result(Request &q, const Sent &sent, const Mes
       const bool more_results = r.boolean();
       const auto pcount = r.get<uint32_t>();
       const auto exec_us = r.get<uint64_t>();
-      if (action == w::SqlAction::kClose) {
-        if (st != nullptr) found.in->erase(id);
-      } else if (action == w::SqlAction::kPrepare) {
-        Statement &s = q.statements[id];
-        s.prepared = true;
-        s.to_client = sent.to_client;
-        s.param_count = pcount;
-      } else if (more_results) {
-        open().state = State::kNext;
-      } else {
-        home();
-      }
+      step.ok(more_results, pcount);
       return ok_reply(iso, affected, insert_id, warns, more_results, pcount, exec_us, q.scope, id);
     }
     case w::SqlResultKind::kRows: {
@@ -1516,18 +1429,13 @@ v8::MaybeLocal<Value> Worker::sql_result(Request &q, const Sent &sent, const Mes
                           v8::Number::New(iso, static_cast<double>(exec_us)),
                           v8::Number::New(iso, static_cast<double>(q.scope)),
                           v8::Number::New(iso, static_cast<double>(id))};
-      if (more || more_results || (st != nullptr && st->prepared)) {
-        Statement &s = open();
-        if (ncols != 0) {
-          s.columns = std::move(types);
-          if (s.prepared) {
-            s.labels.Reset(iso, labels);
-            s.described.Reset(iso, columns);
-          }
+      // A direct statement whose set is complete and after which no result follows is CLOSED.
+      if (Statement *s = step.rows(more, more_results); s != nullptr && ncols != 0) {
+        s->columns = std::move(types);
+        if (s->prepared) {
+          s->labels.Reset(iso, labels);
+          s->described.Reset(iso, columns);
         }
-        s.state = more ? State::kRows : more_results ? State::kNext : State::kIdle;
-      } else {
-        home();  // a direct statement's set is complete and no result follows: CLOSED
       }
       if (!unconvertible.empty()) {
         iso->ThrowException(v8::Exception::TypeError(v8_string(iso, unconvertible)));
@@ -1536,7 +1444,7 @@ v8::MaybeLocal<Value> Worker::sql_result(Request &q, const Sent &sent, const Mes
       return v8::Array::New(iso, o, std::size(o));
     }
     case w::SqlResultKind::kEnd: {
-      home();
+      step.home();
       Local<Value> o[] = {v8::Number::New(iso, 3)};
       return v8::Array::New(iso, o, 1);
     }
@@ -1545,7 +1453,7 @@ v8::MaybeLocal<Value> Worker::sql_result(Request &q, const Sent &sent, const Mes
 }
 
 v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
-  using State = Statement::State;
+  using State = common::StatementState;
   v8::Isolate *iso = m_isolate;
   const Local<v8::Context> ctx = m_context.Get(iso);
   const auto fail = [&](Local<Value> exception) {
@@ -1584,7 +1492,7 @@ v8::MaybeLocal<Value> Worker::sql(const v8::FunctionCallbackInfo<Value> &info) {
     sent.id = *handle;
     // The worker knows the id's state: what the host would answer without doing anything is
     // answered here, without a message (§10.1).
-    Statement *const st = find_statement(q, sent.id).st;
+    Statement *const st = find_statement(q, sent.id);
     if (action == w::SqlAction::kClose) {
       if (st == nullptr) return ok_reply(iso, 0, q.scope, sent.id);
     } else if (action == w::SqlAction::kNextResult) {

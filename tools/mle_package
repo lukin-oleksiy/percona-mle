@@ -32,7 +32,7 @@ Layout: js/ (npm --prefix: node_modules, package.json), python/site-packages
 (pip --target with GraalPy, using GraalPy's binary wheels where they exist),
 java/*.jar (Maven, with dependencies; java/mle_package.json keeps what was
 asked for), cpython/site-packages (pip --target with the CPython the CPython
-worker embeds: mle.worker = CPYTHON). packages.json lists what is installed.
+worker embeds: LANGUAGE CPYTHON). packages.json lists what is installed.
 
 Python packages need a GraalPy of the workers' version with pip (--graalpy):
 the packages do not bring one (README, "Install and packages"). Packages for
@@ -274,7 +274,9 @@ def install_java(d, specs):
                         "<modelVersion>4.0.0</modelVersion><groupId>mle</groupId>"
                         "<artifactId>packages</artifactId><version>1</version>"
                         "<dependencies>%s</dependencies></project>" % "".join(deps))
-            run(["mvn", "-q", "-B", "-f", os.path.join(tmp, "pom.xml"),
+            # -C: a checksum that does not match fails the download (Maven warns by default, and
+            # -q hides the warning; MVP review OPS-14).
+            run(["mvn", "-q", "-B", "-C", "-f", os.path.join(tmp, "pom.xml"),
                  "dependency:copy-dependencies", "-DincludeScope=runtime",
                  "-DoutputDirectory=" + stage])
         resolved = sorted(os.listdir(stage))

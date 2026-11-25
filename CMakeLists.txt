@@ -69,6 +69,9 @@ ADD_CUSTOM_TARGET(mle_build_layout ALL
     ${MLE_AOT_CACHE} ${MLE_BUILD_LAYOUT}/mle.aot
   COMMAND ${CMAKE_COMMAND} -E create_symlink
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/mle_package ${MLE_BUILD_LAYOUT}/mle_package
+  # The build's JDK where packages have percona-mle-jdk: the component compiles in no JDK path,
+  # which on another host could name some other JDK (MVP review OPS-5).
+  COMMAND ${CMAKE_COMMAND} -E create_symlink ${MLE_JAVA_HOME} ${MLE_BUILD_LAYOUT}/jdk
   COMMENT "Linking the MLE layout into plugin_output_directory/mle"
   VERBATIM
   )

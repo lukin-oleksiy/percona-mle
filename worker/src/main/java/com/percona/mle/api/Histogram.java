@@ -26,6 +26,9 @@ public final class Histogram {
   private final double[] edges;
   private final long[] counts;
 
+  /** Bins at most (docs/limits.md): a huge count overflowed or asked for gigabytes (MVP review API-9). */
+  static final int MAX_BINS = 1_000_000;
+
   Histogram(double[] edges, long[] counts) {
     this.edges = edges;
     this.counts = counts;
@@ -37,7 +40,8 @@ public final class Histogram {
    * close together for this many distinct edges are an error.
    */
   static Histogram of(double[] x, int bins) {
-    if (bins < 1) throw new IllegalArgumentException("bins must be at least 1, not " + bins);
+    if (bins < 1 || bins > MAX_BINS)
+      throw new IllegalArgumentException("bins must be from 1 to " + MAX_BINS + ", not " + bins);
     double lo = Double.POSITIVE_INFINITY, hi = Double.NEGATIVE_INFINITY;
     for (double v : x)
       if (!Double.isNaN(v)) {
@@ -79,6 +83,7 @@ public final class Histogram {
     for (int i = 1; i < edges.length; i++)
       if (!(edges[i] > edges[i - 1])) throw new IllegalArgumentException("the edges must increase");
     int bins = edges.length - 1;
+    if (bins > MAX_BINS) throw new IllegalArgumentException("at most " + (MAX_BINS + 1) + " edges are allowed");
     long[] c = new long[bins];
     double lo = edges[0], hi = edges[bins];
     for (double v : x) {

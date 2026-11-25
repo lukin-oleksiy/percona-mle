@@ -143,7 +143,7 @@ ERROR HY000: Python> SyntaxError: '(' was never closed (mle_eval, line 1)
 SELECT mle_eval('python', 'session.run_sql("SELECT 1")');
 ERROR HY000: Python> mle_eval cannot run SQL: put the code in a procedure to run SQL (mle_eval, line 1)
 SELECT mle_eval('cobol', '1');
-ERROR HY000: mle_eval<string> UDF failed; the language must be JAVASCRIPT, PYTHON or JAVA
+ERROR HY000: mle_eval<string> UDF failed; the language must be JAVASCRIPT, PYTHON, JAVA, JS or CPYTHON
 # 6. CREATE checks Python code beyond its syntax: names that are read but
 #    never defined (a typo) are warnings; the routine is created.
 CREATE FUNCTION py_typo(word VARCHAR(20)) RETURNS INT LANGUAGE PYTHON AS $$

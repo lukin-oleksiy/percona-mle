@@ -48,6 +48,8 @@
 #include <vector>
 
 #include "common/mailbox.hpp"
+#include "common/result.hpp"
+#include "common/statements.hpp"
 #include "values.hpp"
 
 namespace mle::v8w {
@@ -66,22 +68,7 @@ struct Config {
   uint64_t message_max = 0;
 };
 
-/** An Error of a RESULT (§7.4). */
-struct ErrorInfo {
-  /** "js", "" (the worker's own error) or a marker (MLE-Type, MLE-TimeZone, MLE-Option). */
-  std::string language;
-  std::string message;
-  struct Frame {
-    std::string function, file;
-    uint32_t line = 0, column = 0, end_column = 0;
-    std::string text;
-  };
-  std::vector<Frame> frames;
-  uint32_t sql_errno = 0;
-  std::string sql_state;
-  /** The error_id of the SQL_RESULT ERROR this error hands back (§10.8), or 0. */
-  uint64_t sql_error_id = 0;
-};
+using common::ErrorInfo;
 
 class Worker {
  public:
@@ -126,6 +113,9 @@ class Worker {
     std::string name;
     int prefix = 0;
     std::vector<std::string> lines;
+    /** Routines whose code is this script: V8 gives identical text under the same name one id
+        (the same routine in two schemas), so it stays while one of them does (MVP review V8-13). */
+    int users = 0;
   };
   /** A prepared routine. A running activation shares it, so a nested PREPARE or DROP of its id
       does not take the code away from it (§8.3). */
@@ -144,22 +134,16 @@ class Worker {
     std::string schema;
   };
 
-  /** An SQL statement id that is not CLOSED (§10.1). */
-  struct Statement {
-    enum class State : uint8_t { kIdle, kRows, kNext };
-    State state = State::kIdle;
-    /** Opened by PREPARE: its home is IDLE. Else by EXECUTE: its home is CLOSED. */
-    bool prepared = false;
-    /** PASS_RESULT_TO_CLIENT, given when the id was opened. */
-    bool to_client = false;
-    /** A prepared statement's number of parameter markers. */
-    uint32_t param_count = 0;
+  /** What the worker keeps of a statement besides its state (worker/common/statements.hpp). */
+  struct StatementColumns {
     /** The types of the columns of the current result set; of a prepared statement, of the columns
         last received, which the first batch of a later set may leave out (§10.3). */
     std::vector<ParamType> columns;
     /** Of a prepared statement: those columns as sql.js takes them (the labels; the columns). */
     v8::Global<v8::Value> labels, described;
   };
+  /** An SQL statement id that is not CLOSED (§10.1). */
+  using Statement = common::Statement<StatementColumns>;
   using Statements = std::unordered_map<uint64_t, Statement>;
 
   /** A request being served, at its depth: a frame of m_frames, used again by the next request
@@ -245,13 +229,8 @@ class Worker {
     /** EXECUTE_MANY: the rows sent. */
     uint32_t rows = 0;
   };
-  /** Where a statement id is, if it is one the request q may use (one it opened). st is nullptr
-      for an id that is CLOSED. */
-  struct Found {
-    Statement *st = nullptr;
-    Statements *in = nullptr;
-  };
-  Found find_statement(Request &q, uint64_t id);
+  /** The statement of id if the request q opened it; nullptr for an id that is CLOSED. */
+  static Statement *find_statement(Request &q, uint64_t id);
   /** Checks of the SQL_RESULT m that answers the message `sent` what §1 lists (the reply kind for
       the action, counts against the bytes, the numbers the worker finds its state by), moves the
       id to its next state (§10.1), and returns the reply for sql.js. Empty and a TypeError thrown
@@ -306,7 +285,17 @@ class Worker {
   std::unordered_map<uint64_t, std::map<std::string, Answer>> m_answers;
   std::map<std::string, ModuleEntry> m_modules;
   std::map<std::string, v8::Global<v8::Module>> m_package_modules;
-  std::unordered_map<int, std::string> m_module_paths;
+  /** The path of each module, for its imports: by identity hash, which is not unique, so each
+      entry is checked against the module (as Node does; MVP review V8-10). */
+  struct ModulePath {
+    v8::Global<v8::Module> module;
+    std::string path;
+  };
+  std::unordered_multimap<int, ModulePath> m_module_paths;
+  void set_module_path(v8::Local<v8::Module> m, const std::string &path);
+  /** nullptr if m has none. */
+  const std::string *module_path(v8::Local<v8::Module> m);
+  void forget_module_path(v8::Local<v8::Module> m);
 
   static inline Worker *s_current = nullptr;
   static size_t near_heap_limit(void *data, size_t current, size_t initial);
@@ -335,6 +324,10 @@ class Worker {
   std::unique_ptr<Values> m_values;
   std::unordered_map<uint64_t, std::shared_ptr<Routine>> m_routines;
   std::unordered_map<int, Script> m_scripts;
+  /** Adds a routine's use of script sid (s describes it the first time). */
+  void keep_script(int sid, Script s);
+  /** Ends a routine's use of script sid (0: none). */
+  void release_script(int sid);
   /** Console output no RESULT has carried yet (§9.4). */
   std::string m_out, m_err;
   bool m_cleared = false;

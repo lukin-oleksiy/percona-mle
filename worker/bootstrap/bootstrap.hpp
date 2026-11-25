@@ -15,8 +15,8 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
-#ifndef MLE_WORKER_BOOTSTRAP_H
-#define MLE_WORKER_BOOTSTRAP_H
+#ifndef MLE_WORKER_BOOTSTRAP_HPP
+#define MLE_WORKER_BOOTSTRAP_HPP
 
 namespace mle::worker {
 
@@ -26,4 +26,4 @@ int install_seccomp();
 
 }  // namespace mle::worker
 
-#endif  // MLE_WORKER_BOOTSTRAP_H
+#endif  // MLE_WORKER_BOOTSTRAP_HPP

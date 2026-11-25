@@ -39,6 +39,7 @@
 #include <cstring>
 #include <new>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -87,6 +88,13 @@ class Ref {
   explicit Ref(PyObject *p) : m_p(p) {}
   PyObject *m_p = nullptr;
 };
+
+/** Text of the host as a str; ill-formed UTF-8 is repaired with U+FFFD (§7.1). */
+Ref host_text(std::string_view s);
+
+/** The Python exception that is set, as ASCII text ("" if none, or if it cannot be shown); the
+    exception is cleared. */
+std::string raised_text();
 
 /** A Python object's buffer for the duration of a call. */
 class Buffer {

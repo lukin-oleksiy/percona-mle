@@ -20,7 +20,8 @@
 #   percona-mle-common         component_mle, mle_launcher, mle_worker            every worker
 #   percona-mle-apparmor       the AppArmor profile (DEB only; -DMLE_APPARMOR=ON, the
 #                              default where /etc/apparmor.d exists)               <- common
-#   percona-mle                the JVM build: worker jar, runtime jars, AOT cache  -> common, jdk
+#   percona-mle                the JVM build: worker jar, runtime jars (its AOT cache is made
+#                              at install: mle_aot_cache)                         -> common, jdk
 #   percona-mle-jdk            the trimmed GraalVM runtime (-DMLE_BUILD_JDK=ON; without it no
 #                              such package, and percona-mle does not ask for one)
 #   percona-mle-python-runtime GraalPy's standard library and the numpy venv     -> common
@@ -31,12 +32,13 @@
 #   percona-mle-v8             the V8 worker (-DMLE_V8=ON, the default with libnode's V8 headers;
 #                              exp design note 63): LANGUAGE JS on the distribution's
 #                              libnode (its V8)                                      -> common, libnode
-#   percona-mle-tools          mle_package (third-party packages; uses the JVM build)
+#   percona-mle-tools          mle_package (third-party packages for every worker kind; needs
+#                              no worker build itself)
 #   percona-mle-selinux        the SELinux policy module (RPM only; -DMLE_SELINUX=ON, the default
 #                              with selinux-policy-devel)                          <- common
 #
 # Every installed worker runs its languages (exp design note 63): the JVM worker JAVASCRIPT, JAVA
-# and PYTHON, the CPython worker CPYTHON.
+# and PYTHON, the CPython worker CPYTHON, the V8 worker JS.
 
 SET(MLE_VERSION "0.1.0" CACHE STRING "Version of the Percona MLE packages")
 SET(MLE_PACKAGE_RELEASE "1" CACHE STRING "Release of the Percona MLE packages")
@@ -127,7 +129,7 @@ SET(CPACK_DEBIAN_MLECPYTHON_PACKAGE_NAME percona-mle-cpython)
 SET(CPACK_DEBIAN_MLECPYTHON_PACKAGE_DEPENDS
   "percona-mle-common (= ${mle_deb_ver}), libpython${MLE_PYTHON_MAJOR_MINOR}")
 SET(CPACK_DEBIAN_MLECPYTHON_DESCRIPTION
-  "Percona MLE: Python stored programs on CPython (mle.worker = CPYTHON): small workers, numpy, no JVM")
+  "Percona MLE: Python stored programs on CPython (LANGUAGE CPYTHON): small workers, numpy, no JVM")
 SET(CPACK_DEBIAN_MLEV8_PACKAGE_NAME percona-mle-v8)
 SET(CPACK_DEBIAN_MLEV8_PACKAGE_DEPENDS "percona-mle-common (= ${mle_deb_ver}), ${mle_libnode_deb}")
 SET(CPACK_DEBIAN_MLEV8_DESCRIPTION
@@ -136,7 +138,8 @@ SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_NAME percona-mle-tools)
 # mle_package is a Python 3 script; it runs npm, Maven, a GraalPy the DBA brings, or the
 # CPython worker's Python (python3-venv): it needs neither build of the workers itself.
 SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_DEPENDS "percona-mle-common (= ${mle_deb_ver}), python3")
-SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_RECOMMENDS "nodejs, npm, maven")
+# python3.X-venv: install cpython makes a venv of the CPython worker's Python.
+SET(CPACK_DEBIAN_MLETOOLS_PACKAGE_RECOMMENDS "nodejs, npm, maven, python${MLE_PYTHON_MAJOR_MINOR}-venv")
 
 # RPM (checked on Oracle Linux 10)
 SET(CPACK_RPM_PACKAGE_RELEASE ${MLE_PACKAGE_RELEASE})
@@ -185,7 +188,7 @@ SET(CPACK_RPM_MLECPYTHON_PACKAGE_NAME percona-mle-cpython)
 SET(CPACK_RPM_MLECPYTHON_PACKAGE_REQUIRES
   "percona-mle-common = ${mle_rpm_ver}, ${MLE_PYTHON_SONAME}()(64bit)")
 SET(CPACK_RPM_MLECPYTHON_PACKAGE_SUMMARY
-  "Percona MLE: Python stored programs on CPython (mle.worker = CPYTHON)")
+  "Percona MLE: Python stored programs on CPython (LANGUAGE CPYTHON)")
 SET(CPACK_RPM_MLEV8_PACKAGE_NAME percona-mle-v8)
 # No automatic dependencies (AUTOREQPROV OFF): libnode by its soname (nodejs-libs).
 # nodejs-full-i18n: ICU's data for nodejs-libs' own ICU (Intl; the worker points ICU at it).

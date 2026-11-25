@@ -42,13 +42,14 @@
 #include <pthread.h>
 #include <sys/prctl.h>
 
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
-#include "bootstrap.h"
+#include "bootstrap.hpp"
 
 namespace {
 
@@ -111,14 +112,18 @@ void *run_jvm(void *p) {
 bool parse(int argc, char **argv, Args *a) {
   for (int i = 1; i < argc; i++) {
     std::string s = argv[i];
-    if (s.rfind("--jvm=", 0) == 0)
+    if (s.rfind("--jvm=", 0) == 0) {
       a->libjvm = s.substr(6);
-    else if (s.rfind("--stack=", 0) == 0)
-      a->stack = std::strtoull(s.c_str() + 8, nullptr, 10);
-    else if (s == "--dumpable")
+    } else if (s.rfind("--stack=", 0) == 0) {
+      // The whole value or nothing: an overflow or trailing text is a bad argument (MVP review JVMP-7).
+      const char *first = s.c_str() + 8, *last = s.c_str() + s.size();
+      const auto [end, ec] = std::from_chars(first, last, a->stack);
+      if (ec != std::errc() || end != last) return false;
+    } else if (s == "--dumpable") {
       a->dumpable = true;
-    else
+    } else {
       a->jvm_options.push_back(s);
+    }
   }
   return !a->libjvm.empty() && a->stack >= (256u << 10);
 }
@@ -139,11 +144,18 @@ int main(int argc, char **argv) {
     return 22;
   }
   Run run{&args};
-  pthread_attr_t attr;
-  pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, args.stack);
+  // pthread, not std::thread: only pthread sets the stack size the JVM's main thread needs.
+  struct Attr {
+    pthread_attr_t a;
+    Attr() { pthread_attr_init(&a); }
+    ~Attr() { pthread_attr_destroy(&a); }
+  } attr;
+  if (pthread_attr_setstacksize(&attr.a, args.stack) != 0) {
+    fprintf(stderr, "mle_worker: stack size %zu refused\n", args.stack);
+    return 26;
+  }
   pthread_t thread;
-  if (pthread_create(&thread, &attr, run_jvm, &run) != 0) return 26;
+  if (pthread_create(&thread, &attr.a, run_jvm, &run) != 0) return 26;
   pthread_join(thread, nullptr);
   return run.exit_code;
 }

@@ -208,14 +208,14 @@ class Services {
     });
   }
 
-  /** The routine leaves the cache: the session's workers drop it. thd is
-      the session that cached it. */
+  /** The routine leaves the cache: the session's workers drop it. This
+      server passes no THD (sp_head's destructor); the cache is freed on its
+      own session's thread, so the current session is the one that cached it. */
   static DEFINE_BOOL_METHOD(deinit, (MYSQL_THD thd, external_program_handle lang_sp,
                                      stored_program_handle)) {
     return guarded([&]() -> bool {
       if (lang_sp == nullptr) return false;
       Routine *routine = routine_of(lang_sp);
-      // The handle CREATE used may come without a THD: it is the current one.
       Session *session = thd != nullptr ? Session::of(thd) : Session::current(false);
       if (session != nullptr) session->forget(*routine);
       (routine->is_function() ? g_counters.functions : g_counters.procedures)--;
@@ -365,7 +365,10 @@ class Libraries {
         return true;
       }
       mle_component::Session *s = mle_component::Session::current(true);
-      if (s == nullptr) return true;
+      if (s == nullptr) {
+        my_error(ER_LANGUAGE_COMPONENT_INTERNAL, MYF(0));  // not without an error (MVP review COMP-10)
+        return true;
+      }
       if (!s->parse_library(bit, std::string(name.str, name.length),
                             std::string(body.str == nullptr ? "" : body.str, body.length)))
         return true;
@@ -429,8 +432,12 @@ mysql_event_tracking_query_subclass_t
 bool Event_tracking_query_implementation::callback(
     const mysql_event_tracking_query_data *data) {
   // Whether the statement failed or not: one that fails may have changed
-  // something before.
-  mle_component::statement_ended(data->sql_command);
+  // something before. Nothing may throw into the server (as the other
+  // callbacks; MVP review COMP-8).
+  try {
+    mle_component::statement_ended(data->sql_command);
+  } catch (...) {
+  }
   return false;
 }
 

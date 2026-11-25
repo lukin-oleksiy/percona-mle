@@ -38,7 +38,6 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
-#include <unistd.h>
 #include <string>
 
 #include <my_inttypes.h>
@@ -687,7 +686,7 @@ bool register_settings() {
           PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY |
               PLUGIN_VAR_NOPERSIST,
           "GraalVM JDK 25 that runs the MLE workers; empty: <mle.dir>/jdk "
-          "(package percona-mle-jdk), else the build's JDK.",
+          "(package percona-mle-jdk).",
           nullptr, nullptr,
           &java_home, &g_java_home))
     return true;
@@ -738,13 +737,8 @@ Settings current_settings() {
   s.cgroup_base = text(g_cgroup_base);
   s.dir = text(g_dir);
   s.java_home = text(g_java_home);
-  if (s.java_home.empty()) {
-    // The packaged runtime (21-packaging.md), else the JDK of the build.
-    const std::string packaged = s.dir + "/jdk";
-    s.java_home = access((packaged + "/lib/server/libjvm.so").c_str(), R_OK) == 0
-                      ? packaged
-                      : MLE_DEFAULT_JAVA_HOME;
-  }
+  // The packaged runtime (21-packaging.md); in a build tree, a link to the build's JDK.
+  if (s.java_home.empty()) s.java_home = s.dir + "/jdk";
   s.package_dir = text(g_package_dir);
   // A value set at startup was not checked: an invalid one means the default.
   if (!parse_prewarm(text(g_pool_prewarm), &s.pool_prewarm)) s.pool_prewarm = kPoolPrewarm;

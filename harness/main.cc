@@ -187,8 +187,10 @@ Percentiles time_calls(Worker &w, uint64_t id, const std::vector<Value> &args,
   us.reserve(n);
   for (int i = 0; i < n; i++) {
     const auto t0 = Clock::now();
-    w.call(id, 0, args, hooks, &res, &err);
+    const Outcome o = w.call(id, 0, args, hooks, &res, &err);
     us.push_back(ms_since(t0) * 1000);
+    // A failed call is not a time (MVP review OPS-17).
+    if (o != Outcome::kOk) die("CALL: " + (res.error ? res.error->message : err));
   }
   std::sort(us.begin(), us.end());
   return {us[n / 2], us[n * 9 / 10], us[n * 99 / 100]};
@@ -302,7 +304,8 @@ void cmd_calls() {
     ResultMsg inner;
     std::string err;
     Hooks h;
-    w->call(9, 0, {}, h, &inner, &err);
+    if (w->call(9, 0, {}, h, &inner, &err) != Outcome::kOk || !inner.ret)
+      die("nested CALL: " + (inner.error ? inner.error->message : err));
     r->kind = SqlResultKind::kRows;
     r->columns.clear();
     r->columns.push_back({"c", "", type(Tag::kI64)});

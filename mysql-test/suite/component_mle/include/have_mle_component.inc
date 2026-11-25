@@ -17,5 +17,7 @@ if (`SELECT CONCAT('--plugin-dir=', REPLACE(@@plugin_dir, '\\\\', '/')) != '$MLE
 
 # MTR runs mysqld without a delegated cgroup.
 call mtr.add_suppression("Component mle reported: 'MLE workers run without cgroups");
+# MTR's mysqld runs as the user who owns the build tree, packages included (MVP review OPS-7).
+call mtr.add_suppression("Component mle reported: 'mle.package_dir .* is writable by mysqld's OS user");
 
 --enable_query_log

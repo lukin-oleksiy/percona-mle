@@ -54,6 +54,11 @@ values map to each language is in its Appendix B.
 * **Float sums.** `inverseNorm` sums |v|² in float (tiny vectors count as
   zero, huge ones give NaN), and Euclidean distance and ranking sum
   squared differences in float, which overflow for huge values.
+* **KILL and statistics.** The vector calls stop within milliseconds of a
+  KILL; the `Stats` and `Frame` calls do not look for it, so a long one
+  is ended by the grace period (`mle.interrupt_grace_ms`), with its worker.
+* **Histograms** have at most 1,000,000 bins (`histogram(x, bins)` and
+  `histogramEdges(x, edges)`).
 
 ## Administration
 

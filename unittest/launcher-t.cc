@@ -53,6 +53,7 @@
 
 #include "cgroup_test_util.h"
 #include "escape_probes.h"
+#include "launcher_internal.h"
 #include "mle/codec.h"
 #include "mle/launcher.h"
 
@@ -766,6 +767,18 @@ TEST(MleLauncherCgroup, LaunchersShareABase) {
   while (count_leaves(base) != 0 && Clock::now() < deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   EXPECT_EQ(count_leaves(base), 0);
+}
+
+TEST(MleLauncherCgroup, OwnStaleLeavesAreRemovedAtStart) {
+  // At cgroup_prepare a leaf named with the launcher's own pid can only be left from an earlier
+  // launcher of that pid (a container restart that kept the cgroup): it was reused as it was, its
+  // memory.events with it (MVP review HOST-5). Here the caller's pid stands for the launcher's.
+  NEED_CGROUP(base);
+  const std::string own = base + "/mle-" + std::to_string(getpid()) + "-w1";
+  ASSERT_EQ(mkdir(own.c_str(), 0755), 0) << strerror(errno);
+  EXPECT_EQ(mle::launcher::cgroup_prepare(base), "");
+  EXPECT_NE(access(own.c_str(), F_OK), 0) << "own stale leaf not removed";
+  rmdir(own.c_str());
 }
 
 TEST(MleLauncherCgroup, MemoryLimitEndsOnlyTheWorker) {

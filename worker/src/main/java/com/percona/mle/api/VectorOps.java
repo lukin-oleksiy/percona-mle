@@ -181,8 +181,12 @@ final class VectorOps {
       used[best] = true;
       picked.add(best);
       float[] b = rows[cand[best]];
-      for (int i = 0; i < m; i++)
+      for (int i = 0; i < m; i++) {
+        // Each step scans every candidate on this thread: KILL is seen every 4096 rows, as in the
+        // engine's scans (MVP review API-7).
+        if ((i & 4095) == 4095) VectorEngine.stopIfKilled();
         if (!used[i]) maxSim[i] = Math.max(maxSim[i], VectorEngine.rowDot(b, rows[cand[i]], lanes) * inv[best] * inv[i]);
+      }
     }
     int[] index = new int[picked.size()];
     float[] score = new float[index.length];

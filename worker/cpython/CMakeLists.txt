@@ -65,6 +65,7 @@ MYSQL_ADD_EXECUTABLE(mle_cpython_worker
   module.cc
   codec.cc
   ../common/mailbox.cc
+  ../common/result.cc
   ../bootstrap/seccomp.cc
   LINK_LIBRARIES Python3::Python
   DESTINATION ${INSTALL_PLUGINDIR}/mle/cpython
@@ -120,10 +121,16 @@ SET_PROPERTY(GLOBAL PROPERTY MLE_PYTHON_MAJOR_MINOR "${Python3_VERSION_MAJOR}.${
 
 INSTALL(FILES ${MLE_CPYTHON_DIR}/python-version
   DESTINATION ${INSTALL_PLUGINDIR}/mle/cpython COMPONENT MleCPython)
+# Read-only for others whatever the builder's umask (pip and git keep it), as the JVM worker's
+# files (MVP review OPS-12); shared objects keep their execute bits.
 INSTALL(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python ${MLE_CPYTHON_DIR}/site-packages
   DESTINATION ${INSTALL_PLUGINDIR}/mle/cpython COMPONENT MleCPython
-  USE_SOURCE_PERMISSIONS PATTERN __pycache__ EXCLUDE)
-# Bytecode for the installed code (workers cannot write it).
-INSTALL(CODE "EXECUTE_PROCESS(COMMAND ${Python3_EXECUTABLE} -m compileall -q
-  \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${INSTALL_PLUGINDIR}/mle/cpython/python\")"
+  FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+  DIRECTORY_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+  PATTERN __pycache__ EXCLUDE
+  REGEX "\\.so(\\.[0-9.]+)?$"
+    PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+# Bytecode for the installed code (workers cannot write it); umask 022 for its directories too.
+INSTALL(CODE "EXECUTE_PROCESS(COMMAND sh -c \"umask 022 && exec \\\"$0\\\" -m compileall -q \\\"$1\\\"\"
+  ${Python3_EXECUTABLE} \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${INSTALL_PLUGINDIR}/mle/cpython/python\")"
   COMPONENT MleCPython)

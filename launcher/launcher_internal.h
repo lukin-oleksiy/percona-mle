@@ -32,11 +32,12 @@ namespace mle::launcher {
 /** Landlock ABI of the running kernel; 0 if Landlock is not available. */
 int landlock_abi();
 
-/** Child side, between clone and exec: restricts the process to reading
-    the system paths, the class's read paths, its own /proc/<pid> and
-    cgroup leaf, executing below the class's exec paths and the system
-    library paths, and writing /dev/null. Returns 0 or an errno value. */
-int apply_landlock(int abi, const ClassConfig &c, const std::string &leaf);
+/** Child side, between clone and exec, at Landlock ABI kMinLandlockAbi or
+    later: restricts the process to reading the system paths, the class's
+    read paths, its own /proc/<pid> and cgroup leaf, executing below the
+    class's exec paths and the system library paths, and writing /dev/null.
+    Returns 0 or an errno value. */
+int apply_landlock(const ClassConfig &c, const std::string &leaf);
 
 // ---------------------------------------------------------------- cgroup
 

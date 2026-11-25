@@ -104,12 +104,14 @@ std::string cgroup_prepare(const std::string &base) {
                         "DelegateSubgroup=): " + error
                : error;
   // Leaves of launchers that are gone (their workers died with them; a
-  // leaf that still has processes is not removed).
+  // leaf that still has processes is not removed). One named with this
+  // launcher's pid can only be from an earlier launcher of that pid (MVP
+  // review HOST-5): reused, its memory.events would report an OOM kill.
   if (DIR *d = opendir(base.c_str())) {
     while (dirent *e = readdir(d)) {
       const pid_t owner = leaf_owner(e->d_name);
-      if (owner != 0 && owner != getpid() && kill(owner, 0) != 0 &&
-          errno == ESRCH)
+      if (owner != 0 &&
+          (owner == getpid() || (kill(owner, 0) != 0 && errno == ESRCH)))
         rmdir((base + "/" + e->d_name).c_str());
     }
     closedir(d);

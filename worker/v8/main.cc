@@ -42,7 +42,7 @@
 #include <exception>
 #include <string_view>
 
-#include "bootstrap.h"
+#include "bootstrap.hpp"
 #include "worker.hpp"
 
 int main(int argc, char **argv) {

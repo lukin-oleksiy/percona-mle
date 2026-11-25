@@ -423,17 +423,28 @@ final class JsOracle {
         if (v.isString() && !t.is("SET")) return v.asString();
       }
       case Wire.T_F64, Wire.T_F32 -> {
-        if (v.fitsInDouble() && !v.fitsInLong()) {  // not integral, so not a BigInt
+        // A Number, or a BigInt that is exactly a double: the value either way (MVP review JVML-14).
+        if (v.fitsInDouble()) {
           double d = v.asDouble();
           if (!Double.isFinite(d)) throw cannot(v, t, h);
           return d;
         }
       }
+      case Wire.T_DECIMAL -> {
+        // An integral Number or a BigInt in long range: the same BigDecimal as by its text.
+        if (v.fitsInLong()) return BigDecimal.valueOf(v.asLong());
+      }
       default -> {}
     }
     if (t.is("SET") || t.is("ENUM")) {
-      Value s = h.getMember("set_text").execute(v);
-      return s.isString() ? s.asString() : h.getMember("str").execute(v).asString();
+      // Oracle's Table 27.7: a string for either, a Set for SET (its members, comma-separated);
+      // anything else is a conversion error (MVP review JVML-11).
+      if (v.isString()) return v.asString();
+      if (t.is("SET")) {
+        Value s = h.getMember("set_text").execute(v);
+        if (s.isString()) return s.asString();
+      }
+      throw cannot(v, t, h);
     }
     if (t.is("YEAR")) {
       Value y = h.getMember("year").execute(v);

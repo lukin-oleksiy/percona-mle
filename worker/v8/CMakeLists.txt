@@ -65,6 +65,7 @@ MYSQL_ADD_EXECUTABLE(mle_v8_worker
   values.cc
   modules.cc
   ../common/mailbox.cc
+  ../common/result.cc
   ../bootstrap/seccomp.cc
   ${MLE_V8_JS_H}
   LINK_LIBRARIES ${MLE_LIBNODE}

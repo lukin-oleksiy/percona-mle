@@ -25,10 +25,10 @@ new connection) on the base build and on the new build, in turn, on the same
 data and server. A round is one server run per build; the order alternates
 (base-new, new-base, ...), so what the machine does meanwhile hits both.
 
-A case is slower when, over the rounds, the new build's times are above the
-base build's by more than the threshold (percent) both for the best run and
-for the median run of a round, and in all rounds but one at most. Exit status
-1 if any case is slower. "check" marks a case over the threshold in one of
+A case is SLOWER when the median over the rounds of new/base is above
+1 + threshold (percent) both for the best run and for the median run of a
+round, and the new build is slower (both measures, by any amount) in all
+rounds but one at most. Exit status 1 if any case is slower. "check" marks a case over the threshold in one of
 the two measures only: noise more often than not; run it again with --only.
 
 Release builds only (RelWithDebInfo), a quiet machine, the CPU governor

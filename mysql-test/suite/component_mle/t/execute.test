@@ -63,6 +63,23 @@ CREATE FUNCTION r_null() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return undefined 
 SELECT r_int(), r_big(), r_dbl(), r_dec(), r_str(), HEX(r_bin()), r_json(),
     r_date(), r_dt(), r_time(), r_year(), r_bit() + 0, r_enum(), r_set(),
     VECTOR_TO_STRING(r_vec()), r_null();
+--echo # ENUM and SET results: a string, or a Set for SET; anything else is an error (Oracle's
+--echo # Table 27.7, MVP review JVML-11). The number was taken as the member's index.
+CREATE FUNCTION r_enum_bad(k INT) RETURNS ENUM('a','b') LANGUAGE JAVASCRIPT
+  AS $$ return [1, new Set(['a']), true][k] $$;
+CREATE FUNCTION r_set_bad(k INT) RETURNS SET('x','y','z') LANGUAGE JAVASCRIPT AS $$ return [3, ['x']][k] $$;
+--error ER_LANGUAGE_COMPONENT
+SELECT r_enum_bad(0);
+--error ER_LANGUAGE_COMPONENT
+SELECT r_enum_bad(1);
+--error ER_LANGUAGE_COMPONENT
+SELECT r_enum_bad(2);
+--error ER_LANGUAGE_COMPONENT
+SELECT r_set_bad(0);
+--error ER_LANGUAGE_COMPONENT
+SELECT r_set_bad(1);
+DROP FUNCTION r_enum_bad;
+DROP FUNCTION r_set_bad;
 
 --echo # Session time zone: bound at the session's first MLE use (Oracle).
 CREATE FUNCTION js_iso(t DATETIME) RETURNS VARCHAR(30) LANGUAGE JAVASCRIPT

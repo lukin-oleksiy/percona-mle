@@ -47,15 +47,7 @@
 
 namespace mle_component {
 
-void log_info(const std::string &message);  // component.cc
-void log_warning(const std::string &message);  // component.cc
-/** mysqld's plugin_dir and datadir; false if they cannot be read. */
-size_t worker_cache_size();       // settings.cc
-uint32_t worker_cache_timeout();  // settings.cc
-
 namespace {
-
-void log_restart(const std::string &message) { log_info(message); }
 
 
 std::mutex g_mutex;
@@ -261,6 +253,13 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   if (char real[PATH_MAX]; !s.package_dir.empty() &&
                            realpath(s.package_dir.c_str(), real) != nullptr)
     layout.package_dir = real;  // a missing directory: no packages
+  // Routines import from it: if mysqld may write there, so may SQL with FILE (a new module through
+  // INTO DUMPFILE, when secure_file_priv allows it). mle_package run as root keeps it root's (MVP
+  // review OPS-7).
+  if (!layout.package_dir.empty() && access(layout.package_dir.c_str(), W_OK) == 0)
+    log_warning("mle.package_dir (" + layout.package_dir +
+                ") is writable by mysqld's OS user: files written through SQL could become code that routines "
+                "import; let root own it (run mle_package as root)");
   const auto fail = [&](std::string why) {
     *error = std::move(why);
     if (!g_launcher) g_error = *error;
@@ -440,9 +439,19 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   }
 
   std::string cgroup;
-  if (li.cgroup_enabled)
+  if (li.cgroup_enabled) {
     cgroup = "worker cgroups below " + li.cgroup_info + ", memory.max " + mib(s.memory_max) +
              " (JVM), " + mib(s.cpython_memory_max) + " (CPython), " + mib(s.v8_memory_max) + " (V8)";
+    // A heap larger than the worker's memory ends in the kernel's OOM kill, not in the
+    // language's out-of-memory error (MVP review COMP-5). A warning, not a refusal: the two are
+    // changed one after the other.
+    if (s.heap_max >= s.memory_max)
+      log_warning("mle.heap_max (" + mib(s.heap_max) + ") is not below mle.memory_max (" + mib(s.memory_max) +
+                  "): JVM workers are killed by the cgroup before their heap is full");
+    if (s.v8_heap_max >= s.v8_memory_max)
+      log_warning("mle.v8_heap_max (" + mib(s.v8_heap_max) + ") is not below mle.v8_memory_max (" +
+                  mib(s.v8_memory_max) + "): V8 workers are killed by the cgroup before their heap is full");
+  }
   else {
     cgroup = "no worker cgroups, so the mle.*memory_max limits are not enforced (" +
              (cgroup_note.empty() ? li.cgroup_info : cgroup_note) + ")";
@@ -581,11 +590,11 @@ std::unique_ptr<mle::Worker> engine_new_worker(WorkerKind kind, const std::strin
       // mle_launcher ended (killed, crashed); its workers died with it.
       // Start a new one with the same settings and try once more (a failed
       // start is retried by a later session, at most once a second).
-      log_restart("mle_launcher ended unexpectedly; starting it again.");
+      log_info("mle_launcher ended unexpectedly; starting it again.");
       std::string info;
       const Settings settings = g_settings;
       if (start_locked(settings, error, &info)) {
-        log_restart(info);
+        log_info(info);
         process = g_launcher->acquire(kind_name(kind), error);
       } else {
         g_last_failed_start = now;
@@ -706,6 +715,9 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal, W
         const auto &languages = it->worker->languages();
         if (std::find(languages.begin(), languages.end(), language) == languages.end())
           continue;
+        // At mle.max_workers the kept worker stays kept: taking it out would only destroy it
+        // (MVP review COMP-7).
+        if (g_workers_in_use + 1 > static_cast<long>(max_workers)) break;
         worker = std::move(it->worker);
         generation = it->generation;
         g_cache.erase(it);
@@ -723,9 +735,9 @@ std::unique_ptr<mle::Worker> engine_reuse_worker(const std::string &principal, W
   if (!worker) return nullptr;
   // usable() is what the worker last did; alive() is the process now.
   const bool healthy = worker->usable() && worker->process().alive();
-  if (!healthy || g_workers_in_use > static_cast<long>(max_workers)) {
+  if (!healthy) {
     --g_workers_in_use;
-    return nullptr;  // destroyed: died while kept, or no room
+    return nullptr;  // destroyed: it died while kept
   }
   {
     std::lock_guard<std::mutex> lock(g_mutex);

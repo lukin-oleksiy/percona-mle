@@ -55,7 +55,8 @@
 #include <string_view>
 #include <vector>
 
-#include "bootstrap.h"
+#include "bootstrap.hpp"
+#include "codec.hpp"
 #include "mailbox.hpp"
 #include "module.hpp"
 
@@ -135,17 +136,8 @@ std::string start_python(const Args &a) {
 
 /** The Python error that is set, as text for a failed READY. */
 std::string python_error() {
-  std::string text = "unknown error";
-  PyObject *e = PyErr_GetRaisedException();
-  if (e != nullptr) {
-    if (PyObject *shown = PyObject_ASCII(e); shown != nullptr) {
-      if (const char *s = PyUnicode_AsUTF8(shown); s != nullptr) text = s;
-      Py_DECREF(shown);
-    }
-    PyErr_Clear();
-    Py_DECREF(e);
-  }
-  return text;
+  const std::string shown = mle::cpython::raised_text();
+  return shown.empty() ? "unknown error" : shown;
 }
 
 }  // namespace

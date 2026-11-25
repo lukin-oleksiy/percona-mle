@@ -69,6 +69,9 @@ TARGET_COMPILE_DEFINITIONS(mle_launcher-t PRIVATE
   MLE_TEST_WORKER_EXE="$<TARGET_FILE:mle_test_worker>"
   )
 ADD_DEPENDENCIES(mle_launcher-t mle_launcher mle_test_worker)
+# The launcher's cgroup code, for a test of a leaf named with the caller's own pid (MVP review HOST-5).
+TARGET_SOURCES(mle_launcher-t PRIVATE ${PROJECT_SOURCE_DIR}/launcher/cgroup.cc)
+TARGET_INCLUDE_DIRECTORIES(mle_launcher-t PRIVATE ${PROJECT_SOURCE_DIR}/launcher)
 TARGET_COMPILE_DEFINITIONS(mle_worker_protocol-t PRIVATE
   MLE_LAUNCHER_EXE="$<TARGET_FILE:mle_launcher>"
   MLE_TEST_WORKER_EXE="$<TARGET_FILE:mle_test_worker>"
@@ -108,7 +111,7 @@ IF(TARGET mle_cpython_worker)
   GET_PROPERTY(MLE_PYTHON_DYNLOAD GLOBAL PROPERTY MLE_PYTHON_DYNLOAD)
   SET(cpy ${PROJECT_SOURCE_DIR}/worker/cpython)
   MYSQL_ADD_EXECUTABLE(mle_cpython_codec-t cpython_codec-t.cc
-    ${cpy}/codec.cc ${cpy}/module.cc ${cpy}/mailbox.cc ${PROJECT_SOURCE_DIR}/worker/common/mailbox.cc
+    ${cpy}/codec.cc ${cpy}/module.cc ${cpy}/mailbox.cc ${PROJECT_SOURCE_DIR}/worker/common/mailbox.cc ${PROJECT_SOURCE_DIR}/worker/common/result.cc
     ADD_TEST mle_cpython_codec
     LINK_LIBRARIES mle_host Python3::Python ${MLE_GMOCK_LIB} ${MLE_GTEST_LIB} Threads::Threads
     )

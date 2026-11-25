@@ -30,13 +30,13 @@ DIR=$(dirname "$(readlink -f "$0")")
 CACHE="$DIR/mle.aot"
 
 if [ "${1:-}" = "--remove" ]; then
-  rm -f "$CACHE" "$CACHE.new"
+  rm -f "$CACHE" "$CACHE".new*
   exit 0
 fi
 JAVA_HOME=${1:-$DIR/jdk}
 if [ ! -x "$JAVA_HOME/bin/java" ]; then
   echo "mle_aot_cache: no JDK at $JAVA_HOME (package percona-mle-jdk); no AOT cache" >&2
-  rm -f "$CACHE" "$CACHE.new"
+  rm -f "$CACHE" "$CACHE".new*
   exit 0
 fi
 
@@ -58,7 +58,10 @@ HOME="$TMP" "$JAVA_HOME/bin/java" -XX:AOTMode=record \
 HOME="$TMP" "$JAVA_HOME/bin/java" -XX:AOTMode=create \
   -XX:AOTConfiguration="$TMP/mle.aotconf" -XX:AOTCache="$TMP/mle.aot" "$@" \
   > "$TMP/create.log" 2>&1 || { cat "$TMP/create.log" >&2; exit 1; }
-# Running workers map the old cache: replace it by a rename.
-install -m 0644 "$TMP/mle.aot" "$CACHE.new"
-mv -f "$CACHE.new" "$CACHE"
+# Running workers map the old cache: replace it by a rename, from a file of this run's own (a
+# concurrent run has another; MVP review OPS-15).
+NEW=$(mktemp "$CACHE.new.XXXXXX")
+trap 'rm -rf "$TMP"; rm -f "$NEW"' EXIT
+install -m 0644 "$TMP/mle.aot" "$NEW"
+mv -f "$NEW" "$CACHE"
 echo "mle_aot_cache: $CACHE ($(du -h "$CACHE" | cut -f1))"

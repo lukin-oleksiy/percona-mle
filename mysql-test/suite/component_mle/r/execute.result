@@ -82,6 +82,23 @@ r_date(), r_dt(), r_time(), r_year(), r_bit() + 0, r_enum(), r_set(),
 VECTOR_TO_STRING(r_vec()), r_null();
 r_int()	r_big()	r_dbl()	r_dec()	r_str()	HEX(r_bin())	r_json()	r_date()	r_dt()	r_time()	r_year()	r_bit() + 0	r_enum()	r_set()	VECTOR_TO_STRING(r_vec())	r_null()
 42	18446744073709551615	0.30000000000000004	12.345	é1	4142FF	{"a": 1, "b": [null, "x"]}	2024-02-29	2024-02-29 23:59:58.123	-12:34:56	2024	5	b	x,z	[1.00000e+00,2.50000e+00,-3.00000e+00]	NULL
+# ENUM and SET results: a string, or a Set for SET; anything else is an error (Oracle's
+# Table 27.7, MVP review JVML-11). The number was taken as the member's index.
+CREATE FUNCTION r_enum_bad(k INT) RETURNS ENUM('a','b') LANGUAGE JAVASCRIPT
+AS $$ return [1, new Set(['a']), true][k] $$;
+CREATE FUNCTION r_set_bad(k INT) RETURNS SET('x','y','z') LANGUAGE JAVASCRIPT AS $$ return [3, ['x']][k] $$;
+SELECT r_enum_bad(0);
+ERROR HY000: MLE-Type> Cannot convert value '1' to ENUM from MLE in 'r_enum_bad(0)'
+SELECT r_enum_bad(1);
+ERROR HY000: MLE-Type> Cannot convert value '[object Set]' to ENUM from MLE in 'r_enum_bad(1)'
+SELECT r_enum_bad(2);
+ERROR HY000: MLE-Type> Cannot convert value 'true' to ENUM from MLE in 'r_enum_bad(2)'
+SELECT r_set_bad(0);
+ERROR HY000: MLE-Type> Cannot convert value '3' to SET from MLE in 'r_set_bad(0)'
+SELECT r_set_bad(1);
+ERROR HY000: MLE-Type> Cannot convert value 'x' to SET from MLE in 'r_set_bad(1)'
+DROP FUNCTION r_enum_bad;
+DROP FUNCTION r_set_bad;
 # Session time zone: bound at the session's first MLE use (Oracle).
 CREATE FUNCTION js_iso(t DATETIME) RETURNS VARCHAR(30) LANGUAGE JAVASCRIPT
 AS $$ return t.toISOString() $$;

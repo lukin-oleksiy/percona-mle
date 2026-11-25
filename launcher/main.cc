@@ -310,9 +310,10 @@ Worker *Launcher::spawn(size_t cls, std::string *error) {
             F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) != 0)
     return cleanup(std::string("seal mailbox: ") + strerror(errno));
 
-  if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) != 0 ||
-      pipe2(pipefd, O_CLOEXEC) != 0)
+  if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) != 0)
     return cleanup(std::string("socketpair: ") + strerror(errno));
+  if (pipe2(pipefd, O_CLOEXEC) != 0)
+    return cleanup(std::string("pipe2: ") + strerror(errno));
 
   if (!m_cgroup_base.empty()) {
     w.leaf = cgroup_create_leaf(m_cgroup_base, id, c.cfg, error);

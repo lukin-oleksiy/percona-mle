@@ -27,6 +27,8 @@
 #include <utility>
 
 #include "codec.hpp"
+#include "common/result.hpp"
+#include "common/statements.hpp"
 #include "mailbox.hpp"
 
 namespace mle::cpython {
@@ -42,21 +44,16 @@ namespace {
 
 // ------------------------------------------------------------------------------ requests
 
-/** An SQL statement id that is not CLOSED (§10.1). */
-struct Statement {
-  enum class State : uint8_t { kIdle, kRows, kNext };
-  State state = State::kIdle;
-  /** Opened by PREPARE: its home is IDLE. Else by EXECUTE: its home is CLOSED. */
-  bool prepared = false;
-  /** PASS_RESULT_TO_CLIENT, given when the id was opened. */
-  bool to_client = false;
-  uint32_t param_count = 0;
-  /** The columns of the current result set; of a prepared statement, the ones last received,
-      which a later set's first batch may leave out (§10.3): (block, labels, tags). */
+/** What the worker keeps of a statement besides its state (worker/common/statements.hpp): the
+    columns of the current result set; of a prepared statement, the ones last received, which a
+    later set's first batch may leave out (§10.3): (block, labels, tags). */
+struct StatementColumns {
   Ref columns;
   uint32_t ncols = 0;
 };
 
+/** An SQL statement id that is not CLOSED (§10.1). */
+using Statement = common::Statement<StatementColumns>;
 using Statements = std::unordered_map<uint64_t, Statement>;
 
 /** A request being served, at its depth. */
@@ -115,14 +112,15 @@ Message receive(Ref &assembled) {
 
 /** The body as a Python object (a memoryview of the arena, or of the reassembled bytes). */
 Ref body_object(const Message &m, Ref &assembled) {
-  if (!m.in_arena) return Ref::steal(PyMemoryView_FromObject(assembled.get()));
+  if (!m.in_arena) {
+    // The bytes received, not the total announced: a short host leaves the rest unset (MVP review
+    // CPY-12), and Python's readers are bounded by the view.
+    Ref whole = Ref::steal(PyMemoryView_FromObject(assembled.get()));
+    if (Py_ssize_t(m.body.size()) == PyBytes_GET_SIZE(assembled.get())) return whole;
+    return Ref::steal(PySequence_GetSlice(whole.get(), 0, Py_ssize_t(m.body.size())));
+  }
   return Ref::steal(PyMemoryView_FromMemory(reinterpret_cast<char *>(const_cast<std::byte *>(m.body.data())),
                                            Py_ssize_t(m.body.size()), PyBUF_READ));
-}
-
-/** Text of the host as a str; ill-formed UTF-8 is repaired (§7.1). */
-Ref str_of(std::string_view s) {
-  return Ref::steal(PyUnicode_DecodeUTF8(s.data(), Py_ssize_t(s.size()), "replace"));
 }
 
 /** The guest code of the request served waits for the host: no interrupt is raised meanwhile.
@@ -151,25 +149,16 @@ void post_internal(const Request &q, std::string_view text) {
   Writer wr(Mailbox::arena());
   // No return value, OUT parameters, console output or findings; an Error without language,
   // frames or SQL error.
-  (void)(wr.put<uint8_t>(0) && wr.put<uint32_t>(0) && wr.put<uint32_t>(0) && wr.put<uint32_t>(0) && wr.put<uint8_t>(0) &&
-         wr.put<uint32_t>(0) && wr.put<uint8_t>(1) && wr.str("") && wr.str(text.substr(0, 1024)) && wr.put<uint32_t>(0) &&
-         wr.put<uint32_t>(0) && wr.str("") && wr.put<uint64_t>(0));
+  common::ErrorInfo e;
+  e.message = text.substr(0, 1024);
+  (void)common::write_result(wr, common::kNoValues, "", "", false, &e);
   Mailbox::post(uint32_t(w::Op::kResult), uint32_t(w::Status::kInternal), q.depth, g_seq, uint32_t(wr.size()));
 }
 
 /** The Python error that is set, as ASCII text; the error is cleared. */
 std::string python_error() {
-  PyObject *e = PyErr_GetRaisedException();
-  std::string text = "the worker's Python code failed";
-  if (e != nullptr) {
-    if (PyObject *shown = PyObject_ASCII(e); shown != nullptr) {
-      if (const char *s = PyUnicode_AsUTF8(shown); s != nullptr) text = text + ": " + s;
-      Py_DECREF(shown);
-    }
-    PyErr_Clear();
-    Py_DECREF(e);
-  }
-  return text;
+  const std::string shown = raised_text();
+  return shown.empty() ? "the worker's Python code failed" : "the worker's Python code failed: " + shown;
 }
 
 /** Posts the RESULT of q, which Python makes from what the request ended with. From here on no
@@ -629,7 +618,7 @@ Ref warnings(Reader &r) {
   Ref list = Ref::steal(PyList_New(n));
   for (uint32_t i = 0; i < n; i++) {
     const uint32_t level = r.get<uint32_t>(), code = r.get<uint32_t>();
-    Ref msg = str_of(r.str());
+    Ref msg = host_text(r.str());
     PyList_SET_ITEM(list.get(), i, Ref::steal(Py_BuildValue("(IIN)", level, code, msg.release())).release());
   }
   return list;
@@ -642,7 +631,7 @@ Ref columns(Reader &r, uint32_t count) {
   Ref labels = Ref::steal(PyTuple_New(count));
   Ref tags = Ref::steal(PyTuple_New(count));
   for (uint32_t i = 0; i < count; i++) {
-    PyTuple_SET_ITEM(labels.get(), i, str_of(r.str()).release());
+    PyTuple_SET_ITEM(labels.get(), i, host_text(r.str()).release());
     r.str();  // table
     const auto tag = r.get<uint8_t>();
     if (tag > w::kMaxTag) protocol_failure("an unknown tag in a Column's Type");
@@ -676,7 +665,7 @@ Ref ok_tuple(const Request &q, uint64_t affected, uint64_t insert_id, Ref warns,
 /** An ERROR the worker answers itself, without a message: it has no error id. */
 Ref error_tuple(uint32_t code, std::string_view state, std::string_view message) {
   return Ref::steal(
-      Py_BuildValue("(iINNOKK)", 0, code, str_of(state).release(), str_of(message).release(), Py_None, 0ULL, 0ULL));
+      Py_BuildValue("(iINNOKK)", 0, code, host_text(state).release(), host_text(message).release(), Py_None, 0ULL, 0ULL));
 }
 
 /** Checks the SQL_RESULT m that answers the message `sent` of q (§1: the reply kind for the
@@ -691,53 +680,16 @@ Ref error_tuple(uint32_t code, std::string_view state, std::string_view message)
     columns: (block, labels, tags) with the first batch of a result set. The rows stay in body
     and are decoded when a routine reads them. */
 Ref sql_result(Request &q, const Sent &sent, const Message &m, Ref &assembled) {
-  using State = Statement::State;
   const w::SqlAction action = sent.action;
   Reader r(m.body);
   const auto kind = r.get<uint8_t>();
-  if (kind > w::kMaxSqlResultKind) protocol_failure("an unknown SQL_RESULT kind");
-  const auto known = q.statements.find(sent.id);
-  Statement *st = known != q.statements.end() ? &known->second : nullptr;  // nullptr: CLOSED
-  const bool to_client = st != nullptr ? st->to_client : sent.to_client;
-  const bool nothing_next = action == w::SqlAction::kNextResult && (st == nullptr || st->state == State::kIdle);
-  bool legal = false;
-  switch (static_cast<w::SqlResultKind>(kind)) {
-    case w::SqlResultKind::kError:
-      legal = action != w::SqlAction::kClose;
-      break;
-    case w::SqlResultKind::kOk:
-      legal = action != w::SqlAction::kFetch && !nothing_next;
-      break;
-    case w::SqlResultKind::kRows:
-      legal = !to_client && !nothing_next && action != w::SqlAction::kPrepare &&
-              action != w::SqlAction::kExecuteMany && action != w::SqlAction::kClose;
-      break;
-    case w::SqlResultKind::kEnd:
-      legal = action == w::SqlAction::kNextResult;
-      break;
-  }
-  if (!legal) protocol_failure("an SQL_RESULT of a kind that cannot answer the action in the statement's state");
-  // The id's home: IDLE for a prepared statement, CLOSED for a direct one.
-  const auto home = [&]() {
-    if (st == nullptr) return;
-    if (st->prepared)
-      st->state = State::kIdle;
-    else
-      q.statements.erase(sent.id);
-    st = nullptr;
-  };
-  // The id has a result to read: a direct statement gets its entry now.
-  const auto open = [&]() -> Statement & {
-    if (st == nullptr) {
-      st = &q.statements[sent.id];
-      st->to_client = to_client;
-    }
-    return *st;
-  };
+  common::StatementStep<Statement> step(q.statements, sent.id, action, sent.to_client);
+  step.check(kind);
+  const Statement *st = step.statement();  // nullptr: CLOSED
   switch (static_cast<w::SqlResultKind>(kind)) {
     case w::SqlResultKind::kError: {
       const uint32_t code = r.get<uint32_t>();
-      Ref state = str_of(r.str()), message = str_of(r.str());
+      Ref state = host_text(r.str()), message = host_text(r.str());
       const uint32_t row = r.get<uint32_t>();
       const uint64_t error_id = r.get<uint64_t>();
       Ref failed = Ref::borrow(Py_None);
@@ -747,7 +699,7 @@ Ref sql_result(Request &q, const Sent &sent, const Message &m, Ref &assembled) {
       }
       // The actions sent are allowed in the id's state (the others fail without a message), so
       // rule 3 applies: the id goes home.
-      home();
+      step.home();
       return Ref::steal(Py_BuildValue("(iINNNKK)", 0, code, state.release(), message.release(), failed.release(),
                                       static_cast<unsigned long long>(error_id), static_cast<unsigned long long>(g_seq)));
     }
@@ -757,18 +709,7 @@ Ref sql_result(Request &q, const Sent &sent, const Message &m, Ref &assembled) {
       const bool more_results = r.boolean();
       const uint32_t params = r.get<uint32_t>();
       const uint64_t exec_us = r.get<uint64_t>();
-      if (action == w::SqlAction::kClose) {
-        if (st != nullptr) q.statements.erase(sent.id);
-      } else if (action == w::SqlAction::kPrepare) {
-        Statement &s = q.statements[sent.id];
-        s.prepared = true;
-        s.to_client = sent.to_client;
-        s.param_count = params;
-      } else if (more_results) {
-        open().state = State::kNext;
-      } else {
-        home();
-      }
+      step.ok(more_results, params);
       return ok_tuple(q, affected, insert_id, std::move(warns), more_results, params, exec_us, sent.id);
     }
     case w::SqlResultKind::kRows: {
@@ -794,18 +735,14 @@ Ref sql_result(Request &q, const Sent &sent, const Message &m, Ref &assembled) {
       const uint64_t exec_us = r.get<uint64_t>();
       // The reply tells the columns with a set's first batch.
       Ref shown = Ref::borrow(Py_None);
-      if (more || more_results || (st != nullptr && st->prepared)) {
-        Statement &s = open();
+      if (Statement *s = step.rows(more, more_results); s != nullptr) {
         if (ncols != 0) {
-          s.columns = std::move(cols);
-          s.ncols = ncols;
+          s->columns = std::move(cols);
+          s->ncols = ncols;
         }
-        if (first) shown = Ref::borrow(s.columns.get());
-        s.state = more ? State::kRows : more_results ? State::kNext : State::kIdle;
-      } else {
-        // A direct statement's set is complete and no result follows: CLOSED.
-        if (first) shown = std::move(cols);
-        home();
+        if (first) shown = Ref::borrow(s->columns.get());
+      } else if (first) {
+        shown = std::move(cols);  // a direct statement's set is complete and no result follows: CLOSED
       }
       Ref body = nrows == 0 ? Ref::borrow(Py_None) : body_object(m, assembled);
       Ref total_rows =
@@ -817,7 +754,7 @@ Ref sql_result(Request &q, const Sent &sent, const Message &m, Ref &assembled) {
                                       static_cast<unsigned long long>(q.scope)));
     }
     case w::SqlResultKind::kEnd:
-      home();
+      step.home();
       return Ref::steal(Py_BuildValue("(i)", 3));
   }
   protocol_failure("an unknown SQL_RESULT kind");
@@ -825,15 +762,8 @@ Ref sql_result(Request &q, const Sent &sent, const Message &m, Ref &assembled) {
 
 /** Sends CLOSE for id and takes its OK (§10.1 rule 1): the id is CLOSED. */
 void sql_close(Request &q, uint64_t id) {
-  std::array<std::byte, w::kSqlCloseSize> close{};
-  Writer wr(close);
-  (void)(wr.put(uint8_t(w::SqlAction::kClose)) && wr.put(id));  // no text, no params, flags and the rest 0
-  Mailbox::send(uint32_t(w::Op::kSql), 0, q.depth, g_seq, close);
   Ref assembled;
-  const Message m = sql_reply(assembled);
-  if (m.discarded || m.body.empty() || m.body[0] != std::byte{uint8_t(w::SqlResultKind::kOk)})
-    protocol_failure("a reply to CLOSE that is not OK");
-  q.statements.erase(id);
+  common::close_statement(q.statements, q.depth, g_seq, id, [&assembled] { return sql_reply(assembled); });
 }
 
 /** sql(action, scope, id, message, count, flags, width) -> the reply tuple (sql_result), or None
@@ -849,7 +779,7 @@ void sql_close(Request &q, uint64_t id) {
     What does not need the host is answered here: an id that is CLOSED (CLOSE: OK; NEXT_RESULT:
     END; others: an ERROR), FETCH without rows to fetch. The handle of another request fails. */
 Ref py_sql(PyObject *args) {
-  using State = Statement::State;
+  using State = common::StatementState;
   unsigned action_code, count, flags, width;
   unsigned long long scope, handle;
   PyObject *message;
@@ -1006,9 +936,9 @@ Ref py_library(PyObject *args) {
   Reader r(m.body);
   const auto status = r.get<uint8_t>();
   if (status > w::kMaxLibraryStatus) protocol_failure("an unknown LIBRARY_RESULT status");
-  Ref language = str_of(r.str()), body = str_of(r.str());
+  Ref language = host_text(r.str()), body = host_text(r.str());
   const uint64_t version = r.get<uint64_t>();
-  Ref message = str_of(r.str());
+  Ref message = host_text(r.str());
   return Ref::steal(Py_BuildValue("(BNNKN)", status, language.release(), body.release(),
                                   static_cast<unsigned long long>(version), message.release()));
 }
@@ -1047,6 +977,62 @@ PyModuleDef kModule = {PyModuleDef_HEAD_INIT, "_mlewire", "The MLE CPython worke
 
 }  // namespace
 
-PyObject *init_mlewire() { return PyModule_Create(&kModule); }
+PyObject *init_mlewire() {
+  PyObject *m = PyModule_Create(&kModule);
+  if (m == nullptr) return nullptr;
+  // The protocol's constants for wire.py, from include/mle/protocol.h rather than copied by hand
+  // (MVP review CPY-13).
+  const std::pair<const char *, long long> constants[] = {
+      {"PREPARE", (long long)w::Op::kPrepare},
+      {"CALL", (long long)w::Op::kCall},
+      {"DROP", (long long)w::Op::kDrop},
+      {"RESET", (long long)w::Op::kReset},
+      {"OPTIONS", (long long)w::Op::kOptions},
+      {"PARSE_LIBRARY", (long long)w::Op::kParseLibrary},
+      {"OK", (long long)w::Status::kOk},
+      {"GUEST_ERROR", (long long)w::Status::kGuestError},
+      {"INTERRUPTED", (long long)w::Status::kInterrupted},
+      {"EXHAUSTED", (long long)w::Status::kExhausted},
+      {"INTERNAL", (long long)w::Status::kInternal},
+      {"T_NULL", (long long)w::Tag::kNull},
+      {"T_I64", (long long)w::Tag::kI64},
+      {"T_U64", (long long)w::Tag::kU64},
+      {"T_F64", (long long)w::Tag::kF64},
+      {"T_F32", (long long)w::Tag::kF32},
+      {"T_DECIMAL", (long long)w::Tag::kDecimal},
+      {"T_STRING", (long long)w::Tag::kString},
+      {"T_BYTES", (long long)w::Tag::kBytes},
+      {"T_DATE", (long long)w::Tag::kDate},
+      {"T_TIME", (long long)w::Tag::kTime},
+      {"T_DATETIME", (long long)w::Tag::kDatetime},
+      {"T_TIMESTAMP", (long long)w::Tag::kTimestamp},
+      {"T_JSON", (long long)w::Tag::kJson},
+      {"T_VECTOR", (long long)w::Tag::kVector},
+      {"MAX_WORKER_MESSAGE", (long long)w::kMaxWorkerMessage},
+      {"MAX_VALUES", (long long)w::kMaxValues},
+      {"MAX_VECTOR_DIMENSIONS", (long long)w::kMaxVectorDimensions},
+      {"MAX_TIME_HOUR", (long long)w::kMaxTimeHour},
+      {"MAX_ERROR_MESSAGE", (long long)w::kMaxErrorMessage},
+      {"MAX_FRAME_TEXT", (long long)w::kMaxFrameText},
+      {"MAX_FRAMES", (long long)w::kMaxStackFrames},
+      {"MAX_FINDING", (long long)w::kMaxFinding},
+      {"MAX_FINDINGS", (long long)w::kMaxFindings},
+      {"MAX_SQL_ERRNO", (long long)w::kMaxSqlErrno},
+      {"MAX_TIMESTAMP", (long long)w::kMaxTimestamp},
+      {"ZERO_TIMESTAMP", (long long)w::kZeroTimestamp},
+  };
+  for (const auto &[name, value] : constants)
+    if (PyModule_Add(m, name, PyLong_FromLongLong(value)) != 0) {
+      Py_DECREF(m);
+      return nullptr;
+    }
+  if (PyModule_AddStringConstant(m, "LANGUAGE_TYPE", w::kLanguageType) != 0 ||
+      PyModule_AddStringConstant(m, "LANGUAGE_TIME_ZONE", w::kLanguageTimeZone) != 0 ||
+      PyModule_AddStringConstant(m, "LANGUAGE_OPTION", w::kLanguageOption) != 0) {
+    Py_DECREF(m);
+    return nullptr;
+  }
+  return m;
+}
 
 }  // namespace mle::cpython

@@ -256,7 +256,10 @@ final class JavaRoutines {
 
   void drop(long id) {
     routines.remove(id);
-    origins.remove(LOADER_PREFIX + id);
+    // A cached routine compiled under this id keeps its loader, and other ids that got it from the
+    // cache name their stack frames by it: the origin stays while it is cached (MVP review JVML-9).
+    String loader = LOADER_PREFIX + id;
+    if (cache.values().stream().noneMatch(c -> c.loaderName().equals(loader))) origins.remove(loader);
   }
 
   void reset() {

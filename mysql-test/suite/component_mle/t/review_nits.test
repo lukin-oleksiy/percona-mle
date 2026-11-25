@@ -1,0 +1,68 @@
+--echo #
+--echo # component_mle: regressions for the nits of the MVP code review (exp note 65, step 5).
+--echo #
+--source ../include/have_mle_component.inc
+--source ../include/have_mle_cgroup.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+
+call mtr.add_suppression("Component mle reported: 'mle.heap_max .* is not below mle.memory_max");
+call mtr.add_suppression("Component mle reported: 'mle.v8_heap_max .* is not below mle.v8_memory_max");
+--mkdir $MYSQL_TMP_DIR/mle-nits-packages
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+
+--echo # OPS-7: a package directory mysqld's OS user can write is reported (MTR's mysqld owns it).
+--let $assert_text = The error log warns about a writable mle.package_dir
+--let $assert_file = $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select = Component mle reported: 'mle.package_dir .*mle-nits-packages.* is writable by mysqld's OS user
+--let $assert_count = 1
+--let $assert_only_after = CURRENT_TEST: component_mle.review_nits
+--let $assert_match =
+--source include/assert_grep.inc
+
+--echo # COMP-5: a heap that does not fit in the worker's memory is accepted, with a warning.
+SET GLOBAL mle.heap_max = @@mle.memory_max;
+SELECT @@mle.heap_max = @@mle.memory_max AS accepted;
+SET GLOBAL mle.heap_max = DEFAULT;
+SET GLOBAL mle.v8_heap_max = @@mle.v8_memory_max;
+SELECT @@mle.v8_heap_max = @@mle.v8_memory_max AS v8_accepted;
+SET GLOBAL mle.v8_heap_max = DEFAULT;
+--let $assert_text = The error log warns about mle.heap_max
+--let $assert_file = $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select = Component mle reported: 'mle.heap_max .* is not below mle.memory_max
+--let $assert_count = 1
+--let $assert_only_after = CURRENT_TEST: component_mle.review_nits
+--let $assert_match =
+--source include/assert_grep.inc
+--let $assert_text = and about mle.v8_heap_max
+--let $assert_select = Component mle reported: 'mle.v8_heap_max .* is not below mle.v8_memory_max
+--source include/assert_grep.inc
+
+--echo # COMP-7: at mle.max_workers a kept worker stays kept; it was destroyed for nothing.
+--connect (con1, localhost, root,,test)
+CREATE FUNCTION js_one() RETURNS INT LANGUAGE JAVASCRIPT AS $$ return 1 $$;
+SELECT js_one();
+--connect (con2, localhost, root,,test)
+SELECT js_one();
+--disconnect con1
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE = 1 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+--source include/wait_condition.inc
+SET GLOBAL mle.max_workers = 1;
+--connect (con3, localhost, root,,test)
+--error ER_LANGUAGE_COMPONENT_CONCURRENCY_LIMIT
+SELECT js_one();
+SELECT VARIABLE_VALUE AS still_kept FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+SET GLOBAL mle.max_workers = DEFAULT;
+SELECT js_one() AS the_kept_one;
+SELECT VARIABLE_VALUE AS taken FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+DROP FUNCTION js_one;
+--disconnect con3
+--disconnect con2
+--connection default
+--source include/wait_until_count_sessions.inc
+
+REVOKE CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
+--rmdir $MYSQL_TMP_DIR/mle-nits-packages

@@ -25,12 +25,14 @@
 #include <linux/futex.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -130,6 +132,20 @@ TEST_F(MleJavaWorker, Ready) {
   EXPECT_EQ(h->stats().state, uint32_t(wire::WorkerState::kIdle));
   EXPECT_GT(h->stats().heap_max, 0u);
   delete h;
+}
+
+TEST(MleJavaWorkerArgs, StackSizeIsTheWholeValue) {
+  // An overflowing --stack was taken as ULLONG_MAX and then not applied (MVP review JVMP-7): the
+  // usage error (exit 20) now, before the JVM is looked for.
+  auto run = [](const std::string &stack) {
+    const std::string cmd = std::string(MLE_WORKER_EXE) + " --jvm=/nonexistent " + stack + " >/dev/null 2>&1";
+    const int status = std::system(cmd.c_str());
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  };
+  EXPECT_EQ(run("--stack=99999999999999999999999"), 20);
+  EXPECT_EQ(run("--stack=1M"), 20);
+  EXPECT_EQ(run("--stack=1024"), 20);       // below 256 KiB
+  EXPECT_NE(run("--stack=1048576"), 20);    // accepted: fails later, without a JVM
 }
 
 TEST_F(MleJavaWorker, AddTwoLongs) {

@@ -34,8 +34,5 @@ MYSQL_ADD_COMPONENT(mle
 # the server's: every worker kind uses it.
 MYSQL_INSTALL_TARGET(component_mle DESTINATION ${INSTALL_PLUGINDIR}
   COMPONENT MleCommon)
-# Default of mle.java_home: the GraalVM JDK the worker was built with.
-TARGET_COMPILE_DEFINITIONS(component_mle PRIVATE
-  MLE_DEFAULT_JAVA_HOME="${MLE_JAVA_HOME}")
 # Building the component also builds what it runs (and the build layout).
 ADD_DEPENDENCIES(component_mle mle_build_layout)

@@ -189,6 +189,7 @@ Runnable[] cases = {
   () -> Stats.linregress(new double[] {1, Double.NaN}, new double[] {1, 2}),
   () -> Stats.linregress(new double[] {2, 2, 2}, x),
   () -> Stats.histogram(x, 0),
+  () -> Stats.histogram(x, Integer.MAX_VALUE),
   () -> Stats.histogramEdges(x, new double[] {0, 2, 1}),
   () -> Stats.histogram(new double[] {1.0, Math.nextUp(1.0)}, 10),
   () -> Stats.outliers(x, "mad", 3),

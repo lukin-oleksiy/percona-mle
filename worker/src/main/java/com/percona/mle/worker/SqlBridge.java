@@ -131,7 +131,7 @@ public final class SqlBridge {
     if (dot <= 0 || dot == p.length() - 1 || p.indexOf('.', dot + 1) >= 0)
       throw new IllegalArgumentException("a library is 'schema.name' or '/schema/name', not '" + library + "'");
     Polyglot polyglot = dispatcher().polyglot();
-    return polyglot.context().asValue(polyglot.libraryModule(p.substring(0, dot), p.substring(dot + 1), false));
+    return polyglot.context().asValue(polyglot.libraryModule(p.substring(0, dot), p.substring(dot + 1)));
   }
 
   public static org.graalvm.polyglot.Context context() {

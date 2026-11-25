@@ -64,7 +64,7 @@ namespace mle::launcher {
 
 constexpr uint32_t kVersion = 2;
 
-/** Landlock ABI 6 (Linux 6.12; the POC's minimum is Linux 7.0) scopes
+/** Landlock ABI 6 (Linux 6.12; MLE's minimum is Linux 7.0) scopes
     signals and abstract unix sockets to the worker: below it a worker
     running as the mysqld OS user could signal mysqld (fcntl F_SETOWN +
     O_ASYNC is not a kill-family call the seccomp filter sees), and below 3

@@ -21,9 +21,9 @@
 /**
   @file include/mle/defaults.h
 
-  Where the MLE files are and how a JVM worker class (D-10) is configured
-  by default. Used by the component (Phase 4), the benchmark harness and the
-  tests, so that all of them run workers the same way.
+  Where the MLE files are and how the worker classes (JVM, CPython, V8) are
+  configured by default. Used by the component, the benchmark harness and
+  the tests, so that all of them run workers the same way.
 
   Installed layout (one directory, e.g. <plugin dir>/mle):
     mle_launcher, mle_worker   executables
@@ -114,10 +114,6 @@ struct JvmClassOptions {
 ClassConfig jvm_worker_class(const Layout &layout,
                              const JvmClassOptions &options = {});
 
-/** The CPython worker class (exp design note 62; Python only):
-    mle_cpython_worker with its code, its site-packages and the DBA's CPython
-    packages (<package_dir>/cpython/site-packages) on sys.path; limits,
-    environment and hidden paths as for the JVM class. */
 /** The V8 worker class (exp design note 63; LANGUAGE JS): mle_v8_worker with
     the V8 heap limit (--heap-mb) and the DBA's npm packages
     (<package_dir>/js); limits, environment and hidden paths as for the JVM
@@ -125,6 +121,10 @@ ClassConfig jvm_worker_class(const Layout &layout,
 ClassConfig v8_worker_class(const Layout &layout, const JvmClassOptions &options,
                             uint64_t heap_max);
 
+/** The CPython worker class (exp design note 62; LANGUAGE CPYTHON):
+    mle_cpython_worker with its code, its site-packages and the DBA's CPython
+    packages (<package_dir>/cpython/site-packages) on sys.path; limits,
+    environment and hidden paths as for the JVM class. */
 ClassConfig cpython_worker_class(const Layout &layout,
                                  const JvmClassOptions &options = {});
 
