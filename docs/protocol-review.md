@@ -758,3 +758,23 @@ Host behaviour within the text: a request whose nested request ended the worker 
 nested outcome (violation, timed out, killed), not "died", and the loss is counted and logged once
 (HOST-2); a native worker gets `--message-mb` of a quarter of its class's memory, so that a host
 message it cannot hold is answered as §5.3 says instead of ending in the kernel's OOM kill (CPY-9).
+
+## 25. Python `decimal` precision (26 Nov)
+
+One change of the text, in B.4 and B.6: a Python worker sets the `decimal` context of the thread
+that runs routines to precision 65 (MySQL's largest DECIMAL precision, Python's default is 28),
+other fields at Python's defaults, before the first routine and at every RESET, and the precision
+of `decimal.DefaultContext` to 65. RESET restores them, so a context guest code changed does not
+reach the next session. Before, `a + b` on two DECIMAL(65,30) arguments rounded to 28 digits.
+
+Worker change within the text, from the GraalVM 25.6 update (GraalPy's `decimal` is now a Java
+object; passing one from the host to Python as an argument costs about twice what it did): a JVM
+worker routine with DECIMAL parameters or a DECIMAL result runs in a Python wrapper. Its DECIMAL
+arguments come as text and become `Decimal` inside Python, and a `Decimal` result (or OUT value)
+goes back as text. What guest code sees is unchanged. Rows are not changed: a `Decimal` a row
+gives through its proxy got cheaper with 25.6 (198 → 67 ns), not dearer.
+
+| Section | Change | Code |
+|---|---|---|
+| B.4, B.6 | `decimal` context precision 65, restored at RESET | JVM (GraalPy), CPython |
+

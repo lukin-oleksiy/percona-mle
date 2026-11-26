@@ -744,7 +744,18 @@ def _install_signals():
             pass
 
 
+def _decimal_context():
+    """Appendix B.4: precision 65 (MySQL's largest DECIMAL), Python's other defaults; again at
+    every RESET (B.6)."""
+    import decimal
+    decimal.DefaultContext.prec = 65
+    decimal.setcontext(decimal.Context(
+        prec=65, rounding=decimal.ROUND_HALF_EVEN, Emin=-999999, Emax=999999, capitals=1, clamp=0,
+        flags=[], traps=[decimal.InvalidOperation, decimal.DivisionByZero, decimal.Overflow]))
+
+
 def _restore_process_state():
+    _decimal_context()
     for t in _ITIMERS:
         signal.setitimer(t, 0)
     for s, h in _handlers.items():
@@ -774,6 +785,7 @@ def start():
     _mlewire.setup(decimal.Decimal, json.loads, wire.temporal, wire.new_vector, wire.demote, sql._row_temporal,
                    float, wire.timestamp)
     d = Dispatcher(_mlewire.arena_size())
+    _decimal_context()
     _install_signals()
     sys.stdout = d.console.out
     sys.stderr = d.console.err

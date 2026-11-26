@@ -1,0 +1,142 @@
+--echo #
+--echo # component_mle: Python's DECIMAL (docs/protocol.md Appendix B.4, B.6). The
+--echo # decimal context has precision 65, restored at RESET; the JVM worker passes a
+--echo # routine's DECIMAL values as text and makes the Decimal inside Python (exp
+--echo # note 67). Also run on the CPython worker (cpython_py_decimal.test).
+--echo #
+--source ../include/have_mle_component.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+
+# Through the client: mysqltest takes the indentation off the lines of a body.
+--write_file $MYSQLTEST_VARDIR/tmp/py_decimal.sql
+CREATE FUNCTION py_dec_add(a DECIMAL(65,30), b DECIMAL(65,30)) RETURNS DECIMAL(65,30) LANGUAGE PYTHON AS $$
+    return a + b
+$$;
+CREATE FUNCTION py_dec_ctx() RETURNS VARCHAR(300) LANGUAGE PYTHON AS $$
+    import decimal
+    c = decimal.getcontext()
+    return '%d %s %d %d %d %d %s %s | default %d' % (
+        c.prec, c.rounding, c.Emin, c.Emax, c.capitals, c.clamp,
+        sorted(k.__name__ for k, v in c.traps.items() if v),
+        sorted(k.__name__ for k, v in c.flags.items() if v), decimal.DefaultContext.prec)
+$$;
+CREATE FUNCTION py_dec_lower(p INT) RETURNS INT LANGUAGE PYTHON AS $$
+    import decimal
+    decimal.getcontext().prec = p
+    decimal.getcontext().rounding = decimal.ROUND_DOWN
+    decimal.DefaultContext.prec = p
+    return decimal.getcontext().prec
+$$;
+CREATE FUNCTION py_dec_args(a DECIMAL(10,2), n INT, s VARCHAR(10), b DECIMAL(20,6)) RETURNS VARCHAR(200) LANGUAGE PYTHON AS $$
+    return ' '.join(type(v).__name__ + ':' + repr(v) for v in (a, n, s, b))
+$$;
+CREATE PROCEDURE py_dec_inout(INOUT a DECIMAL(20,6), OUT b DECIMAL(20,6), OUT t VARCHAR(20), OUT n INT) LANGUAGE PYTHON AS $$
+    t = type(a).__name__
+    b = a * 2
+    a = a + 1
+    n = 3
+$$;
+CREATE FUNCTION py_dec_ret_int() RETURNS DECIMAL(10,2) LANGUAGE PYTHON AS $$
+    return 7
+$$;
+CREATE FUNCTION py_dec_ret_str() RETURNS DECIMAL(10,2) LANGUAGE PYTHON AS $$
+    return '1.25'
+$$;
+CREATE FUNCTION py_dec_ret_float() RETURNS DECIMAL(10,2) LANGUAGE PYTHON AS $$
+    return 1.5
+$$;
+CREATE FUNCTION py_dec_ret_round(a DECIMAL(20,6)) RETURNS DECIMAL(10,2) LANGUAGE PYTHON AS $$
+    return a
+$$;
+CREATE FUNCTION py_dec_null(a DECIMAL(10,2)) RETURNS DECIMAL(10,2) LANGUAGE PYTHON AS $$
+    return a
+$$;
+CREATE FUNCTION py_dec_nan() RETURNS DECIMAL(10,2) LANGUAGE PYTHON AS $$
+    import decimal
+    return decimal.Decimal('NaN')
+$$;
+CREATE FUNCTION py_dec_error(a DECIMAL(10,2)) RETURNS INT LANGUAGE PYTHON AS $$
+    x = 1
+    raise ValueError('bad ' + str(a))
+$$;
+CREATE FUNCTION py_dec_double(a DECIMAL(10,2)) RETURNS DOUBLE LANGUAGE PYTHON AS $$
+    return a
+$$;
+CREATE FUNCTION py_dec_text(a DECIMAL(10,2)) RETURNS VARCHAR(20) LANGUAGE PYTHON AS $$
+    return a
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/py_decimal.sql
+--remove_file $MYSQLTEST_VARDIR/tmp/py_decimal.sql
+
+--connect (con1, localhost, root,,test)
+--echo #
+--echo # Precision 65: the sum of two DECIMAL(65,30) values keeps all their digits
+--echo # (Python's own default, 28, rounds it).
+--echo #
+SELECT py_dec_add(12345678901234567890123456789012345.123456789012345678901234567890,
+                  0.000000000000000000000000000001) AS sum65;
+SELECT py_dec_ctx() AS context;
+
+--echo #
+--echo # A routine's DECIMAL values: arguments are Decimal (NULL is None), a
+--echo # Decimal result goes back exactly, other results as before.
+--echo #
+SELECT py_dec_args(12.50, 3, 'x', -0.000001) AS args;
+SET @a = 41.5;
+CALL py_dec_inout(@a, @b, @t, @n);
+SELECT @a, @b, @t, @n;
+SELECT py_dec_ret_int(), py_dec_ret_str(), py_dec_ret_float(), py_dec_ret_round(2.345678) AS rounded;
+SELECT py_dec_null(NULL), py_dec_double(2.25), py_dec_text(-3.10);
+--error ER_LANGUAGE_COMPONENT
+SELECT py_dec_nan();
+--error ER_LANGUAGE_COMPONENT_RUNTIME
+SELECT py_dec_error(1.5);
+
+--echo #
+--echo # Guest code may change the context; the change lasts in the session ...
+--echo #
+SELECT py_dec_lower(5) AS lowered;
+SELECT py_dec_ctx() AS context;
+SELECT py_dec_add(1.000001, 2) AS sum5;
+let $pid1 = `SELECT mle_debug_worker_pid()`;
+--disconnect con1
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE = 1 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+--source include/wait_condition.inc
+
+--echo #
+--echo # ... but not past RESET: the next session gets the same worker with
+--echo # precision 65 again.
+--echo #
+--connect (con2, localhost, root,,test)
+SELECT py_dec_ctx() AS context;
+let $pid2 = `SELECT mle_debug_worker_pid()`;
+let $same = `SELECT $pid1 = $pid2`;
+--echo same worker process: $same
+--disconnect con2
+--connection default
+let $wait_condition = SELECT VARIABLE_VALUE = 1 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'mle_workers_cached';
+--source include/wait_condition.inc
+--source include/wait_until_count_sessions.inc
+
+DROP FUNCTION py_dec_add;
+DROP FUNCTION py_dec_ctx;
+DROP FUNCTION py_dec_lower;
+DROP FUNCTION py_dec_args;
+DROP PROCEDURE py_dec_inout;
+DROP FUNCTION py_dec_ret_int;
+DROP FUNCTION py_dec_ret_str;
+DROP FUNCTION py_dec_ret_float;
+DROP FUNCTION py_dec_ret_round;
+DROP FUNCTION py_dec_null;
+DROP FUNCTION py_dec_nan;
+DROP FUNCTION py_dec_error;
+DROP FUNCTION py_dec_double;
+DROP FUNCTION py_dec_text;
+REVOKE CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

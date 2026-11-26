@@ -128,9 +128,11 @@ final class Polyglot {
 
   /**
    * A prepared routine. Body form (entry ""): js is set for JavaScript; Python routines with OUT
-   * parameters return (result, out1, ...), outs gives the parameters' indexes.
+   * parameters return (result, out1, ...), outs gives the parameters' indexes. call is what a CALL
+   * executes: fn, or for a Python routine with DECIMAL values fn wrapped to take and give them as
+   * text (decimal_call); libraries are bound to fn.
    */
-  record Routine(String language, Value fn, Value[] converters, Values.ParamType ret, Values.ParamType[] params,
+  record Routine(String language, Value fn, Value call, Value[] converters, Values.ParamType ret, Values.ParamType[] params,
       int[] outs, JsOracle.Routine js, List<LibraryFileSystem.Import> imports) {
     int arity() {
       return params.length;
@@ -643,6 +645,40 @@ final class Polyglot {
     Value ns = c.eval(Source.create("python", """
         import array as _array, datetime as _dt, decimal as _decimal, json as _json
 
+        def _mle_decimal_context():
+            # Appendix B.4: precision 65 (MySQL's largest DECIMAL), Python's other defaults;
+            # again at every RESET.
+            _decimal.DefaultContext.prec = 65
+            _decimal.setcontext(_decimal.Context(
+                prec=65, rounding=_decimal.ROUND_HALF_EVEN, Emin=-999999, Emax=999999, capitals=1,
+                clamp=0, flags=[], traps=[_decimal.InvalidOperation, _decimal.DivisionByZero,
+                                          _decimal.Overflow]))
+        _mle_decimal_context()
+
+        def _mle_decimal_call(fn, args, results, tuple_form):
+            # A routine's DECIMAL arguments come as text and become Decimal here; a Decimal for a
+            # DECIMAL result (results: its positions in the (result, *parameters) tuple, or [0])
+            # goes back as text. GraalPy's Decimal costs more to cross to the host than its text.
+            D = _decimal.Decimal
+            args, results = tuple(args), tuple(results)
+            def call(*a):
+                if args:
+                    a = list(a)
+                    for i in args:
+                        if a[i] is not None:
+                            a[i] = D(a[i])
+                r = fn(*a)
+                if tuple_form:
+                    if results and isinstance(r, (tuple, list)):
+                        r = list(r)
+                        for i in results:
+                            if i < len(r) and isinstance(r[i], D):
+                                r[i] = str(r[i])
+                elif results and isinstance(r, D):
+                    r = str(r)
+                return r
+            return call
+
         # Phase 7: routines cannot start threads (deterministic KILL and memory accounting).
         import _thread as _mle_thread_mod, threading as _mle_threading, types as _mle_types_mod
         def _mle_no_threads(*args, **kwargs):
@@ -1029,6 +1065,8 @@ final class Polyglot {
             'decimal': lambda s: _decimal.Decimal(s),
             'bigint': lambda s: int(s),
             'str': lambda v: str(v),
+            'decimal_context': _mle_decimal_context,
+            'decimal_call': _mle_decimal_call,
             'toJson': lambda v: _json.dumps(v, separators=(',', ':')),
             'toBytes': _to_bytes,
             'toVector': _to_vector,
@@ -1126,7 +1164,7 @@ final class Polyglot {
       // of the frames (Python).
       throw new JavaRoutines.CompileException(describe(e, false));
     }
-    routines.put(id, new Routine(language, fn, new Value[0], ret, new Values.ParamType[0], new int[0], null,
+    routines.put(id, new Routine(language, fn, fn, new Value[0], ret, new Values.ParamType[0], new int[0], null,
         List.of()));
   }
 
@@ -1469,6 +1507,8 @@ final class Polyglot {
   }
 
   void reset() {
+    // Appendix B.4/B.6: the decimal context guest code may have changed does not reach the next session.
+    if (python != null) pythonHelper0(context, "decimal_context").execute();
     routines.clear();
     prefixes.clear();
     pythonSources.clear();
@@ -1532,7 +1572,25 @@ final class Polyglot {
     Value[] converters = new Value[params.size()];
     if (jsRoutine == null)
       for (int i = 0; i < converters.length; i++) converters[i] = converter(h, types[i].tag(), language);
-    routines.put(id, new Routine(language, fn, converters, ret, types, outs, jsRoutine, imports));
+    Value call = language.equals("python") ? decimalCall(c, fn, types, ret, outs) : fn;
+    routines.put(id, new Routine(language, fn, call, converters, ret, types, outs, jsRoutine, imports));
+  }
+
+  /**
+   * A Python routine with DECIMAL parameters or a DECIMAL result, wrapped so that those cross as
+   * text (decimal_call): in GraalPy 25.6 a Decimal passed to or from the host costs several times
+   * its text, while Decimal(text) and str() inside Python are cheap. Others: fn itself.
+   */
+  private static Value decimalCall(Context c, Value fn, Values.ParamType[] types, Values.ParamType ret, int[] outs) {
+    int[] args = java.util.stream.IntStream.range(0, types.length)
+        .filter(i -> types[i].tag() == Wire.T_DECIMAL).toArray();
+    java.util.stream.IntStream.Builder results = java.util.stream.IntStream.builder();
+    if (ret != null && ret.tag() == Wire.T_DECIMAL) results.add(0);
+    for (int i : outs)
+      if (types[i].tag() == Wire.T_DECIMAL) results.add(i + 1);
+    int[] r = results.build().toArray();
+    if (args.length == 0 && r.length == 0) return fn;
+    return pythonHelper0(c, "decimal_call").execute(fn, args, r, outs.length > 0);
   }
 
   /**
@@ -1550,7 +1608,8 @@ final class Polyglot {
       case Wire.T_DATE -> python ? null : h.date();
       case Wire.T_DATETIME, Wire.T_TIMESTAMP -> python ? null : h.datetime();
       case Wire.T_TIME -> h.time();
-      case Wire.T_DECIMAL -> h.decimal();
+      // Python's is made inside the routine's wrapper (decimalCall).
+      case Wire.T_DECIMAL -> python ? null : h.decimal();
       // BIGINT UNSIGNED beyond 2^63 comes as a string (hostForm): Python makes it an int.
       case Wire.T_U64 -> python ? h.bigint() : null;
       case Wire.T_I64 -> null;
@@ -1596,7 +1655,7 @@ final class Polyglot {
     if (r.language().equals("python"))
       for (LibraryFileSystem.Import i : r.imports())
         pySql.bind.execute(r.fn(), i.binding(), libraryModule(i.schema(), i.name()));
-    Value result = r.fn().execute(args);
+    Value result = r.call().execute(args);
     Helpers h = helpers(r.language());
     if (r.outs().length > 0) {
       // Python body form: (result, parameter 1, ...)

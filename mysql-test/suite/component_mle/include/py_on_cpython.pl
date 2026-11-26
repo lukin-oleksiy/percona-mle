@@ -18,6 +18,7 @@ our @KNOWN = (
   # The words of a conversion error.
   ['py_spec_mvp', qr/MLE-Type> TIMESTAMP value out of range: 1965-03-01T12:00:00Z/,
    'MLE-Type> value 1965-03-01 12:00:00+00:00 is out of range for TIMESTAMP'],
+  ['py_decimal', qr/cannot convert 'NaN' to DECIMAL/, 'cannot convert Decimal to DECIMAL'],
 );
 
 sub py_on_cpython {

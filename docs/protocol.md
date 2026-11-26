@@ -2346,6 +2346,17 @@ SQL results; routine arguments are always `Decimal`. Java: DATE `LocalDate`, TIM
 DATETIME `LocalDateTime`, TIMESTAMP `Instant`, DECIMAL
 `BigDecimal`; a zero date or the zero timestamp is a conversion error.
 
+Python's `decimal` context: before the first routine and again at every
+RESET, a Python worker gives the thread that runs routines a new context
+of precision 65 (MySQL's largest DECIMAL precision) with Python's other
+defaults (`ROUND_HALF_EVEN`, the default traps, no flags), and sets the
+precision of `decimal.DefaultContext`, from which threads that guest code
+starts take theirs, to 65. Arithmetic on DECIMAL values then keeps their
+digits; Python's own default precision is 28. Conversions are exact under
+any context: a DECIMAL becomes a `Decimal` of its text, and a `Decimal`
+goes back by its digits. Guest code may change the context; its change
+lasts until RESET.
+
 ### B.5 Errors a worker raises itself
 
 A value guest code gives that has no wire form (NaN as a parameter, a
@@ -2367,6 +2378,9 @@ Limits of the language (§9.4):
 |---|---|
 | `jvm`, `v8` | JavaScript `globalThis`; loaded libraries |
 | `jvm`, `cpython` | Python modules already imported |
+
+Not kept: the Python `decimal` context of the thread that runs routines
+and the precision of `decimal.DefaultContext` (B.4).
 
 ### B.7 JavaScript: choices where Oracle's documentation is silent
 

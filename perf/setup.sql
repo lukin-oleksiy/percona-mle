@@ -316,6 +316,8 @@ INSERT INTO cases (name, stmt, warm, reps) VALUES
   ('types_java',  'SELECT SUM(java_types(i, d, s, dt, tm, b, j)) INTO @x FROM mix', 5, 9),
   ('ret_js',      'SELECT SUM(js_dec(d)), MAX(js_time(tm)), MAX(js_str(s)) INTO @x, @y, @z FROM mix', 5, 9),
   ('ret_py',      'SELECT SUM(py_dec(d)), MAX(py_time(tm)), MAX(py_str(s)) INTO @x, @y, @z FROM mix', 5, 9),
+  ('rdec_py',     'SELECT SUM(py_dec(d)) INTO @x FROM mix', 5, 9),
+  ('rdec_js',     'SELECT SUM(js_dec(d)) INTO @x FROM mix', 5, 9),
   ('ret_java',    'SELECT SUM(java_dec(d)), MAX(java_time(tm)), MAX(java_str(s)) INTO @x, @y, @z FROM mix', 5, 9),
   ('lib_js',      'SELECT SUM(js_lib(n)) INTO @x FROM t WHERE n <= 200000', 3, 9),
   ('lib_py',      'SELECT SUM(py_lib(n)) INTO @x FROM t WHERE n <= 200000', 3, 9),

@@ -1,0 +1,79 @@
+#
+# component_mle: Python's DECIMAL (docs/protocol.md Appendix B.4, B.6). The
+# decimal context has precision 65, restored at RESET; the JVM worker passes a
+# routine's DECIMAL values as text and makes the Decimal inside Python (exp
+# note 67). Also run on the CPython worker (cpython_py_decimal.test).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_CPYTHON_ROUTINE ON *.* TO root@localhost;
+#
+# Precision 65: the sum of two DECIMAL(65,30) values keeps all their digits
+# (Python's own default, 28, rounds it).
+#
+SELECT py_dec_add(12345678901234567890123456789012345.123456789012345678901234567890,
+0.000000000000000000000000000001) AS sum65;
+sum65
+12345678901234567890123456789012345.123456789012345678901234567891
+SELECT py_dec_ctx() AS context;
+context
+65 ROUND_HALF_EVEN -999999 999999 1 0 ['DivisionByZero', 'InvalidOperation', 'Overflow'] [] | default 65
+#
+# A routine's DECIMAL values: arguments are Decimal (NULL is None), a
+# Decimal result goes back exactly, other results as before.
+#
+SELECT py_dec_args(12.50, 3, 'x', -0.000001) AS args;
+args
+Decimal:Decimal('12.50') int:3 str:'x' Decimal:Decimal('-0.000001')
+SET @a = 41.5;
+CALL py_dec_inout(@a, @b, @t, @n);
+SELECT @a, @b, @t, @n;
+@a	@b	@t	@n
+42.500000	83.000000	Decimal	3
+SELECT py_dec_ret_int(), py_dec_ret_str(), py_dec_ret_float(), py_dec_ret_round(2.345678) AS rounded;
+py_dec_ret_int()	py_dec_ret_str()	py_dec_ret_float()	rounded
+7.00	1.25	1.50	2.35
+Warnings:
+Note	1265	Data truncated for column 'rounded' at row 1
+SELECT py_dec_null(NULL), py_dec_double(2.25), py_dec_text(-3.10);
+py_dec_null(NULL)	py_dec_double(2.25)	py_dec_text(-3.10)
+NULL	2.25	-3.10
+SELECT py_dec_nan();
+ERROR HY000: MLE-Type> cannot convert Decimal to DECIMAL in 'py_dec_nan()'
+SELECT py_dec_error(1.5);
+ERROR HY000: Python> ValueError: bad 1.50 (py_dec_error, line 3)
+#
+# Guest code may change the context; the change lasts in the session ...
+#
+SELECT py_dec_lower(5) AS lowered;
+lowered
+5
+SELECT py_dec_ctx() AS context;
+context
+5 ROUND_DOWN -999999 999999 1 0 ['DivisionByZero', 'InvalidOperation', 'Overflow'] [] | default 5
+SELECT py_dec_add(1.000001, 2) AS sum5;
+sum5
+3.000000000000000000000000000000
+#
+# ... but not past RESET: the next session gets the same worker with
+# precision 65 again.
+#
+SELECT py_dec_ctx() AS context;
+context
+65 ROUND_HALF_EVEN -999999 999999 1 0 ['DivisionByZero', 'InvalidOperation', 'Overflow'] [] | default 65
+same worker process: 1
+DROP FUNCTION py_dec_add;
+DROP FUNCTION py_dec_ctx;
+DROP FUNCTION py_dec_lower;
+DROP FUNCTION py_dec_args;
+DROP PROCEDURE py_dec_inout;
+DROP FUNCTION py_dec_ret_int;
+DROP FUNCTION py_dec_ret_str;
+DROP FUNCTION py_dec_ret_float;
+DROP FUNCTION py_dec_ret_round;
+DROP FUNCTION py_dec_null;
+DROP FUNCTION py_dec_nan;
+DROP FUNCTION py_dec_error;
+DROP FUNCTION py_dec_double;
+DROP FUNCTION py_dec_text;
+REVOKE CREATE_CPYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
