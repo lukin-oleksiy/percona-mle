@@ -496,6 +496,11 @@ final class Polyglot {
     }
   }
 
+  /**
+   * The polyglot context: engine and context, shared by every language (exp note 68). JavaScript is
+   * set up on its first use (jsContext): a worker that runs only Java or Python does not pay for
+   * GraalJS.
+   */
   Context context() {
     if (context == null) {
       Context c = builder(console).build();
@@ -504,34 +509,42 @@ final class Polyglot {
       c.enter();
       // The static side of com.percona.mle.api.Mle (Mle.context(), Mle.session()) in JS and Python.
       mleApi = c.asValue(com.percona.mle.api.Mle.class).getMember("static");
-      if (JS) c.getBindings("js").putMember("Mle", mleApi);
       c.getPolyglotBindings().putMember("Mle", mleApi);
-      if (JS) {
-        js = jsHelpers(c);
-        jsOracle = JsOracle.helpers(c);
-        jsOracle.putMember("datesBridge", (org.graalvm.polyglot.proxy.ProxyExecutable) a -> dateMethods(c, a));
-        // USING in JavaScript routines (Phase 6): $c.lib(...) gets every library's module.
-        jsOracle.putMember("libBridge",
-            (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString()));
-        // importPython('numpy'): Python modules from JavaScript.
-        c.getBindings("js").putMember("importPython",
-            (org.graalvm.polyglot.proxy.ProxyExecutable) a -> importPython(a[0].asString()));
-        // The SQL API (Phase 5): the globals session, mysql and SqlError. Python's are made
-        // with Python's helpers, on first use (GraalPy costs ~150 MB: JS-only workers skip it).
-        new JsSql(c, options);
-        // Oracle: console.clear() clears the session's stdout and stderr.
-        if (console != null) {
-          Value clear = c.asValue((org.graalvm.polyglot.proxy.ProxyExecutable) a -> {
-            console.clear();
-            return null;
-          });
-          c.eval("js", "(f) => { console.clear = () => { f(); }; }").execute(clear);
-        }
-      }
       context = c;
       applyOptions();
     }
     return context;
+  }
+
+  /** The context with JavaScript set up: MLE's globals, helpers and Oracle's API, once. */
+  Context jsContext() {
+    Context c = context();
+    if (JS && js == null) {
+      c.getBindings("js").putMember("Mle", mleApi);
+      Helpers h = jsHelpers(c);
+      jsOracle = JsOracle.helpers(c);
+      jsOracle.putMember("datesBridge", (org.graalvm.polyglot.proxy.ProxyExecutable) a -> dateMethods(c, a));
+      // USING in JavaScript routines (Phase 6): $c.lib(...) gets every library's module.
+      jsOracle.putMember("libBridge",
+          (org.graalvm.polyglot.proxy.ProxyExecutable) a -> libraryModule(a[0].asString(), a[1].asString()));
+      // importPython('numpy'): Python modules from JavaScript.
+      c.getBindings("js").putMember("importPython",
+          (org.graalvm.polyglot.proxy.ProxyExecutable) a -> importPython(a[0].asString()));
+      // The SQL API (Phase 5): the globals session, mysql and SqlError. Python's are made
+      // with Python's helpers, on first use (GraalPy costs ~150 MB: JS-only workers skip it).
+      new JsSql(c, options);
+      // Oracle: console.clear() clears the session's stdout and stderr.
+      if (console != null) {
+        Value clear = c.asValue((org.graalvm.polyglot.proxy.ProxyExecutable) a -> {
+          console.clear();
+          return null;
+        });
+        c.eval("js", "(f) => { console.clear = () => { f(); }; }").execute(clear);
+      }
+      js = h;
+      applyOptions();
+    }
+    return c;
   }
 
   /**
@@ -571,7 +584,13 @@ final class Polyglot {
       b.option("python.PosixModuleBackend", "java")
           .option("python.DontWriteBytecodeFlag", "true")
           .option("python.NoUserSiteFlag", "true")
-          .option("python.WarnExperimentalFeatures", "false");
+          .option("python.WarnExperimentalFeatures", "false")
+          // GraalPy's background GC task ("Python GC": System.gc() when the RSS grows past 4 GB):
+          // off. MemoryWatch does this job within the worker's limit, and its thread, which enters
+          // the context, kept a worker that started Python first from setting JavaScript up later
+          // ("multi threaded access ... not allowed for js": GraalJS is single-threaded) and was
+          // taken by ThreadWatch for a routine's (exp note 68).
+          .option("python.BackgroundGCTask", "false");
     // Third-party packages installed by the DBA (14 §3): npm packages for require() and
     // import of bare names (CommonJS support is an experimental GraalJS option), Python
     // packages on the module path.
@@ -654,6 +673,17 @@ final class Polyglot {
                 clamp=0, flags=[], traps=[_decimal.InvalidOperation, _decimal.DivisionByZero,
                                           _decimal.Overflow]))
         _mle_decimal_context()
+
+        # JavaScript is set up on its first use (exp note 68). A routine's own polyglot.eval
+        # gets MLE's globals (session, Mle, importPython) as a JavaScript routine does: the
+        # first call sets JavaScript up, then the original takes its place.
+        import polyglot as _mle_polyglot
+        _mle_polyglot_eval = _mle_polyglot.eval
+        def _mle_polyglot_eval_first(*args, **kwargs):
+            _mle_polyglot.eval = _mle_polyglot_eval
+            _mle_helpers['js_ready']()
+            return _mle_polyglot_eval(*args, **kwargs)
+        _mle_polyglot.eval = _mle_polyglot_eval_first
 
         def _mle_decimal_call(fn, args, results, tuple_form):
             # A routine's DECIMAL arguments come as text and become Decimal here; a Decimal for a
@@ -1135,7 +1165,7 @@ final class Polyglot {
    */
   void prepareEval(long id, String language, String code, Values.ParamType ret)
       throws JavaRoutines.CompileException {
-    Context c = context();
+    Context c = language.equals("js") ? jsContext() : context();
     Value fn;
     try {
       if (language.equals("js")) {
@@ -1235,7 +1265,7 @@ final class Polyglot {
     Source s = Source.newBuilder("js", "import * as ns from " + JsOracle.jsString(specifier) + ";export default ns;",
             "mle-import-" + (++moduleWrappers) + ".mjs")
         .mimeType("application/javascript+module").buildLiteral();
-    return context().eval(s).getMember("default");
+    return jsContext().eval(s).getMember("default");
   }
 
   private final Map<String, Object[]> javaLibraries = new HashMap<>();
@@ -1323,7 +1353,7 @@ final class Polyglot {
 
   private Value jsBulk() {
     if (jsBulk == null)
-      jsBulk = context().eval("js", """
+      jsBulk = jsContext().eval("js", """
           (() => {
             const typed = [[Float32Array, 'float32'], [Float64Array, 'float64'], [Int8Array, 'int8'],
               [Int16Array, 'int16'], [Int32Array, 'int32'], [Uint8Array, 'uint8'], [Uint16Array, 'uint16'],
@@ -1408,7 +1438,7 @@ final class Polyglot {
    * CommonJS, else import() of an ES module.
    */
   Value importJs(String name) {
-    Context c = context();
+    Context c = jsContext();
     // An ES module (or no such CommonJS module) goes to import(); a CommonJS module's own failure
     // while it loads is the routine's to see.
     Value required = c.eval("js", """
@@ -1449,6 +1479,12 @@ final class Polyglot {
     Helpers h = pythonHelpers(c);
     c.getBindings("python").getMember("_mle_helpers").putHashEntry("bulk",
         (org.graalvm.polyglot.proxy.ProxyExecutable) a -> bulkArray(a[0]));
+    // polyglot.eval's first call (above): JavaScript with MLE's globals.
+    c.getBindings("python").getMember("_mle_helpers").putHashEntry("js_ready",
+        (org.graalvm.polyglot.proxy.ProxyExecutable) a -> {
+          jsContext();
+          return null;
+        });
     // Python's rows take row['label'] (exp note 41): a Python class registered for their proxy class.
     pythonHelper0(c, "register_row").execute(c.asValue(GuestSql.GPyRow.class).getMember("static"));
     pySql = new PySql(c, options, a -> libraryModule(a[0].asString(), a[1].asString()),
@@ -1458,7 +1494,10 @@ final class Polyglot {
   }
 
   private Helpers helpers(String language) {
-    if (language.equals("js")) return js;
+    if (language.equals("js")) {
+      jsContext();
+      return js;
+    }
     pythonReady();
     return python;
   }
@@ -1910,7 +1949,7 @@ final class Polyglot {
    * "SyntaxError: name:line:col message") or null.
    */
   String parseLibrary(String language, String name, String body) {
-    Context c = context();
+    Context c = language.equals("js") ? jsContext() : context();
     try {
       switch (language) {
         case "js" -> c.parse(Source.newBuilder("js", body, name).mimeType("application/javascript+module")

@@ -299,11 +299,14 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   options.malloc_mmap_threshold = s.malloc_mmap_threshold;
   options.pool_size = s.pool_size;
   options.vector_threads = s.vector_threads;
-  // Pool workers start Java (javac) and JavaScript, which are cheap; GraalPy
-  // (and numpy) only when mle.pool_prewarm asks (15 §1: Python starts lazily
-  // by default, for memory); "vectors" warms the vector helper up after READY
-  // while the worker is idle (exp note 35). The CPython worker reads "numpy".
-  options.prewarm = s.pool_prewarm == "none" ? "java,js" : "java,js," + s.pool_prewarm;
+  // JVM workers start Java (javac) and the polyglot engine and context, which
+  // every language shares; JavaScript (js), GraalPy (python) and numpy only
+  // when mle.pool_prewarm asks: otherwise on their first use (15 §1, exp note
+  // 68: JavaScript set up in every worker cost a Java worker 13 % of its
+  // memory and 19 % of its start). "vectors" warms the vector helper up after
+  // READY while the worker is idle (exp note 35). The CPython worker reads
+  // "numpy".
+  options.prewarm = s.pool_prewarm == "none" ? "java,context" : "java,context," + s.pool_prewarm;
   if (!server_private_paths(&options.hidden_paths))
     return fail(
         "cannot read mysqld's plugin_dir and datadir (hidden from routines); "

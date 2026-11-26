@@ -1,0 +1,63 @@
+#
+# component_mle: a JVM worker sets JavaScript up on its first use (exp note
+# 68): pool workers make the polyglot engine and context, and JavaScript
+# only when mle.pool_prewarm lists js. Every way in to JavaScript gets MLE's
+# globals, and a worker whose first language is Python is kept.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+SELECT @@mle.pool_prewarm;
+@@mle.pool_prewarm
+vectors
+# Every session from a fresh pool worker: none set JavaScript up yet.
+SET GLOBAL mle.worker_cache_size = 0;
+#
+# Python first, with numpy (GraalPy's C API): the worker stays the
+# session's across more than the 5 s between its checks for threads a
+# routine left. GraalPy's background GC task (a thread of its own, which it
+# starts only while JavaScript is not set up) is off.
+#
+SELECT py_np() AS first;
+first
+3
+SELECT SLEEP(6) AS waited;
+waited
+0
+SELECT py_np() AS second;
+second
+3
+SELECT py_np() AS third;
+third
+3
+same worker: 1
+# Java's Mle.context() sets JavaScript up with MLE's globals.
+CALL java_js(@r);
+SELECT @r AS java;
+java
+object,object,function
+#
+# Python's own polyglot.eval, first in its worker, gets MLE's globals too;
+# then a JavaScript routine in the same worker.
+#
+SELECT py_np() AS python_first;
+python_first
+3
+SELECT py_js() AS python;
+python
+object,object,function
+SELECT js_session() AS javascript;
+javascript
+object,object,function
+#
+# A JavaScript routine first, in a worker of its own.
+#
+SELECT js_session() AS javascript;
+javascript
+object,object,function
+SET GLOBAL mle.worker_cache_size = DEFAULT;
+DROP FUNCTION py_np;
+DROP FUNCTION py_js;
+DROP PROCEDURE java_js;
+DROP FUNCTION js_session;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

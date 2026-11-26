@@ -1,0 +1,82 @@
+--echo #
+--echo # component_mle: a JVM worker sets JavaScript up on its first use (exp note
+--echo # 68): pool workers make the polyglot engine and context, and JavaScript
+--echo # only when mle.pool_prewarm lists js. Every way in to JavaScript gets MLE's
+--echo # globals, and a worker whose first language is Python is kept.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+SELECT @@mle.pool_prewarm;
+--echo # Every session from a fresh pool worker: none set JavaScript up yet.
+SET GLOBAL mle.worker_cache_size = 0;
+
+# Through the client: mysqltest takes the indentation off the lines of a body.
+--write_file $MYSQLTEST_VARDIR/tmp/lazy_js.sql
+CREATE FUNCTION py_np() RETURNS INT LANGUAGE PYTHON AS $$
+    import numpy
+    return int(numpy.ones(3).sum())
+$$;
+CREATE FUNCTION py_js() RETURNS VARCHAR(100) LANGUAGE PYTHON AS $$
+    import polyglot
+    return polyglot.eval(language='js', string='[typeof session, typeof Mle, typeof importPython].join()')
+$$;
+CREATE PROCEDURE java_js(OUT r TEXT) LANGUAGE JAVA AS $$
+  r[0] = Mle.context().eval("js", "[typeof session, typeof Mle, typeof importPython].join()").asString();
+$$;
+CREATE FUNCTION js_session() RETURNS VARCHAR(100) LANGUAGE JAVASCRIPT AS $$
+  return [typeof session, typeof Mle, typeof importPython].join()
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/lazy_js.sql
+--remove_file $MYSQLTEST_VARDIR/tmp/lazy_js.sql
+
+--echo #
+--echo # Python first, with numpy (GraalPy's C API): the worker stays the
+--echo # session's across more than the 5 s between its checks for threads a
+--echo # routine left. GraalPy's background GC task (a thread of its own, which it
+--echo # starts only while JavaScript is not set up) is off.
+--echo #
+--connect (con1, localhost, root,,test)
+SELECT py_np() AS first;
+let $pid1 = `SELECT mle_debug_worker_pid('jvm')`;
+SELECT SLEEP(6) AS waited;
+SELECT py_np() AS second;
+SELECT py_np() AS third;
+let $pid2 = `SELECT mle_debug_worker_pid('jvm')`;
+let $same = `SELECT $pid1 = $pid2`;
+--echo same worker: $same
+--echo # Java's Mle.context() sets JavaScript up with MLE's globals.
+CALL java_js(@r);
+SELECT @r AS java;
+--disconnect con1
+
+--echo #
+--echo # Python's own polyglot.eval, first in its worker, gets MLE's globals too;
+--echo # then a JavaScript routine in the same worker.
+--echo #
+--connect (con2, localhost, root,,test)
+SELECT py_np() AS python_first;
+SELECT py_js() AS python;
+SELECT js_session() AS javascript;
+--disconnect con2
+
+--echo #
+--echo # A JavaScript routine first, in a worker of its own.
+--echo #
+--connect (con3, localhost, root,,test)
+SELECT js_session() AS javascript;
+--disconnect con3
+
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.worker_cache_size = DEFAULT;
+DROP FUNCTION py_np;
+DROP FUNCTION py_js;
+DROP PROCEDURE java_js;
+DROP FUNCTION js_session;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

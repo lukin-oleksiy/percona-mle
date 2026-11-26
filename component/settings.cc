@@ -37,6 +37,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <iterator>
 #include <thread>
 #include <string>
 
@@ -224,8 +225,8 @@ int check_languages(MYSQL_THD, SYS_VAR *, void *save,
   return 0;
 }
 
-/** mle.pool_prewarm: none, or a list of python, numpy and vectors; shapes
-    workers (refused while a session holds one). */
+/** mle.pool_prewarm: none, or a list of js, python, numpy and vectors;
+    shapes workers (refused while a session holds one). */
 int check_prewarm(MYSQL_THD thd, SYS_VAR *, void *save, struct st_mysql_value *value) {
   int length = 0;
   const char *s = value->val_str(value, nullptr, &length);
@@ -498,7 +499,9 @@ bool register_settings() {
   pool_prewarm.def_val = const_cast<char *>(kPoolPrewarm);
   if (reg("pool_prewarm", PLUGIN_VAR_STR,
           "What pool workers prepare before a session needs them: none, or a "
-          "comma list of python (GraalPy started, ~1-5 s and ~195 MB per idle "
+          "comma list of js (JavaScript set up, ~150 ms and ~20 MB per worker; "
+          "without it, a worker sets JavaScript up on its first JavaScript "
+          "call), python (GraalPy started, ~1-5 s and ~195 MB per idle "
           "worker), numpy (Python and numpy) and vectors (the vector helper's "
           "kernels compiled, ~0.6 s and ~2 CPU-seconds per worker, while it "
           "waits in the pool). Can be changed while no session holds a "
@@ -831,8 +834,9 @@ bool parse_languages(std::string_view text, unsigned *bits) {
 }
 
 bool parse_prewarm(std::string_view text, std::string *normalized) {
-  static constexpr const char *kItems[] = {"python", "numpy", "vectors"};
-  bool seen[3] = {false, false, false};
+  static constexpr const char *kItems[] = {"js", "python", "numpy", "vectors"};
+  constexpr size_t kCount = std::size(kItems);
+  bool seen[kCount] = {};
   bool none = false;
   int items = 0;
   while (true) {
@@ -846,7 +850,7 @@ bool parse_prewarm(std::string_view text, std::string *normalized) {
     if (lower == "none") {
       none = known = true;
     } else {
-      for (size_t i = 0; i < 3; i++)
+      for (size_t i = 0; i < kCount; i++)
         if (lower == kItems[i]) seen[i] = known = true;
     }
     if (!known) return false;
@@ -856,7 +860,7 @@ bool parse_prewarm(std::string_view text, std::string *normalized) {
   }
   if (none && items > 1) return false;  // none alone
   normalized->clear();
-  for (size_t i = 0; i < 3; i++) {
+  for (size_t i = 0; i < kCount; i++) {
     if (!seen[i]) continue;
     if (!normalized->empty()) *normalized += ",";
     *normalized += kItems[i];

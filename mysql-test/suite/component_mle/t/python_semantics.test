@@ -210,8 +210,8 @@ SELECT @r;
 DROP PROCEDURE py_row_vecs;
 SET GLOBAL mle.sql_chunk_rows = DEFAULT;
 
---echo # 5. mle.pool_prewarm: none, or a list of python, numpy and vectors (a DBA
---echo # choice).
+--echo # 5. mle.pool_prewarm: none, or a list of js, python, numpy and vectors (a
+--echo # DBA choice).
 SELECT @@mle.pool_prewarm;
 --error ER_WRONG_VALUE_FOR_VAR,ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
 SET GLOBAL mle.pool_prewarm = 'ruby';
@@ -231,6 +231,11 @@ SELECT @@mle.pool_prewarm;
 --let $mle_pool = 2
 --source ../include/wait_for_pool.inc
 SET GLOBAL mle.pool_prewarm = 'Numpy , VECTORS';
+SELECT @@mle.pool_prewarm;
+--let $mle_pool = 2
+--source ../include/wait_for_pool.inc
+--echo # js: JavaScript set up before a session needs it (else on its first use).
+SET GLOBAL mle.pool_prewarm = 'VECTORS, Js';
 SELECT @@mle.pool_prewarm;
 --let $mle_pool = 2
 --source ../include/wait_for_pool.inc

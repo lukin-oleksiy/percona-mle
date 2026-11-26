@@ -52,7 +52,10 @@ public final class Main {
       try {
         String prewarm = System.getProperty("mle.prewarm", "");
         if (prewarm.contains("java")) java.prewarm();
-        if (prewarm.contains("js") && Polyglot.JS) polyglot.context().eval("js", "1");
+        // js: the context with JavaScript set up; context: the shared engine and context only, each
+        // language set up on its first use (exp note 68).
+        if (prewarm.contains("js") && Polyglot.JS) polyglot.jsContext().eval("js", "1");
+        else if (prewarm.contains("context")) polyglot.context();
         // mle.pool_prewarm (15 §2): python, or numpy (Python and numpy).
         if (prewarm.contains("python") || prewarm.contains("numpy")) polyglot.prewarmPython(prewarm.contains("numpy"));
         // Starting leaves garbage and a grown heap; a worker often waits in the pool, so give

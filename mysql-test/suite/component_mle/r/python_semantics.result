@@ -111,8 +111,8 @@ row 1 again: ndarray float32 True [42.0, 0.0, 0.0]
 prepared: [0.9, 0.1, 0.0] / [0.0, 0.0, 1.0] / [0.0, 0.2, 0.9]
 DROP PROCEDURE py_row_vecs;
 SET GLOBAL mle.sql_chunk_rows = DEFAULT;
-# 5. mle.pool_prewarm: none, or a list of python, numpy and vectors (a DBA
-# choice).
+# 5. mle.pool_prewarm: none, or a list of js, python, numpy and vectors (a
+# DBA choice).
 SELECT @@mle.pool_prewarm;
 @@mle.pool_prewarm
 vectors
@@ -134,6 +134,11 @@ SET GLOBAL mle.pool_prewarm = 'Numpy , VECTORS';
 SELECT @@mle.pool_prewarm;
 @@mle.pool_prewarm
 Numpy , VECTORS
+# js: JavaScript set up before a session needs it (else on its first use).
+SET GLOBAL mle.pool_prewarm = 'VECTORS, Js';
+SELECT @@mle.pool_prewarm;
+@@mle.pool_prewarm
+VECTORS, Js
 SET GLOBAL mle.pool_prewarm = DEFAULT;
 DROP FUNCTION py_counter;
 DROP FUNCTION py_lib_counter;

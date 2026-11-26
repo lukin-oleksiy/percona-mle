@@ -137,6 +137,7 @@ public final class SqlBridge {
   public static org.graalvm.polyglot.Context context() {
     Dispatcher d = dispatcher;
     if (d == null) throw new IllegalStateException("MLE worker not running");
-    return d.polyglot().context();
+    // Guest code may run JavaScript through it (Mle.context().eval("js", ...)): with MLE's globals.
+    return d.polyglot().jsContext();
   }
 }
