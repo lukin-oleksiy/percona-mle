@@ -79,8 +79,9 @@ session that uses two kinds holds two workers. Each kind has its own pool and li
 
 **The CPython worker** (`-DMLE_CPYTHON=ON`, the default when Python 3.12 or later with its headers is found,
 e.g. `python3-dev`): `mle_cpython_worker` embeds the distribution's CPython and runs `LANGUAGE CPYTHON`, with
-the same launcher, sandbox, protocol and SQL API (exp design note 62). A worker takes about 15 MB (PSS; 25 MB
-with numpy) instead of hundreds, starts in about 60 ms, and frees numpy memory at once. The build installs numpy
+the same launcher, sandbox, protocol and SQL API (exp design note 62). A worker takes 12–18 MB (PSS; 23–34 MB
+with numpy) instead of hundreds, answers a new connection's first call in about 75 ms, and frees numpy memory at
+once. The build installs numpy
 (`MLE_CPYTHON_NUMPY`, default `numpy==2.4.4`) from PyPI into `cpython/site-packages`. In a build tree the
 worker's Python code (`worker/cpython/python`) is linked, not copied: an edit needs no build, the next worker
 reads it. Not on CPython: Java and JavaScript routines, cross-language libraries and the GraalVM-only helpers
