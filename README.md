@@ -130,7 +130,7 @@ stored procedure (about 8 minutes); `perf/README.md` and `perf/e2e/README.md` sa
 **The run below:** 26 Nov 2026, full runs (not `--quick`), one run of each tool; the JSON with every measurement is
 in `perf/results/2026-11-26/`. A developer laptop, not a dedicated machine: HP ZBook Power G10 A, AMD Ryzen 9
 7940HS (8 cores, 16 threads), 64 GB, Ubuntu 26.04.1, kernel 7.0, CPU governor `performance`. Release builds
-(RelWithDebInfo): MLE `60d2a86` (component and workers as on `main`), Percona Server 26.7.0 with js_lang and the
+(RelWithDebInfo): MLE `3b5a8e2` (component and workers as on `main`), Percona Server 26.7.0 with js_lang and the
 language router. GraalVM CE 25.6.5.1 (JDK 25.0.5.1), GraalPy 25.6.5 (Python 3.13), CPython 3.14.4, numpy 2.4.4, libnode
 127. MLE defaults, except `mle.heap_max` 2 GB and `mle.memory_max` 4 GB in the end-to-end run. bench.py times
 statements in the server and reports the best of 5 runs after a warm-up; lower is better everywhere except requests
@@ -145,8 +145,8 @@ Python routines with DECIMAL values 13–36 % faster.
 
 | | SQL (PSM) | js_lang | V8 worker | GraalJS | GraalPy | CPython | Java |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `a + b` | 1.09 | 1.22 | 1.40 | 1.31 | 1.28 | 1.34 | 1.21 |
-| Levenshtein of two strings | 95.5 | 2.21 | 2.39 | 2.38 | 2.62 | 9.29 | 1.56 |
+| `a + b` | 1.06 | 1.21 | 1.34 | 1.27 | 1.25 | 1.31 | 1.20 |
+| Levenshtein of two strings | 91.1 | 2.19 | 2.41 | 2.40 | 2.70 | 8.77 | 1.51 |
 
 A call into a worker costs 0.1–0.3 µs more than an SQL stored function's, about what js_lang's V8 inside mysqld costs;
 per-row logic runs 10–60 times faster than in an SQL stored function.
@@ -155,47 +155,51 @@ JavaScript, one call (ms):
 
 | | js_lang | V8 worker | GraalJS |
 |---|---:|---:|---:|
-| `Math.sqrt(i) * Math.sin(i)`, 5,000,000 times | 219 | 225 | 124 |
-| make and sort 200,000 objects | 51.8 | 55.7 | 105 |
-| `JSON.stringify` 200,000 small objects, `JSON.parse` the array | 85.2 | 98.0 | 152 |
+| `Math.sqrt(i) * Math.sin(i)`, 5,000,000 times | 221 | 220 | 129 |
+| make and sort 200,000 objects | 52.0 | 57.4 | 100 |
+| `JSON.stringify` 200,000 small objects, `JSON.parse` the array | 82.9 | 91.8 | 132 |
 
 ### SQL from routines (bench.py)
 
 | | SQL (PSM) | V8 worker | GraalJS | GraalPy | CPython | Java |
 |---|---:|---:|---:|---:|---:|---:|
-| read 100,000 rows one by one (ms) | 94.4 | 30.7 | 24.3 | 26.8 | 35.9 | 19.9 |
-| a small statement (µs each) | | 6.54 | 5.82 | 6.74 | 10.3 | 5.96 |
-| `executeMany`, 1,000 rows (ms) | | 11.8 | 13.9 | 13.9 | 13.5 | 12.8 |
+| read 100,000 rows one by one (ms) | 93.0 | 29.8 | 24.6 | 26.6 | 35.5 | 19.3 |
+| a small statement (µs each) | | 6.59 | 5.81 | 6.66 | 10.3 | 5.97 |
+| `executeMany`, 1,000 rows (ms) | | 13.2 | 14.2 | 14.8 | 13.5 | 13.3 |
 
 ### Vectors (bench.py)
 
 | | ms |
 |---|---:|
-| 10 nearest of 100,000 `VECTOR(768)`: SQL, exact | 107 |
-| the same with an HNSW index (`M = 16`, default search settings; 5 of the exact 10 found) | 0.25 |
-| the same in GraalPy, numpy | 284 |
-| the same in CPython, numpy | 378 |
+| 10 nearest of 100,000 `VECTOR(768)`: SQL, exact | 102 |
+| the same with an HNSW index (`M = 16`, default search settings; 5 of the exact 10 found) | 0.30 |
+| the same in GraalPy, numpy | 279 |
+| the same in CPython, numpy | 370 |
 | the same in Java, the Vector API | 240 |
-| related items of 10,000 vectors (cosine), the built-in library from Java / JavaScript / Python | 216 / 215 / 219 |
-| the same, the library on one thread (`mle.vector_threads` is 4) | 800 |
-| the same in numpy, one BLAS thread: GraalPy / CPython | 2,102 / 1,922 |
+| related items of 10,000 vectors (cosine), the built-in library from Java / JavaScript / Python | 216 / 218 / 218 |
+| the same, the library on one thread (`mle.vector_threads` is 4) | 824 |
+| the same in numpy, one BLAS thread: GraalPy / CPython | 1,928 / 1,937 |
 
-A `VECTOR(768)` argument costs 4.5 µs per row in GraalPy and 3.8 µs in CPython.
+A `VECTOR(768)` argument costs 4.3 µs per row in GraalPy and 3.7 µs in CPython.
 
 ### A new connection's first call (bench.py)
 
-ms at the client, median of 7 new `mysql` processes; a plain connection with no routine takes 5.5 ms:
+ms at the client, median of 7 new `mysql` processes; a plain connection with no routine takes 6.6 ms:
 
 | | new worker (pool off) | worker from the pool |
 |---|---:|---:|
-| js_lang (in mysqld) | 6.4 | |
-| V8 worker | 30 | 8.7 |
-| CPython | 75 | 16 |
-| CPython, `import numpy` | 244 | 188 |
-| GraalJS | 737 | 18 |
-| Java | 773 | 50 |
-| GraalPy | 2,260 | 1,694 |
-| GraalPy, `import numpy` | 4,969 | 4,492 |
+| js_lang (in mysqld) | 6.6 | |
+| V8 worker | 32 | 8.9 |
+| CPython | 77 | 17 |
+| CPython, `import numpy` | 271 | 206 |
+| GraalJS | 753 | 177 |
+| Java | 689 | 55 |
+| GraalPy | 2,179 | 1,872 |
+| GraalPy, `import numpy` | 5,080 | 4,817 |
+
+A worker from the pool has the polyglot engine ready and sets JavaScript and GraalPy up on their first use, which
+keeps Java and Python workers smaller; `mle.pool_prewarm` sets them up in advance (`js`: GraalJS's first call in
+about 20 ms; `python`; `numpy`).
 
 ### Memory per worker (bench.py)
 
@@ -203,36 +207,36 @@ PSS in MiB per worker, one worker alone and each of eight at once (they share co
 
 | | one | each of eight |
 |---|---:|---:|
-| V8 worker | 41 | 10 |
+| V8 worker | 40 | 10 |
 | CPython | 18 | 12 |
 | CPython, numpy | 34 | 23 |
-| Java | 286 | 162 |
-| GraalJS | 334 | 211 |
-| GraalPy | 544 | 446 |
-| GraalPy, numpy | 658 | 528 |
+| Java | 268 | 145 |
+| GraalJS | 332 | 204 |
+| GraalPy | 542 | 423 |
+| GraalPy, numpy | 704 | 584 |
 
 js_lang costs 0.5 MiB per session inside mysqld. The JVM worker maps its AOT cache at the cache's own address
-(`-XX:ArchiveRelocationMode=0`); relocated, as the JDK does by default, each of eight GraalJS workers takes 281 MiB
-instead of 211, and GraalPy with numpy 622 instead of 528.
+(`-XX:ArchiveRelocationMode=0`); relocated, as the JDK does by default, each of eight GraalJS workers takes 275 MiB
+instead of 204, and GraalPy with numpy 637 instead of 584.
 
 ### An application against the same logic in MLE (e2e.py)
 
-Clients in a network namespace with 1 ms added delay (round trip 1.15 ms, an application server on a LAN); clients
+Clients in a network namespace with 1 ms added delay (round trip 1.14 ms, an application server on a LAN); clients
 and server on the same laptop. Median ms per request with one client (change against the application in the same
 language), and requests per second with several clients:
 
 | Case | Java app | `LANGUAGE JAVA` | Python app (numpy) | `LANGUAGE PYTHON` (GraalPy) | `LANGUAGE CPYTHON` |
 |---|---:|---:|---:|---:|---:|
-| `chatty`: 3 dependent queries, 200 HNSW candidates | 6.61 | 4.09 (−38 %) | 8.09 | 6.26 (−23 %) | 5.07 (−37 %) |
-| `mmr500`: re-rank 500 candidates with their vectors | 4.73 | 3.96 (−16 %) | 7.31 | 7.53 (+3 %) | 7.03 (−4 %) |
-| `rescore1000`: rescore 1,000 candidates | 5.52 | 4.78 (−13 %) | 6.41 | 7.36 (+15 %) | 7.19 (+12 %) |
-| `bulk`: ~5,000 vectors of a category | 26.2 | 17.3 (−34 %) | 40.2 | 20.9 (−48 %) | 25.7 (−36 %) |
-| `wb200`: read 200 rows, score, upsert, commit | 7.15 | 4.50 (−37 %) | 7.00 | 6.35 (−9 %) | 6.30 (−10 %) |
-| `wb1000`: the same with 1,000 rows | 14.0 | 10.4 (−26 %) | 18.1 | 14.1 (−22 %) | 14.8 (−18 %) |
-| `wbvec200`: write back 200 rows with a `VECTOR(768)` each | 15.4 | 10.8 (−30 %) | 26.2 | 14.0 (−47 %) | 15.0 (−43 %) |
-| `chatty`, 8 clients (req/s) | 1,231 | 1,665 | 922 | 796 | 1,295 |
-| `mmr500`, 8 clients (req/s) | 1,162 | 1,474 | 769 | 862 | 952 |
-| `wb200`, 4 clients (req/s) | 556 | 852 | 544 | 567 | 605 |
+| `chatty`: 3 dependent queries, 200 HNSW candidates | 6.87 | 4.02 (−41 %) | 8.32 | 6.67 (−20 %) | 5.57 (−33 %) |
+| `mmr500`: re-rank 500 candidates with their vectors | 4.97 | 4.11 (−17 %) | 7.82 | 7.85 (0 %) | 7.39 (−5 %) |
+| `rescore1000`: rescore 1,000 candidates | 5.76 | 5.08 (−12 %) | 6.94 | 7.72 (+11 %) | 7.45 (+7 %) |
+| `bulk`: ~5,000 vectors of a category | 28.4 | 18.0 (−37 %) | 44.7 | 22.0 (−51 %) | 26.7 (−40 %) |
+| `wb200`: read 200 rows, score, upsert, commit | 7.50 | 4.79 (−36 %) | 7.56 | 7.31 (−3 %) | 7.11 (−6 %) |
+| `wb1000`: the same with 1,000 rows | 15.1 | 11.0 (−28 %) | 20.1 | 15.2 (−24 %) | 15.8 (−21 %) |
+| `wbvec200`: write back 200 rows with a `VECTOR(768)` each | 16.2 | 12.9 (−20 %) | 28.7 | 15.1 (−48 %) | 16.7 (−42 %) |
+| `chatty`, 8 clients (req/s) | 1,194 | 1,593 | 895 | 870 | 1,226 |
+| `mmr500`, 8 clients (req/s) | 1,102 | 1,390 | 728 | 831 | 920 |
+| `wb200`, 4 clients (req/s) | 543 | 714 | 517 | 531 | 552 |
 
 MLE wins where the application needs several round trips or moves many rows; where one query brings all the data
 and the work is numpy's, the Python application is about as fast (`mmr500`) or faster (`rescore1000`).
