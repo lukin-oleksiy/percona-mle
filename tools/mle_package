@@ -57,7 +57,10 @@ from xml.sax.saxutils import escape
 
 # The MLE directory the tool is started from (the build layout links it).
 HERE = os.path.dirname(os.path.abspath(__file__))
-GRAALPY_WHEELS = "https://www.graalvm.org/python/wheels/"
+# GraalPy's prebuilt binary wheels: the extra index GraalPy's own pip uses by default since 25.6 (the old
+# https://www.graalvm.org/python/wheels/ is deprecated). As GraalPy does, none when PIP_INDEX_URL names the
+# index to use (a mirror, an offline index).
+GRAALPY_WHEELS = "https://gds.oracle.com/repositories/pypi/public-release/"
 
 
 def run(cmd, **kw):
@@ -204,7 +207,7 @@ def install_python(d, specs, args, language="python"):
         if language == "python":
             run([graalpy(args), "-m", "pip", "install", "--disable-pip-version-check",
                  *binary, "--target", stage, "--constraint", constraints,
-                 "--extra-index-url", GRAALPY_WHEELS,
+                 *([] if "PIP_INDEX_URL" in os.environ else ["--extra-index-url", GRAALPY_WHEELS]),
                  *specs])
         else:
             # The distribution's pip refuses to install for its Python (PEP 668):
