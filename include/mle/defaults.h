@@ -101,6 +101,9 @@ struct JvmClassOptions {
   /** Threads of the vector helper (com.percona.mle.api.Vectors, exp note
       33): at most this many per call, never more than the CPUs. */
   uint32_t vector_threads = 4;
+  /** A JVM worker with Python set up, idle this long between top-level
+      requests, runs a full GC and malloc_trim (exp note 68 §8); 0: never. */
+  uint32_t idle_trim_ms = 0;
   /** Truffle and C2 compiler threads. */
   int compiler_threads = 2;
   bool inherit_stderr = false;

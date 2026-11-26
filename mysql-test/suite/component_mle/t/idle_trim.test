@@ -1,0 +1,92 @@
+--echo #
+--echo # component_mle: mle.idle_trim_ms (exp note 68 §8). A JVM worker with
+--echo # Python set up, idle in its session for that long after a top-level
+--echo # request, gives memory back: a full GC and malloc_trim, once per idle
+--echo # period, counted in mle_worker_memory_gcs when the session releases the
+--echo # worker. A worker without Python (Java, JavaScript) is not trimmed: it
+--echo # gave nothing back.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+SELECT @@mle.idle_trim_ms;
+--error ER_WRONG_VALUE_FOR_VAR,ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
+SET GLOBAL mle.idle_trim_ms = 3600001;
+SET GLOBAL mle.idle_trim_ms = 300;
+SELECT @@mle.idle_trim_ms;
+--echo # Every session from a fresh worker: a kept one may have Python set up by
+--echo # an earlier session of the account (the CREATE below checks Python code).
+SET GLOBAL mle.worker_cache_size = 0;
+
+# Through the client: mysqltest takes the indentation off the lines of a body.
+--write_file $MYSQLTEST_VARDIR/tmp/idle_trim.sql
+CREATE FUNCTION py_one() RETURNS INT LANGUAGE PYTHON AS $$
+    return 1
+$$;
+CREATE FUNCTION java_one() RETURNS INT LANGUAGE JAVA AS $$ return 1; $$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/idle_trim.sql
+--remove_file $MYSQLTEST_VARDIR/tmp/idle_trim.sql
+
+--echo #
+--echo # Java only (no Python in the worker): idle periods, no trim.
+--echo #
+let $g0 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_worker_memory_gcs', Value, 1);
+--connect (con1, localhost, root,,test)
+SELECT java_one() AS one;
+SELECT SLEEP(1) AS idle;
+SELECT java_one() AS two;
+SELECT SLEEP(1) AS idle;
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+let $g1 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_worker_memory_gcs', Value, 1);
+--expr $java = $g1 - $g0
+--echo java-only trims: $java
+
+--echo #
+--echo # Python (started in the pool worker, so that the call itself grows no
+--echo # memory and the memory watcher forces nothing): one trim per idle period.
+--echo #
+SET GLOBAL mle.pool_prewarm = 'python,vectors';
+--let $mle_pool = 2
+--source ../include/wait_for_pool.inc
+--connect (con2, localhost, root,,test)
+SELECT py_one() AS one;
+SELECT SLEEP(1) AS idle;
+SELECT py_one() AS two;
+SELECT SLEEP(1) AS idle;
+--disconnect con2
+--connection default
+--source include/wait_until_count_sessions.inc
+let $g2 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_worker_memory_gcs', Value, 1);
+--expr $python = $g2 - $g1
+--echo python trims: $python
+
+--echo #
+--echo # mle.idle_trim_ms = 0: never.
+--echo #
+SET GLOBAL mle.idle_trim_ms = 0;
+--let $mle_pool = 2
+--source ../include/wait_for_pool.inc
+--connect (con3, localhost, root,,test)
+SELECT py_one() AS one;
+SELECT SLEEP(1) AS idle;
+SELECT py_one() AS two;
+SELECT SLEEP(1) AS idle;
+--disconnect con3
+--connection default
+--source include/wait_until_count_sessions.inc
+let $g3 = query_get_value(SHOW GLOBAL STATUS LIKE 'mle_worker_memory_gcs', Value, 1);
+--expr $off = $g3 - $g2
+--echo python trims with 0: $off
+
+SET GLOBAL mle.idle_trim_ms = DEFAULT;
+SET GLOBAL mle.pool_prewarm = DEFAULT;
+SET GLOBAL mle.worker_cache_size = DEFAULT;
+DROP FUNCTION py_one;
+DROP FUNCTION java_one;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

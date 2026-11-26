@@ -49,6 +49,18 @@ final class Native {
               ValueLayout.JAVA_LONG));
   private static final MethodHandle MUNMAP =
       fn("munmap", FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+  private static final MethodHandle MALLOC_TRIM =
+      fn("malloc_trim", FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
+
+  /** glibc's malloc_trim(0): free memory at the top and inside malloc's heaps back to the system. */
+  static void mallocTrim() {
+    try {
+      int unused = (int) MALLOC_TRIM.invokeExact(0L);
+    } catch (Throwable t) {
+      // Not glibc's malloc, or refused: nothing given back.
+    }
+  }
+
   // syscall(SYS_futex, addr, op, val, timeout, 0, 0): variadic in C.
   private static final MethodHandle SYSCALL_FUTEX =
       fn(
@@ -123,6 +135,20 @@ final class Native {
     try {
       long unused =
           (long) SYSCALL_FUTEX.invokeExact(SYS_FUTEX, word, FUTEX_WAIT, expected, MemorySegment.NULL, MemorySegment.NULL, 0);
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /** The timeout of futexWait(word, expected, nanos): a struct timespec, of the dispatcher's thread only. */
+  private static final MemorySegment TIMEOUT = java.lang.foreign.Arena.global().allocate(16, 8);
+
+  /** As futexWait, for at most nanos (relative): a timeout, a wake-up or a changed word return. */
+  static void futexWait(MemorySegment word, int expected, long nanos) {
+    TIMEOUT.set(ValueLayout.JAVA_LONG, 0, nanos / 1_000_000_000L);
+    TIMEOUT.set(ValueLayout.JAVA_LONG, 8, nanos % 1_000_000_000L);
+    try {
+      long unused = (long) SYSCALL_FUTEX.invokeExact(SYS_FUTEX, word, FUTEX_WAIT, expected, TIMEOUT, MemorySegment.NULL, 0);
     } catch (Throwable t) {
       throw rethrow(t);
     }

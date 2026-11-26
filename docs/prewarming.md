@@ -3,6 +3,8 @@
 For administrators: what decides how long a session's first call of a
 routine takes, and what memory buys a shorter one. Three groups of server
 variables control it: the pools, `mle.pool_prewarm`, and the worker cache.
+A fourth, `mle.idle_trim_ms`, decides what a worker gives back while its
+session is idle.
 
 ## A worker's life
 
@@ -103,6 +105,25 @@ JVM pool, `mle.pool_size` × the idle pool worker above (366 MB with the
 defaults). A CPython or V8 pool worker takes 10–20 MB, so their pools are
 cheap.
 
+## Memory of an idle session: `mle.idle_trim_ms`
+
+A worker keeps the memory of its last calls while its session stays
+connected and idle, as an application's connection pool keeps sessions. A
+JVM worker with Python set up gives memory back after `mle.idle_trim_ms`
+(default 5000) of idleness: a full GC and `malloc_trim`, once per idle
+period. `0` turns it off. A call that comes while the trim runs waits for
+it. Measured on one worker idle in its session:
+
+| Worker | Given back | The trim's pause |
+|---|---:|---:|
+| GraalPy | about 80 MB (−15 %) | about 80 ms |
+| GraalPy with numpy | about 60 MB (−9 %) | about 145 ms |
+| Java, GraalJS | nothing: they are not trimmed | |
+
+A worker counts as having Python set up once any Python ran or was checked
+in it: also a Java session's worker that an earlier session of the account
+used for Python, through the worker cache.
+
 ## Watching it
 
 | Status variable | What it counts |
@@ -112,6 +133,7 @@ cheap.
 | `mle_workers_spawned` | workers started since the engine started |
 | `mle_workers_cached` | reset workers kept for reuse |
 | `mle_worker_reuses` | sessions that got a kept worker |
+| `mle_worker_memory_gcs` | GCs the workers forced: their memory watchers' during calls, and idle trims, counted when a session releases its workers |
 
 Many spawned workers against few reuses means sessions find no warm worker:
 a larger worker cache or pool helps, if memory allows.

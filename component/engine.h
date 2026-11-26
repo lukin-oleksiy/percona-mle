@@ -70,6 +70,8 @@ struct Settings {
   uint32_t pool_size = 2;
   /** Threads of the vector helper (com.percona.mle.api.Vectors) per worker. */
   uint32_t vector_threads = 4;
+  /** A Python worker idle this long in its session gives memory back (mle.idle_trim_ms); 0: never. */
+  uint32_t idle_trim_ms = 5000;
   /** AUTO, NONE or a cgroup v2 directory. */
   std::string cgroup_base = "AUTO";
   std::string dir;

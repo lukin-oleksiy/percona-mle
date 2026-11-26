@@ -148,6 +148,11 @@ final class MemoryWatch implements Runnable {
     return GCS.get();
   }
 
+  /** A GC the worker forced outside a call (the idle trim): counted as the nudges are. */
+  static void forcedGc() {
+    GCS.incrementAndGet();
+  }
+
   /** RESET: the host has taken the count with the session's statistics. */
   static void clear() {
     GCS.set(0);

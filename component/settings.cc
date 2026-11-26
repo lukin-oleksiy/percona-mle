@@ -21,7 +21,7 @@
   The mle.* system variables (11-phase4-component.md §6).
 
   - Settings that shape workers (memory_max, heap_max, pool_size,
-    vector_threads) can be
+    vector_threads, idle_trim_ms) can be
     changed while no session holds a worker, else 6116 (as Oracle's
     mle.memory_max "while the component is active"). A change restarts the
     engine, so INSTALL COMPONENT ... SET GLOBAL mle.memory_max = ... works
@@ -75,6 +75,7 @@ ulonglong g_v8_memory_max = 0;
 ulonglong g_v8_heap_max = 0;
 uint g_v8_pool_size = 0;
 uint g_vector_threads = 4;
+uint g_idle_trim_ms = 5000;
 uint g_max_workers = 0;
 uint g_worker_cache_size = 0;
 uint g_worker_cache_timeout = 0;
@@ -200,6 +201,8 @@ constexpr const char kV8PoolSize[] = "v8_pool_size";
 /** mle.pool_prewarm's default (exp note 35): the vector helper warmed up. */
 constexpr const char kPoolPrewarm[] = "vectors";
 constexpr const char kVectorThreads[] = "vector_threads";
+constexpr const char kIdleTrimMs[] = "idle_trim_ms";
+constexpr uint kIdleTrimMsMax = 3600 * 1000;
 
 constexpr ulonglong kMiB = 1ULL << 20;
 constexpr ulonglong kMemoryMaxMin = 256 * kMiB;
@@ -305,7 +308,7 @@ Registered g_registered[] = {
     {"sql_call_results_max", false},
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
     {"package_dir", false}, {"pool_prewarm", false},
-    {"vector_threads", false}, {"console", false},
+    {"vector_threads", false}, {"idle_trim_ms", false}, {"console", false},
     {"malloc_mmap_threshold", false}, {"debug_test_worker", false}};
 
 /** mle.console (session): OFF, or WARNINGS (exp note 39). */
@@ -493,6 +496,25 @@ bool register_settings() {
           check_shaping<uint, kVectorThreads, 1, kVectorThreadsMax>,
           update_shaping<uint, kVectorThreads>, &vector_threads,
           &g_vector_threads))
+    return true;
+
+  // Exp note 68 §8: a GraalPy worker idle in its session keeps the heap and
+  // native memory of its last calls; a full GC and malloc_trim gave back
+  // 60-80 MB (9-15 %). Java and JavaScript-only workers gave back nothing
+  // and are not trimmed.
+  uint_check_arg_s idle_trim_ms;
+  idle_trim_ms.def_val = 5000;
+  idle_trim_ms.min_val = 0;
+  idle_trim_ms.max_val = kIdleTrimMsMax;
+  idle_trim_ms.blk_sz = 0;
+  if (reg("idle_trim_ms", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Milliseconds a JVM worker with Python set up waits idle in its "
+          "session before it gives memory back (a full GC, ~80-150 ms, and "
+          "malloc_trim); a call that comes meanwhile waits for it. 0: never. "
+          "Can be changed while no session holds a worker; restarts the "
+          "engine.",
+          check_shaping<uint, kIdleTrimMs, 0, kIdleTrimMsMax>,
+          update_shaping<uint, kIdleTrimMs>, &idle_trim_ms, &g_idle_trim_ms))
     return true;
 
   STR_CHECK_ARG(pool_prewarm) pool_prewarm;
@@ -738,6 +760,7 @@ Settings current_settings() {
   s.v8_heap_max = g_v8_heap_max;
   s.v8_pool_size = g_v8_pool_size;
   s.vector_threads = g_vector_threads;
+  s.idle_trim_ms = g_idle_trim_ms;
   s.cgroup_base = text(g_cgroup_base);
   s.dir = text(g_dir);
   s.java_home = text(g_java_home);

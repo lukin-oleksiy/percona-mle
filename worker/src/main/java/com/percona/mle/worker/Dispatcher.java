@@ -80,6 +80,17 @@ final class Dispatcher {
   private boolean defaultsDue;
   /** How long a reset worker waits for a request before it collects (exp note 38). */
   private static final long IDLE_GC_NS = 200_000_000L;
+  /**
+   * mle.idle_trim_ms: a worker with Python set up gives memory back when it is idle in a session
+   * (exp note 68 §8): when no request comes for this long after a top-level request, a full GC
+   * and malloc_trim, once per idle period. GraalPy's heap and native memory gave back 60-80 MB;
+   * Java and JavaScript gave back nothing, so a worker without Python is not trimmed. The wait
+   * sleeps on the mailbox's futex: a request wakes it at once (a 1 ms poll cost every call 1 ms).
+   * 0: never.
+   */
+  private static final long IDLE_TRIM_NS = Long.getLong("mle.idleTrimMs", 0) * 1_000_000L;
+  /** A top-level request ended since the last trim (or RESET's GC). */
+  private boolean trimWhenIdle;
   private final ThreadWatch threads = new ThreadWatch();
   private static final byte[] NO_BYTES = new byte[0];
   private static final Object[] NO_VALUES = new Object[0];
@@ -286,6 +297,14 @@ final class Dispatcher {
         if (!mb.awaitPending(IDLE_GC_NS)) System.gc();
         // Idle after a RESET (§3.1): the host's memory figures, after the GC if there was one.
         mb.stats(Wire.STATE_IDLE);
+      } else if (trimWhenIdle && IDLE_TRIM_NS > 0 && polyglot.pythonStarted()) {
+        trimWhenIdle = false;
+        if (!mb.awaitMessage(IDLE_TRIM_NS)) {
+          MemoryWatch.forcedGc();
+          System.gc();
+          Native.mallocTrim();
+          mb.stats(Wire.STATE_IDLE);
+        }
       }
       serveNext();
     }
@@ -296,6 +315,7 @@ final class Dispatcher {
     Mailbox.Message m = mb.receive(topLevel);
     lastSeq = m.callSeq();
     handle(m);
+    if (!gcWhenIdle) trimWhenIdle = true;
   }
 
   /**

@@ -162,6 +162,27 @@ final class Mailbox {
     }
   }
 
+  /**
+   * Waits up to nanos for a message from the host as waitHost() waits for one (spin, then sleep on
+   * the futex, so that a message wakes it at once), without taking it; true if one came.
+   */
+  boolean awaitMessage(long nanos) {
+    for (int i = 0; i < spin; i++) {
+      if (pending()) return true;
+      Thread.onSpinWait();
+    }
+    long end = System.nanoTime() + nanos;
+    while (true) {
+      INT.setVolatile(region, Wire.OFF_W_SLEEP, 1);
+      int v = (int) INT.getVolatile(region, Wire.OFF_TO_W);
+      long left = end - System.nanoTime();
+      if (v == seenW && left > 0) Native.futexWait(toW, seenW, left);
+      INT.setRelease(region, Wire.OFF_W_SLEEP, 0);
+      if (pending()) return true;
+      if (end - System.nanoTime() <= 0) return false;
+    }
+  }
+
   /** True if the host has sent a message that receive() has not taken yet. */
   boolean pending() {
     return (int) INT.getAcquire(region, Wire.OFF_TO_W) != seenW;

@@ -21,6 +21,7 @@ mle.console	OFF
 mle.cpython_memory_max	1073741824
 mle.cpython_pool_size	2
 mle.heap_max	536870912
+mle.idle_trim_ms	5000
 mle.interrupt_grace_ms	1000
 mle.languages	JAVASCRIPT,PYTHON,JAVA,JS,CPYTHON
 mle.malloc_mmap_threshold	4194304

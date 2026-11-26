@@ -1,0 +1,80 @@
+#
+# component_mle: mle.idle_trim_ms (exp note 68 §8). A JVM worker with
+# Python set up, idle in its session for that long after a top-level
+# request, gives memory back: a full GC and malloc_trim, once per idle
+# period, counted in mle_worker_memory_gcs when the session releases the
+# worker. A worker without Python (Java, JavaScript) is not trimmed: it
+# gave nothing back.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+SELECT @@mle.idle_trim_ms;
+@@mle.idle_trim_ms
+5000
+SET GLOBAL mle.idle_trim_ms = 3600001;
+Got one of the listed errors
+SET GLOBAL mle.idle_trim_ms = 300;
+SELECT @@mle.idle_trim_ms;
+@@mle.idle_trim_ms
+300
+# Every session from a fresh worker: a kept one may have Python set up by
+# an earlier session of the account (the CREATE below checks Python code).
+SET GLOBAL mle.worker_cache_size = 0;
+#
+# Java only (no Python in the worker): idle periods, no trim.
+#
+SELECT java_one() AS one;
+one
+1
+SELECT SLEEP(1) AS idle;
+idle
+0
+SELECT java_one() AS two;
+two
+1
+SELECT SLEEP(1) AS idle;
+idle
+0
+java-only trims: 0
+#
+# Python (started in the pool worker, so that the call itself grows no
+# memory and the memory watcher forces nothing): one trim per idle period.
+#
+SET GLOBAL mle.pool_prewarm = 'python,vectors';
+SELECT py_one() AS one;
+one
+1
+SELECT SLEEP(1) AS idle;
+idle
+0
+SELECT py_one() AS two;
+two
+1
+SELECT SLEEP(1) AS idle;
+idle
+0
+python trims: 2
+#
+# mle.idle_trim_ms = 0: never.
+#
+SET GLOBAL mle.idle_trim_ms = 0;
+SELECT py_one() AS one;
+one
+1
+SELECT SLEEP(1) AS idle;
+idle
+0
+SELECT py_one() AS two;
+two
+1
+SELECT SLEEP(1) AS idle;
+idle
+0
+python trims with 0: 0
+SET GLOBAL mle.idle_trim_ms = DEFAULT;
+SET GLOBAL mle.pool_prewarm = DEFAULT;
+SET GLOBAL mle.worker_cache_size = DEFAULT;
+DROP FUNCTION py_one;
+DROP FUNCTION java_one;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

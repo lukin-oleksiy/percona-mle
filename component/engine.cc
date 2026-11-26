@@ -299,6 +299,7 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   options.malloc_mmap_threshold = s.malloc_mmap_threshold;
   options.pool_size = s.pool_size;
   options.vector_threads = s.vector_threads;
+  options.idle_trim_ms = s.idle_trim_ms;
   // JVM workers start Java (javac) and the polyglot engine and context, which
   // every language shares; JavaScript (js), GraalPy (python) and numpy only
   // when mle.pool_prewarm asks: otherwise on their first use (15 §1, exp note

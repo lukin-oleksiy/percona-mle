@@ -262,7 +262,9 @@ GraalPy (`python`), numpy (`numpy`) and the vector library (`vectors`, the defau
 | `python,vectors` | 539 MB | 139 / 96 / 3,927 / 59 |
 | `numpy,vectors` | 755 MB | 148 / 42 / 44 / 58 |
 
-`docs/prewarming.md` describes a worker's life, the pool and cache variables, how to choose, and what to watch.
+A GraalPy worker idle in its session gives 60–80 MB back after `mle.idle_trim_ms` (default 5000; 0: never).
+`docs/prewarming.md` describes a worker's life, the pool and cache variables, the idle trim, how to choose, and what
+to watch.
 
 ## Diagnostics
 

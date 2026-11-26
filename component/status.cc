@@ -41,7 +41,8 @@
     mle_workers              workers held by sessions
     mle_workers_spawned      worker processes started by the launcher
     mle_worker_failures      workers that died, were killed or misbehaved
-    mle_worker_memory_gcs    GCs forced by the workers' memory watchers
+    mle_worker_memory_gcs    GCs the workers forced: their memory watchers'
+                             during calls, and idle trims (mle.idle_trim_ms)
     mle_pool_idle            started workers waiting in the pool
     mle_workers_cached       reset workers kept for sessions of their account
     mle_worker_reuses        sessions that got a kept worker

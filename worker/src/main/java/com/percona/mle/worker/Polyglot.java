@@ -1493,6 +1493,11 @@ final class Polyglot {
     python = h;
   }
 
+  /** Whether GraalPy is set up in this worker (Dispatcher's idle trim). */
+  boolean pythonStarted() {
+    return python != null;
+  }
+
   private Helpers helpers(String language) {
     if (language.equals("js")) {
       jsContext();
