@@ -51,7 +51,7 @@ mysqld loads `component_mle`, which uses the host library to talk to workers; th
 | `harness/` | `mle_harness`, a command-line driver for workers without mysqld (development: start-up, calls, memory) |
 | `unittest/` | GoogleTest tests (13 binaries: codec, launcher, protocol, conformance of all workers, failures, each worker kind), `mle_test_worker` (a scripted worker for protocol tests), `mle_proto_scripts` |
 | `mysql-test/suite/component_mle/` | the MTR suite: `t/` and `r/`; `include/` (requirements, and the scripts that run JavaScript tests on V8 and Python tests on CPython); `std_data/` (a package directory) |
-| `docs/` | `protocol.md`: the host–worker protocol, specification 1.0; `protocol-review.md`: its reviews, the differences from the code before it, the measurements; `limits.md`: known limits |
+| `docs/` | `protocol.md`: the host–worker protocol, specification 1.0; `protocol-review.md`: its reviews, the differences from the code before it, the measurements; `limits.md`: known limits; `prewarming.md`: pools, pre-warming and worker reuse, for administrators |
 | `perf/` | `regression.py` (two builds side by side), `bench.py` (every runtime of one build), `mle_perf.py` (what they share), their SQL; `e2e/`: against the same logic in an application over a network; `results/`: published runs (JSON) |
 | `docker/` | the server + MLE image (`Dockerfile`), the DBA tools image (`Dockerfile.tools`, with a GraalPy launcher), compose, `run.sh` (start, SQL, status), `demo/` (the recorded demos' SQL) |
 | `packaging/` | the packages' scripts: `debian/`, `rpm/`, the AppArmor profiles (`apparmor/`), the SELinux policy (`selinux/`) |
@@ -248,6 +248,21 @@ calls 13–16 % faster, `TIMESTAMP` values 13–23 %, per-row logic, libraries a
 other cases (rows, statements, writes, vectors, connections, cold start, idle memory) equal within measurement.
 One cost is open: the component's subscription to query events adds about 0.1 µs to every statement on the server,
 MLE or not (`docs/protocol-review.md` §22).
+
+## First call and memory: pools, pre-warming, reuse
+
+A session's first call is fast when its worker comes warm from the worker cache, or from a pool that prepared the
+routine's language. JVM workers prepare Java and the polyglot engine; `mle.pool_prewarm` adds JavaScript (`js`),
+GraalPy (`python`), numpy (`numpy`) and the vector library (`vectors`, the default), each for memory per worker:
+
+| `mle.pool_prewarm` | Idle pool worker | First call from the pool: JavaScript / Python / Python with numpy / Java (ms) |
+|---|---:|---|
+| `vectors` (default) | 183 MB | 174 / 1,996 / 5,032 / 56 |
+| `js,vectors` | 206 MB | 18 / 1,987 / 5,307 / 56 |
+| `python,vectors` | 539 MB | 139 / 96 / 3,927 / 59 |
+| `numpy,vectors` | 755 MB | 148 / 42 / 44 / 58 |
+
+`docs/prewarming.md` describes a worker's life, the pool and cache variables, how to choose, and what to watch.
 
 ## Diagnostics
 

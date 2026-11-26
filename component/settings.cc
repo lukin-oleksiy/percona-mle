@@ -411,9 +411,9 @@ bool register_settings() {
   pool_size.max_val = kPoolSizeMax;
   pool_size.blk_sz = 0;
   if (reg("pool_size", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
-          "Started JVM workers kept ready for sessions (Java, JavaScript and "
-          "Python loaded). Can be changed while no session holds a worker; "
-          "restarts the engine.",
+          "Started JVM workers kept ready for sessions (Java and the polyglot "
+          "engine ready; JavaScript and Python as mle.pool_prewarm says). Can "
+          "be changed while no session holds a worker; restarts the engine.",
           check_shaping<uint, kPoolSize, 0, kPoolSizeMax>,
           update_shaping<uint, kPoolSize>, &pool_size, &g_pool_size))
     return true;
@@ -498,14 +498,15 @@ bool register_settings() {
   STR_CHECK_ARG(pool_prewarm) pool_prewarm;
   pool_prewarm.def_val = const_cast<char *>(kPoolPrewarm);
   if (reg("pool_prewarm", PLUGIN_VAR_STR,
-          "What pool workers prepare before a session needs them: none, or a "
-          "comma list of js (JavaScript set up, ~150 ms and ~20 MB per worker; "
-          "without it, a worker sets JavaScript up on its first JavaScript "
-          "call), python (GraalPy started, ~1-5 s and ~195 MB per idle "
-          "worker), numpy (Python and numpy) and vectors (the vector helper's "
-          "kernels compiled, ~0.6 s and ~2 CPU-seconds per worker, while it "
-          "waits in the pool). Can be changed while no session holds a "
-          "worker; restarts the engine.",
+          "What JVM workers prepare before a session needs them (pool workers, "
+          "and workers started for a waiting session): none, or a comma list "
+          "of js (JavaScript, ~150 ms and ~20 MB per worker; without it a "
+          "worker sets JavaScript up on its first JavaScript call), python "
+          "(GraalPy started, ~1-5 s and ~355 MB), numpy (Python and numpy, "
+          "~570 MB; CPython workers import numpy) and vectors (the vector "
+          "helper's kernels compiled, ~2 CPU-seconds while a pool worker "
+          "waits). See docs/prewarming.md. Can be changed while no session "
+          "holds a worker; restarts the engine.",
           check_prewarm, update_prewarm, &pool_prewarm, &g_pool_prewarm))
     return true;
 
