@@ -51,6 +51,9 @@ constexpr uint32_t version_major(uint32_t version) { return version >> 16; }
 constexpr uint32_t version_minor(uint32_t version) { return version & 0xFFFF; }
 
 constexpr size_t kCacheLine = 64;
+/** The inline body of a line (§5.1): a message of at most this many bytes
+    is carried in the poster's line, not in the arena. */
+constexpr size_t kInlineBody = 40;
 /** Size of RegionHeader; the arena starts here. */
 constexpr size_t kHeaderSize = 4096;
 
@@ -232,17 +235,60 @@ enum class WorkerState : uint32_t {
   kCompiling = 3,
 };
 
-/** The message header (§5.1). */
+/** A message header (§5.1), as the code handles it: read from a line with
+    load_header, written with store_header. The fields are wider than on
+    the wire; a header taken from a line never holds more than a byte in
+    op, status, flags and depth, or more than a u32 in total_len. */
 struct MessageHeader {
   uint32_t op;
   uint32_t status;
   uint32_t flags;
   uint32_t depth;
   uint32_t len;
-  uint32_t reserved;
   uint64_t total_len;
   uint64_t call_seq;
 };
+
+/** Is the body of a message of this size inline (§5.1)? */
+constexpr bool is_inline(uint64_t total_len) { return total_len <= kInlineBody; }
+
+/** A side's line (§3, §5.1): its sequence word, the header of its last
+    message and the inline body. Only that side writes it. */
+struct alignas(kCacheLine) Line {
+  /** to_w in the host line, to_h in the worker line. */
+  std::atomic<uint32_t> word;
+  uint8_t op;
+  uint8_t status;
+  uint8_t flags;
+  uint8_t depth;
+  uint32_t len;
+  uint32_t total_len;
+  uint64_t call_seq;
+  std::byte body[kInlineBody];
+};
+static_assert(sizeof(Line) == kCacheLine);
+static_assert(offsetof(Line, op) == 4);
+static_assert(offsetof(Line, len) == 8);
+static_assert(offsetof(Line, total_len) == 12);
+static_assert(offsetof(Line, call_seq) == 16);
+static_assert(offsetof(Line, body) == 24);
+
+/** The header of the other side's last message, copied out of its line. */
+inline MessageHeader load_header(const Line &l) {
+  return {l.op, l.status, l.flags, l.depth, l.len, l.total_len, l.call_seq};
+}
+/** Writes m into this side's line (not the word: the post stores it). The
+    caller passes legal values (§5.1): op, status, flags and depth below
+    256, total_len at most 2^30. */
+inline void store_header(Line &l, const MessageHeader &m) {
+  l.op = static_cast<uint8_t>(m.op);
+  l.status = static_cast<uint8_t>(m.status);
+  l.flags = static_cast<uint8_t>(m.flags);
+  l.depth = static_cast<uint8_t>(m.depth);
+  l.len = m.len;
+  l.total_len = static_cast<uint32_t>(m.total_len);
+  l.call_seq = m.call_seq;
+}
 static_assert(sizeof(MessageHeader) == 40);
 
 /** Worker statistics (§3.1): for reporting only. A worker writes them when
@@ -268,18 +314,15 @@ struct alignas(kCacheLine) RegionHeader {
   uint64_t region_size;
   uint32_t arena_size;
   char reserved0[kCacheLine - 20];
-  /** Sequence word, host to worker. */
-  std::atomic<uint32_t> to_w;
-  char pad1[kCacheLine - 4];
-  /** Sequence word, worker to host. */
-  std::atomic<uint32_t> to_h;
-  char pad2[kCacheLine - 4];
+  /** The host line: to_w and the host's message. */
+  Line host;
+  /** The worker line: to_h and the worker's message. */
+  Line worker;
   std::atomic<uint32_t> w_sleep;
   char pad3[kCacheLine - 4];
   std::atomic<uint32_t> h_sleep;
   char pad4[kCacheLine - 4];
-  MessageHeader msg;
-  char pad5[kCacheLine - sizeof(MessageHeader)];
+  char reserved5[kCacheLine];
   WorkerStats stats;
   char pad6[kCacheLine - sizeof(WorkerStats)];
   char reserved[kHeaderSize - 7 * kCacheLine];
@@ -288,11 +331,10 @@ struct alignas(kCacheLine) RegionHeader {
 static_assert(sizeof(RegionHeader) == kHeaderSize);
 static_assert(offsetof(RegionHeader, region_size) == 8);
 static_assert(offsetof(RegionHeader, arena_size) == 16);
-static_assert(offsetof(RegionHeader, to_w) == 64);
-static_assert(offsetof(RegionHeader, to_h) == 128);
+static_assert(offsetof(RegionHeader, host) == 64);
+static_assert(offsetof(RegionHeader, worker) == 128);
 static_assert(offsetof(RegionHeader, w_sleep) == 192);
 static_assert(offsetof(RegionHeader, h_sleep) == 256);
-static_assert(offsetof(RegionHeader, msg) == 320);
 static_assert(offsetof(RegionHeader, stats) == 384);
 
 inline constexpr size_t region_size(uint32_t arena_size) {

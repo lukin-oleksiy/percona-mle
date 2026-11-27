@@ -1201,8 +1201,6 @@ bool check_worker_header(const wire::MessageHeader &h, uint32_t arena_size,
     why = "unknown flags";
   else if ((h.flags & wire::kTainted) != 0 && !result)
     why = "TAINTED in a message that is not a RESULT";
-  else if (h.reserved != 0)
-    why = "reserved header field is not 0";
   else if (h.len > arena_size)
     why = "chunk larger than the arena";
   else if (more && h.len != arena_size)

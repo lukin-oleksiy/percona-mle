@@ -77,12 +77,13 @@ constexpr uint32_t kAuto = 0xFFFFFFFE;
 class Script {
  public:
   /** A raw post. depth and call_seq are those of the request plus the
-      deltas. The arena gets arena (cut to its size); len and total_len are
-      what the header says, by default the size of arena. */
+      deltas. The body goes where total_len puts it (§5.1): inline, cut to
+      40 bytes, or in the arena, cut to its size; len and total_len are what
+      the header says, by default the size of arena. */
   Script &post(uint32_t op, uint32_t status, uint32_t flags,
                std::string_view arena, uint32_t len = kAuto,
                uint64_t total_len = kAuto, int32_t depth_delta = 0,
-               int64_t seq_delta = 0, uint32_t reserved = 0) {
+               int64_t seq_delta = 0) {
     step(Step::kPost);
     w().u32(op);
     w().u32(status);
@@ -91,7 +92,6 @@ class Script {
     w().u64(total_len);
     w().u32(static_cast<uint32_t>(depth_delta));
     w().i64(seq_delta);
-    w().u32(reserved);
     w().str(arena);
     return *this;
   }

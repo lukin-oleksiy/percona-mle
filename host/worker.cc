@@ -334,9 +334,14 @@ std::string &Worker::buffer(
 void Worker::post(Op op, uint32_t flags, const char *data, size_t len,
                   uint64_t total) {
   wire::RegionHeader *h = m_process->header();
-  // A DirectReply is already in the arena.
-  if (len > 0 && data != reinterpret_cast<const char *>(m_process->arena()))
+  // A body of at most 40 bytes goes in the host line, a larger one in the
+  // arena (§5.1); a DirectReply is already in the arena.
+  if (wire::is_inline(total)) {
+    if (len > 0) memcpy(h->host.body, data, len);
+  } else if (len > 0 &&
+             data != reinterpret_cast<const char *>(m_process->arena())) {
     memcpy(m_process->arena(), data, len);
+  }
   m_posts++;
   wire::MessageHeader m{};
   m.op = static_cast<uint32_t>(op);
@@ -345,11 +350,12 @@ void Worker::post(Op op, uint32_t flags, const char *data, size_t len,
   m.len = static_cast<uint32_t>(len);
   m.total_len = total;
   m.call_seq = m_seq;
-  memcpy(&h->msg, &m, sizeof m);
+  wire::store_header(h->host, m);
   // The post is a store of the private count: the word is the worker's to
   // write too, and is never read back (§4.1).
-  h->to_w.store(++m_posted, std::memory_order_seq_cst);
-  if (h->w_sleep.load(std::memory_order_seq_cst) != 0) futex_wake(&h->to_w);
+  h->host.word.store(++m_posted, std::memory_order_seq_cst);
+  if (h->w_sleep.load(std::memory_order_seq_cst) != 0)
+    futex_wake(&h->host.word);
   if (m_noticed) m_turn_start = now_ns();
 }
 
@@ -444,7 +450,7 @@ Worker::Wait Worker::wait_post(CallHooks *hooks, Transfer *transfer,
   // A message has arrived when the worker's word differs from the value
   // seen last; the word is compared only for equality (§4.1).
   auto arrived = [&] {
-    const uint32_t v = h->to_h.load(std::memory_order_acquire);
+    const uint32_t v = h->worker.word.load(std::memory_order_acquire);
     if (v == m_seen) return false;
     m_seen = v;
     return true;
@@ -471,8 +477,8 @@ Worker::Wait Worker::wait_post(CallHooks *hooks, Transfer *transfer,
   while (true) {
     // The sleep handshake of §4.3.
     h->h_sleep.store(1, std::memory_order_seq_cst);
-    if (h->to_h.load(std::memory_order_seq_cst) == m_seen)
-      futex_wait(&h->to_h, m_seen, kTickMs);
+    if (h->worker.word.load(std::memory_order_seq_cst) == m_seen)
+      futex_wait(&h->worker.word, m_seen, kTickMs);
     h->h_sleep.store(0, std::memory_order_release);
     if (arrived()) return Wait::kMessage;
     if (!m_process->alive()) {
@@ -514,8 +520,8 @@ Worker::Wait Worker::receive(Message *m, CallHooks *hooks, const Expect &expect,
     if (w != Wait::kMessage) return w;
     // Copied once, before any check: the worker can write the region at
     // any time.
-    wire::MessageHeader h;
-    memcpy(&h, &m_process->header()->msg, sizeof h);
+    const wire::MessageHeader h =
+        wire::load_header(m_process->header()->worker);
     if (const Wait k = end_turn(in, turn_len, error); k != Wait::kMessage)
       return k;
     if (first) {
@@ -557,9 +563,14 @@ Worker::Wait Worker::receive(Message *m, CallHooks *hooks, const Expect &expect,
       }
     }
     // A message of one chunk is decoded where it is, each byte read once
-    // (§1); the chunks of a longer one are copied once as they come.
+    // (§1); the chunks of a longer one are copied once as they come. A body
+    // of at most 40 bytes is in the worker line (§5.1).
     const bool leave = first && in_place && !more;
-    const Assembler::Step step = a.add(h, m_process->arena(), !leave);
+    const void *chunk = wire::is_inline(h.total_len)
+                            ? static_cast<const void *>(
+                                  m_process->header()->worker.body)
+                            : static_cast<const void *>(m_process->arena());
+    const Assembler::Step step = a.add(h, chunk, !leave);
     if (step == Assembler::Step::kError) {
       *error = a.error();
       return Wait::kProtocol;
@@ -574,8 +585,7 @@ Worker::Wait Worker::receive(Message *m, CallHooks *hooks, const Expect &expect,
       }
       unsigned char head[wire::kSqlHeadSize];
       memcpy(head,
-             leave ? static_cast<const void *>(m_process->arena())
-                   : static_cast<const void *>(a.body().data()),
+             leave ? chunk : static_cast<const void *>(a.body().data()),
              sizeof head);
       const uint8_t action = head[0];
       m->sql_action = static_cast<wire::SqlAction>(action);
@@ -613,8 +623,8 @@ Worker::Wait Worker::receive(Message *m, CallHooks *hooks, const Expect &expect,
       m->h = a.header();
       m->in_region = leave;
       if (leave) {
-        m->data = std::string_view(
-            reinterpret_cast<const char *>(m_process->arena()), h.len);
+        m->data =
+            std::string_view(static_cast<const char *>(chunk), h.len);
       } else {
         m->body = a.release_body();
         m->data = m->body;
@@ -654,8 +664,8 @@ Worker::Wait Worker::send(Op op, std::string_view body, CallHooks *hooks,
     if (!more) return Wait::kMessage;
     const Wait w = wait_post(hooks, &m_host_transfer, len, deadline, error);
     if (w != Wait::kMessage) return w;
-    wire::MessageHeader h;
-    memcpy(&h, &m_process->header()->msg, sizeof h);
+    const wire::MessageHeader h =
+        wire::load_header(m_process->header()->worker);
     if (m_dead) return Wait::kDied;
     if (const Wait k = end_turn(&m_host_transfer, len, error);
         k != Wait::kMessage)

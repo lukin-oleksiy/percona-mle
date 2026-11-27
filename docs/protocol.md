@@ -269,17 +269,18 @@ All integers are little-endian. The region is `4096 + arena_size` bytes: a
 | 8 | 8 | `region_size` | launcher, once | `4096 + arena_size` |
 | 16 | 4 | `arena_size` | launcher, once | bytes of the arena |
 | 20 | 44 | reserved | — | 0 |
-| 64 | 4 | `to_w` | host | sequence word, host to worker |
-| 128 | 4 | `to_h` | worker | sequence word, worker to host |
+| 64 | 64 | host line | host | `to_w`, the sequence word host to worker, and the host's message header and inline body (§5.1) |
+| 128 | 64 | worker line | worker | `to_h`, the sequence word worker to host, and the worker's message header and inline body (§5.1) |
 | 192 | 4 | `w_sleep` | worker | 1 while the worker sleeps or is about to sleep |
 | 256 | 4 | `h_sleep` | host | 1 while the host sleeps or is about to sleep |
-| 320 | 40 | `msg` | the side whose turn it is (§4) | header of the message in the arena (§5) |
+| 320 | 64 | reserved | — | 0 |
 | 384 | 32 | `stats` | worker, at any time | worker statistics (§3.1) |
 | 448 | 3648 | reserved | — | 0 |
 | 4096 | `arena_size` | arena | the side whose turn it is | message bytes |
 
-Every field from offset 64 on starts a 64-byte cache line of its own, so
-no two fields that different sides write share a line. Bytes not listed
+Every field from offset 64 on starts a 64-byte cache line of its own, and
+each line is written by one side only. A message whose body fits in its
+line (§5.1) moves one line from the poster to the receiver. Bytes not listed
 are reserved: the launcher leaves them 0 and nobody checks them.
 
 `arena_size` MUST be a multiple of 4096, at least 65536 (64 KiB) and at
@@ -320,21 +321,24 @@ worker can write it). Initially W = H = 0.
 
 * It is the **worker's turn** when H = W and the **host's turn** when
   H = W + 1. No other state is legal.
-* Only the side whose turn it is may write `msg` and the arena. It posts
-  by writing the arena, then `msg`, then storing its word. The post
+* Only the side whose turn it is may write the arena and the header and
+  inline body in its own line (§5.1). It posts by writing the body (into
+  the arena, or inline), then the header, then storing its word. The post
   passes the turn.
-* The side that does not have the turn MUST NOT write `msg` or the arena.
-* A side reads `msg` and the arena only between observing the other
-  side's post and its own next write to the arena. What it needs later it
-  MUST copy first.
+* The side that does not have the turn MUST NOT write the arena or its
+  line's header and inline body.
+* A side reads the other side's header and inline body, and the arena,
+  only between observing the other side's post and its own next post or
+  write to the arena, whichever comes first. What it needs later it MUST
+  copy first.
 * While a side composes a message, nothing else may be posted and the
   message must not be disturbed. A worker that converts guest values
   while it writes (a conversion can run guest code) meets this either by
   converting first and writing afterwards, or by refusing, with an error
   in guest code, any SQL or import that guest code attempts during the
   conversion. In both cases the body is complete before its first chunk
-  is posted; views of the arena that guest code holds are copied or
-  detached before the worker writes the arena; and a request is not over
+  is posted; views of a received body that guest code holds are copied
+  or detached before the worker writes the arena or posts; and a request is not over
   for interrupts (§11.1) before its conversions are done.
 
 So the worker begins (READY), and every message, CONTINUE included, passes
@@ -365,11 +369,12 @@ header that is not the reply it expects and ends the worker.
 
 ### 4.2 Memory ordering
 
-* The poster's writes to the arena and to `msg` precede its store to the
-  word. That store, and the poster's load of the other side's sleep flag
+* The poster's writes to the arena and to its line precede its store to
+  the word. That store, and the poster's load of the other side's sleep flag
   that follows it (§4.3), MUST be sequentially consistent.
 * The receiver's load of the word that discovers a post MUST have at least
-  acquire ordering, and precede its reads of `msg` and the arena.
+  acquire ordering, and precede its reads of the other side's line and of
+  the arena.
 * In the sleep handshake (§4.3), the store to the sleep flag (step 1) and
   the load of the word that follows it (step 2) MUST be sequentially
   consistent. Steps 3 and 4 need no more than a plain store and an
@@ -411,16 +416,28 @@ learns that the host is gone from the control socket (§6).
 
 ### 5.1 The message header
 
-| Offset in `msg` | Size | Field | Meaning |
+Each side's line (§3: the host line at 64, the worker line at 128) holds
+its sequence word, the header of its last message and an inline body:
+
+| Offset in the line | Size | Field | Meaning |
 |---:|---:|---|---|
-| 0 | 4 | `op` | operation, §9 |
-| 4 | 4 | `status` | RESULT: §9.4; READY: §9.1. Every other message: 0 |
-| 8 | 4 | `flags` | bit 0 `MORE`: more chunks of this message follow. Bit 1 `TAINTED`: only in a RESULT: the worker asks to be retired (§11.5). Other bits: 0 |
-| 12 | 4 | `depth` | nesting depth of the request this message belongs to (§8.2) |
-| 16 | 4 | `len` | bytes of this chunk in the arena |
-| 20 | 4 | reserved | 0 |
-| 24 | 8 | `total_len` | bytes of the whole message body |
-| 32 | 8 | `call_seq` | sequence number of the top-level request (§8.2) |
+| 0 | 4 | `to_w` / `to_h` | the sequence word (§4.1) |
+| 4 | 1 | `op` | operation, §9 |
+| 5 | 1 | `status` | RESULT: §9.4; READY: §9.1. Every other message: 0 |
+| 6 | 1 | `flags` | bit 0 `MORE`: more chunks of this message follow. Bit 1 `TAINTED`: only in a RESULT: the worker asks to be retired (§11.5). Other bits: 0 |
+| 7 | 1 | `depth` | nesting depth of the request this message belongs to (§8.2) |
+| 8 | 4 | `len` | bytes of this chunk |
+| 12 | 4 | `total_len` | bytes of the whole message body |
+| 16 | 8 | `call_seq` | sequence number of the top-level request (§8.2) |
+| 24 | 40 | inline body | the body of a message of at most 40 bytes |
+
+**Inline bodies.** A message whose `total_len` is at most 40 is one chunk
+(`len` = `total_len`) and its body is in the poster's line at offset 24;
+the arena is not used, and the receiver MUST NOT look for the body there.
+A larger body is in the arena (§5.2). Bytes of the inline area past `len`
+are unspecified: the receiver ignores them. (A two-argument CALL of
+numbers, the RESULT of a scalar, and CONTINUE fit; a round trip of two
+such messages moves two lines, one each way.)
 
 A message is a header and a body of `total_len` bytes. The body's layout
 depends on `op` (§9). The host MUST consume a worker's body exactly:
@@ -430,7 +447,8 @@ body and need not look for trailing bytes (§1).
 ### 5.2 Chunks
 
 * If `total_len <= arena_size`, the message is one chunk:
-  `len = total_len`, `MORE` clear.
+  `len = total_len`, `MORE` clear; inline if `total_len` is at most 40
+  (§5.1), else in the arena.
 * Otherwise the sender splits the body in order: every chunk but the last
   has `len = arena_size` and `MORE` set; the last has `MORE` clear and
   carries the rest (1 to `arena_size` bytes). All chunks carry the same
@@ -656,12 +674,13 @@ zero), then the elements follow. So the encoding of a VECTOR depends on
 where it stands in the body: it cannot be copied between messages byte for
 byte. The arena starts at a multiple of 4096 and every chunk but the last
 is a whole arena, so the elements of a one-chunk message are 16-byte
-aligned in the arena; a receiver that reassembles a chunked message and
+aligned in the arena; in an inline body (offset 24 of a 64-byte line)
+they are 8-byte aligned; a receiver that reassembles a chunked message and
 reads elements in place MUST put the body at a 16-byte aligned address.
 Elements never straddle a chunk boundary (`arena_size` is a multiple of
 16), but a VECTOR may. (The padding lets a worker read the elements in
-place as an array of floats. Such a view of the arena is valid only until
-the worker's next write to the arena, §4.1: guest code that keeps a
+place as an array of floats. Such a view is valid only until the
+worker's next post or write to the arena, §4.1: guest code that keeps a
 vector gets a copy.)
 
 ### 7.3 SQL types and tags (normative)
@@ -1773,12 +1792,11 @@ What the host does with each thing a worker controls. "V" = violation
 
 | Item | Check | Outcome |
 |---|---|---|
-| `msg.op` | assigned, and allowed here by §8.1 | V |
-| `msg.status` | 0 unless RESULT or READY; then per §9 | V |
-| `msg.flags` | only MORE and TAINTED; MORE per §5.2 | V |
-| `msg.depth`, `msg.call_seq` | as expected (§8.2), on every chunk | V |
-| `msg.len`, `msg.total_len` | §5.2; limit of §12 for this op | V |
-| `msg` reserved | 0 | V |
+| Header `op` | assigned, and allowed here by §8.1 | V |
+| Header `status` | 0 unless RESULT or READY; then per §9 | V |
+| Header `flags` | only MORE and TAINTED; MORE per §5.2 | V |
+| Header `depth`, `call_seq` | as expected (§8.2), on every chunk | V |
+| Header `len`, `total_len` | §5.1, §5.2; limit of §12 for this op | V |
 | CONTINUE | every field as §5.2 | V |
 | Body | consumed exactly; counts within bytes and limits | V |
 | bool, value tags, SQL `action`, `flags` | known values | V |
@@ -1798,10 +1816,10 @@ What the host does with each thing a worker controls. "V" = violation
 | LIBRARY: existence, permission | host policy | REFUSED |
 | LIBRARY: `known_version` | none | a version the host does not know gets BODY |
 | `stats` | none | replaced when impossible; never decided on |
-| `msg.flags` `TAINTED` | only in a RESULT | V elsewhere; retires the worker (§11.5) |
+| Header `flags` `TAINTED` | only in a RESULT | V elsewhere; retires the worker (§11.5) |
 | `Error.sql_error_id` | none | unknown or no longer held: rules 2 and 3 of §10.8 |
 | Sequence word, sleep flag, timing | none can be trusted | bounded sleeps, deadlines, grace |
-| Reserved bytes of the region outside `msg` | none | ignored |
+| Reserved bytes of the region; the inline area past `len` | none | ignored |
 
 A worker checks the host's messages only as far as §1 lists, and exits on
 what it finds.
@@ -1815,9 +1833,10 @@ what it finds.
   host of different versions can at least say so:
   * the descriptors (fd 3, fd 4), the socket's type, end of file as the
     order to stop, and exit status 2;
-  * `magic`, line 0, and the offsets of `to_w`, `to_h`, `w_sleep`,
-    `h_sleep`, `msg` and of the arena;
-  * the layout of the message header and the turn and sleep rules (§4);
+  * `magic`, line 0, and the offsets of the host and worker lines,
+    `w_sleep`, `h_sleep` and of the arena;
+  * the layout of the lines and of the message header (§5.1), inline
+    bodies, and the turn and sleep rules (§4);
   * READY: op 1, one chunk of at most 64 KiB, `flags` 0, `depth` 0,
     `call_seq` 0, status 0 (OK) or 4 (INTERNAL), and the first two fields
     of its body, `u32 version` and `str info`, in the encodings of §7.1.
@@ -2018,16 +2037,16 @@ Bytes in hexadecimal.
 ```
 
 **Its header** when posted as a top-level request with call_seq 3
-(40 bytes at offset 320):
+(bytes 4–23 of the host line, at 68; the body, 56 bytes, is in the
+arena, §5.1):
 
 ```
-03 00 00 00   op = CALL
-00 00 00 00   status
-00 00 00 00   flags
-00 00 00 00   depth
+03            op = CALL
+00            status
+00            flags
+00            depth
 38 00 00 00   len = 56
-00 00 00 00   reserved
-38 00 00 00 00 00 00 00   total_len = 56
+38 00 00 00   total_len = 56
 03 00 00 00 00 00 00 00   call_seq = 3
 ```
 
@@ -2093,6 +2112,18 @@ zero TIMESTAMP:
 has `len` 65536, `flags` 1, `total_len` 65546; the receiver posts CONTINUE
 (`op` 10, `len` 0, `total_len` 0, same `depth` and `call_seq`); chunk 2
 has `len` 10, `flags` 0, `total_len` 65546.
+
+**An inline CALL** of routine 7, `library_epoch` 1, arguments I64 1 and
+I64 2, `call_seq` 5: the body is 38 bytes, so the host line holds the
+whole message (offsets 0–61 of the line at 64; `to_w` = 5 after the
+host's fifth post, the rest of the line unspecified):
+
+```
+05 00 00 00 03 00 00 00 26 00 00 00 26 00 00 00
+05 00 00 00 00 00 00 00 07 00 00 00 00 00 00 00
+01 00 00 00 00 00 00 00 02 00 00 00 01 01 00 00
+00 00 00 00 00 01 02 00 00 00 00 00 00 00
+```
 
 **TIMESTAMP** 2024-01-01 00:00:00 UTC = 1704067200000000 µs:
 

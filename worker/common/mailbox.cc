@@ -119,7 +119,7 @@ void cpu_relax() {
 /** Waits for the host's post (§4.3): polls, then sleeps on the futex (EngineHooks around it). */
 void wait_host() {
   for (int i = 0; i < g_spin; i++) {
-    const uint32_t v = g_hdr->to_w.load(std::memory_order_acquire);
+    const uint32_t v = g_hdr->host.word.load(std::memory_order_acquire);
     if (v != g_seen) {
       g_seen = v;
       return;
@@ -129,9 +129,9 @@ void wait_host() {
   if (g_hooks.before_sleep != nullptr) g_hooks.before_sleep();
   while (true) {
     g_hdr->w_sleep.store(1, std::memory_order_seq_cst);
-    if (g_hdr->to_w.load(std::memory_order_seq_cst) == g_seen) futex(&g_hdr->to_w, FUTEX_WAIT, g_seen);
+    if (g_hdr->host.word.load(std::memory_order_seq_cst) == g_seen) futex(&g_hdr->host.word, FUTEX_WAIT, g_seen);
     g_hdr->w_sleep.store(0, std::memory_order_release);
-    const uint32_t v = g_hdr->to_w.load(std::memory_order_acquire);
+    const uint32_t v = g_hdr->host.word.load(std::memory_order_acquire);
     if (v != g_seen) {
       g_seen = v;
       break;
@@ -140,12 +140,17 @@ void wait_host() {
   if (g_hooks.after_sleep != nullptr) g_hooks.after_sleep();
 }
 
-/** Posts what is in the arena under header m (§4.1, §4.2): the header, then the word, then the
-    wake-up if the host sleeps. */
+/** Posts header m (§4.1, §4.2), its body in place (§5.1: in the worker line if it has at most 40
+    bytes, else in the arena): the header, then the word, then the wake-up if the host sleeps. */
 void post_raw(const w::MessageHeader &m) {
-  g_hdr->msg = m;
-  g_hdr->to_h.store(++g_posted, std::memory_order_seq_cst);
-  if (g_hdr->h_sleep.load(std::memory_order_seq_cst) != 0) futex(&g_hdr->to_h, FUTEX_WAKE, 1);
+  w::store_header(g_hdr->worker, m);
+  g_hdr->worker.word.store(++g_posted, std::memory_order_seq_cst);
+  if (g_hdr->h_sleep.load(std::memory_order_seq_cst) != 0) futex(&g_hdr->worker.word, FUTEX_WAKE, 1);
+}
+
+/** Where the body of the host's message with this header is: the host line or the arena (§5.1). */
+const std::byte *host_body(const w::MessageHeader &m) {
+  return w::is_inline(m.total_len) ? g_hdr->host.body : g_arena;
 }
 
 w::MessageHeader header(uint32_t op, uint32_t status, uint32_t flags, uint32_t depth, uint32_t len, uint64_t total,
@@ -328,14 +333,16 @@ void Mailbox::failed_ready(std::string_view info) {
 
 Message Mailbox::receive(const std::function<std::byte *(size_t)> &allocate) {
   wait_host();
-  const w::MessageHeader first = g_hdr->msg;  // copied once; the checks are made on the copy
+  const w::MessageHeader first = w::load_header(g_hdr->host);  // copied once; the checks are made on the copy
   uint64_t len = first.len;
   bool more = (first.flags & w::kMore) != 0;
   const uint64_t total = first.total_len;
-  // §5.2: of each chunk its len, at most the arena and the bytes still due.
+  // §5.2: of each chunk its len, at most the arena and the bytes still due; an inline message is
+  // one chunk (§5.1).
   if (len > g_arena_size || len > total) protocol_failure("a chunk longer than the arena or the message");
+  if (w::is_inline(total) && (more || len != total)) protocol_failure("an inline message of more than one chunk");
   check_received(first);
-  if (!more) return {first.op, first.depth, first.call_seq, {g_arena, static_cast<size_t>(len)}, true, false, 0};
+  if (!more) return {first.op, first.depth, first.call_seq, {host_body(first), static_cast<size_t>(len)}, true, false, 0};
   uint64_t head = 0;
   std::memcpy(&head, g_arena, std::min<uint64_t>(len, sizeof head));
   std::byte *dst = total <= SIZE_MAX ? allocate(static_cast<size_t>(total)) : nullptr;
@@ -346,7 +353,7 @@ Message Mailbox::receive(const std::function<std::byte *(size_t)> &allocate) {
     if (!more) break;
     post_raw(header(static_cast<uint32_t>(w::Op::kContinue), 0, 0, first.depth, 0, 0, first.call_seq));
     wait_host();
-    const w::MessageHeader m = g_hdr->msg;
+    const w::MessageHeader m = w::load_header(g_hdr->host);
     more = (m.flags & w::kMore) != 0;
     len = m.len;
     if (len > g_arena_size || len > total - have) protocol_failure("a chunk longer than the arena or the bytes still due");
@@ -358,8 +365,14 @@ Message Mailbox::receive(const std::function<std::byte *(size_t)> &allocate) {
 
 void Mailbox::send(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, std::span<const std::byte> body) {
   const uint64_t total = body.size();
+  if (w::is_inline(total)) {
+    check_sent(op, depth, seq, total);
+    if (total != 0) std::memcpy(g_hdr->worker.body, body.data(), total);
+    post_raw(header(op, status, result_flags(op), depth, static_cast<uint32_t>(total), total, seq));
+    return;
+  }
   if (total <= g_arena_size) {
-    if (total != 0) std::memcpy(g_arena, body.data(), total);
+    std::memcpy(g_arena, body.data(), total);
     post(op, status, depth, seq, static_cast<uint32_t>(total));
     return;
   }
@@ -374,7 +387,7 @@ void Mailbox::send(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, s
     if (!more) break;
     wait_host();
     // §5.2: of a CONTINUE, its op.
-    if (!is(g_hdr->msg.op, w::Op::kContinue)) protocol_failure("a message that is not the CONTINUE of a transfer");
+    if (!is(g_hdr->host.op, w::Op::kContinue)) protocol_failure("a message that is not the CONTINUE of a transfer");
   }
 }
 
@@ -382,10 +395,12 @@ std::span<std::byte> Mailbox::arena() { return {g_arena, g_arena_size}; }
 
 void Mailbox::post(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, uint32_t len) {
   check_sent(op, depth, seq, len);
+  // Written in the arena: a body of at most 40 bytes moves to the worker line (§5.1).
+  if (w::is_inline(len) && len != 0) std::memcpy(g_hdr->worker.body, g_arena, len);
   post_raw(header(op, status, result_flags(op), depth, len, len, seq));
 }
 
-bool Mailbox::pending() { return g_hdr->to_w.load(std::memory_order_acquire) != g_seen; }
+bool Mailbox::pending() { return g_hdr->host.word.load(std::memory_order_acquire) != g_seen; }
 
 void Mailbox::taint() { g_tainted = true; }
 

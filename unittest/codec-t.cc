@@ -164,15 +164,25 @@ TEST(MleProtocol, RegionLayout) {
   EXPECT_EQ(offsetof(wire::RegionHeader, version), 4u);
   EXPECT_EQ(offsetof(wire::RegionHeader, region_size), 8u);
   EXPECT_EQ(offsetof(wire::RegionHeader, arena_size), 16u);
-  EXPECT_EQ(offsetof(wire::RegionHeader, to_w), 64u);
-  EXPECT_EQ(offsetof(wire::RegionHeader, to_h), 128u);
+  EXPECT_EQ(offsetof(wire::RegionHeader, host), 64u);
+  EXPECT_EQ(offsetof(wire::RegionHeader, worker), 128u);
   EXPECT_EQ(offsetof(wire::RegionHeader, w_sleep), 192u);
   EXPECT_EQ(offsetof(wire::RegionHeader, h_sleep), 256u);
-  EXPECT_EQ(offsetof(wire::RegionHeader, msg), 320u);
   EXPECT_EQ(offsetof(wire::RegionHeader, stats), 384u);
   EXPECT_EQ(sizeof(wire::RegionHeader), 4096u);
-  EXPECT_EQ(offsetof(MessageHeader, total_len), 24u);
-  EXPECT_EQ(offsetof(MessageHeader, call_seq), 32u);
+  // A line (§5.1): the word, the header, the inline body.
+  EXPECT_EQ(offsetof(wire::Line, op), 4u);
+  EXPECT_EQ(offsetof(wire::Line, status), 5u);
+  EXPECT_EQ(offsetof(wire::Line, flags), 6u);
+  EXPECT_EQ(offsetof(wire::Line, depth), 7u);
+  EXPECT_EQ(offsetof(wire::Line, len), 8u);
+  EXPECT_EQ(offsetof(wire::Line, total_len), 12u);
+  EXPECT_EQ(offsetof(wire::Line, call_seq), 16u);
+  EXPECT_EQ(offsetof(wire::Line, body), 24u);
+  EXPECT_EQ(sizeof(wire::Line), 64u);
+  EXPECT_TRUE(wire::is_inline(0));
+  EXPECT_TRUE(wire::is_inline(40));
+  EXPECT_FALSE(wire::is_inline(41));
   EXPECT_EQ(offsetof(wire::WorkerStats, state), 24u);
   EXPECT_EQ(offsetof(wire::WorkerStats, reserved), 28u);
   EXPECT_EQ(uint32_t{wire::kMore}, 1u);
@@ -227,17 +237,52 @@ TEST(MleSpecVectors, CallBody) {
 
 TEST(MleSpecVectors, CallHeader) {
   const std::string bytes = hex(
-      "03 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00"
-      "38 00 00 00  00 00 00 00"
-      "38 00 00 00 00 00 00 00"
+      "03 00 00 00"
+      "38 00 00 00"
+      "38 00 00 00"
       "03 00 00 00 00 00 00 00");
   MessageHeader h{};
   h.op = static_cast<uint32_t>(wire::Op::kCall);
   h.len = 56;
   h.total_len = 56;
   h.call_seq = 3;
-  ASSERT_EQ(bytes.size(), sizeof h);
-  EXPECT_EQ(std::string(reinterpret_cast<const char *>(&h), sizeof h), bytes);
+  wire::Line line{};
+  wire::store_header(line, h);
+  ASSERT_EQ(bytes.size(), 20u);
+  EXPECT_EQ(std::string(reinterpret_cast<const char *>(&line) + 4, 20), bytes);
+  const MessageHeader back = wire::load_header(line);
+  EXPECT_EQ(back.op, h.op);
+  EXPECT_EQ(back.len, 56u);
+  EXPECT_EQ(back.total_len, 56u);
+  EXPECT_EQ(back.call_seq, 3u);
+}
+
+// A CALL of two I64 is inline: the whole message is in the host line.
+TEST(MleSpecVectors, InlineCall) {
+  const std::string bytes = hex(
+      "05 00 00 00 03 00 00 00 26 00 00 00 26 00 00 00"
+      "05 00 00 00 00 00 00 00 07 00 00 00 00 00 00 00"
+      "01 00 00 00 00 00 00 00 02 00 00 00 01 01 00 00"
+      "00 00 00 00 00 01 02 00 00 00 00 00 00 00");
+  ASSERT_EQ(bytes.size(), 62u);
+  CallMsg m;
+  m.routine_id = 7;
+  m.library_epoch = 1;
+  m.args = {Value::i64(1), Value::i64(2)};
+  std::string body;
+  encode(m, &body);
+  ASSERT_EQ(body.size(), 38u);
+  ASSERT_TRUE(wire::is_inline(body.size()));
+  wire::Line line{};
+  MessageHeader h{};
+  h.op = static_cast<uint32_t>(wire::Op::kCall);
+  h.len = 38;
+  h.total_len = 38;
+  h.call_seq = 5;
+  wire::store_header(line, h);
+  memcpy(line.body, body.data(), body.size());
+  line.word.store(5);
+  EXPECT_EQ(std::string(reinterpret_cast<const char *>(&line), 62), bytes);
 }
 
 TEST(MleSpecVectors, ResultBody) {
@@ -1583,9 +1628,10 @@ TEST(MleAssembler, WorkerHeaderCheck) {
   EXPECT_FALSE(bad([](MessageHeader &h) {
     h.flags = 1, h.len = 1024, h.total_len = 5000;
   }));
-  // reserved: 0.
-  EXPECT_TRUE(bad([](MessageHeader &h) { h.reserved = 1; }));
-  // len and total_len.
+  // len and total_len. (An inline message, at most 40 bytes, is one chunk:
+  // the Assembler finds one that is not, as it finds any chunk that is
+  // shorter than the arena and not the whole message.)
+  EXPECT_FALSE(bad([](MessageHeader &h) { h.len = 40, h.total_len = 40; }));
   EXPECT_TRUE(bad([](MessageHeader &h) { h.len = 1025, h.total_len = 1025; }));
   EXPECT_FALSE(bad([](MessageHeader &h) {
     h.flags = 1, h.len = 1024, h.total_len = wire::kMaxWorkerMessage;
@@ -1601,9 +1647,6 @@ TEST(MleAssembler, WorkerHeaderCheck) {
   EXPECT_TRUE(bad([](MessageHeader &h) { h.len = 1, h.total_len = 0; }, go));
   EXPECT_TRUE(bad([](MessageHeader &h) {
     h.len = 0, h.total_len = 0, h.status = 1;
-  }, go));
-  EXPECT_TRUE(bad([](MessageHeader &h) {
-    h.len = 0, h.total_len = 0, h.reserved = 1;
   }, go));
   EXPECT_TRUE(bad([](MessageHeader &h) {
     h.len = 0, h.total_len = 0, h.flags = 1;

@@ -89,21 +89,25 @@ final class Wire {
   static final long OFF_VERSION = 4;
   static final long OFF_REGION_SIZE = 8;
   static final long OFF_ARENA_SIZE = 16;
+  /** The host line: to_w, then the host's message header and inline body (§5.1). */
   static final long OFF_TO_W = 64;
+  /** The worker line: to_h, then the worker's message header and inline body. */
   static final long OFF_TO_H = 128;
   static final long OFF_W_SLEEP = 192;
   static final long OFF_H_SLEEP = 256;
-  static final long OFF_MSG = 320;
   static final long OFF_STATS = 384;
-  // The message header (§5.1), relative to OFF_MSG.
-  static final long MSG_OP = 0;
-  static final long MSG_STATUS = 4;
-  static final long MSG_FLAGS = 8;
-  static final long MSG_DEPTH = 12;
-  static final long MSG_LEN = 16;
-  static final long MSG_RESERVED = 20;
-  static final long MSG_TOTAL_LEN = 24;
-  static final long MSG_CALL_SEQ = 32;
+  // The message header (§5.1), relative to a line: u8 op, status, flags, depth; u32 len,
+  // total_len; u64 call_seq; then the inline body.
+  static final long LINE_OP = 4;
+  static final long LINE_STATUS = 5;
+  static final long LINE_FLAGS = 6;
+  static final long LINE_DEPTH = 7;
+  static final long LINE_LEN = 8;
+  static final long LINE_TOTAL_LEN = 12;
+  static final long LINE_CALL_SEQ = 16;
+  static final long LINE_BODY = 24;
+  /** A body of at most this many bytes is inline, in the poster's line (§5.1). */
+  static final int INLINE_BODY = 40;
   // The worker statistics (§3.1), relative to OFF_STATS.
   static final long STATS_HEAP_USED = 0;
   static final long STATS_HEAP_MAX = 8;

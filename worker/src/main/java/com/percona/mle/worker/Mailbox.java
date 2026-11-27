@@ -27,8 +27,8 @@ import java.util.concurrent.locks.LockSupport;
  * The worker's side of the shared memory mailbox (§3 to §5): mapped with FFM, sequence words read
  * and written with VarHandle atomics, futex waits through a syscall downcall.
  *
- * <p>Messages are decoded in place from the arena when they fit in one chunk; larger messages
- * are reassembled in a native buffer. Messages are written in place by {@link MessageWriter}.
+ * <p>Messages are decoded in place when they fit in one chunk (from the host line if they have at
+ * most 40 bytes, §5.1, else from the arena); larger messages are reassembled in a native buffer. Messages are written in place by {@link MessageWriter}.
  *
  * <p>The host is trusted (§1): of its headers the worker checks what its own safety needs, which
  * is the operation, that its state can take the message (the receiver's Admission: op, depth,
@@ -48,6 +48,9 @@ final class Mailbox {
   final int version;
   private final MemorySegment toW;
   private final MemorySegment toH;
+  /** The inline bodies (§5.1): the host's, read, and the worker's, written. */
+  private final MemorySegment hostBody;
+  private final MemorySegment workerBody;
   private final int spin;
   /** The value of the host's word seen last (§4.1). */
   private int seenW;
@@ -105,6 +108,8 @@ final class Mailbox {
     this.arena = region.asSlice(Wire.HEADER_SIZE, arenaSize);
     this.toW = region.asSlice(Wire.OFF_TO_W, 4);
     this.toH = region.asSlice(Wire.OFF_TO_H, 4);
+    this.hostBody = region.asSlice(Wire.OFF_TO_W + Wire.LINE_BODY, Wire.INLINE_BODY);
+    this.workerBody = region.asSlice(Wire.OFF_TO_H + Wire.LINE_BODY, Wire.INLINE_BODY);
     this.spin = spin;
   }
 
@@ -199,31 +204,39 @@ final class Mailbox {
   }
 
   /**
-   * Posts what is in msg and the arena (§4.1, §4.2): the new count is stored into the worker's
-   * word, and that store and the load of the host's sleep flag are sequentially consistent.
+   * Posts the header and body written in place (§4.1, §4.2): the new count is stored into the
+   * worker's word, and that store and the load of the host's sleep flag are sequentially consistent.
    */
   private void post() {
     INT.setVolatile(region, Wire.OFF_TO_H, ++posts);
     if ((int) INT.getVolatile(region, Wire.OFF_H_SLEEP) != 0) Native.futexWake(toH);
   }
 
+  /** The worker's header in the worker line (§5.1); the values are legal, so they fit. */
   private void header(int op, int status, int flags, int depth, long len, long total, long seq) {
-    region.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_OP, op);
-    region.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_STATUS, status);
-    region.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_FLAGS, flags);
-    region.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_DEPTH, depth);
-    region.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_LEN, (int) len);
-    region.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_RESERVED, 0);
-    region.set(ValueLayout.JAVA_LONG, Wire.OFF_MSG + Wire.MSG_TOTAL_LEN, total);
-    region.set(ValueLayout.JAVA_LONG, Wire.OFF_MSG + Wire.MSG_CALL_SEQ, seq);
+    writeHeader(region, Wire.OFF_TO_H, op, status, flags, depth, len, total, seq);
   }
 
-  private int msgInt(long field) {
-    return region.get(ValueLayout.JAVA_INT, Wire.OFF_MSG + field);
+  /** A header into the line at line (also Train's, as the host). */
+  static void writeHeader(MemorySegment region, long line, int op, int status, int flags, int depth, long len,
+      long total, long seq) {
+    region.set(ValueLayout.JAVA_BYTE, line + Wire.LINE_OP, (byte) op);
+    region.set(ValueLayout.JAVA_BYTE, line + Wire.LINE_STATUS, (byte) status);
+    region.set(ValueLayout.JAVA_BYTE, line + Wire.LINE_FLAGS, (byte) flags);
+    region.set(ValueLayout.JAVA_BYTE, line + Wire.LINE_DEPTH, (byte) depth);
+    region.set(ValueLayout.JAVA_INT, line + Wire.LINE_LEN, (int) len);
+    region.set(ValueLayout.JAVA_INT, line + Wire.LINE_TOTAL_LEN, (int) total);
+    region.set(ValueLayout.JAVA_LONG, line + Wire.LINE_CALL_SEQ, seq);
   }
 
-  private long msgLong(long field) {
-    return region.get(ValueLayout.JAVA_LONG, Wire.OFF_MSG + field);
+  /** A byte field of the host's header, unsigned. */
+  private int hostByte(long field) {
+    return Byte.toUnsignedInt(region.get(ValueLayout.JAVA_BYTE, Wire.OFF_TO_W + field));
+  }
+
+  /** A u32 field of the host's header. */
+  private long hostU32(long field) {
+    return Integer.toUnsignedLong(region.get(ValueLayout.JAVA_INT, Wire.OFF_TO_W + field));
   }
 
   private static boolean hostOp(int op) {
@@ -256,12 +269,12 @@ final class Mailbox {
    */
   Message receive(Admission admission) {
     waitHost();
-    int op = msgInt(Wire.MSG_OP);
-    int flags = msgInt(Wire.MSG_FLAGS);
-    int depth = msgInt(Wire.MSG_DEPTH);
-    long len = Integer.toUnsignedLong(msgInt(Wire.MSG_LEN));
-    long total = msgLong(Wire.MSG_TOTAL_LEN);
-    long seq = msgLong(Wire.MSG_CALL_SEQ);
+    int op = hostByte(Wire.LINE_OP);
+    int flags = hostByte(Wire.LINE_FLAGS);
+    int depth = hostByte(Wire.LINE_DEPTH);
+    long len = hostU32(Wire.LINE_LEN);
+    long total = hostU32(Wire.LINE_TOTAL_LEN);
+    long seq = region.get(ValueLayout.JAVA_LONG, Wire.OFF_TO_W + Wire.LINE_CALL_SEQ);
     if (dropAssembly) {  // a large message's buffer is not kept for the worker's life
       assembly = MemorySegment.NULL;
       dropAssembly = false;
@@ -269,10 +282,13 @@ final class Mailbox {
     if (!hostOp(op)) throw ProtocolFailure.exit("op " + op + " from the host");
     boolean more = (flags & Wire.FLAG_MORE) != 0;
     if (len > arenaSize) throw ProtocolFailure.exit("a chunk of op " + op + " of " + len + " bytes");
+    // An inline message is one chunk (§5.1).
+    if (total <= Wire.INLINE_BODY && (more || len != total))
+      throw ProtocolFailure.exit("an inline message of op " + op + " in chunks");
     admission.check(op, depth, seq);
-    if (!more) return message(op, depth, seq, arena, len, false);
+    if (!more) return message(op, depth, seq, total <= Wire.INLINE_BODY ? hostBody : arena, len, false);
 
-    boolean discard = total < 0 || total > Wire.MAX_HOST_MESSAGE;
+    boolean discard = total > Wire.MAX_HOST_MESSAGE;
     if (!discard && assembly.byteSize() < total) {
       try {
         assembly = Arena.ofAuto().allocate(total, Wire.VECTOR_ALIGNMENT);
@@ -297,9 +313,10 @@ final class Mailbox {
       header(Wire.CONTINUE, 0, 0, depth, 0, 0, seq);
       post();
       waitHost();
-      if (msgInt(Wire.MSG_OP) != op) throw ProtocolFailure.exit("op " + msgInt(Wire.MSG_OP) + " among the chunks of op " + op);
-      more = (msgInt(Wire.MSG_FLAGS) & Wire.FLAG_MORE) != 0;
-      len = Integer.toUnsignedLong(msgInt(Wire.MSG_LEN));
+      if (hostByte(Wire.LINE_OP) != op)
+        throw ProtocolFailure.exit("op " + hostByte(Wire.LINE_OP) + " among the chunks of op " + op);
+      more = (hostByte(Wire.LINE_FLAGS) & Wire.FLAG_MORE) != 0;
+      len = hostU32(Wire.LINE_LEN);
       if (len > arenaSize) throw ProtocolFailure.exit("a chunk of op " + op + " of " + len + " bytes");
     }
     return discard ? message(op, depth, seq, head, headLength, true) : message(op, depth, seq, assembly, have, false);
@@ -313,6 +330,8 @@ final class Mailbox {
   void send(int op, int status, int flags, int depth, long seq, MessageWriter w) {
     long total = w.size();
     if (!w.spilled()) {
+      // Written in the arena: a body of at most 40 bytes moves to the worker line (§5.1).
+      if (total <= Wire.INLINE_BODY && total > 0) MemorySegment.copy(arena, 0, workerBody, 0, total);
       header(op, status, flags, depth, total, total, seq);
       post();
       return;
@@ -328,7 +347,7 @@ final class Mailbox {
       sent += len;
       if (!more) return;
       waitHost();
-      if (msgInt(Wire.MSG_OP) != Wire.CONTINUE) throw ProtocolFailure.exit("expected CONTINUE for op " + op);
+      if (hostByte(Wire.LINE_OP) != Wire.CONTINUE) throw ProtocolFailure.exit("expected CONTINUE for op " + op);
     }
   }
 

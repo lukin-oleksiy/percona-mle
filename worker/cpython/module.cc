@@ -115,7 +115,7 @@ Message receive(Ref &assembled) {
 
 /** The body as a Python object (a memoryview of the arena, or of the reassembled bytes). */
 Ref body_object(const Message &m, Ref &assembled) {
-  if (!m.in_arena) {
+  if (!m.in_region) {
     // The bytes received, not the total announced: a short host leaves the rest unset (MVP review
     // CPY-12), and Python's readers are bounded by the view.
     Ref whole = Ref::steal(PyMemoryView_FromObject(assembled.get()));

@@ -165,9 +165,9 @@ ResultMsg failed(std::string language = "", std::string message = "boom") {
 Script raw_result(std::string_view arena, uint32_t status = 0,
                   uint32_t flags = 0, uint32_t len = mle_test::kAuto,
                   uint64_t total = mle_test::kAuto, int32_t depth_delta = 0,
-                  int64_t seq_delta = 0, uint32_t reserved = 0) {
+                  int64_t seq_delta = 0) {
   return Script().post(u(Op::kResult), status, flags, arena, len, total,
-                       depth_delta, seq_delta, reserved);
+                       depth_delta, seq_delta);
 }
 
 Script fail_with(Status status, std::string language = "") {
@@ -207,9 +207,9 @@ std::vector<std::pair<std::string, Script>> ready_classes() {
   auto raw = [&c](const char *name, std::string_view arena, uint32_t status = 0,
                   uint32_t flags = 0, uint32_t len = mle_test::kAuto,
                   uint64_t total = mle_test::kAuto, int32_t depth = 0,
-                  int64_t seq = 0, uint32_t reserved = 0) {
+                  int64_t seq = 0) {
     c.emplace_back(name, Script().post(u(Op::kReady), status, flags, arena, len,
-                                       total, depth, seq, reserved));
+                                       total, depth, seq));
   };
   const std::string good = bytes_of(good_ready());
   ReadyMsg m = good_ready();
@@ -233,7 +233,8 @@ std::vector<std::pair<std::string, Script>> ready_classes() {
   raw("r_more", good, 0, kMore);
   raw("r_depth", good, 0, 0, mle_test::kAuto, mle_test::kAuto, 1);
   raw("r_seq", good, 0, 0, mle_test::kAuto, mle_test::kAuto, 0, 1);
-  raw("r_reserved", good, 0, 0, mle_test::kAuto, mle_test::kAuto, 0, 0, 1);
+  // A READY that says it is inline (at most 40 bytes) but has two chunks.
+  raw("r_inline", good, 0, 0, 30, 40);
   raw("r_big", good, 0, kMore, kArena, kArena + 1);
   raw("r_trailing", good + "x");
   raw("r_short", good.substr(0, good.size() - 1));
@@ -467,10 +468,13 @@ class MleWorkerProtocol : public ::testing::Test {
   static std::vector<Logged> parse_log(const std::string &log) {
     std::vector<Logged> out;
     size_t at = 0;
-    while (log.size() - at >= sizeof(wire::MessageHeader)) {
+    // Each entry: the header as on the wire (20 bytes, §5.1), the body.
+    while (log.size() - at >= 20) {
       Logged l;
-      memcpy(&l.h, log.data() + at, sizeof l.h);
-      at += sizeof l.h;
+      wire::Line line{};
+      memcpy(reinterpret_cast<char *>(&line) + 4, log.data() + at, 20);
+      l.h = wire::load_header(line);
+      at += 20;
       if (l.h.total_len > log.size() - at) break;
       l.body = log.substr(at, l.h.total_len);
       at += l.h.total_len;
@@ -647,9 +651,9 @@ TEST_F(MleWorkerProtocol, SpecVectorsOnTheWire) {
             Outcome::kOk)
       << err;  // 3
   const unsigned char header_and_body[] = {
-      0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // op .. depth
-      0x38, 0, 0, 0, 0, 0, 0, 0,                             // len, reserved
-      0x38, 0, 0, 0, 0, 0, 0, 0,                             // total_len
+      0x03, 0, 0, 0,                                         // op .. depth
+      0x38, 0, 0, 0,                                         // len
+      0x38, 0, 0, 0,                                         // total_len
       0x03, 0, 0, 0, 0, 0, 0, 0,                             // call_seq
       0x07, 0, 0, 0, 0, 0, 0, 0,                             // routine_id
       0x01, 0, 0, 0, 0, 0, 0, 0,                             // library_epoch
@@ -830,7 +834,7 @@ TEST_F(MleWorkerProtocol, ReadyViolations) {
       {"r_more", "does not fill the arena"},
       {"r_depth", "wrong request"},
       {"r_seq", "wrong request"},
-      {"r_reserved", "reserved"},
+      {"r_inline", "message truncated"},
       {"r_big", "READY larger than its limit"},
       {"r_trailing", "bad READY: trailing bytes"},
       {"r_short", "bad READY"},
@@ -859,8 +863,8 @@ TEST_F(MleWorkerProtocol, ReadyViolations) {
 
 // ---------------------------------------------------------------- violations
 
-// §13: msg.op, msg.status, msg.flags, msg.depth and msg.call_seq, msg.len
-// and msg.total_len, msg reserved.
+// §13: the header's op, status, flags, depth and call_seq, len and
+// total_len; an inline message is one chunk (§5.1).
 TEST_F(MleWorkerProtocol, HeaderViolations) {
   const std::string good = bytes_of(good_result());
   const std::string plain = bytes_of(ResultMsg());
@@ -975,22 +979,20 @@ TEST_F(MleWorkerProtocol, HeaderViolations) {
   violation("a LIBRARY of more than 64 KiB", Where::kCall,
             Script().post(u(Op::kLibrary), 0, kMore, full, kArena, kArena + 1),
             "LIBRARY larger than its limit");
-  // reserved.
-  violation("reserved", Where::kCall,
-            raw_result(good, 0, 0, mle_test::kAuto, mle_test::kAuto, 0, 0, 1),
-            "reserved");
-  violation("reserved of an SQL", Where::kCall,
-            Script().post(u(Op::kSql), 0, 0, select, mle_test::kAuto,
-                          mle_test::kAuto, 0, 0, 0x80000000),
-            "reserved");
+  // Inline (§5.1): a body of at most 40 bytes is one chunk, len = total_len.
+  violation("an inline RESULT with a short len", Where::kCall,
+            raw_result(plain, 0, 0, 20, 28), "message truncated");
+  violation("an inline RESULT with MORE", Where::kCall,
+            raw_result(full, 0, kMore, kArena, 40),
+            "chunk larger than the message");
 }
 
 // §13, CONTINUE: every field as §5.2.
 TEST_F(MleWorkerProtocol, ContinueViolations) {
   auto go = [](uint32_t status, uint32_t flags, uint32_t len, uint64_t total,
-               int32_t depth = 0, int64_t seq = 0, uint32_t reserved = 0) {
+               int32_t depth = 0, int64_t seq = 0) {
     return Script().post(u(Op::kContinue), status, flags, {}, len, total, depth,
-                         seq, reserved);
+                         seq);
   };
   violation("len", Where::kContinue, go(0, 0, 1, 0), "bad CONTINUE");
   violation("total_len", Where::kContinue, go(0, 0, 0, 1), "bad CONTINUE");
@@ -1000,7 +1002,6 @@ TEST_F(MleWorkerProtocol, ContinueViolations) {
   violation("depth", Where::kContinue, go(0, 0, 0, 0, 1), "expected CONTINUE");
   violation("call_seq", Where::kContinue, go(0, 0, 0, 0, 0, 1),
             "expected CONTINUE");
-  violation("reserved", Where::kContinue, go(0, 0, 0, 0, 0, 0, 1), "reserved");
   violation("another op", Where::kContinue,
             Script().post(u(Op::kResult), 0, 0, bytes_of(ResultMsg())),
             "expected CONTINUE for a chunk of PREPARE");
@@ -1874,7 +1875,6 @@ TEST_F(MleWorkerProtocol, SqlAndLibrary) {
     EXPECT_EQ(l.h.depth, 0u);
     EXPECT_EQ(l.h.call_seq, log[0].h.call_seq);
     EXPECT_EQ(l.h.status, 0u);
-    EXPECT_EQ(l.h.reserved, 0u);
   }
   const auto r = replies(res.console_out);
   ASSERT_EQ(r.size(), 5u);

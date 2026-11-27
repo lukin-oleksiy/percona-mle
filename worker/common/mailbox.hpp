@@ -61,14 +61,15 @@ struct EngineHooks {
   void (*interrupted_end)() = nullptr;
 };
 
-/** A received message. body is the arena (one chunk: valid until the worker's next write to the
-    arena) or the bytes received into the buffer the allocator gave (a message in chunks). */
+/** A received message. body is in the region (one chunk: the host line if it has at most 40
+    bytes, else the arena; valid until the worker's next post or write to the arena, §4.1) or the
+    bytes received into the buffer the allocator gave (a message in chunks). */
 struct Message {
   uint32_t op;
   uint32_t depth;
   uint64_t call_seq;
   std::span<const std::byte> body;
-  bool in_arena;
+  bool in_region;
   /** The worker could not hold the message (the allocator gave no buffer): the transfer was
       completed and its chunks discarded (§5.3); body is empty. The caller fails it locally. */
   bool discarded;
@@ -107,7 +108,8 @@ class Mailbox {
       gets the TAINTED flag once taint() was called. */
   static void send(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, std::span<const std::byte> body);
 
-  /** The arena, for a message of one chunk written in place; post() sends its first len bytes. */
+  /** The arena, for a message of one chunk written in place; post() sends its first len bytes
+      (from the worker line if they are at most 40, §5.1). */
   static std::span<std::byte> arena();
   static void post(uint32_t op, uint32_t status, uint32_t depth, uint64_t seq, uint32_t len);
 

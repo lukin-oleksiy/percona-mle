@@ -150,20 +150,17 @@ public final class Train {
    */
   private static void request(Mailbox mb, Dispatcher d, int op, MessageWriter w) {
     MemorySegment r = mb.region;
-    r.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_OP, op);
-    r.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_STATUS, 0);
-    r.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_FLAGS, 0);
-    r.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_DEPTH, 0);
-    r.set(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_LEN, (int) w.size());
-    r.set(ValueLayout.JAVA_LONG, Wire.OFF_MSG + Wire.MSG_TOTAL_LEN, w.size());
-    r.set(ValueLayout.JAVA_LONG, Wire.OFF_MSG + Wire.MSG_CALL_SEQ, ++seq);
+    // A body of at most 40 bytes is in the host line, not in the arena (§5.1).
+    if (w.size() <= Wire.INLINE_BODY && w.size() > 0)
+      MemorySegment.copy(mb.arena, 0, r, Wire.OFF_TO_W + Wire.LINE_BODY, w.size());
+    Mailbox.writeHeader(r, Wire.OFF_TO_W, op, 0, 0, 0, w.size(), w.size(), ++seq);
     r.set(ValueLayout.JAVA_INT, Wire.OFF_TO_W, r.get(ValueLayout.JAVA_INT, Wire.OFF_TO_W) + 1);
     d.serveNext();
     // The training covers the path of requests that succeed.
-    if (r.get(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_OP) != Wire.RESULT
-        || r.get(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_STATUS) != Wire.OK)
-      throw new IllegalStateException("training request of op " + op + " failed: status "
-          + r.get(ValueLayout.JAVA_INT, Wire.OFF_MSG + Wire.MSG_STATUS));
+    int resultOp = Byte.toUnsignedInt(r.get(ValueLayout.JAVA_BYTE, Wire.OFF_TO_H + Wire.LINE_OP));
+    int status = Byte.toUnsignedInt(r.get(ValueLayout.JAVA_BYTE, Wire.OFF_TO_H + Wire.LINE_STATUS));
+    if (resultOp != Wire.RESULT || status != Wire.OK)
+      throw new IllegalStateException("training request of op " + op + " failed: status " + status);
   }
 
   /** A Type (§7.1) of the tag, without a SQL type name. */

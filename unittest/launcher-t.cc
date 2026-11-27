@@ -102,17 +102,21 @@ std::unique_ptr<Launcher> start(const LauncherConfig &c) {
 bool wait_ready(const WorkerProcess &w, ReadyMsg *m, std::string *error,
                 int timeout_ms = 10000) {
   const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
-  while (w.header()->to_h.load(std::memory_order_acquire) == 0) {
+  while (w.header()->worker.word.load(std::memory_order_acquire) == 0) {
     if (!w.alive())
       return *error = "worker died: " + w.exit_info(2000).describe(), false;
     if (Clock::now() > deadline) return *error = "no READY", false;
     std::this_thread::sleep_for(std::chrono::microseconds(200));
   }
   // Copy out, then check: the worker is untrusted.
-  const wire::MessageHeader h = w.header()->msg;
+  const wire::MessageHeader h = wire::load_header(w.header()->worker);
   if (!check_worker_header(h, w.arena_size(), error)) return false;
   Assembler a(w.arena_size(), wire::kMaxSmallMessage);
-  if (a.add(h, w.arena()) != Assembler::Step::kDone)
+  // At most 40 bytes are in the worker line (§5.1).
+  const void *body = wire::is_inline(h.total_len)
+                         ? static_cast<const void *>(w.header()->worker.body)
+                         : static_cast<const void *>(w.arena());
+  if (a.add(h, body) != Assembler::Step::kDone)
     return *error = a.error(), false;
   if (h.op != static_cast<uint32_t>(wire::Op::kReady))
     return *error = "not READY", false;

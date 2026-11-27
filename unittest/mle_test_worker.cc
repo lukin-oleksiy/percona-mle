@@ -82,16 +82,20 @@ void post_ready(wire::RegionHeader *h, const std::string &info) {
   std::string body;
   encode(m, &body);
   if (body.size() > wire::kMaxSmallMessage) _exit(92);
-  memcpy(reinterpret_cast<char *>(h) + wire::kHeaderSize, body.data(),
-         body.size());
-  h->msg = wire::MessageHeader{};
-  h->msg.op = static_cast<uint32_t>(wire::Op::kReady);
-  h->msg.len = static_cast<uint32_t>(body.size());
-  h->msg.total_len = body.size();
-  h->to_h.store(1, std::memory_order_seq_cst);
+  // At most 40 bytes in the worker line, else in the arena (§5.1).
+  memcpy(wire::is_inline(body.size())
+             ? reinterpret_cast<char *>(h->worker.body)
+             : reinterpret_cast<char *>(h) + wire::kHeaderSize,
+         body.data(), body.size());
+  wire::MessageHeader hdr{};
+  hdr.op = static_cast<uint32_t>(wire::Op::kReady);
+  hdr.len = static_cast<uint32_t>(body.size());
+  hdr.total_len = body.size();
+  wire::store_header(h->worker, hdr);
+  h->worker.word.store(1, std::memory_order_seq_cst);
   if (h->h_sleep.load(std::memory_order_seq_cst) != 0)
-    syscall(SYS_futex, reinterpret_cast<uint32_t *>(&h->to_h), FUTEX_WAKE, 1,
-            nullptr, nullptr, 0);
+    syscall(SYS_futex, reinterpret_cast<uint32_t *>(&h->worker.word),
+            FUTEX_WAKE, 1, nullptr, nullptr, 0);
 }
 
 [[noreturn]] void wait_for_eof() {
@@ -207,24 +211,38 @@ class Proto {
     Routine routine;
   };
 
+  /** Posts m with bytes where the host looks for them by total_len (§5.1):
+      inline (cut to 40 bytes) or in the arena (cut to its size). */
   void post(const wire::MessageHeader &m, std::string_view bytes) {
-    memcpy(m_arena, bytes.data(), std::min<size_t>(bytes.size(), m_arena_size));
-    m_h->msg = m;
-    m_h->to_h.store(++m_posted, std::memory_order_seq_cst);
+    if (wire::is_inline(m.total_len))
+      memcpy(m_h->worker.body, bytes.data(),
+             std::min<size_t>(bytes.size(), wire::kInlineBody));
+    else
+      memcpy(m_arena, bytes.data(),
+             std::min<size_t>(bytes.size(), m_arena_size));
+    wire::store_header(m_h->worker, m);
+    m_h->worker.word.store(++m_posted, std::memory_order_seq_cst);
     if (m_h->h_sleep.load(std::memory_order_seq_cst) != 0)
-      syscall(SYS_futex, reinterpret_cast<uint32_t *>(&m_h->to_h), FUTEX_WAKE,
-              1, nullptr, nullptr, 0);
+      syscall(SYS_futex, reinterpret_cast<uint32_t *>(&m_h->worker.word),
+              FUTEX_WAKE, 1, nullptr, nullptr, 0);
+  }
+
+  /** Where the body of the host's message with header m is (§5.1). */
+  const char *host_body(const wire::MessageHeader &m) const {
+    return wire::is_inline(m.total_len)
+               ? reinterpret_cast<const char *>(m_h->host.body)
+               : m_arena;
   }
 
   /** The sleep handshake of the specification, §4.3. */
   void wait_host() {
     while (true) {
       m_h->w_sleep.store(1, std::memory_order_seq_cst);
-      if (m_h->to_w.load(std::memory_order_seq_cst) == m_seen)
-        syscall(SYS_futex, reinterpret_cast<uint32_t *>(&m_h->to_w), FUTEX_WAIT,
-                m_seen, nullptr, nullptr, 0);
+      if (m_h->host.word.load(std::memory_order_seq_cst) == m_seen)
+        syscall(SYS_futex, reinterpret_cast<uint32_t *>(&m_h->host.word),
+                FUTEX_WAIT, m_seen, nullptr, nullptr, 0);
       m_h->w_sleep.store(0, std::memory_order_release);
-      const uint32_t v = m_h->to_w.load(std::memory_order_acquire);
+      const uint32_t v = m_h->host.word.load(std::memory_order_acquire);
       if (v != m_seen) {
         m_seen = v;
         return;
@@ -247,14 +265,17 @@ class Proto {
       CONTINUE that breaks §5.2 ends the worker with status 98. */
   wire::MessageHeader receive(std::string *body) {
     wait_host();
-    const wire::MessageHeader first = m_h->msg;
+    const wire::MessageHeader first = wire::load_header(m_h->host);
     wire::MessageHeader m = first;
-    body->assign(m_arena, m.len);
+    if (wire::is_inline(first.total_len) &&
+        ((first.flags & wire::kMore) != 0 || first.len != first.total_len))
+      _exit(98);
+    body->assign(host_body(first), m.len);
     while (true) {
       const bool more = (m.flags & wire::kMore) != 0;
       if (m.op != first.op || m.status != 0 || m.depth != first.depth ||
           m.call_seq != first.call_seq || m.total_len != first.total_len ||
-          m.reserved != 0 || (m.flags & ~wire::kKnownMessageFlags) != 0 ||
+          (m.flags & ~wire::kKnownMessageFlags) != 0 ||
           (more ? m.len != m_arena_size || body->size() >= m.total_len
                 : body->size() != m.total_len))
         _exit(98);
@@ -269,7 +290,7 @@ class Proto {
         post(header(wire::Op::kContinue, 0, first.depth, first.call_seq), {});
       }
       wait_host();
-      m = m_h->msg;
+      m = wire::load_header(m_h->host);
       body->append(m_arena, m.len);
     }
   }
@@ -292,16 +313,20 @@ class Proto {
       sent += len;
       if (!more) return;
       wait_host();
-      const wire::MessageHeader go = m_h->msg;
+      const wire::MessageHeader go = wire::load_header(m_h->host);
       if (go.op != static_cast<uint32_t>(wire::Op::kContinue) ||
-          go.status != 0 || go.flags != 0 || go.len != 0 || go.reserved != 0 ||
+          go.status != 0 || go.flags != 0 || go.len != 0 ||
           go.total_len != 0 || go.depth != depth || go.call_seq != seq)
         _exit(98);
     }
   }
 
+  /** A log entry: the header as on the wire (bytes 4 to 23 of a line,
+      §5.1), then the body. */
   void log(const wire::MessageHeader &h, const std::string &body) {
-    m_log.append(reinterpret_cast<const char *>(&h), sizeof h);
+    wire::Line line{};
+    wire::store_header(line, h);
+    m_log.append(reinterpret_cast<const char *>(&line) + 4, 20);
     m_log += body;
   }
 
@@ -445,7 +470,7 @@ class Proto {
           if (!in.u32(&m.op) || !in.u32(&m.status) || !in.u32(&m.flags) ||
               !in.u32(&m.len) || !in.u64(&m.total_len) ||
               !in.u32(&depth_delta) || !in.i64(&seq_delta) ||
-              !in.u32(&m.reserved) || !in.bytes(&arena))
+              !in.bytes(&arena))
             _exit(97);
           if (m.len == mle_test::kAuto)
             m.len = static_cast<uint32_t>(arena.size());
