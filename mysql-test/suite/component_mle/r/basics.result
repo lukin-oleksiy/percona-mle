@@ -36,6 +36,7 @@ mle.sql_chunk_rows	1000
 mle.sql_exec_time	OFF
 mle.sql_result_max	67108864
 mle.sql_row_max	16777216
+mle.sql_statement_cache	16
 mle.sql_statements_max	1024
 mle.v8_heap_max	536870912
 mle.v8_memory_max	1073741824

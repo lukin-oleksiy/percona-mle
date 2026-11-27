@@ -164,6 +164,8 @@ uint64_t timing_generation();
 size_t sql_result_max();
 size_t sql_row_max();
 size_t sql_statements_max();
+/** mle.sql_statement_cache: the most kept statements per request (0: none). */
+size_t sql_statement_cache();
 /** mle.sql_call_results_max (0: four times mle.sql_result_max). */
 size_t sql_call_results_max();
 uint32_t sql_chunk_rows();

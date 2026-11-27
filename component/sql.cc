@@ -18,6 +18,8 @@
 #include "sql.h"
 
 #include <algorithm>
+#include <array>
+#include <cassert>
 #include <cctype>
 #include <chrono>
 #include <climits>
@@ -29,6 +31,8 @@
 #include <mysql/components/services/bits/stored_program_bits.h>
 #include <mysql/components/services/mysql_runtime_error_service.h>
 #include <mysql/components/services/mysql_statement_service.h>
+#include <mysql/components/services/mysql_string.h>
+#include <mysql/components/services/mysql_system_variable.h>
 #include <mysql/components/services/mysql_thd_attributes.h>
 #include <mysqld_error.h>
 
@@ -36,6 +40,9 @@
 #include "routine.h"
 
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_factory);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_string_converter);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_string_factory);
+extern REQUIRES_SERVICE_PLACEHOLDER(mysql_system_variable_reader);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_execute);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_execute_direct);
 extern REQUIRES_SERVICE_PLACEHOLDER(mysql_stmt_bind);
@@ -149,10 +156,149 @@ void read_warnings(my_h_statement h, std::vector<mle::Warning> *warnings) {
   }
 }
 
+/** Whether running sql may change the session's sql_mode, schema or
+    character sets for the rest of the request (protocol.md Appendix A,
+    "Statements within a call"): it begins, after spaces and comments, with
+    SET, USE, EXECUTE or DROP (any case), or with an executable comment. A
+    routine the statement calls cannot: the server restores them when it
+    returns. */
+bool may_change_environment(std::string_view sql) {
+  const size_t n = sql.size();
+  size_t i = 0;
+  while (i < n) {
+    const auto c = static_cast<unsigned char>(sql[i]);
+    if (isspace(c)) {
+      i++;
+    } else if (c == '#' || (c == '-' && i + 1 < n && sql[i + 1] == '-' &&
+                            (i + 2 >= n || isspace(static_cast<unsigned char>(
+                                               sql[i + 2]))))) {
+      const size_t end = sql.find('\n', i);
+      i = end == std::string_view::npos ? n : end + 1;
+    } else if (c == '/' && i + 1 < n && sql[i + 1] == '*') {
+      if (sql.substr(i + 2, 1) == "!" || sql.substr(i + 2, 2) == "M!")
+        return true;
+      const size_t end = sql.find("*/", i + 2);
+      i = end == std::string_view::npos ? n : end + 2;
+    } else {
+      break;
+    }
+  }
+  size_t end = i;
+  while (end < n && isalpha(static_cast<unsigned char>(sql[end]))) end++;
+  const std::string_view word = sql.substr(i, end - i);
+  const auto is = [word](std::string_view keyword) {
+    return word.size() == keyword.size() &&
+           std::equal(word.begin(), word.end(), keyword.begin(),
+                      [](char a, char b) {
+                        return toupper(static_cast<unsigned char>(a)) == b;
+                      });
+  };
+  return is("SET") || is("USE") || is("EXECUTE") || is("DROP");
+}
+
+/** The kind of value a marker is bound with, as far as the server derives
+    the marker's type from it when it prepares a statement again for its
+    values (Item_param's source type, signedness and character set): the
+    value's tag, with tags bound alike merged; a negative TIME is bound as
+    text. A DECIMAL marker's precision does not depend on the value. */
+char value_kind(const Value &v) {
+  switch (v.tag()) {
+    case Tag::kF32:
+      return static_cast<char>(Tag::kF64);
+    case Tag::kJson:
+      return static_cast<char>(Tag::kString);
+    case Tag::kVector:
+      return static_cast<char>(Tag::kBytes);
+    case Tag::kTimestamp:
+      return static_cast<char>(Tag::kDatetime);
+    case Tag::kTime:
+      return static_cast<char>(v.as_temporal().negative ? Tag::kString
+                                                        : Tag::kTime);
+    default:
+      return static_cast<char>(v.tag());
+  }
+}
+
+/** The kinds of values[from, from + n): a statement executed only with
+    values of one shape is in the state a new preparation executed with them
+    would be in (a marker whose type no context fixes takes it from the
+    values of the first execution). */
+std::string value_shape(const std::vector<Value> &values, size_t from,
+                        size_t n) {
+  std::string out(n, '\0');
+  for (size_t i = 0; i < n; i++) out[i] = value_kind(values[from + i]);
+  return out;
+}
+
+bool same_shape(const std::string &shape, const std::vector<Value> &values,
+                size_t from, size_t n) {
+  if (shape.size() != n) return false;
+  for (size_t i = 0; i < n; i++)
+    if (shape[i] != value_kind(values[from + i])) return false;
+  return true;
+}
+
+#ifndef NDEBUG
+/** The session's sql_mode and schema, for the debug check that a kept
+    statement runs in the environment it was prepared in. */
+std::string environment(MYSQL_THD thd) {
+  std::string out;
+  std::array<char, 4096> mode{};
+  void *value = mode.data();
+  size_t length = mode.size() - 1;
+  if (!mysql_service_mysql_system_variable_reader->get(
+          thd, "SESSION", "mysql_server", "sql_mode", &value, &length))
+    out.assign(static_cast<const char *>(value), length);
+  out += '|';
+  my_h_string schema = nullptr;
+  if (!mysql_service_mysql_thd_attributes->get(thd, "schema", &schema) &&
+      schema != nullptr) {
+    std::array<char, 4 * 64 + 1> buf{};
+    if (!mysql_service_mysql_string_converter->convert_to_buffer(
+            schema, buf.data(), buf.size(), "utf8mb4"))
+      out += buf.data();
+    mysql_service_mysql_string_factory->destroy(schema);
+  }
+  return out;
+}
+#endif
+
 }  // namespace
 
 struct SqlRunner::Statement {
   my_h_statement h = nullptr;
+  /** Prepared for an EXECUTE with params or a PREPARE, without
+      PASS_RESULT_TO_CLIENT: parked when its id closes (SqlRunner::release),
+      unless the runner's generation moved on since. */
+  bool keepable = false;
+  uint64_t generation = 0;
+  /** Running it may change the session's environment
+      (may_change_environment): never kept, and it ends the generation. */
+  bool changes_environment = false;
+  /** Counted in budget->statements: not while it is parked. */
+  bool open = true;
+  /** The value_shape() of its executions since it was prepared (empty:
+      none yet), and whether one had another shape: then it is not kept. */
+  std::string shape;
+  bool mixed = false;
+  /** A PREPARE took it from the kept ones, executed with values of `shape`:
+      at its first execution with values of another shape it is prepared
+      again, as a new PREPARE would be. */
+  bool recheck = false;
+#ifndef NDEBUG
+  /** environment() when it was prepared. */
+  std::string prepared_in;
+#endif
+  /** It was prepared for text (sql) in this generation and can be kept. */
+  void keep_as(std::string_view text, uint64_t now,
+               [[maybe_unused]] MYSQL_THD thd) {
+    keepable = true;
+    sql = text;
+    generation = now;
+#ifndef NDEBUG
+    prepared_in = environment(thd);
+#endif
+  }
   /** Opened by PREPARE: at home in IDLE, kept until CLOSE or the end of the
       request. Else opened by EXECUTE: at home in CLOSED. */
   /** The statement's text (prepared ids), and its cast_markers() once a
@@ -283,7 +429,7 @@ struct SqlRunner::Statement {
   ~Statement() {
     if (budget != nullptr) {
       budget->results_held -= held;
-      budget->statements--;
+      if (open) budget->statements--;
     }
     if (h != nullptr) (void)mysql_service_mysql_stmt_factory->close(h);
   }
@@ -345,14 +491,102 @@ void refusal_error(SqlRefusal why, const char *no_sql, SqlResultMsg *error) {
 SqlRunner::SqlRunner(MYSQL_THD thd, SqlBudget *budget, ZoneCache *zones)
     : m_thd(thd), m_budget(budget), m_zones(zones) {}
 
-SqlRunner::~SqlRunner() { m_statements.clear(); }
+SqlRunner::~SqlRunner() {
+  m_statements.clear();
+  m_kept.clear();
+}
 
 SqlRunner::Statement *SqlRunner::find(uint64_t id) {
   const auto it = m_statements.find(id);
   return it == m_statements.end() ? nullptr : it->second.get();
 }
 
-void SqlRunner::close(uint64_t id) { m_statements.erase(id); }
+void SqlRunner::close(uint64_t id) {
+  if (const auto it = m_statements.find(id); it != m_statements.end())
+    release(it);
+}
+
+void SqlRunner::release(
+    std::map<uint64_t, std::unique_ptr<Statement>>::iterator it) {
+  std::unique_ptr<Statement> s = std::move(it->second);
+  m_statements.erase(it);
+  const size_t most = sql_statement_cache();
+  if (!s->keepable || s->mixed || s->changes_environment ||
+      s->generation != m_generation || most == 0 || s->budget == nullptr)
+    return;  // closed here
+  // Parked: no id, no results for a worker; what the server still holds for
+  // it stays counted until it runs again or is closed.
+  s->discard();
+  s->prepared = false;
+  s->worker_has_columns = false;
+  s->returns_rows = false;
+  s->budget->statements--;
+  s->open = false;
+  m_kept.push_back(std::move(s));
+  if (m_kept.size() > most) m_kept.erase(m_kept.begin(), m_kept.end() - most);
+}
+
+std::unique_ptr<SqlRunner::Statement> SqlRunner::take_kept(
+    std::string_view sql, const std::string *shape) {
+  for (auto it = m_kept.end(); it != m_kept.begin();) {
+    --it;
+    if ((*it)->sql != sql ||
+        (shape != nullptr && !(*it)->shape.empty() && (*it)->shape != *shape))
+      continue;
+    std::unique_ptr<Statement> s = std::move(*it);
+    m_kept.erase(it);
+    s->recheck = shape == nullptr && !s->shape.empty();
+    // A change of sql_mode or the schema that may_change_environment() did
+    // not see.
+    assert(s->prepared_in == environment(m_thd));
+    return s;
+  }
+  return nullptr;
+}
+
+bool SqlRunner::note_shape(Statement &s, const std::vector<Value> &values,
+                           size_t from, size_t n, SqlResultMsg *result) {
+  if (!s.keepable) return false;
+  if (s.recheck) {
+    s.recheck = false;
+    if (!same_shape(s.shape, values, from, n)) {
+      if (prepare_text(s, s.sql)) {
+        s.keepable = false;
+        statement_error(s, result);
+        return true;
+      }
+      s.shape.clear();
+    }
+  }
+  if (s.shape.empty())
+    s.shape = value_shape(values, from, n);
+  else if (!s.mixed && !same_shape(s.shape, values, from, n))
+    s.mixed = true;
+  return false;
+}
+
+void SqlRunner::forget_kept() {
+  m_kept.clear();
+  m_generation++;
+}
+
+bool SqlRunner::prepare_text(Statement &s, std::string_view sql) {
+  const mysql_cstring_with_length text{sql.data(), sql.size()};
+  if (!mysql_service_mysql_stmt_execute->prepare(text, s.h)) return false;
+  // Kept statements count in the server's max_prepared_stmt_count: at that
+  // bound they go, and the statement is prepared once more.
+  uint64_t err_no = 0;
+  if (m_kept.empty() ||
+      mysql_service_mysql_stmt_diagnostics->error_number(s.h, &err_no) ||
+      err_no != ER_MAX_PREPARED_STMT_COUNT_REACHED)
+    return true;
+  m_kept.clear();
+  if (mysql_service_mysql_stmt_execute->prepare(text, s.h)) return true;
+  // The first attempt's error must not stay in the caller's diagnostics
+  // area.
+  clear_diagnostics(m_thd);
+  return false;
+}
 
 void SqlRunner::send_home(uint64_t id) {
   const auto it = m_statements.find(id);
@@ -360,13 +594,17 @@ void SqlRunner::send_home(uint64_t id) {
   if (it->second->prepared)
     it->second->discard();
   else
-    m_statements.erase(it);
+    release(it);
 }
 
 bool SqlRunner::over_budget(const Statement *except, SqlResultMsg *result) {
-  const size_t others =
-      m_budget->results_held - (except != nullptr ? except->held : 0);
-  if (others < sql_call_results_max()) return false;
+  const auto others = [&] {
+    return m_budget->results_held - (except != nullptr ? except->held : 0);
+  };
+  // The results of kept statements go first.
+  while (others() >= sql_call_results_max() && !m_kept.empty())
+    m_kept.erase(m_kept.begin());
+  if (others() < sql_call_results_max()) return false;
   sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
             "the results of the open statements hold too much memory "
             "(mle.sql_call_results_max): read or close them first");
@@ -889,34 +1127,58 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
                              SqlResultMsg *result) {
   BindContext bind{m_thd, m_zones, request.statement};
   if (request.params.empty() && refused_here(result)) return;
-  if (too_many_statements(result) || over_budget(nullptr, result)) return;
+  const bool changes = may_change_environment(request.statement);
+  if (changes) forget_kept();
   const bool to_client =
       (request.flags & mle::wire::kPassResultToClient) != 0;
   const bool with_params = !request.params.empty();
-  auto s = std::make_unique<Statement>();
-  // The server buffers the whole result (buffer_capacity bytes), with or
-  // without parameters (no cursor: new_statement).
-  s->h = new_statement(to_client, sql_result_max(), with_params, &s->buffered);
-  if (s->h == nullptr)
-    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-                     "cannot create a statement");
-  s->to_client = to_client;
+  const bool keepable =
+      with_params && !to_client && !changes && sql_statement_cache() != 0;
+  // A one-shot prepared execution runs a kept statement of the same text if
+  // there is one.
+  const std::string shape =
+      keepable ? value_shape(request.params, 0, request.params.size())
+               : std::string();
+  std::unique_ptr<Statement> s =
+      keepable ? take_kept(request.statement, &shape) : nullptr;
+  const bool kept = s != nullptr;
+  if (too_many_statements(result) || over_budget(s.get(), result)) return;
+  if (!kept) {
+    s = std::make_unique<Statement>();
+    // The server buffers the whole result (buffer_capacity bytes), with or
+    // without parameters (no cursor: new_statement).
+    s->h =
+        new_statement(to_client, sql_result_max(), with_params, &s->buffered);
+    if (s->h == nullptr)
+      return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
+                       "cannot create a statement");
+    s->to_client = to_client;
+    s->changes_environment = changes;
+  }
+  if (keepable) {
+    bind.casts = &s->casts;
+    bind.casts_known = &s->casts_known;
+  }
   const mysql_cstring_with_length text{request.statement.data(),
                                        request.statement.size()};
   const bool timed = sql_exec_time();
   const uint64_t t0 = timed ? now_us() : 0;
   bool failed;
   if (with_params) {
-    failed = mysql_service_mysql_stmt_execute->prepare(text, s->h);
+    failed = !kept && prepare_text(*s, request.statement);
     if (!failed) {
+      if (!kept) {
+        (void)mysql_service_mysql_stmt_metadata->param_count(s->h,
+                                                             &s->param_count);
+        if (keepable) s->keep_as(request.statement, m_generation, m_thd);
+      }
       // A one-shot prepared execution: exactly one value per marker.
-      uint32_t markers = 0;
-      (void)mysql_service_mysql_stmt_metadata->param_count(s->h, &markers);
-      if (request.params.size() != markers)
+      if (request.params.size() != s->param_count)
         return sql_error(result, ER_WRONG_ARGUMENTS,
-                         request.params.size() > markers
+                         request.params.size() > s->param_count
                              ? "more values than parameter markers"
                              : "fewer values than parameter markers");
+      if (keepable && s->shape.empty()) s->shape = shape;
       failed = bind_values(s->h, request.params, 0, request.params.size(), bind) ||
                mysql_service_mysql_stmt_execute->execute(s->h);
     }
@@ -927,6 +1189,7 @@ void SqlRunner::execute_text(const mle::SqlMsg &request,
   if (failed) return statement_failed(std::move(s), result);
   Statement &st = *s;
   st.budget = m_budget;
+  st.open = true;
   m_budget->statements++;
   count_results(st);
   m_statements[request.stmt_id] = std::move(s);
@@ -939,23 +1202,30 @@ void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
   if (too_many_statements(result)) return;
   const bool to_client =
       (request.flags & mle::wire::kPassResultToClient) != 0;
-  auto s = std::make_unique<Statement>();
-  s->h = new_statement(to_client, sql_result_max(), true, &s->buffered);
-  if (s->h == nullptr)
-    return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
-                     "cannot create a statement");
+  const bool changes = may_change_environment(request.statement);
+  const bool keepable = !to_client && !changes && sql_statement_cache() != 0;
+  std::unique_ptr<Statement> s =
+      keepable ? take_kept(request.statement, nullptr) : nullptr;
+  if (s == nullptr) {
+    s = std::make_unique<Statement>();
+    s->h = new_statement(to_client, sql_result_max(), true, &s->buffered);
+    if (s->h == nullptr)
+      return sql_error(result, ER_LANGUAGE_COMPONENT_INTERNAL,
+                       "cannot create a statement");
+    s->to_client = to_client;
+    s->changes_environment = changes;
+    s->sql = request.statement;
+    if (prepare_text(*s, request.statement))
+      return statement_failed(std::move(s), result);
+    (void)mysql_service_mysql_stmt_metadata->param_count(s->h, &s->param_count);
+    if (keepable) s->keep_as(request.statement, m_generation, m_thd);
+  }
   s->prepared = true;
-  s->to_client = to_client;
-  s->sql = request.statement;
-  const mysql_cstring_with_length text{request.statement.data(),
-                                       request.statement.size()};
-  if (mysql_service_mysql_stmt_execute->prepare(text, s->h))
-    return statement_failed(std::move(s), result);
-  (void)mysql_service_mysql_stmt_metadata->param_count(s->h, &s->param_count);
   *result = SqlResultMsg();
   result->kind = SqlResultKind::kOk;
   result->param_count = s->param_count;
   s->budget = m_budget;
+  s->open = true;
   m_budget->statements++;
   m_statements[request.stmt_id] = std::move(s);
 }
@@ -963,6 +1233,7 @@ void SqlRunner::prepare(const mle::SqlMsg &request, SqlResultMsg *result) {
 void SqlRunner::execute_prepared(const mle::SqlMsg &request, Statement &s,
                                  SqlResultMsg *result) {
   BindContext bind{m_thd, m_zones, s.sql, &s.casts, &s.casts_known};
+  if (s.changes_environment) forget_kept();
   // All pending results of the id go first; an ERROR from here on leaves it
   // IDLE.
   s.discard();
@@ -972,6 +1243,7 @@ void SqlRunner::execute_prepared(const mle::SqlMsg &request, Statement &s,
                          ? "more values than parameter markers"
                          : "fewer values than parameter markers");
   if (over_budget(&s, result)) return;  // its own results go when it runs
+  if (note_shape(s, request.params, 0, request.params.size(), result)) return;
   const bool timed = sql_exec_time();
   const uint64_t t0 = timed ? now_us() : 0;
   const bool failed =
@@ -987,6 +1259,7 @@ void SqlRunner::execute_prepared(const mle::SqlMsg &request, Statement &s,
 void SqlRunner::execute_many(const mle::SqlMsg &request, Statement &s,
                              SqlResultMsg *result) {
   BindContext bind{m_thd, m_zones, s.sql, &s.casts, &s.casts_known};
+  if (s.changes_environment) forget_kept();
   // The prepared statement once per row, in the caller's session and
   // transaction, without a round trip to the worker in between. It stops at
   // the first failing row; the rows before it stay executed (the
@@ -1010,7 +1283,8 @@ void SqlRunner::execute_many(const mle::SqlMsg &request, Statement &s,
     return refuse(ER_WRONG_ARGUMENTS,
                   "executeMany runs statements that return no rows; this one "
                   "returns a result set");
-  if (over_budget(&s, result)) {
+  if (over_budget(&s, result) ||
+      note_shape(s, request.params, 0, request.row_width, result)) {
     result->failed_row = 0;
     return;
   }
@@ -1030,6 +1304,9 @@ void SqlRunner::execute_many(const mle::SqlMsg &request, Statement &s,
     const auto failed_at_row = [&] {
       result->failed_row = static_cast<uint32_t>(i);
     };
+    if (i > 0 && s.keepable && !s.mixed &&
+        !same_shape(s.shape, request.params, i * width, width))
+      s.mixed = true;
     if (bind_values(s.h, request.params, i * width, width, bind) ||
         mysql_service_mysql_stmt_execute->execute(s.h)) {
       statement_error(s, result);

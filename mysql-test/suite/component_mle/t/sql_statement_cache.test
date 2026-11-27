@@ -1,0 +1,357 @@
+--echo #
+--echo # component_mle: kept statements (docs/protocol.md Appendix A, "Statements
+--echo # within a call"; exp note 70). A statement prepared for a one-shot
+--echo # runSql with parameters or a prepare() is kept when its id closes and
+--echo # used again for the same text in the same CALL: a loop prepares once.
+--echo # mle.sql_statement_cache bounds them (0: none). After a statement that
+--echo # may change sql_mode, the schema or the character sets (SET, USE,
+--echo # EXECUTE, DROP, an executable comment) nothing prepared before is kept.
+--echo # Results are those of a new preparation, in every worker.
+--echo #
+--source ../include/have_mle_component.inc
+--source ../include/have_mle_cpython.inc
+--source ../include/have_mle_v8.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE, CREATE_CPYTHON_ROUTINE, CREATE_JS_ROUTINE
+  ON *.* TO root@localhost;
+--connect (con1, localhost, root,,test)
+SELECT @@mle.sql_statement_cache;
+
+CREATE TABLE t (a INT PRIMARY KEY);
+INSERT INTO t VALUES (1), (2), (3);
+CREATE TABLE u (a INT PRIMARY KEY);
+
+--echo # The server's preparations in this session so far (the statement service's
+--echo # prepare events in performance_schema).
+CREATE PROCEDURE prepares(OUT n BIGINT)
+  SELECT COUNT_STAR INTO n FROM performance_schema.events_statements_summary_by_thread_by_event_name
+   WHERE THREAD_ID = PS_CURRENT_THREAD_ID() AND EVENT_NAME = 'statement/stmt_handle/prepare';
+--let $before = CALL prepares(@p0)
+--let $after = CALL prepares(@p1)
+
+--echo #
+--echo # 1. The same text in a loop: one preparation (JavaScript on the JVM worker,
+--echo #    Java, CPython, JavaScript on V8); with mle.sql_statement_cache = 0, one
+--echo #    per statement.
+--echo #
+CREATE PROCEDURE js_loop(IN k INT, OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  let t = 0
+  for (let i = 0; i < k; i++) t += session.runSql('SELECT ? + 1 AS v', [i]).fetchOne().v
+  r = String(t)
+$$;
+CREATE PROCEDURE java_loop(IN k INT, OUT r TEXT) LANGUAGE JAVA AS $$
+    long t = 0;
+    var s = Mle.session();
+    for (int i = 0; i < k; i++) t += ((Number) s.runSql("SELECT ? + 1 AS v", i).fetchOne().get(0)).longValue();
+    r[0] = String.valueOf(t);
+$$;
+CREATE PROCEDURE cpy_loop(IN k INT, OUT r TEXT) LANGUAGE CPYTHON AS $$
+    r = str(sum(session.run_sql('SELECT ? + 1 AS v', [i]).fetch_one().v for i in range(k)))
+$$;
+CREATE PROCEDURE v8_loop(IN k INT, OUT r TEXT) LANGUAGE JS AS $$
+  let t = 0
+  for (let i = 0; i < k; i++) t += session.runSql('SELECT ? + 1 AS v', [i]).fetchOne().v
+  r = String(t)
+$$;
+--echo # Each worker started once, so that its own start-up does not count.
+CALL js_loop(1, @r);
+CALL java_loop(1, @r);
+CALL cpy_loop(1, @r);
+CALL v8_loop(1, @r);
+--disable_query_log
+eval $before;
+CALL js_loop(100, @r);
+eval $after;
+SELECT 'js_loop' AS routine, @r AS r, @p1 - @p0 AS prepares;
+eval $before;
+CALL java_loop(100, @r);
+eval $after;
+SELECT 'java_loop' AS routine, @r AS r, @p1 - @p0 AS prepares;
+eval $before;
+CALL cpy_loop(100, @r);
+eval $after;
+SELECT 'cpy_loop' AS routine, @r AS r, @p1 - @p0 AS prepares;
+eval $before;
+CALL v8_loop(100, @r);
+eval $after;
+SELECT 'v8_loop' AS routine, @r AS r, @p1 - @p0 AS prepares;
+SET GLOBAL mle.sql_statement_cache = 0;
+eval $before;
+CALL js_loop(100, @r);
+eval $after;
+SELECT 'js_loop, cache 0' AS routine, @r AS r, @p1 - @p0 AS prepares;
+SET GLOBAL mle.sql_statement_cache = DEFAULT;
+--enable_query_log
+
+--echo #
+--echo # 2. prepare() and executeMany(): a prepared statement closed in a loop is
+--echo #    kept too; two open at once with the same text are two statements, both
+--echo #    kept afterwards.
+--echo #
+CREATE PROCEDURE js_prepared(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  for (let i = 0; i < 10; i++) {
+    const p = session.prepare('SELECT ? * 2 AS v')
+    out.push(p.bind(i).execute().fetchOne().v)
+    p.deallocate()
+  }
+  for (let i = 0; i < 10; i++) session.executeMany('INSERT INTO u VALUES (?)', [[2 * i], [2 * i + 1]])
+  const a = session.prepare('SELECT ? - 1 AS v')
+  const b = session.prepare('SELECT ? - 1 AS v')
+  out.push(a.bind(10).execute().fetchOne().v + b.bind(20).execute().fetchOne().v)
+  a.deallocate()
+  b.deallocate()
+  for (let i = 0; i < 5; i++) out.push(session.runSql('SELECT ? - 1 AS v', [i]).fetchOne().v)
+  out.push(session.runSql('SELECT COUNT(*) AS n FROM u').fetchOne().n)
+  r = out.join(' ')
+$$;
+--disable_query_log
+eval $before;
+CALL js_prepared(@r);
+eval $after;
+SELECT @r AS r, @p1 - @p0 AS prepares;
+--enable_query_log
+DELETE FROM u;
+
+--echo #
+--echo # 3. Tables that change between executions: the server prepares a kept
+--echo #    statement again (a new column; a temporary table that hides the table
+--echo #    and goes again).
+--echo #
+CREATE PROCEDURE js_tables(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  const show = () => {
+    const res = session.runSql('SELECT * FROM t WHERE a > ? ORDER BY a', [1])
+    out.push(res.getColumnNames().join(',') + '=' + res.fetchAll().map((row) => row.join(':')).join(';'))
+  }
+  show()
+  session.runSql('ALTER TABLE t ADD COLUMN b INT DEFAULT 7')
+  show()
+  session.runSql('CREATE TEMPORARY TABLE t (a INT, c TEXT)')
+  session.runSql("INSERT INTO t VALUES (5, 'temp')")
+  show()
+  session.runSql('DROP TEMPORARY TABLE t')
+  show()
+  session.runSql('ALTER TABLE t DROP COLUMN b')
+  r = out.join(' | ')
+$$;
+CALL js_tables(@r);
+SELECT @r;
+
+--echo #
+--echo # 4. sql_mode changed by the routine: the statement after it is prepared
+--echo #    again ('0' || '1' is 1 as OR, 01 as concatenation); a SET in an executable comment
+--echo #    too. A routine called in between runs with its own sql_mode, which the
+--echo #    server restores when it returns: the kept statement stays right.
+--echo #
+SET sql_mode = 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+CREATE PROCEDURE concat_mode(OUT v TEXT) SELECT '0' || '1' INTO v;
+SET sql_mode = 'PIPES_AS_CONCAT';
+CREATE PROCEDURE pipes_mode(OUT v TEXT) SELECT '0' || '1' INTO v;
+SET sql_mode = DEFAULT;
+CREATE PROCEDURE js_modes(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  const pipe = () => out.push(String(session.runSql("SELECT ? || '1' AS v", ['0']).fetchOne().v))
+  pipe()
+  session.runSql('CALL pipes_mode(@v)')
+  out.push(session.runSql('SELECT @v AS v').fetchOne().v)
+  pipe()
+  session.runSql("SET sql_mode = CONCAT(@@sql_mode, ',PIPES_AS_CONCAT')")
+  pipe()
+  session.runSql('CALL concat_mode(@v)')
+  out.push(session.runSql('SELECT @v AS v').fetchOne().v)
+  pipe()
+  session.runSql("/*!80000 SET sql_mode = REPLACE(@@sql_mode, 'PIPES_AS_CONCAT', '') */")
+  pipe()
+  session.runSql("SET sql_mode = CONCAT(@@sql_mode, ',PIPES_AS_CONCAT')")
+  pipe()
+  r = out.join(' ')
+$$;
+CALL js_modes(@r);
+SELECT @r, @@sql_mode = (SELECT @@GLOBAL.sql_mode) AS mode_restored;
+
+--echo #
+--echo # 5. USE in the routine (where the server runs it): the statement after it
+--echo #    reads the other schema's table.
+--echo #
+CREATE DATABASE other;
+CREATE TABLE other.t (a INT);
+INSERT INTO other.t VALUES (10), (20);
+CREATE PROCEDURE js_use(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  const count = () => out.push(session.runSql('SELECT COUNT(*) AS n FROM t WHERE a > ?', [0]).fetchOne().n)
+  count()
+  try { session.runSql('USE other'); out.push('use') } catch (e) { out.push('USE: ' + e.message) }
+  count()
+  r = out.join(' ')
+$$;
+CALL js_use(@r);
+SELECT @r, DATABASE();
+DROP DATABASE other;
+
+--echo #
+--echo # 6. Values of other kinds for the same markers give what a new preparation
+--echo #    gives: a marker whose type no context fixes takes it from the values of
+--echo #    the first execution, so a statement is kept for the kinds of values it
+--echo #    ran with; a prepare() that takes one executed with other kinds is
+--echo #    prepared again. Values, types, lengths and decimals with the cache and
+--echo #    without it are the same (JavaScript; CPython adds DECIMAL, negative
+--echo #    TIME, unsigned integers).
+--echo #
+CREATE TABLE w (a INT, s VARCHAR(20), d DECIMAL(8,3));
+CREATE PROCEDURE js_kinds(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  const show = (res) => {
+    const row = res.fetchOne()
+    const c = res.getColumns()[0]
+    return c.getType() + '(' + c.getLength() + ',' + c.getFractionalDigits() + ')=' +
+      (row[0] instanceof Date ? row[0].toISOString() : String(row[0]))
+  }
+  const values = [1, 'text', 1.5, null, 2n ** 62n, new Date(Date.UTC(2024, 0, 2, 3, 4, 5)), true, 7,
+                  'x'.repeat(40), -3, new Uint8Array([65, 66]), '12', 0.25, 1]
+  for (const q of ['SELECT ? AS v', 'SELECT CONCAT(?) AS v', 'SELECT ? + 1 AS v', 'SELECT COALESCE(?, 2) AS v',
+                   'SELECT CAST(? AS CHAR) AS v', 'SELECT LEFT(?, 3) AS v'])
+    out.push(q + ': ' + values.map((v) => show(session.runSql(q, [v]))).join(' '))
+  // Kept after a number, then prepared and executed with a string.
+  show(session.runSql('SELECT ? AS k', [1]))
+  const k = session.prepare('SELECT ? AS k')
+  out.push('prepared after a number ' + show(k.bind('text').execute()) + ' ' + show(k.bind('more').execute()))
+  k.deallocate()
+  for (let i = 0; i < 3; i++) {
+    const p = session.prepare('SELECT ? AS v')
+    out.push('prepared ' + [values[i], values[i + 1], values[i]].map((v) => show(p.bind(v).execute())).join(' '))
+    p.deallocate()
+  }
+  session.runSql('DELETE FROM w')
+  for (const rows of [[[1, 'a', 1.5]], [['2', 5, '2.25']], [[3n, null, 7]], [[4, 'd', 0.125]]])
+    session.executeMany('INSERT INTO w VALUES (?, ?, ?)', rows)
+  out.push('rows ' + session.runSql('SELECT a, s, d FROM w ORDER BY a').fetchAll().map((x) => x.join(':')).join(' '))
+  r = out.join('\n')
+$$;
+# Through the client: mysqltest takes the indentation off the lines of a body.
+--write_file $MYSQLTEST_VARDIR/tmp/sql_statement_cache.sql
+CREATE PROCEDURE cpy_kinds(OUT r TEXT) LANGUAGE CPYTHON AS $$
+    import datetime, decimal
+    out = []
+    def show(res):
+        row = res.fetch_one()
+        c = res.get_columns()[0]
+        return '%s(%s,%s)=%s' % (c.get_type(), c.get_length(), c.get_fractional_digits(), row[0])
+    values = [decimal.Decimal('1.5'), decimal.Decimal('123.4567'), 1, 2 ** 63 + 1, -5, 1.5,
+              datetime.timedelta(hours=-1, minutes=-2), datetime.timedelta(hours=3), datetime.date(2024, 5, 6),
+              datetime.datetime(2024, 5, 6, 7, 8, 9, 123456), b'AB', 'text', None, decimal.Decimal('7')]
+    for q in ('SELECT ? AS v', 'SELECT CONCAT(?) AS v', 'SELECT ? / 2 AS v', 'SELECT ADDTIME(?, 0) AS v'):
+        out.append(q + ': ' + ' '.join(show(session.run_sql(q, [v])) for v in values))
+    r = '\n'.join(out)
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/sql_statement_cache.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/sql_statement_cache.sql
+CALL js_kinds(@js);
+CALL cpy_kinds(@cpy);
+--replace_result \n |
+SELECT @js;
+--replace_result \n |
+SELECT @cpy;
+SET GLOBAL mle.sql_statement_cache = 0;
+CALL js_kinds(@js0);
+CALL cpy_kinds(@cpy0);
+SET GLOBAL mle.sql_statement_cache = DEFAULT;
+SELECT @js = @js0 AS js_same_without_cache, @cpy = @cpy0 AS cpython_same_without_cache;
+
+--echo #
+--echo # 7. Errors: a failing execution, then the same text again; a wrong number
+--echo #    of values; executeMany of a SELECT run before. The routine goes on with
+--echo #    right results.
+--echo #
+CREATE PROCEDURE js_errors(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  for (const v of [100, 100, 101]) {
+    try { session.runSql('INSERT INTO u VALUES (?)', [v]); out.push('ok ' + v) }
+    catch (e) { out.push('error ' + e.code) }
+  }
+  try { session.runSql('INSERT INTO u VALUES (?)', [1, 2]) } catch (e) { out.push('error ' + e.code) }
+  // A kept SELECT is new to executeMany: it runs the first row, then refuses.
+  session.runSql('SELECT ? + 0 AS v', [1])
+  try { session.executeMany('SELECT ? + 0 AS v', [[1], [2]]) } catch (e) { out.push(e.message + ' row ' + e.row) }
+  out.push(session.runSql('SELECT GROUP_CONCAT(a ORDER BY a) AS s FROM u WHERE a > ?', [0]).fetchOne().s)
+  r = out.join(' | ')
+$$;
+CALL js_errors(@r);
+SELECT @r;
+DELETE FROM u;
+
+--echo #
+--echo # 8. More texts than mle.sql_statement_cache: the least recently used goes
+--echo #    (three texts in turn, 10 times: 3 preparations with room for 3, 30 with
+--echo #    room for 2).
+--echo #
+CREATE PROCEDURE js_texts(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  let t = 0
+  for (let i = 0; i < 10; i++)
+    for (const q of ['SELECT ? + 1 AS v', 'SELECT ? + 2 AS v', 'SELECT ? + 3 AS v'])
+      t += session.runSql(q, [i]).fetchOne().v
+  r = String(t)
+$$;
+--disable_query_log
+SET GLOBAL mle.sql_statement_cache = 3;
+eval $before;
+CALL js_texts(@r);
+eval $after;
+SELECT 'room for 3' AS cache, @r AS r, @p1 - @p0 AS prepares;
+SET GLOBAL mle.sql_statement_cache = 2;
+eval $before;
+CALL js_texts(@r);
+eval $after;
+SELECT 'room for 2' AS cache, @r AS r, @p1 - @p0 AS prepares;
+SET GLOBAL mle.sql_statement_cache = DEFAULT;
+--enable_query_log
+
+--echo #
+--echo # 9. The results a kept statement still holds count in the session's budget
+--echo #    and go first when it is short: with mle.sql_call_results_max = 1 every
+--echo #    statement still runs (each held result is closed with its statement).
+--echo #
+SET GLOBAL mle.sql_call_results_max = 1;
+CALL js_texts(@r);
+SELECT @r;
+SET GLOBAL mle.sql_call_results_max = DEFAULT;
+
+--echo #
+--echo # 10. Kept statements count in the server's max_prepared_stmt_count: at the
+--echo #     bound they are closed, and the statement is prepared once more. None
+--echo #     outlives its CALL.
+--echo #
+SET @old_max_prepared = @@GLOBAL.max_prepared_stmt_count;
+SHOW GLOBAL STATUS LIKE "Prepared_stmt_count";
+SET GLOBAL max_prepared_stmt_count = 2;
+CALL js_texts(@r);
+SELECT @r;
+SET GLOBAL max_prepared_stmt_count = @old_max_prepared;
+--echo # None outlives its CALL.
+SHOW GLOBAL STATUS LIKE "Prepared_stmt_count";
+
+DROP PROCEDURE prepares;
+DROP PROCEDURE js_loop;
+DROP PROCEDURE java_loop;
+DROP PROCEDURE cpy_loop;
+DROP PROCEDURE v8_loop;
+DROP PROCEDURE js_prepared;
+DROP PROCEDURE js_tables;
+DROP PROCEDURE concat_mode;
+DROP PROCEDURE pipes_mode;
+DROP PROCEDURE js_modes;
+DROP PROCEDURE js_use;
+DROP PROCEDURE js_kinds;
+DROP PROCEDURE cpy_kinds;
+DROP PROCEDURE js_errors;
+DROP PROCEDURE js_texts;
+DROP TABLE t, u, w;
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE, CREATE_CPYTHON_ROUTINE, CREATE_JS_ROUTINE
+  ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

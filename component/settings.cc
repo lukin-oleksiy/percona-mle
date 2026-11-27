@@ -85,6 +85,7 @@ ulonglong g_sql_result_max = 0;
 ulonglong g_sql_row_max = 0;
 ulonglong g_sql_call_results_max = 0;
 uint g_sql_statements_max = 0;
+uint g_sql_statement_cache = 0;
 uint g_sql_chunk_rows = 0;
 bool g_sql_exec_time = false;
 char *g_languages = nullptr;
@@ -305,7 +306,7 @@ Registered g_registered[] = {
     {"java_home", false},  {"sql_result_max", false}, {"sql_row_max", false},
     {"sql_statements_max", false}, {"sql_chunk_rows", false},
     {"sql_exec_time", false},
-    {"sql_call_results_max", false},
+    {"sql_call_results_max", false}, {"sql_statement_cache", false},
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
     {"package_dir", false}, {"pool_prewarm", false},
     {"vector_threads", false}, {"idle_trim_ms", false}, {"console", false},
@@ -630,6 +631,16 @@ bool register_settings() {
           "Most statements a routine call keeps open (as Oracle: 1024).",
           nullptr, nullptr, &statements_max, &g_sql_statements_max))
     return true;
+  uint_check_arg_s statement_cache;
+  statement_cache.def_val = 16;
+  statement_cache.min_val = 0;
+  statement_cache.max_val = 1024;
+  statement_cache.blk_sz = 0;
+  if (reg("sql_statement_cache", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Most prepared statements a routine call keeps after their use, "
+          "to run the same text again without preparing it (0: none).",
+          nullptr, nullptr, &statement_cache, &g_sql_statement_cache))
+    return true;
   uint_check_arg_s chunk_rows;
   chunk_rows.def_val = 1000;
   chunk_rows.min_val = 1;
@@ -799,6 +810,7 @@ size_t sql_call_results_max() {
                                  : 4 * g_sql_result_max);
 }
 size_t sql_statements_max() { return g_sql_statements_max; }
+size_t sql_statement_cache() { return g_sql_statement_cache; }
 uint32_t sql_chunk_rows() { return g_sql_chunk_rows; }
 bool sql_exec_time() { return g_sql_exec_time; }
 int spin_us() { return static_cast<int>(g_spin_us); }

@@ -1,0 +1,311 @@
+#
+# component_mle: kept statements (docs/protocol.md Appendix A, "Statements
+# within a call"; exp note 70). A statement prepared for a one-shot
+# runSql with parameters or a prepare() is kept when its id closes and
+# used again for the same text in the same CALL: a loop prepares once.
+# mle.sql_statement_cache bounds them (0: none). After a statement that
+# may change sql_mode, the schema or the character sets (SET, USE,
+# EXECUTE, DROP, an executable comment) nothing prepared before is kept.
+# Results are those of a new preparation, in every worker.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE, CREATE_CPYTHON_ROUTINE, CREATE_JS_ROUTINE
+ON *.* TO root@localhost;
+SELECT @@mle.sql_statement_cache;
+@@mle.sql_statement_cache
+16
+CREATE TABLE t (a INT PRIMARY KEY);
+INSERT INTO t VALUES (1), (2), (3);
+CREATE TABLE u (a INT PRIMARY KEY);
+# The server's preparations in this session so far (the statement service's
+# prepare events in performance_schema).
+CREATE PROCEDURE prepares(OUT n BIGINT)
+SELECT COUNT_STAR INTO n FROM performance_schema.events_statements_summary_by_thread_by_event_name
+WHERE THREAD_ID = PS_CURRENT_THREAD_ID() AND EVENT_NAME = 'statement/stmt_handle/prepare';
+#
+# 1. The same text in a loop: one preparation (JavaScript on the JVM worker,
+#    Java, CPython, JavaScript on V8); with mle.sql_statement_cache = 0, one
+#    per statement.
+#
+CREATE PROCEDURE js_loop(IN k INT, OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+let t = 0
+for (let i = 0; i < k; i++) t += session.runSql('SELECT ? + 1 AS v', [i]).fetchOne().v
+r = String(t)
+$$;
+CREATE PROCEDURE java_loop(IN k INT, OUT r TEXT) LANGUAGE JAVA AS $$
+long t = 0;
+var s = Mle.session();
+for (int i = 0; i < k; i++) t += ((Number) s.runSql("SELECT ? + 1 AS v", i).fetchOne().get(0)).longValue();
+r[0] = String.valueOf(t);
+$$;
+CREATE PROCEDURE cpy_loop(IN k INT, OUT r TEXT) LANGUAGE CPYTHON AS $$
+r = str(sum(session.run_sql('SELECT ? + 1 AS v', [i]).fetch_one().v for i in range(k)))
+$$;
+CREATE PROCEDURE v8_loop(IN k INT, OUT r TEXT) LANGUAGE JS AS $$
+let t = 0
+for (let i = 0; i < k; i++) t += session.runSql('SELECT ? + 1 AS v', [i]).fetchOne().v
+r = String(t)
+$$;
+# Each worker started once, so that its own start-up does not count.
+CALL js_loop(1, @r);
+CALL java_loop(1, @r);
+CALL cpy_loop(1, @r);
+CALL v8_loop(1, @r);
+routine	r	prepares
+js_loop	5050	1
+routine	r	prepares
+java_loop	5050	1
+routine	r	prepares
+cpy_loop	5050	1
+routine	r	prepares
+v8_loop	5050	1
+routine	r	prepares
+js_loop, cache 0	5050	100
+#
+# 2. prepare() and executeMany(): a prepared statement closed in a loop is
+#    kept too; two open at once with the same text are two statements, both
+#    kept afterwards.
+#
+CREATE PROCEDURE js_prepared(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+const out = []
+for (let i = 0; i < 10; i++) {
+const p = session.prepare('SELECT ? * 2 AS v')
+out.push(p.bind(i).execute().fetchOne().v)
+p.deallocate()
+}
+for (let i = 0; i < 10; i++) session.executeMany('INSERT INTO u VALUES (?)', [[2 * i], [2 * i + 1]])
+const a = session.prepare('SELECT ? - 1 AS v')
+const b = session.prepare('SELECT ? - 1 AS v')
+out.push(a.bind(10).execute().fetchOne().v + b.bind(20).execute().fetchOne().v)
+a.deallocate()
+b.deallocate()
+for (let i = 0; i < 5; i++) out.push(session.runSql('SELECT ? - 1 AS v', [i]).fetchOne().v)
+out.push(session.runSql('SELECT COUNT(*) AS n FROM u').fetchOne().n)
+r = out.join(' ')
+$$;
+r	prepares
+0 2 4 6 8 10 12 14 16 18 28 -1 0 1 2 3 20	5
+DELETE FROM u;
+#
+# 3. Tables that change between executions: the server prepares a kept
+#    statement again (a new column; a temporary table that hides the table
+#    and goes again).
+#
+CREATE PROCEDURE js_tables(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+const out = []
+const show = () => {
+const res = session.runSql('SELECT * FROM t WHERE a > ? ORDER BY a', [1])
+out.push(res.getColumnNames().join(',') + '=' + res.fetchAll().map((row) => row.join(':')).join(';'))
+}
+show()
+session.runSql('ALTER TABLE t ADD COLUMN b INT DEFAULT 7')
+show()
+session.runSql('CREATE TEMPORARY TABLE t (a INT, c TEXT)')
+session.runSql("INSERT INTO t VALUES (5, 'temp')")
+show()
+session.runSql('DROP TEMPORARY TABLE t')
+show()
+session.runSql('ALTER TABLE t DROP COLUMN b')
+r = out.join(' | ')
+$$;
+CALL js_tables(@r);
+SELECT @r;
+@r
+a=2;3 | a,b=2:7;3:7 | a,c=5:temp | a,b=2:7;3:7
+#
+# 4. sql_mode changed by the routine: the statement after it is prepared
+#    again ('0' || '1' is 1 as OR, 01 as concatenation); a SET in an executable comment
+#    too. A routine called in between runs with its own sql_mode, which the
+#    server restores when it returns: the kept statement stays right.
+#
+SET sql_mode = 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+CREATE PROCEDURE concat_mode(OUT v TEXT) SELECT '0' || '1' INTO v;
+Warnings:
+Warning	1287	'|| as a synonym for OR' is deprecated and will be removed in a future release. Please use OR instead
+SET sql_mode = 'PIPES_AS_CONCAT';
+CREATE PROCEDURE pipes_mode(OUT v TEXT) SELECT '0' || '1' INTO v;
+SET sql_mode = DEFAULT;
+CREATE PROCEDURE js_modes(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+const out = []
+const pipe = () => out.push(String(session.runSql("SELECT ? || '1' AS v", ['0']).fetchOne().v))
+pipe()
+session.runSql('CALL pipes_mode(@v)')
+out.push(session.runSql('SELECT @v AS v').fetchOne().v)
+pipe()
+session.runSql("SET sql_mode = CONCAT(@@sql_mode, ',PIPES_AS_CONCAT')")
+pipe()
+session.runSql('CALL concat_mode(@v)')
+out.push(session.runSql('SELECT @v AS v').fetchOne().v)
+pipe()
+session.runSql("/*!80000 SET sql_mode = REPLACE(@@sql_mode, 'PIPES_AS_CONCAT', '') */")
+pipe()
+session.runSql("SET sql_mode = CONCAT(@@sql_mode, ',PIPES_AS_CONCAT')")
+pipe()
+r = out.join(' ')
+$$;
+CALL js_modes(@r);
+SELECT @r, @@sql_mode = (SELECT @@GLOBAL.sql_mode) AS mode_restored;
+@r	mode_restored
+1 01 1 01 1 01 1 01	1
+#
+# 5. USE in the routine (where the server runs it): the statement after it
+#    reads the other schema's table.
+#
+CREATE DATABASE other;
+CREATE TABLE other.t (a INT);
+INSERT INTO other.t VALUES (10), (20);
+CREATE PROCEDURE js_use(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+const out = []
+const count = () => out.push(session.runSql('SELECT COUNT(*) AS n FROM t WHERE a > ?', [0]).fetchOne().n)
+count()
+try { session.runSql('USE other'); out.push('use') } catch (e) { out.push('USE: ' + e.message) }
+count()
+r = out.join(' ')
+$$;
+CALL js_use(@r);
+SELECT @r, DATABASE();
+@r	DATABASE()
+3 USE: USE is not allowed in stored procedures 3	test
+DROP DATABASE other;
+#
+# 6. Values of other kinds for the same markers give what a new preparation
+#    gives: a marker whose type no context fixes takes it from the values of
+#    the first execution, so a statement is kept for the kinds of values it
+#    ran with; a prepare() that takes one executed with other kinds is
+#    prepared again. Values, types, lengths and decimals with the cache and
+#    without it are the same (JavaScript; CPython adds DECIMAL, negative
+#    TIME, unsigned integers).
+#
+CREATE TABLE w (a INT, s VARCHAR(20), d DECIMAL(8,3));
+CREATE PROCEDURE js_kinds(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+const out = []
+const show = (res) => {
+const row = res.fetchOne()
+const c = res.getColumns()[0]
+return c.getType() + '(' + c.getLength() + ',' + c.getFractionalDigits() + ')=' +
+(row[0] instanceof Date ? row[0].toISOString() : String(row[0]))
+}
+const values = [1, 'text', 1.5, null, 2n ** 62n, new Date(Date.UTC(2024, 0, 2, 3, 4, 5)), true, 7,
+'x'.repeat(40), -3, new Uint8Array([65, 66]), '12', 0.25, 1]
+for (const q of ['SELECT ? AS v', 'SELECT CONCAT(?) AS v', 'SELECT ? + 1 AS v', 'SELECT COALESCE(?, 2) AS v',
+'SELECT CAST(? AS CHAR) AS v', 'SELECT LEFT(?, 3) AS v'])
+out.push(q + ': ' + values.map((v) => show(session.runSql(q, [v]))).join(' '))
+// Kept after a number, then prepared and executed with a string.
+show(session.runSql('SELECT ? AS k', [1]))
+const k = session.prepare('SELECT ? AS k')
+out.push('prepared after a number ' + show(k.bind('text').execute()) + ' ' + show(k.bind('more').execute()))
+k.deallocate()
+for (let i = 0; i < 3; i++) {
+const p = session.prepare('SELECT ? AS v')
+out.push('prepared ' + [values[i], values[i + 1], values[i]].map((v) => show(p.bind(v).execute())).join(' '))
+p.deallocate()
+}
+session.runSql('DELETE FROM w')
+for (const rows of [[[1, 'a', 1.5]], [['2', 5, '2.25']], [[3n, null, 7]], [[4, 'd', 0.125]]])
+session.executeMany('INSERT INTO w VALUES (?, ?, ?)', rows)
+out.push('rows ' + session.runSql('SELECT a, s, d FROM w ORDER BY a').fetchAll().map((x) => x.join(':')).join(' '))
+r = out.join('\n')
+$$;
+CALL js_kinds(@js);
+CALL cpy_kinds(@cpy);
+SELECT @js;
+@js
+SELECT ? AS v: BIGINT(0,0)=1 STRING(65532,0)=text DOUBLE(0,0)=1.5 STRING(65532,0)=null BIGINT(0,0)=4611686018427387904 DATETIME(0,6)=2024-01-02T03:04:05.000Z BIGINT(0,0)=1 BIGINT(0,0)=7 STRING(65532,0)=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx BIGINT(0,0)=-3 STRING(65532,0)=AB STRING(65532,0)=12 DOUBLE(0,0)=0.25 BIGINT(0,0)=1|SELECT CONCAT(?) AS v: STRING(84,0)=1 STRING(65532,0)=text STRING(88,0)=1.5 STRING(65532,0)=null STRING(84,0)=4611686018427387904 STRING(104,0)=2024-01-02 06:04:05.000000 STRING(84,0)=1 STRING(84,0)=7 STRING(65532,0)=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx STRING(84,0)=-3 STRING(65532,0)=AB STRING(65532,0)=12 STRING(88,0)=0.25 STRING(84,0)=1|SELECT ? + 1 AS v: BIGINT(0,0)=2 BIGINT(0,0)=1 DOUBLE(0,0)=2.5 BIGINT(0,0)=null BIGINT(0,0)=4611686018427387905 DECIMAL(0,6)=20240102060406.000000 BIGINT(0,0)=2 BIGINT(0,0)=8 BIGINT(0,0)=1 BIGINT(0,0)=-2 BIGINT(0,0)=1 BIGINT(0,0)=13 DOUBLE(0,0)=1.25 BIGINT(0,0)=2|SELECT COALESCE(?, 2) AS v: BIGINT(0,0)=1 BIGINT(0,0)=0 DOUBLE(0,0)=1.5 BIGINT(0,0)=2 BIGINT(0,0)=4611686018427387904 STRING(104,0)=2024-01-02 06:04:05.000000 BIGINT(0,0)=1 BIGINT(0,0)=7 BIGINT(0,0)=0 BIGINT(0,0)=-3 BIGINT(0,0)=0 BIGINT(0,0)=12 DOUBLE(0,0)=0.25 BIGINT(0,0)=1|SELECT CAST(? AS CHAR) AS v: STRING(65532,0)=1 STRING(65532,0)=text STRING(65532,0)=1.5 STRING(65532,0)=null STRING(65532,0)=4611686018427387904 STRING(65532,0)=2024-01-02 06:04:05.000000 STRING(65532,0)=1 STRING(65532,0)=7 STRING(65532,0)=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx STRING(65532,0)=-3 STRING(65532,0)=AB STRING(65532,0)=12 STRING(65532,0)=0.25 STRING(65532,0)=1|SELECT LEFT(?, 3) AS v: STRING(12,0)=1 STRING(12,0)=tex STRING(12,0)=1.5 STRING(12,0)=null STRING(12,0)=461 STRING(12,0)=202 STRING(12,0)=1 STRING(12,0)=7 STRING(12,0)=xxx STRING(12,0)=-3 STRING(12,0)=AB STRING(12,0)=12 STRING(12,0)=0.2 STRING(12,0)=1|prepared after a number STRING(65532,0)=text STRING(65532,0)=more|prepared BIGINT(0,0)=1 BIGINT(0,0)=0 BIGINT(0,0)=1|prepared STRING(65532,0)=text DOUBLE(0,0)=1.5 DOUBLE(0,0)=0|prepared DOUBLE(0,0)=1.5 DOUBLE(0,0)=null DOUBLE(0,0)=1.5|rows 1:a:1.500 2:5:2.250 3::7.000 4:d:0.125
+SELECT @cpy;
+@cpy
+SELECT ? AS v: DECIMAL(0,30)=1.5 DECIMAL(0,30)=123.4567 BIGINT(0,0)=1 BIGINT(0,0)=9223372036854775809 BIGINT(0,0)=-5 DOUBLE(0,0)=1.5 STRING(65532,0)=-01:02:00.000000 TIME(0,6)=3:00:00 DATE(0,0)=2024-05-06 DATETIME(0,6)=2024-05-06 07:08:09.123456 STRING(65532,0)=AB STRING(65532,0)=text STRING(65532,0)=None DECIMAL(0,30)=7|SELECT CONCAT(?) AS v: STRING(268,0)=1.5 STRING(268,0)=123.4567 STRING(84,0)=1 STRING(84,0)=9223372036854775809 STRING(84,0)=-5 STRING(88,0)=1.5 STRING(65532,0)=-01:02:00.000000 STRING(68,0)=03:00:00.000000 STRING(40,0)=2024-05-06 STRING(104,0)=2024-05-06 07:08:09.123456 STRING(65532,0)=AB STRING(65532,0)=text STRING(65532,0)=None STRING(268,0)=7|SELECT ? / 2 AS v: DECIMAL(0,30)=0.750000000000000000000000000000 DECIMAL(0,30)=61.728350000000000000000000000000 DECIMAL(0,4)=0.5000 DECIMAL(0,4)=4611686018427387904.5000 DECIMAL(0,4)=-2.5000 DOUBLE(0,0)=0.75 DECIMAL(0,4)=-0.5000 DECIMAL(0,10)=15000.0000000000 DECIMAL(0,4)=10120253.0000 DECIMAL(0,10)=10120253035404.5617280000 DECIMAL(0,4)=0.0000 DECIMAL(0,4)=0.0000 DECIMAL(0,4)=None DECIMAL(0,30)=3.500000000000000000000000000000|SELECT ADDTIME(?, 0) AS v: TIME(0,6)=0:00:01.500000 TIME(0,6)=0:01:23.456700 TIME(0,6)=0:00:01 TIME(0,6)=None TIME(0,6)=-1 day, 23:59:55 TIME(0,6)=0:00:01.500000 TIME(0,6)=-1 day, 22:58:00 TIME(0,6)=3:00:00 DATETIME(0,0)=2024-05-06 00:00:00 TIME(0,6)=7:08:09.123456 TIME(0,6)=None TIME(0,6)=None TIME(0,6)=None TIME(0,6)=0:00:07
+SET GLOBAL mle.sql_statement_cache = 0;
+CALL js_kinds(@js0);
+CALL cpy_kinds(@cpy0);
+SET GLOBAL mle.sql_statement_cache = DEFAULT;
+SELECT @js = @js0 AS js_same_without_cache, @cpy = @cpy0 AS cpython_same_without_cache;
+js_same_without_cache	cpython_same_without_cache
+1	1
+#
+# 7. Errors: a failing execution, then the same text again; a wrong number
+#    of values; executeMany of a SELECT run before. The routine goes on with
+#    right results.
+#
+CREATE PROCEDURE js_errors(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+const out = []
+for (const v of [100, 100, 101]) {
+try { session.runSql('INSERT INTO u VALUES (?)', [v]); out.push('ok ' + v) }
+catch (e) { out.push('error ' + e.code) }
+}
+try { session.runSql('INSERT INTO u VALUES (?)', [1, 2]) } catch (e) { out.push('error ' + e.code) }
+// A kept SELECT is new to executeMany: it runs the first row, then refuses.
+session.runSql('SELECT ? + 0 AS v', [1])
+try { session.executeMany('SELECT ? + 0 AS v', [[1], [2]]) } catch (e) { out.push(e.message + ' row ' + e.row) }
+out.push(session.runSql('SELECT GROUP_CONCAT(a ORDER BY a) AS s FROM u WHERE a > ?', [0]).fetchOne().s)
+r = out.join(' | ')
+$$;
+CALL js_errors(@r);
+SELECT @r;
+@r
+ok 100 | error 1062 | ok 101 | error 1210 | executeMany runs statements that return no rows; this one returned a result set (the row was executed) row 0 | 100,101
+DELETE FROM u;
+#
+# 8. More texts than mle.sql_statement_cache: the least recently used goes
+#    (three texts in turn, 10 times: 3 preparations with room for 3, 30 with
+#    room for 2).
+#
+CREATE PROCEDURE js_texts(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+let t = 0
+for (let i = 0; i < 10; i++)
+for (const q of ['SELECT ? + 1 AS v', 'SELECT ? + 2 AS v', 'SELECT ? + 3 AS v'])
+t += session.runSql(q, [i]).fetchOne().v
+r = String(t)
+$$;
+cache	r	prepares
+room for 3	195	3
+cache	r	prepares
+room for 2	195	30
+#
+# 9. The results a kept statement still holds count in the session's budget
+#    and go first when it is short: with mle.sql_call_results_max = 1 every
+#    statement still runs (each held result is closed with its statement).
+#
+SET GLOBAL mle.sql_call_results_max = 1;
+CALL js_texts(@r);
+SELECT @r;
+@r
+195
+SET GLOBAL mle.sql_call_results_max = DEFAULT;
+#
+# 10. Kept statements count in the server's max_prepared_stmt_count: at the
+#     bound they are closed, and the statement is prepared once more. None
+#     outlives its CALL.
+#
+SET @old_max_prepared = @@GLOBAL.max_prepared_stmt_count;
+SHOW GLOBAL STATUS LIKE "Prepared_stmt_count";
+Variable_name	Value
+Prepared_stmt_count	0
+SET GLOBAL max_prepared_stmt_count = 2;
+CALL js_texts(@r);
+SELECT @r;
+@r
+195
+SET GLOBAL max_prepared_stmt_count = @old_max_prepared;
+# None outlives its CALL.
+SHOW GLOBAL STATUS LIKE "Prepared_stmt_count";
+Variable_name	Value
+Prepared_stmt_count	0
+DROP PROCEDURE prepares;
+DROP PROCEDURE js_loop;
+DROP PROCEDURE java_loop;
+DROP PROCEDURE cpy_loop;
+DROP PROCEDURE v8_loop;
+DROP PROCEDURE js_prepared;
+DROP PROCEDURE js_tables;
+DROP PROCEDURE concat_mode;
+DROP PROCEDURE pipes_mode;
+DROP PROCEDURE js_modes;
+DROP PROCEDURE js_use;
+DROP PROCEDURE js_kinds;
+DROP PROCEDURE cpy_kinds;
+DROP PROCEDURE js_errors;
+DROP PROCEDURE js_texts;
+DROP TABLE t, u, w;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_JAVA_ROUTINE, CREATE_CPYTHON_ROUTINE, CREATE_JS_ROUTINE
+ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

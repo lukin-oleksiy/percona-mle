@@ -57,6 +57,23 @@
   client: unchanged if it is still the one in the diagnostics area, else
   raised again with its number and SQLSTATE.
 
+  Kept statements (protocol.md Appendix A, "Statements within a call"). A
+  statement prepared for an EXECUTE with params or a PREPARE (without
+  PASS_RESULT_TO_CLIENT) is parked when its id closes, and a later EXECUTE
+  with params or PREPARE of the same text in this request takes it instead
+  of preparing again: at most mle.sql_statement_cache of them, the least
+  recently used closed first. An EXECUTE takes one only if it ran with
+  values of the same kinds (a marker that no context types takes its type
+  from the first execution's values); a PREPARE takes one and prepares it
+  again at its first execution with values of other kinds. A parked
+  statement's last results stay counted in the session's budget until it
+  runs again or is closed, and are the first to go when the budget is short.
+  The server restores sql_mode, the schema and the character sets when a
+  routine it calls returns, so only this request's own statements change
+  them: after one that begins with SET, USE, EXECUTE or DROP, or with an
+  executable comment, nothing prepared before is kept (a debug build checks
+  sql_mode and the schema at every reuse).
+
   The server's execution time (exec_us) is measured only when
   mle.sql_exec_time is ON: it costs two clock reads per statement.
 
@@ -68,6 +85,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <mysql/components/services/mysql_current_thread_reader.h>
@@ -183,6 +201,28 @@ class SqlRunner {
   /** True (and the server's error in result) if statements are not allowed
       here: in a stored function or trigger. */
   bool refused_here(mle::SqlResultMsg *result);
+  /** A kept statement of this text, taken out of the kept ones (it is not
+      counted as open), or nullptr. shape: the value_shape() of the values an
+      EXECUTE runs it with (a statement executed with others does not
+      match); nullptr for a PREPARE (it checks at its first execution). */
+  std::unique_ptr<Statement> take_kept(std::string_view sql,
+                                       const std::string *shape);
+  /** Statement s is executed with values[from, from + n): its shape is
+      recorded, and one a PREPARE took from the kept ones is prepared again
+      if they have another shape (true, and the error in result, if that
+      fails). */
+  bool note_shape(Statement &s, const std::vector<mle::Value> &values,
+                  size_t from, size_t n, mle::SqlResultMsg *result);
+  /** The id is CLOSED now: its statement is parked if it can be kept, else
+      closed. */
+  void release(std::map<uint64_t, std::unique_ptr<Statement>>::iterator it);
+  /** The session's sql_mode, schema or character sets may change: nothing
+      prepared before is kept. */
+  void forget_kept();
+  /** Prepares sql for s (true on failure, the error in its diagnostics);
+      at the server's max_prepared_stmt_count the kept statements are closed
+      and it is tried once more. */
+  bool prepare_text(Statement &s, std::string_view sql);
 
   MYSQL_THD m_thd;
   SqlBudget *m_budget;
@@ -190,6 +230,11 @@ class SqlRunner {
   /** The arena for the message being served (handle), or nullptr. */
   mle::DirectReply *m_direct = nullptr;
   std::map<uint64_t, std::unique_ptr<Statement>> m_statements;
+  /** Kept statements, the most recently used last. */
+  std::vector<std::unique_ptr<Statement>> m_kept;
+  /** Advances at forget_kept(): a statement prepared in an earlier
+      generation is closed, not kept. */
+  uint64_t m_generation = 0;
   bool m_context_checked = false;
   bool m_refused = false;
   /** The error_id of the reply to the message being served, if it is an

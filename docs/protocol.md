@@ -1337,6 +1337,10 @@ Actions:
 
 * **EXECUTE** runs `text`, one SQL statement. With params it is a one-shot
   prepared execution: exactly one value per parameter marker, else ERROR.
+  The host may keep the statement prepared when the id is closed and use it
+  again for a later EXECUTE with params, or PREPARE, of the same `text` in
+  the same request (Appendix A, "Statements within a call"). A worker cannot
+  tell: what it receives is what a new preparation would give.
 * **PREPARE** prepares `text`. Reply OK with `param_count`, the number of
   markers.
 * **EXECUTE_PREPARED** executes the id with exactly one value per marker,
@@ -2112,6 +2116,7 @@ These are choices of the current host, not rules of the protocol.
 | Longest time a worker can add after a kill (§11.1 step 3) | G + what is outstanding at notice (a host transfer, or the extension: ≤ 65 G) + 32 RESULT transfers (≤ 5 G each): 226 G with an arena below 64 MiB, 66 G with one of 64 MiB or more. The server's own time to end statements and one bounded sleep per check come on top. A RESULT of one chunk gets no size allowance, and a chunked SQL message begun after the notice none either: G must cover them, so G should not be set below about 100 ms. |
 | Rows per batch when `max_rows` is 0 | `mle.sql_chunk_rows` |
 | Open statements | `mle.sql_statements_max` |
+| Idle prepared statements kept per request | `mle.sql_statement_cache`, default 16 (0: none) |
 | Memory of buffered results | `mle.sql_result_max` per result, `mle.sql_call_results_max` per session |
 | Request bytes in progress per session (§10.7) | 256 MiB |
 | Console output kept | 64 KiB per session |
@@ -2123,6 +2128,33 @@ a pointer to that call's diagnostics area. A routine called many times
 therefore prepares its statements on every call. Wanted: a statement
 service whose prepared statements outlive the call (then a KEEP flag can
 be added in a minor version).
+
+**Statements within a call.** The host keeps a statement that it prepared
+for an EXECUTE with params or a PREPARE (not one with PASS_RESULT_TO_CLIENT)
+when its id is closed, and uses it again for the same text later in the
+same request, at the same depth, instead of preparing it anew: a routine
+that runs a statement in a loop is parsed once. A marker whose type no
+context fixes (`SELECT ?`) takes its type from the values of the first
+execution, so an EXECUTE takes a kept statement only if it was executed
+with values of the same kinds (the value's tag; FLOAT32 as FLOAT64, JSON as
+STRING, VECTOR as BYTES, TIMESTAMP as DATETIME, a negative TIME as STRING);
+a PREPARE takes one whatever it ran with, and prepares it again at its first
+execution if the values are of other kinds; an id executed with values of
+different kinds is not kept. Each request keeps at most
+`mle.sql_statement_cache` such statements (the least recently used is
+closed first) and closes them when its RESULT arrives. The server prepares
+a kept statement again itself after a change of the tables it uses. The
+server restores a routine's `sql_mode`, schema and character sets when a
+routine it calls returns, so only the request's own statements change
+them: the host forgets all kept statements of the request after it runs a
+statement that begins with `SET`, `USE`, `EXECUTE` or `DROP`, or with an
+executable comment. A kept statement's last results stay counted in the
+session's memory of buffered results until it runs again or is closed;
+kept statements are closed first when that memory runs short. They also
+count in the server's `max_prepared_stmt_count`: when a preparation fails
+at that bound, the request's kept statements are closed and it is tried
+once more. Warnings of the preparation itself are not reported in either
+case.
 
 **Reading results.** The host need not buffer a whole result set before
 it sends the first batch: `total_rows` may be unknown. `exec_us` costs
