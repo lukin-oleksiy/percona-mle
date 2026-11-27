@@ -300,16 +300,53 @@ final class Dispatcher {
         }
         // Idle after a RESET (§3.1): the host's memory figures, after the GC if there was one.
         mb.stats(Wire.STATE_IDLE);
-      } else if (trimWhenIdle && IDLE_TRIM_NS > 0 && polyglot.pythonStarted()) {
-        trimWhenIdle = false;
-        if (!mb.awaitMessage(IDLE_TRIM_NS)) {
-          MemoryWatch.forcedGc();
-          System.gc();
-          Native.mallocTrim();
-          mb.stats(Wire.STATE_IDLE);
-        }
+      } else {
+        idle();
       }
       serveNext();
+    }
+  }
+
+  /**
+   * Idle in a session, until a request comes: what is due meanwhile, on the mailbox's futex wait
+   * with the earliest deadline (no thread of its own; never during a call). The idle trim (above);
+   * the give-back after the vector cache let go of a lot (exp note 76 C12: drop, dropAll, expiry or
+   * eviction freed 64 MiB or the whole cache; for every JVM worker, after IDLE_GC_NS of quiet, as
+   * after RESET); and the cache's idle expiry (C11), which may free enough for a give-back.
+   */
+  private void idle() {
+    long now = System.nanoTime();
+    long trimAt = trimWhenIdle && IDLE_TRIM_NS > 0 && polyglot.pythonStarted() ? now + IDLE_TRIM_NS : Long.MAX_VALUE;
+    trimWhenIdle = false;
+    long giveBackAt = com.percona.mle.api.VectorCache.takeGiveBack() ? now + IDLE_GC_NS : Long.MAX_VALUE;
+    while (true) {
+      long expiryAt = com.percona.mle.api.VectorCache.nextExpiry();
+      long at = Math.min(trimAt, Math.min(giveBackAt, expiryAt));
+      if (at == Long.MAX_VALUE) return;
+      long wait = at - System.nanoTime();
+      if (wait > 0 && mb.awaitMessage(wait)) return;  // a request: what is due waits for the next idle time
+      now = System.nanoTime();
+      if (expiryAt <= now) {
+        com.percona.mle.api.VectorCache.expire();
+        if (giveBackAt == Long.MAX_VALUE && com.percona.mle.api.VectorCache.takeGiveBack()) giveBackAt = now;
+      }
+      if (trimAt <= now || giveBackAt <= now) {
+        boolean cache = giveBackAt <= now;
+        trimAt = giveBackAt = Long.MAX_VALUE;  // once per idle period
+        MemoryWatch.forcedGc();
+        System.gc();
+        // SerialGC shrinks the heap in steps over consecutive full GCs (ShrinkHeapInSteps: 0, 10,
+        // 40, 100 %). After the cache let go of a large set the live data is small and a GC is
+        // short: a few more, until the committed heap stops falling, give it back now.
+        if (cache)
+          for (int i = 0; i < 3; i++) {
+            long committed = Runtime.getRuntime().totalMemory();
+            System.gc();
+            if (Runtime.getRuntime().totalMemory() >= committed) break;
+          }
+        Native.mallocTrim();
+        mb.stats(Wire.STATE_IDLE);
+      }
     }
   }
 
@@ -317,6 +354,8 @@ final class Dispatcher {
   void serveNext() {
     Mailbox.Message m = mb.receive(topLevel);
     lastSeq = m.callSeq();
+    // A kept set idle past its time goes before the request can use it (exp note 76 C11).
+    com.percona.mle.api.VectorCache.expire();
     handle(m);
     if (!gcWhenIdle) trimWhenIdle = true;
   }
@@ -419,6 +458,7 @@ final class Dispatcher {
     polyglot.reset();
     schemas.clear();
     LibraryFileSystem.reset();
+    com.percona.mle.api.VectorCache.reset();  // the session's kept sets end with it (exp note 76 C2)
     // What guest code printed and no RESULT carried is dropped; the options end (in the
     // languages when guest code runs next: defaultsDue).
     console.discard();

@@ -21,7 +21,7 @@
   The mle.* system variables (11-phase4-component.md §6).
 
   - Settings that shape workers (memory_max, heap_max, pool_size,
-    vector_threads, idle_trim_ms) can be
+    vector_threads, idle_trim_ms, vector_cache_max, vector_cache_idle_ms) can be
     changed while no session holds a worker, else 6116 (as Oracle's
     mle.memory_max "while the component is active"). A change restarts the
     engine, so INSTALL COMPONENT ... SET GLOBAL mle.memory_max = ... works
@@ -76,6 +76,8 @@ ulonglong g_v8_heap_max = 0;
 uint g_v8_pool_size = 0;
 uint g_vector_threads = 4;
 uint g_idle_trim_ms = 5000;
+longlong g_vector_cache_max = -1;
+uint g_vector_cache_idle_ms = 1800 * 1000;
 uint g_max_workers = 0;
 uint g_worker_cache_size = 0;
 uint g_worker_cache_timeout = 0;
@@ -168,6 +170,23 @@ int check_shaping(MYSQL_THD thd, SYS_VAR *, void *save,
   return 0;
 }
 
+/** check_shaping for a signed setting whose -1 means "computed" (mle.vector_cache_max). */
+template <const char *Name, longlong Min, longlong Max>
+int check_shaping_signed(MYSQL_THD thd, SYS_VAR *, void *save,
+                         struct st_mysql_value *value) {
+  long long v = 0;
+  if (value->val_int(value, &v) != 0) return 1;
+  if (value->is_unsigned(value) && v < 0) return 1;  // above LLONG_MAX
+  if (v < Min || v > Max) return 1;
+  if (workers_held(thd)) {
+    my_error(ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE, MYF(0),
+             (std::string("mle.") + Name).c_str());
+    return 1;
+  }
+  *static_cast<longlong *>(save) = v;
+  return 0;
+}
+
 template <typename T, const char *Name>
 void update_shaping(MYSQL_THD thd, SYS_VAR *, void *val_ptr,
                     const void *save) {
@@ -204,6 +223,10 @@ constexpr const char kPoolPrewarm[] = "vectors";
 constexpr const char kVectorThreads[] = "vector_threads";
 constexpr const char kIdleTrimMs[] = "idle_trim_ms";
 constexpr uint kIdleTrimMsMax = 3600 * 1000;
+constexpr const char kVectorCacheMax[] = "vector_cache_max";
+constexpr const char kVectorCacheIdleMs[] = "vector_cache_idle_ms";
+/** A week: an idle time longer than that is "for the session" (0). */
+constexpr uint kVectorCacheIdleMsMax = 7 * 24 * 3600 * 1000;
 
 constexpr ulonglong kMiB = 1ULL << 20;
 constexpr ulonglong kMemoryMaxMin = 256 * kMiB;
@@ -310,6 +333,7 @@ Registered g_registered[] = {
     {"worker_cache_size", false}, {"worker_cache_timeout", false},
     {"package_dir", false}, {"pool_prewarm", false},
     {"vector_threads", false}, {"idle_trim_ms", false}, {"console", false},
+    {"vector_cache_max", false}, {"vector_cache_idle_ms", false},
     {"malloc_mmap_threshold", false}, {"debug_test_worker", false}};
 
 /** mle.console (session): OFF, or WARNINGS (exp note 39). */
@@ -516,6 +540,40 @@ bool register_settings() {
           "engine.",
           check_shaping<uint, kIdleTrimMs, 0, kIdleTrimMsMax>,
           update_shaping<uint, kIdleTrimMs>, &idle_trim_ms, &g_idle_trim_ms))
+    return true;
+
+  // Exp note 76: the vector sets a JVM worker keeps between the calls of a
+  // session (Vectors.cached, keep). C8: a quarter of the heap by default;
+  // C10: 0 turns the cache off (routines then load every call).
+  INTEGRAL_CHECK_ARG(longlong) vector_cache_max;
+  vector_cache_max.def_val = -1;
+  vector_cache_max.min_val = -1;
+  vector_cache_max.max_val = static_cast<longlong>(kHeapMaxMax);
+  vector_cache_max.blk_sz = 0;
+  if (reg("vector_cache_max", PLUGIN_VAR_LONGLONG,
+          "Bytes of vector sets a JVM worker keeps between the calls of a "
+          "session (com.percona.mle.api.Vectors.cached, keep), least recently "
+          "used evicted first; -1: a quarter of mle.heap_max; 0: no cache. "
+          "Can be changed while no session holds a worker; restarts the "
+          "engine.",
+          check_shaping_signed<kVectorCacheMax, -1,
+                               static_cast<longlong>(kHeapMaxMax)>,
+          update_shaping<longlong, kVectorCacheMax>, &vector_cache_max,
+          &g_vector_cache_max))
+    return true;
+  uint_check_arg_s vector_cache_idle_ms;
+  vector_cache_idle_ms.def_val = 1800 * 1000;
+  vector_cache_idle_ms.min_val = 0;
+  vector_cache_idle_ms.max_val = kVectorCacheIdleMsMax;
+  vector_cache_idle_ms.blk_sz = 0;
+  if (reg("vector_cache_idle_ms", PLUGIN_VAR_INT | PLUGIN_VAR_UNSIGNED,
+          "Milliseconds a vector set kept between calls (Vectors.cached, "
+          "keep) stays when no call uses it, unless the routine sets its own "
+          "(Vectors.expireAfter); 0: for the session. Can be changed while no "
+          "session holds a worker; restarts the engine.",
+          check_shaping<uint, kVectorCacheIdleMs, 0, kVectorCacheIdleMsMax>,
+          update_shaping<uint, kVectorCacheIdleMs>, &vector_cache_idle_ms,
+          &g_vector_cache_idle_ms))
     return true;
 
   STR_CHECK_ARG(pool_prewarm) pool_prewarm;
@@ -772,6 +830,8 @@ Settings current_settings() {
   s.v8_pool_size = g_v8_pool_size;
   s.vector_threads = g_vector_threads;
   s.idle_trim_ms = g_idle_trim_ms;
+  s.vector_cache_max = g_vector_cache_max;
+  s.vector_cache_idle_ms = g_vector_cache_idle_ms;
   s.cgroup_base = text(g_cgroup_base);
   s.dir = text(g_dir);
   s.java_home = text(g_java_home);

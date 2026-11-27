@@ -49,7 +49,7 @@ import jdk.incubator.vector.VectorSpecies;
  * <p>Threads: the scan is split over the vector pool like {@link VectorSet#nearest}; candidates
  * are ranked by score then position, so results do not depend on the number of threads.
  */
-public final class QuantizedSet {
+public final class QuantizedSet implements CacheTable.Sized {
   static final VectorSpecies<Float> SP = VectorEngine.SP;
   static final int L = VectorEngine.L;
   static final VectorSpecies<Byte> BS = VectorSpecies.of(byte.class, VectorShape.forBitSize(L * 8));
@@ -66,7 +66,9 @@ public final class QuantizedSet {
   private final long[] ids;
   private final String[] labels;
   private final int skipped;
-  private Map<Long, Integer> byId;
+  private volatile Map<Long, Integer> byId;  // made on first use, published whole
+  /** The set whose floats it rescores with (VectorSet.quantize), or null. */
+  private Object source;
 
   private QuantizedSet(boolean binary, int d, byte[][] codes, float[] scale, long[][] bits, float[] norm,
       float[][] floats, long[] ids, String[] labels, int skipped) {
@@ -227,13 +229,46 @@ public final class QuantizedSet {
 
   /** The position of the vector with this id, or -1. */
   public int indexOf(long id) {
-    if (byId == null) {
+    Map<Long, Integer> b = byId;
+    if (b == null) {
       Map<Long, Integer> m = new HashMap<>(ids.length * 2);
       for (int i = ids.length - 1; i >= 0; i--) m.put(ids[i], i);
-      byId = m;
+      byId = b = m;
     }
-    Integer i = byId.get(id);
+    Integer i = b.get(id);
     return i == null ? -1 : i;
+  }
+
+  // ----------------------------------------------- bytes (exp note 76)
+
+  /** The VectorSet whose floats this set rescores with, or null. */
+  @Override
+  public Object base() {
+    return source instanceof VectorSet v ? v.base() : null;
+  }
+
+  @Override
+  public long baseBytes() {
+    return source instanceof VectorSet v ? v.baseBytes() : 0;
+  }
+
+  /** The codes, scales, norms, ids and labels (not the floats a rescoring set shares with its VectorSet). */
+  @Override
+  public long ownBytes() {
+    long n = size();
+    long perVector = binary ? 16 + 8L * ((d + 63) / 64) : 16 + d + 4;
+    return n * (perVector + 4 + 8) + 3 * 16 + (labels == null ? 0 : 16 + 48 * n) + (byId == null ? 0 : 48 * n)
+        + (floats != null ? 16 + 8 * n : 0);
+  }
+
+  @Override
+  public int rows() {
+    return size();
+  }
+
+  QuantizedSet from(Object set) {
+    this.source = set;
+    return this;
   }
 
   // ---------------------------------------------------------- the search

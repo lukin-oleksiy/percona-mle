@@ -123,7 +123,9 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
       // The worker's memory watcher forces GCs below this limit (exp note 30).
       "-Dmle.memoryMax=" + std::to_string(o.memory_max),
       "-Dmle.vectorThreads=" + std::to_string(o.vector_threads),
-      "-Dmle.idleTrimMs=" + std::to_string(o.idle_trim_ms)};
+      "-Dmle.idleTrimMs=" + std::to_string(o.idle_trim_ms),
+      "-Dmle.vectorCacheMax=" + std::to_string(o.vector_cache_max),
+      "-Dmle.vectorCacheIdleMs=" + std::to_string(o.vector_cache_idle_ms)};
   if (!layout.aot_cache.empty()) {
     c.args.push_back("-XX:AOTCache=" + layout.aot_cache);
     // Map the cache at the address it was created for, so its pages stay

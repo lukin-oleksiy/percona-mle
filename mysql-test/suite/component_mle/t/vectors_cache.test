@@ -1,0 +1,338 @@
+--echo #
+--echo # component_mle: the vector cache (exp note 76): sets kept between the calls
+--echo # of a session by name (Vectors.cached, cachedQuantized, keep, kept, refresh,
+--echo # drop, dropAll, expireAfter, cacheInfo); a snapshot; one name, one query;
+--echo # names per schema; least recently used evicted at mle.vector_cache_max, a set
+--echo # over it not kept, 0 = off; idle expiry (also while the session is idle) and
+--echo # memory given back; separate caches per principal; the session's end,
+--echo # mle_session_reset() and COM_CHANGE_USER empty it, COM_RESET_CONNECTION does
+--echo # not; Java, JavaScript, Python.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+SELECT @@mle.vector_cache_max, @@mle.vector_cache_idle_ms;
+--error ER_WRONG_VALUE_FOR_VAR,ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
+SET GLOBAL mle.vector_cache_max = -2;
+--error ER_WRONG_VALUE_FOR_VAR,ER_LANGUAGE_COMPONENT_SET_SYSTEM_VARIABLE
+SET GLOBAL mle.vector_cache_idle_ms = 604800001;
+CREATE TABLE items (id BIGINT PRIMARY KEY, v VECTOR(4), cat VARCHAR(4));
+INSERT INTO items VALUES (1, STRING_TO_VECTOR('[1,0,0,0]'), 'a'), (2, STRING_TO_VECTOR('[0.9,0.1,0,0]'), 'a'),
+  (3, STRING_TO_VECTOR('[0,1,0,0]'), 'b'), (4, STRING_TO_VECTOR('[0,0.9,0.1,0]'), 'b'), (5, STRING_TO_VECTOR('[0,0,1,0]'), 'c'),
+  (6, STRING_TO_VECTOR('[0,0,0.9,0.1]'), 'c'), (7, STRING_TO_VECTOR('[0,0,0,1]'), 'd'), (8, STRING_TO_VECTOR('[0.5,0.5,0,0]'), 'd');
+CREATE DATABASE other;
+CREATE TABLE other.items (id BIGINT PRIMARY KEY, v VECTOR(4));
+INSERT INTO other.items VALUES (100, STRING_TO_VECTOR('[1,1,1,1]')), (101, STRING_TO_VECTOR('[1,0,1,0]'));
+CREATE USER u1;
+GRANT EXECUTE ON test.* TO u1;
+GRANT SELECT ON test.items TO u1;
+--write_file $MYSQLTEST_VARDIR/tmp/vectors_cache.sql
+-- What the cache holds: schema.name kind rows uses state, one line each (bytes are left out: they
+-- depend on how much the JVM's arrays take; checked as relations).
+CREATE PROCEDURE info(OUT r TEXT) LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+for (CacheEntry e : Vectors.cacheInfo())
+  b.append(e.schema()).append(".").append(e.name()).append(" ").append(e.kind()).append(" rows ").append(e.rows())
+   .append(" uses ").append(e.uses()).append(" ").append(e.state().replaceAll("[0-9.]+ MiB", "N MiB")).append('\n');
+r[0] = b.length() == 0 ? "(empty)" : b.toString().trim();
+$$;
+CREATE PROCEDURE inv_info(OUT r TEXT) SQL SECURITY INVOKER LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+for (CacheEntry e : Vectors.cacheInfo()) b.append(e.schema()).append(".").append(e.name()).append(" uses ").append(e.uses()).append('\n');
+r[0] = b.length() == 0 ? "(empty)" : b.toString().trim();
+$$;
+-- JavaScript: the 2 nearest from the kept set.
+CREATE PROCEDURE js_near(IN q VECTOR(4), OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors')
+  const s = V.cached('items', 'SELECT id, v, cat FROM items')
+  r = `${s.size()} rows, nearest ${Array.from(s.nearest(q, 2, 'cosine').ids())}`
+$$;
+-- Python: the same name and query from another language: the same set.
+CREATE PROCEDURE py_near(IN q VECTOR(4), OUT r TEXT) LANGUAGE PYTHON AS $$
+    import java
+    V = java.type('com.percona.mle.api.Vectors')
+    s = V.cached('items', 'SELECT id, v, cat FROM items')
+    r = '%d rows, nearest %s' % (s.size(), list(s.nearest(q, 2, 'cosine').ids()))
+$$;
+CREATE PROCEDURE js_refresh(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors')
+  const s = V.refresh('items')
+  r = s === null ? 'null' : `${s.size()} rows`
+$$;
+-- The rules of names, from Java.
+CREATE PROCEDURE java_names(OUT r TEXT) LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+Runnable[] cases = {
+  () -> Vectors.cached("items", "SELECT id, v FROM items"),
+  () -> Vectors.cachedQuantized("items", "int8", "SELECT id, v, cat FROM items"),
+  () -> Vectors.cached("byp", "SELECT id, v FROM items WHERE id > ?", 6L),
+  () -> Vectors.cached("byp", "SELECT id, v FROM items WHERE id > ?", 6),
+  () -> Vectors.cached("byp", "SELECT id, v FROM items WHERE id > ?", 6.0),
+  () -> Vectors.cached("byp", "SELECT id, v FROM items WHERE id > ?", 5),
+  () -> Vectors.keep("mine", Vectors.load("SELECT id, v FROM items WHERE id < 3")),
+  () -> Vectors.cached("mine", "SELECT id, v FROM items WHERE id < 3"),
+  () -> Vectors.refresh("mine"),
+  () -> b.append("refresh of a name never kept: ").append(Vectors.refresh("never")).append('\n'),
+  () -> b.append("keep replaces: ").append(Vectors.keep("mine", Vectors.load("SELECT id, v FROM items WHERE id < 5")))
+         .append(", now ").append(((VectorSet) Vectors.kept("mine")).size()).append(" rows\n"),
+  () -> Vectors.cached("bad", "SELECT id, v FROM no_such_table"),
+  () -> Vectors.cached("", "SELECT id, v FROM items"),
+  () -> Vectors.expireAfter("mine", -1),
+};
+for (Runnable c : cases) {
+  try { c.run(); }
+  catch (RuntimeException e) { b.append(e.getMessage().replaceAll("\\(java_names.*", "").trim()).append('\n'); }
+}
+r[0] = b.toString().trim();
+$$;
+-- Views and a quantized set kept: the vectors they share count once.
+CREATE PROCEDURE java_views(OUT r TEXT) LANGUAGE JAVA AS $$
+VectorSet s = Vectors.cached("all", "SELECT id, v, cat FROM items");
+Vectors.keep("ab", s.withLabel("a", "b"));
+Vectors.keep("q8", s.quantize("int8"));
+long sum = 0, all = 0;
+for (CacheEntry e : Vectors.cacheInfo()) {
+  if (e.name().equals("ab") || e.name().equals("q8") || e.name().equals("all")) sum += e.bytes();
+  if (e.name().equals("all")) all = e.bytes();
+}
+VectorSet ab = (VectorSet) Vectors.kept("ab");
+QuantizedSet q8 = (QuantizedSet) Vectors.kept("q8");
+r[0] = "view of " + ab.size() + " rows, int8 set nearest " + q8.nearest(new float[] {1, 0, 0, 0}, 1, "cosine").id(0)
+    + "; kept bytes count the shared vectors once: " + (Vectors.cacheBytes() < sum) + ", the base once: "
+    + (Vectors.cacheBytes() - all < sum - all);
+$$;
+-- A failed refresh keeps the old set.
+CREATE PROCEDURE java_failed_refresh(OUT r TEXT) LANGUAGE JAVA AS $$
+Vectors.cached("tmp", "SELECT id, v FROM tmp_items");
+Mle.session().runSql("DROP TABLE tmp_items");
+String err;
+try { Vectors.refresh("tmp"); err = "no error"; } catch (RuntimeException e) { err = "refresh failed"; }
+r[0] = err + "; still kept: " + ((VectorSet) Vectors.kept("tmp")).size() + " rows";
+$$;
+CREATE PROCEDURE other.near(OUT r TEXT) LANGUAGE JAVA AS $$
+VectorSet s = Vectors.cached("items", "SELECT id, v FROM items");
+r[0] = s.size() + " rows in schema other: ids " + Arrays.toString(s.nearest(new float[] {1, 1, 1, 1}, 2, "cosine").ids());
+$$;
+-- Definer and invoker rights: two principals, two workers, two caches.
+CREATE PROCEDURE def_search(OUT r TEXT) SQL SECURITY DEFINER LANGUAGE JAVA AS $$
+r[0] = "definer: " + Vectors.cached("shared", "SELECT id, v FROM items").size() + " rows";
+$$;
+CREATE PROCEDURE inv_search(OUT r TEXT) SQL SECURITY INVOKER LANGUAGE JAVA AS $$
+r[0] = "invoker: " + Vectors.cached("shared", "SELECT id, v FROM items").size() + " rows";
+$$;
+-- The way to manage a definer-rights routine's cache: a routine of the same definer and schema.
+CREATE PROCEDURE def_drop(OUT r TEXT) SQL SECURITY DEFINER LANGUAGE JAVA AS $$
+r[0] = "dropped: " + Vectors.drop("shared");
+$$;
+CREATE PROCEDURE java_drop_all() LANGUAGE JAVA AS $$ Vectors.dropAll(); $$;
+CREATE PROCEDURE java_keep_for(IN name VARCHAR(20), IN ms BIGINT, OUT r TEXT) LANGUAGE JAVA AS $$
+Vectors.cached(name, "SELECT id, v FROM items");
+r[0] = name + " expires after " + ms + " ms: " + Vectors.expireAfter(name, ms);
+$$;
+-- A large set (about 73 MiB: 70,000 x VECTOR(256)) and the Java heap the worker has committed (MiB).
+CREATE PROCEDURE fill_big() LANGUAGE JAVA AS $$
+Random r = new Random(1);
+PreparedStatement p = Mle.session().prepare("INSERT INTO big VALUES (?, ?)");
+Mle.session().startTransaction();
+for (int id = 0; id < 70000; id++) {
+  float[] v = new float[256];
+  for (int i = 0; i < 256; i++) v[i] = r.nextFloat();
+  p.bind((long) id, v).execute();
+}
+Mle.session().commit();
+$$;
+CREATE PROCEDURE java_big(IN what VARCHAR(10), OUT mib BIGINT) LANGUAGE JAVA AS $$
+// After keep: a GC sizes the heap for what is live, the kept set with it. Otherwise no GC: the
+// heap the worker has committed falls only if the idle give-back ran.
+if (what.equals("keep")) { Vectors.cached("big", "SELECT id, v FROM big"); System.gc(); }
+if (what.equals("drop")) Vectors.drop("big");
+mib[0] = Runtime.getRuntime().totalMemory() >> 20;
+$$;
+-- The eviction order at a small limit: sets of 2, 3 and 4 rows.
+CREATE PROCEDURE java_lru(OUT r TEXT) LANGUAGE JAVA AS $$
+Vectors.cached("s2", "SELECT id, v FROM items WHERE id <= 2");
+Vectors.cached("s3", "SELECT id, v FROM items WHERE id <= 3");
+Vectors.kept("s2");  // s3 is now the least recently used
+Vectors.cached("s4", "SELECT id, v FROM items WHERE id <= 4");
+VectorSet all = Vectors.cached("all8", "SELECT id, v FROM items");
+r[0] = "kept: s2 " + (Vectors.kept("s2") != null) + ", s3 " + (Vectors.kept("s3") != null) + ", s4 "
+    + (Vectors.kept("s4") != null) + "; the set over the limit returned with " + all.size() + " rows, kept "
+    + (Vectors.kept("all8") != null);
+$$;
+CREATE PROCEDURE java_off(OUT r TEXT) LANGUAGE JAVA AS $$
+VectorSet a = Vectors.cached("x", "SELECT id, v FROM items");
+VectorSet b = Vectors.cached("x", "SELECT id, v FROM items");
+r[0] = "max " + Vectors.cacheMax() + ": loaded twice " + (a != b) + ", keep " + Vectors.keep("y", a) + ", kept "
+    + Vectors.kept("x") + ", refresh " + Vectors.refresh("x") + ", " + Vectors.cacheInfo().length + " entries";
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/vectors_cache.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/vectors_cache.sql
+--source include/wait_until_count_sessions.inc
+
+--echo # 1. Kept between calls; the same set from JavaScript and Python; a snapshot.
+--connect (con1, localhost, root,,test)
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+SELECT @r AS first_call;
+CALL py_near(STRING_TO_VECTOR('[0,1,0,0]'), @r);
+SELECT @r AS python_finds_it;
+INSERT INTO items VALUES (9, STRING_TO_VECTOR('[1,0,0,0.01]'), 'e');
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+SELECT @r AS snapshot;
+CALL js_refresh(@r);
+SELECT @r AS refreshed;
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+SELECT @r AS after_refresh;
+CALL info(@r);
+SELECT @r AS cache;
+
+--echo # 2. One name, one query; parameters by value; keep; refresh; failures.
+CALL java_names(@r);
+SELECT @r AS names;
+CALL java_views(@r);
+SELECT @r AS views;
+CREATE TABLE tmp_items (id BIGINT PRIMARY KEY, v VECTOR(4));
+INSERT INTO tmp_items VALUES (1, STRING_TO_VECTOR('[1,2,3,4]'));
+CALL java_failed_refresh(@r);
+SELECT @r AS failed_refresh;
+
+--echo # 3. A name belongs to the routine's schema.
+CALL other.near(@r);
+SELECT @r AS other_schema;
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+SELECT @r AS this_schema;
+CALL info(@r);
+SELECT @r AS cache;
+
+--echo # 4. COM_RESET_CONNECTION keeps it; mle_session_reset() and COM_CHANGE_USER empty it.
+--reset_connection
+CALL info(@r);
+SELECT @r AS after_reset_connection;
+SELECT mle_session_reset();
+CALL info(@r);
+SELECT @r AS after_session_reset;
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+--change_user root,,test
+CALL info(@r);
+SELECT @r AS after_change_user;
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+--echo # The session's end: the account's next session may get the same worker, empty.
+--connect (con1, localhost, root,,test)
+CALL info(@r);
+SELECT @r AS next_session;
+
+--echo # 5. Definer and invoker rights: separate caches; a definer routine drops the definer's.
+--connect (con_u1, localhost, u1,,test)
+CALL def_search(@r);
+SELECT @r AS r;
+CALL inv_search(@r);
+SELECT @r AS r;
+CALL def_search(@r);
+CALL inv_search(@r);
+CALL inv_info(@r);
+SELECT @r AS invoker_cache;
+CALL def_drop(@r);
+SELECT @r AS r;
+CALL inv_info(@r);
+SELECT @r AS invoker_cache_after;
+--disconnect con_u1
+--connection con1
+
+--echo # 6. Idle expiry: per set (expireAfter), at the start of a request.
+CALL java_keep_for('soon', 200, @r);
+SELECT @r AS r;
+CALL java_keep_for('never', 0, @r);
+SELECT @r AS r;
+SELECT SLEEP(0.5);
+CALL info(@r);
+SELECT @r AS cache;
+CALL java_drop_all();
+CALL info(@r);
+SELECT @r AS after_drop_all;
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+
+--echo # 7. A large set dropped: memory given back while the session is idle, in a
+--echo #    worker without Python; then the same by idle expiry (mle.vector_cache_idle_ms).
+CREATE TABLE big (id BIGINT PRIMARY KEY, v VECTOR(256));
+SET GLOBAL mle.sql_result_max = 256 * 1024 * 1024;
+--connect (con2, localhost, root,,test)
+CALL fill_big();
+CALL java_big('keep', @kept);
+CALL java_big('drop', @dropped);
+SELECT SLEEP(1);
+CALL java_big('', @after);
+SELECT @kept - @after >= 30 AS heap_given_back_while_idle;
+--disconnect con2
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.vector_cache_idle_ms = 500;
+--source ../include/wait_for_pool.inc
+--connect (con2, localhost, root,,test)
+CALL java_big('keep', @kept);
+SELECT SLEEP(1.5);
+CALL java_big('', @after);
+SELECT @kept - @after >= 30 AS expired_while_idle_and_given_back;
+CALL info(@r);
+SELECT @r AS cache;
+--disconnect con2
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.vector_cache_idle_ms = DEFAULT;
+SET GLOBAL mle.sql_result_max = DEFAULT;
+
+--echo # 8. A small limit: least recently used first; a set over it is returned, not kept.
+SET GLOBAL mle.vector_cache_max = 400;
+--source ../include/wait_for_pool.inc
+--connect (con3, localhost, root,,test)
+CALL java_lru(@r);
+SELECT @r AS lru;
+CALL info(@r);
+SELECT @r AS cache;
+--disconnect con3
+--connection default
+--source include/wait_until_count_sessions.inc
+
+--echo # 9. 0: off; routines run unchanged and load every call.
+SET GLOBAL mle.vector_cache_max = 0;
+--source ../include/wait_for_pool.inc
+--connect (con3, localhost, root,,test)
+CALL java_off(@r);
+SELECT @r AS off;
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+SELECT @r AS still_works;
+--disconnect con3
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.vector_cache_max = DEFAULT;
+--source ../include/wait_for_pool.inc
+
+DROP TABLE items, big;
+DROP DATABASE other;
+DROP USER u1;
+DROP PROCEDURE info;
+DROP PROCEDURE inv_info;
+DROP PROCEDURE js_near;
+DROP PROCEDURE py_near;
+DROP PROCEDURE js_refresh;
+DROP PROCEDURE java_names;
+DROP PROCEDURE java_views;
+DROP PROCEDURE java_failed_refresh;
+DROP PROCEDURE def_search;
+DROP PROCEDURE inv_search;
+DROP PROCEDURE def_drop;
+DROP PROCEDURE java_drop_all;
+DROP PROCEDURE java_keep_for;
+DROP PROCEDURE fill_big;
+DROP PROCEDURE java_big;
+DROP PROCEDURE java_lru;
+DROP PROCEDURE java_off;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

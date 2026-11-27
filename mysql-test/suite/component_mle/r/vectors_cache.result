@@ -1,0 +1,247 @@
+#
+# component_mle: the vector cache (exp note 76): sets kept between the calls
+# of a session by name (Vectors.cached, cachedQuantized, keep, kept, refresh,
+# drop, dropAll, expireAfter, cacheInfo); a snapshot; one name, one query;
+# names per schema; least recently used evicted at mle.vector_cache_max, a set
+# over it not kept, 0 = off; idle expiry (also while the session is idle) and
+# memory given back; separate caches per principal; the session's end,
+# mle_session_reset() and COM_CHANGE_USER empty it, COM_RESET_CONNECTION does
+# not; Java, JavaScript, Python.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+SELECT @@mle.vector_cache_max, @@mle.vector_cache_idle_ms;
+@@mle.vector_cache_max	@@mle.vector_cache_idle_ms
+-1	1800000
+SET GLOBAL mle.vector_cache_max = -2;
+Got one of the listed errors
+SET GLOBAL mle.vector_cache_idle_ms = 604800001;
+Got one of the listed errors
+CREATE TABLE items (id BIGINT PRIMARY KEY, v VECTOR(4), cat VARCHAR(4));
+INSERT INTO items VALUES (1, STRING_TO_VECTOR('[1,0,0,0]'), 'a'), (2, STRING_TO_VECTOR('[0.9,0.1,0,0]'), 'a'),
+(3, STRING_TO_VECTOR('[0,1,0,0]'), 'b'), (4, STRING_TO_VECTOR('[0,0.9,0.1,0]'), 'b'), (5, STRING_TO_VECTOR('[0,0,1,0]'), 'c'),
+(6, STRING_TO_VECTOR('[0,0,0.9,0.1]'), 'c'), (7, STRING_TO_VECTOR('[0,0,0,1]'), 'd'), (8, STRING_TO_VECTOR('[0.5,0.5,0,0]'), 'd');
+CREATE DATABASE other;
+CREATE TABLE other.items (id BIGINT PRIMARY KEY, v VECTOR(4));
+INSERT INTO other.items VALUES (100, STRING_TO_VECTOR('[1,1,1,1]')), (101, STRING_TO_VECTOR('[1,0,1,0]'));
+CREATE USER u1;
+GRANT EXECUTE ON test.* TO u1;
+GRANT SELECT ON test.items TO u1;
+# 1. Kept between calls; the same set from JavaScript and Python; a snapshot.
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+SELECT @r AS first_call;
+first_call
+8 rows, nearest 1,2
+CALL py_near(STRING_TO_VECTOR('[0,1,0,0]'), @r);
+SELECT @r AS python_finds_it;
+python_finds_it
+8 rows, nearest [3, 4]
+INSERT INTO items VALUES (9, STRING_TO_VECTOR('[1,0,0,0.01]'), 'e');
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+SELECT @r AS snapshot;
+snapshot
+8 rows, nearest 1,2
+CALL js_refresh(@r);
+SELECT @r AS refreshed;
+refreshed
+9 rows
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+SELECT @r AS after_refresh;
+after_refresh
+9 rows, nearest 1,9
+CALL info(@r);
+SELECT @r AS cache;
+cache
+test.items vectors rows 9 uses 4 kept
+# 2. One name, one query; parameters by value; keep; refresh; failures.
+CALL java_names(@r);
+SELECT @r AS names;
+names
+'items' is kept for another query (SELECT id, v, cat FROM items): one name, one query; drop it first
+'items' is kept as vectors, not int8: one name, one kind
+'byp' is kept for another query (SELECT id, v FROM items WHERE id > ? with [6]): one name, one query; drop it first
+'mine' is kept by keep(), without a query: use kept()
+'mine' is kept by keep(), without a query to run again
+refresh of a name never kept: null
+keep replaces: true, now 4 rows
+Table 'test.no_such_table' doesn't exist
+a cached set needs a name
+idleMs must be at least 0 (0: never), not -1
+CALL java_views(@r);
+SELECT @r AS views;
+views
+view of 4 rows, int8 set nearest 1; kept bytes count the shared vectors once: true, the base once: true
+CREATE TABLE tmp_items (id BIGINT PRIMARY KEY, v VECTOR(4));
+INSERT INTO tmp_items VALUES (1, STRING_TO_VECTOR('[1,2,3,4]'));
+CALL java_failed_refresh(@r);
+SELECT @r AS failed_refresh;
+failed_refresh
+refresh failed; still kept: 1 rows
+# 3. A name belongs to the routine's schema.
+CALL other.near(@r);
+SELECT @r AS other_schema;
+other_schema
+2 rows in schema other: ids [100, 101]
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+SELECT @r AS this_schema;
+this_schema
+9 rows, nearest 1,9
+CALL info(@r);
+SELECT @r AS cache;
+cache
+test.byp vectors rows 3 uses 2 kept
+test.mine vectors rows 4 uses 1 kept
+test.all vectors rows 9 uses 0 kept
+test.ab vectors rows 4 uses 1 kept
+test.q8 int8 rows 9 uses 1 kept
+test.tmp vectors rows 1 uses 1 kept
+other.items vectors rows 2 uses 0 kept
+test.items vectors rows 9 uses 5 kept
+# 4. COM_RESET_CONNECTION keeps it; mle_session_reset() and COM_CHANGE_USER empty it.
+CALL info(@r);
+SELECT @r AS after_reset_connection;
+after_reset_connection
+test.byp vectors rows 3 uses 2 kept
+test.mine vectors rows 4 uses 1 kept
+test.all vectors rows 9 uses 0 kept
+test.ab vectors rows 4 uses 1 kept
+test.q8 int8 rows 9 uses 1 kept
+test.tmp vectors rows 1 uses 1 kept
+other.items vectors rows 2 uses 0 kept
+test.items vectors rows 9 uses 5 kept
+SELECT mle_session_reset();
+mle_session_reset()
+The session state is successfully reset.
+CALL info(@r);
+SELECT @r AS after_session_reset;
+after_session_reset
+(empty)
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+CALL info(@r);
+SELECT @r AS after_change_user;
+after_change_user
+(empty)
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+# The session's end: the account's next session may get the same worker, empty.
+CALL info(@r);
+SELECT @r AS next_session;
+next_session
+(empty)
+# 5. Definer and invoker rights: separate caches; a definer routine drops the definer's.
+CALL def_search(@r);
+SELECT @r AS r;
+r
+definer: 9 rows
+CALL inv_search(@r);
+SELECT @r AS r;
+r
+invoker: 9 rows
+CALL def_search(@r);
+CALL inv_search(@r);
+CALL inv_info(@r);
+SELECT @r AS invoker_cache;
+invoker_cache
+test.shared uses 1
+CALL def_drop(@r);
+SELECT @r AS r;
+r
+dropped: true
+CALL inv_info(@r);
+SELECT @r AS invoker_cache_after;
+invoker_cache_after
+test.shared uses 1
+# 6. Idle expiry: per set (expireAfter), at the start of a request.
+CALL java_keep_for('soon', 200, @r);
+SELECT @r AS r;
+r
+soon expires after 200 ms: true
+CALL java_keep_for('never', 0, @r);
+SELECT @r AS r;
+r
+never expires after 0 ms: true
+SELECT SLEEP(0.5);
+SLEEP(0.5)
+0
+CALL info(@r);
+SELECT @r AS cache;
+cache
+test.never vectors rows 9 uses 0 kept
+CALL java_drop_all();
+CALL info(@r);
+SELECT @r AS after_drop_all;
+after_drop_all
+(empty)
+# 7. A large set dropped: memory given back while the session is idle, in a
+#    worker without Python; then the same by idle expiry (mle.vector_cache_idle_ms).
+CREATE TABLE big (id BIGINT PRIMARY KEY, v VECTOR(256));
+SET GLOBAL mle.sql_result_max = 256 * 1024 * 1024;
+CALL fill_big();
+CALL java_big('keep', @kept);
+CALL java_big('drop', @dropped);
+SELECT SLEEP(1);
+SLEEP(1)
+0
+CALL java_big('', @after);
+SELECT @kept - @after >= 30 AS heap_given_back_while_idle;
+heap_given_back_while_idle
+1
+SET GLOBAL mle.vector_cache_idle_ms = 500;
+CALL java_big('keep', @kept);
+SELECT SLEEP(1.5);
+SLEEP(1.5)
+0
+CALL java_big('', @after);
+SELECT @kept - @after >= 30 AS expired_while_idle_and_given_back;
+expired_while_idle_and_given_back
+1
+CALL info(@r);
+SELECT @r AS cache;
+cache
+(empty)
+SET GLOBAL mle.vector_cache_idle_ms = DEFAULT;
+SET GLOBAL mle.sql_result_max = DEFAULT;
+# 8. A small limit: least recently used first; a set over it is returned, not kept.
+SET GLOBAL mle.vector_cache_max = 400;
+CALL java_lru(@r);
+SELECT @r AS lru;
+lru
+kept: s2 true, s3 false, s4 true; the set over the limit returned with 9 rows, kept false
+CALL info(@r);
+SELECT @r AS cache;
+cache
+test.s2 vectors rows 2 uses 2 kept
+test.s4 vectors rows 4 uses 1 kept
+test.all8 vectors rows 9 uses 0 not kept: N MiB is more than mle.vector_cache_max (N MiB)
+# 9. 0: off; routines run unchanged and load every call.
+SET GLOBAL mle.vector_cache_max = 0;
+CALL java_off(@r);
+SELECT @r AS off;
+off
+max 0: loaded twice true, keep false, kept null, refresh null, 0 entries
+CALL js_near(STRING_TO_VECTOR('[1,0,0,0]'), @r);
+SELECT @r AS still_works;
+still_works
+9 rows, nearest 1,9
+SET GLOBAL mle.vector_cache_max = DEFAULT;
+DROP TABLE items, big;
+DROP DATABASE other;
+DROP USER u1;
+DROP PROCEDURE info;
+DROP PROCEDURE inv_info;
+DROP PROCEDURE js_near;
+DROP PROCEDURE py_near;
+DROP PROCEDURE js_refresh;
+DROP PROCEDURE java_names;
+DROP PROCEDURE java_views;
+DROP PROCEDURE java_failed_refresh;
+DROP PROCEDURE def_search;
+DROP PROCEDURE inv_search;
+DROP PROCEDURE def_drop;
+DROP PROCEDURE java_drop_all;
+DROP PROCEDURE java_keep_for;
+DROP PROCEDURE fill_big;
+DROP PROCEDURE java_big;
+DROP PROCEDURE java_lru;
+DROP PROCEDURE java_off;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

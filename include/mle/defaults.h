@@ -104,6 +104,11 @@ struct JvmClassOptions {
   /** A JVM worker with Python set up, idle this long between top-level
       requests, runs a full GC and malloc_trim (exp note 68 §8); 0: never. */
   uint32_t idle_trim_ms = 0;
+  /** Bytes of vector sets the worker keeps between calls (exp note 76); -1:
+      a quarter of the Java heap; 0: no cache. */
+  int64_t vector_cache_max = -1;
+  /** A kept vector set unused this long is dropped; 0: never. */
+  uint32_t vector_cache_idle_ms = 1800 * 1000;
   /** Truffle and C2 compiler threads. */
   int compiler_threads = 2;
   bool inherit_stderr = false;

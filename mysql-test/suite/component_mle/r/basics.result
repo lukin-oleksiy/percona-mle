@@ -41,6 +41,8 @@ mle.sql_statements_max	1024
 mle.v8_heap_max	536870912
 mle.v8_memory_max	1073741824
 mle.v8_pool_size	2
+mle.vector_cache_idle_ms	1800000
+mle.vector_cache_max	-1
 mle.vector_threads	4
 mle.worker_cache_size	4
 mle.worker_cache_timeout	60

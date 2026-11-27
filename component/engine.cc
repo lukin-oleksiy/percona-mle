@@ -300,6 +300,8 @@ bool start_locked(const Settings &s, std::string *error, std::string *info) {
   options.pool_size = s.pool_size;
   options.vector_threads = s.vector_threads;
   options.idle_trim_ms = s.idle_trim_ms;
+  options.vector_cache_max = s.vector_cache_max;
+  options.vector_cache_idle_ms = s.vector_cache_idle_ms;
   // JVM workers start Java (javac) and the polyglot engine and context, which
   // every language shares; JavaScript (js), GraalPy (python) and numpy only
   // when mle.pool_prewarm asks: otherwise on their first use (15 §1, exp note

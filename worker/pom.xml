@@ -63,6 +63,14 @@
       <version>${graalvm.version}</version>
       <type>pom</type>
     </dependency>
+    <!-- Unit tests of the worker's own Java (src/test/java; the vector cache's table, exp note 76),
+         run by the build; test scope, so not copied next to the jar. -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.11.0</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
@@ -92,6 +100,15 @@
               <version>${graalvm.version}</version>
             </path>
           </annotationProcessorPaths>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.4</version>
+        <configuration>
+          <argLine>--add-modules=jdk.incubator.vector</argLine>
+          <trimStackTrace>false</trimStackTrace>
         </configuration>
       </plugin>
       <plugin>

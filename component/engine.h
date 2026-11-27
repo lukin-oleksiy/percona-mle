@@ -72,6 +72,10 @@ struct Settings {
   uint32_t vector_threads = 4;
   /** A Python worker idle this long in its session gives memory back (mle.idle_trim_ms); 0: never. */
   uint32_t idle_trim_ms = 5000;
+  /** Bytes of vector sets a JVM worker keeps between calls (mle.vector_cache_max); -1: a quarter of the heap; 0: off. */
+  int64_t vector_cache_max = -1;
+  /** A kept set unused this long is dropped (mle.vector_cache_idle_ms); 0: never. */
+  uint32_t vector_cache_idle_ms = 1800 * 1000;
   /** AUTO, NONE or a cgroup v2 directory. */
   std::string cgroup_base = "AUTO";
   std::string dir;

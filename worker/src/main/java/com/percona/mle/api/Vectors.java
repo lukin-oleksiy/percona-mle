@@ -462,6 +462,82 @@ public final class Vectors {
     return QuantizedSet.load(type, sql, params);
   }
 
+  // ----------------------------------------------- the cache (exp note 76)
+
+  /**
+   * The set kept under name, or the query's vectors loaded (as {@link #load}) and kept under name:
+   * the next calls of the session find them without loading again. Only what a routine asks for
+   * by name is kept; a kept set is a snapshot (rows written after the load are not in it: {@link
+   * #refresh}), and the cache may forget it (the limit, idle expiry, the session's end), so this
+   * loads again when it is not kept. A name belongs to the calling routine's schema; the same name
+   * with another query or other parameters is an error (one name, one query).
+   */
+  public static VectorSet cached(String name, String sql, Object... params) {
+    return VectorCache.cached(name, sql, params);
+  }
+
+  /** {@link #cached} for a quantized set ({@link #loadQuantized}: 'int8' or 'binary', without the floats). */
+  public static QuantizedSet cachedQuantized(String name, String type, String sql, Object... params) {
+    return VectorCache.cachedQuantized(name, type, sql, params);
+  }
+
+  /**
+   * Keeps a set made any way (a view, a quantized set, a projection) under name, replacing what the
+   * name held; false when it was not kept (the cache off, or the set larger than the limit).
+   */
+  public static boolean keep(String name, VectorSet set) {
+    if (set == null) throw new IllegalArgumentException("the set must not be null");
+    return VectorCache.TABLE.keep(VectorCache.key(name), "vectors", set);
+  }
+
+  public static boolean keep(String name, QuantizedSet set) {
+    if (set == null) throw new IllegalArgumentException("the set must not be null");
+    return VectorCache.TABLE.keep(VectorCache.key(name), set.type(), set);
+  }
+
+  /** The set kept under name (a VectorSet or a QuantizedSet), or null. */
+  public static Object kept(String name) {
+    return VectorCache.TABLE.kept(VectorCache.key(name));
+  }
+
+  /**
+   * Runs the query of the set kept under name again and keeps the new set (its idle time stays):
+   * the new set, or null when the name is not kept. If the load fails, the old set stays.
+   */
+  public static Object refresh(String name) {
+    return VectorCache.refresh(name);
+  }
+
+  /** Forgets the set kept under name; false if there was none. */
+  public static boolean drop(String name) {
+    return VectorCache.TABLE.drop(VectorCache.key(name));
+  }
+
+  /** Forgets every kept set of this worker (every schema). */
+  public static void dropAll() {
+    VectorCache.TABLE.dropAll();
+  }
+
+  /** The idle time after which the set kept under name is forgotten (0: never); false if it is not kept. */
+  public static boolean expireAfter(String name, long idleMs) {
+    return VectorCache.TABLE.expireAfter(VectorCache.key(name), idleMs);
+  }
+
+  /** The kept sets, least recently used first, then the last set that was not kept, with why. */
+  public static CacheEntry[] cacheInfo() {
+    return VectorCache.TABLE.info().stream().map(CacheEntry::new).toArray(CacheEntry[]::new);
+  }
+
+  /** The cache's limit in bytes (mle.vector_cache_max; 0: off). */
+  public static long cacheMax() {
+    return VectorCache.TABLE.max();
+  }
+
+  /** The bytes kept now. */
+  public static long cacheBytes() {
+    return VectorCache.TABLE.total();
+  }
+
   /** The threads this worker's helper uses at most (mle.vector_threads, at most the CPUs). */
   public static int threads() {
     return VectorEngine.THREADS;

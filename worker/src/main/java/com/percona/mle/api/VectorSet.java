@@ -35,15 +35,22 @@ import java.util.Map;
  * {@link #mean} and {@link #meanOf} (centroids, profiles), {@link #kmeans}, {@link #classify}
  * (k nearest neighbours' vote) and {@link #truncate} (Matryoshka embeddings).
  */
-public final class VectorSet {
+public final class VectorSet implements CacheTable.Sized {
   private final float[][] rows;
   private final long[] ids;
   private final String[] labels;
   private final int skipped;
-  private float[] inverseNorms;
-  private Map<Long, Integer> byId;
-  private int[] labelIds;  // per vector, its label's number (-1: no label); made on first use
-  private int labelCount;
+  // Built on first use and published whole (a set kept in the cache is shared by calls and the
+  // vector pool's threads: exp note 76): each is made into a local, then one volatile write.
+  private volatile float[] inverseNorms;
+  private volatile Map<Long, Integer> byId;
+  /** Each vector's label as a number (-1: no label) and how many labels: made on first use, together. */
+  private record Labels(int[] ids, int count) {}
+  private volatile Labels labelNumbers;
+  /** The set whose vectors this one shares (a view's), or this set. */
+  private VectorSet root = this;
+  /** The bytes of the labels' text (counted once, at load). */
+  private long labelBytes;
 
   private VectorSet(float[][] rows, long[] ids, String[] labels, int skipped) {
     this.rows = rows;
@@ -93,8 +100,12 @@ public final class VectorSet {
     }
     long[] ids = new long[n];
     for (int i = 0; i < n; i++) ids[i] = idList.get(i);
-    return new VectorSet(vectors.toArray(new float[0][]), ids,
+    VectorSet set = new VectorSet(vectors.toArray(new float[0][]), ids,
         withLabels ? labelList.toArray(new String[0]) : null, skipped);
+    if (withLabels)
+      for (String l : set.labels)
+        if (l != null) set.labelBytes += 40 + l.length();  // a String and its bytes (Latin-1 or UTF-16: about)
+    return set;
   }
 
   /** An id as a long: a whole number in the BIGINT range, never truncated or wrapped. */
@@ -149,12 +160,13 @@ public final class VectorSet {
 
   /** The position of the vector with this id, or -1. */
   public int indexOf(long id) {
-    if (byId == null) {
+    Map<Long, Integer> b = byId;
+    if (b == null) {
       Map<Long, Integer> m = new HashMap<>(ids.length * 2);
       for (int i = ids.length - 1; i >= 0; i--) m.put(ids[i], i);  // the first of duplicate ids
-      byId = m;
+      byId = b = m;
     }
-    Integer i = byId.get(id);
+    Integer i = b.get(id);
     return i == null ? -1 : i;
   }
 
@@ -293,17 +305,19 @@ public final class VectorSet {
     float[][] r = new float[n][];
     long[] id = new long[n];
     String[] l = labels == null ? null : new String[n];
-    float[] inv = inverseNorms == null ? null : new float[n];
+    float[] parentInv = inverseNorms;
+    float[] inv = parentInv == null ? null : new float[n];
     for (int i = 0, o = 0; i < keep.length; i++)
       if (keep[i]) {
         r[o] = rows[i];
         id[o] = ids[i];
         if (l != null) l[o] = labels[i];
-        if (inv != null) inv[o] = inverseNorms[i];
+        if (inv != null) inv[o] = parentInv[i];
         o++;
       }
     VectorSet v = new VectorSet(r, id, l, 0);
     v.inverseNorms = inv;
+    v.root = root;
     return v;
   }
 
@@ -320,14 +334,16 @@ public final class VectorSet {
     if (groups < 1 || perGroup < 1)
       throw new IllegalArgumentException("groups and perGroup must be at least 1, not " + groups + " and " + perGroup);
     int m = VectorEngine.code(metric);
-    if (labelIds == null) {  // each label a number, once per set: no hashing per query
+    Labels ln = labelNumbers;
+    if (ln == null) {  // each label a number, once per set: no hashing per query
       Map<String, Integer> numbers = new HashMap<>();
       int[] lid = new int[rows.length];
       for (int i = 0; i < rows.length; i++)
         lid[i] = labels[i] == null ? -1 : numbers.computeIfAbsent(labels[i], x -> numbers.size());
-      labelCount = numbers.size();
-      labelIds = lid;
+      labelNumbers = ln = new Labels(lid, numbers.size());
     }
+    final int[] labelIds = ln.ids();
+    final int labelCount = ln.count();
     float[] key = VectorEngine.keys(query, rows, terms(m), m);
     if ((long) labelCount * perGroup > Integer.MAX_VALUE - 8)
       throw new IllegalArgumentException(labelCount + " groups x " + perGroup + " per group is too many");
@@ -569,7 +585,7 @@ public final class VectorSet {
    * vectors kept to rescore the candidates with (exact scores). Same ids and labels.
    */
   public QuantizedSet quantize(String type) {
-    return QuantizedSet.of(rows, ids, labels, skipped, type, true);
+    return QuantizedSet.of(rows, ids, labels, skipped, type, true).from(this);
   }
 
   /** The principal components of the set's vectors ({@link Pca}): k directions of the largest variance. */
@@ -586,11 +602,47 @@ public final class VectorSet {
     return new VectorSet(pca.project(rows), ids, labels, skipped);
   }
 
+  // ----------------------------------------------- bytes (exp note 76)
+
+  /** The set whose vectors this one shares: a view's root, else this set. */
+  @Override
+  public Object base() {
+    return root;
+  }
+
+  /** The bytes of the root set: its vectors, ids, labels and the indexes it has built. */
+  @Override
+  public long baseBytes() {
+    return root.storageBytes();
+  }
+
+  /** A view's own arrays (references, ids, its indexes); 0 for a set that is its own root. */
+  @Override
+  public long ownBytes() {
+    return root == this ? 0 : 3 * (16 + 8L * rows.length) + indexBytes();
+  }
+
+  @Override
+  public int rows() {
+    return rows.length;
+  }
+
+  private long storageBytes() {
+    long n = rows.length, d = dimensions();
+    return n * (16 + 4 * d) + 16 + 8 * n + 16 + 8 * n + (labels == null ? 0 : 16 + 8 * n + labelBytes) + indexBytes();
+  }
+
+  private long indexBytes() {
+    return (inverseNorms == null ? 0 : 16 + 4L * rows.length) + (labelNumbers == null ? 0 : 16 + 4L * rows.length)
+        + (byId == null ? 0 : 48L * rows.length);
+  }
+
   /** The per-row terms of a metric, computed once. */
   private float[] terms(int metric) {
     if (metric == VectorEngine.COSINE) {
-      if (inverseNorms == null) inverseNorms = VectorEngine.rowTerms(rows, metric);
-      return inverseNorms;
+      float[] inv = inverseNorms;
+      if (inv == null) inverseNorms = inv = VectorEngine.rowTerms(rows, metric);
+      return inv;
     }
     return null;  // DOT and EUCLIDEAN need none
   }
