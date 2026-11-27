@@ -38,6 +38,9 @@ package com.percona.mle.worker;
  * the common pool's workers (parallel streams, CompletableFuture). A routine may use them for
  * parallel work; their threads stay idle for a while after it (30 s, 60 s), and the routine
  * cannot end them. Like the runtime-named ones, they are strangers while they run routine code.
+ * When they are the only strangers, the worker looks again for a short while (SETTLE_NS): right
+ * after a parallel stream returns, a pool thread can still be leaving the routine's last frames,
+ * for milliseconds on a busy machine. A task the routine left in them is still there after it.
  * A pool the routine makes is its own: it must close it.
  *
  * <p>A live virtual thread is always a stranger: neither the worker nor its language runtimes
@@ -51,6 +54,9 @@ final class ThreadWatch {
       "VirtualThread-unblocker", "TruffleCompilerThread", "Truffle", "python-actions-pool",
       "C API reference queue watcher", "process reaper", "JFR "};
   private static final long PERIOD_NS = 5_000_000_000L;
+  /** How long strangers that are only shared-pool threads are given to leave routine code. */
+  private static final long SETTLE_NS = 200_000_000L;
+  private static final long SETTLE_STEP_MS = 2;
   private static final ThreadGroup ROOT = root();
   private long next;
   /** The threads alive when the worker started (before any routine): the JVM's own. */
@@ -68,12 +74,44 @@ final class ThreadWatch {
     return strangers();
   }
 
-  /** True if a thread not belonging to the runtime is alive. */
+  /**
+   * True if a thread not belonging to the runtime is alive. Shared-pool threads that run routine
+   * code are given SETTLE_NS to leave it; any other stranger is one at once.
+   */
   boolean strangers() {
-    for (Thread t : allThreads())
-      if (t.isAlive() && (t.isVirtual() || !(system(t.getName()) || sharedPool(t)) || runsGuestCode(t)))
-        return true;
-    return false;
+    long end = System.nanoTime() + SETTLE_NS;
+    while (true) {
+      switch (look()) {
+        case NONE:
+          return false;
+        case OTHER:
+          return true;
+        case SHARED_POOL:
+          if (System.nanoTime() - end >= 0) return true;
+          try {
+            Thread.sleep(SETTLE_STEP_MS);
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return true;
+          }
+      }
+    }
+  }
+
+  private enum Found { NONE, SHARED_POOL, OTHER }
+
+  /** The strangers alive now: none, only shared-pool threads running routine code, or others. */
+  private Found look() {
+    Found found = Found.NONE;
+    for (Thread t : allThreads()) {
+      if (!t.isAlive()) continue;
+      if (t.isVirtual() || !(system(t.getName()) || sharedPool(t))) return Found.OTHER;
+      if (runsGuestCode(t)) {
+        if (!sharedPool(t)) return Found.OTHER;
+        found = Found.SHARED_POOL;
+      }
+    }
+    return found;
   }
 
   private static final java.lang.reflect.Method CONTAINER_ROOT, CONTAINER_THREADS, CONTAINER_CHILDREN;
