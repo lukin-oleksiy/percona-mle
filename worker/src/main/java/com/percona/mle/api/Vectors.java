@@ -453,6 +453,15 @@ public final class Vectors {
     return VectorSet.load(sql, params);
   }
 
+  /**
+   * Runs a query as {@link #load} and keeps its vectors quantized ('int8' or 'binary', {@link
+   * QuantizedSet}), each encoded as it arrives: the float vectors are never kept, so the set takes
+   * 4 (int8) or 32 (binary) times less memory; scores are approximate.
+   */
+  public static QuantizedSet loadQuantized(String type, String sql, Object... params) {
+    return QuantizedSet.load(type, sql, params);
+  }
+
   /** The threads this worker's helper uses at most (mle.vector_threads, at most the CPUs). */
   public static int threads() {
     return VectorEngine.THREADS;

@@ -96,7 +96,7 @@ public final class VectorSet {
   }
 
   /** An id as a long: a whole number in the BIGINT range, never truncated or wrapped. */
-  private static long id(Object v, int row) {
+  static long id(Object v, int row) {
     if (v instanceof Long l) return l;
     if (v instanceof Integer || v instanceof Short || v instanceof Byte) return ((Number) v).longValue();
     if (v instanceof BigInteger b && b.bitLength() < 64) return b.longValue();  // BIGINT UNSIGNED up to 2^63 - 1
@@ -215,6 +215,155 @@ public final class VectorSet {
   /** {@link #related(int, Vectors.Metric)} with the metric by name. */
   public Matches[] related(int k, String metric) {
     return related(k, Vectors.Metric.of(metric));
+  }
+
+  // ------------------------------------------------- views (exp note 75)
+
+  /**
+   * The vectors whose ids are in ids, in set order (ids not in the set are ignored): a view that
+   * shares the vectors (nothing is copied but references), on which every search, mmr, within,
+   * pairs, kmeans ... looks at those vectors only. Filtered search on a set loaded once: by a
+   * category's ids, by the ids a SQL query or a full-text search returned. Positions (index()) of a
+   * view's results are positions in the view; ids are ids.
+   */
+  public VectorSet filter(long[] ids) {
+    if (ids == null) throw new IllegalArgumentException("the ids must not be null");
+    java.util.Set<Long> want = new java.util.HashSet<>(ids.length * 2);
+    for (long id : ids) want.add(id);
+    boolean[] keep = new boolean[rows.length];
+    for (int i = 0; i < rows.length; i++) keep[i] = want.contains(this.ids[i]);
+    return view(keep);
+  }
+
+  /** The vectors where mask is true (one per vector, in set order): a view as {@link #filter(long[])}. */
+  public VectorSet filter(boolean[] mask) {
+    if (mask == null) throw new IllegalArgumentException("the mask must not be null");
+    if (mask.length != rows.length)
+      throw new IllegalArgumentException("the mask has " + mask.length + " values, the set " + rows.length + " vectors");
+    return view(mask);
+  }
+
+  /** {@link #filter(long[])} or {@link #filter(boolean[])} for a JavaScript or Python array of ids or of booleans. */
+  public VectorSet filter(Object idsOrMask) {
+    org.graalvm.polyglot.Value v = GuestVectors.value(idsOrMask);
+    if (v == null || v.isNull()) throw new IllegalArgumentException("the ids must not be null");
+    if (v.isHostObject() && v.asHostObject() instanceof boolean[] b) return filter(b);
+    if (!v.isHostObject() && v.hasArrayElements() && v.getArraySize() > 0 && v.getArrayElement(0).isBoolean()) {
+      boolean[] mask = new boolean[(int) Math.min(Integer.MAX_VALUE - 8, v.getArraySize())];
+      for (int i = 0; i < mask.length; i++) {
+        org.graalvm.polyglot.Value e = v.getArrayElement(i);
+        if (!e.isBoolean()) throw new IllegalArgumentException("the mask: element " + i + " is not a boolean");
+        mask[i] = e.asBoolean();
+      }
+      return filter(mask);
+    }
+    return filter(GuestVectors.longs(idsOrMask, "the ids"));
+  }
+
+  /** The vectors whose ids are not in ids (already shown, already bought): a view as {@link #filter(long[])}. */
+  public VectorSet exclude(long[] ids) {
+    if (ids == null) throw new IllegalArgumentException("the ids must not be null");
+    java.util.Set<Long> drop = new java.util.HashSet<>(ids.length * 2);
+    for (long id : ids) drop.add(id);
+    boolean[] keep = new boolean[rows.length];
+    for (int i = 0; i < rows.length; i++) keep[i] = !drop.contains(this.ids[i]);
+    return view(keep);
+  }
+
+  public VectorSet exclude(Object ids) {
+    return exclude(GuestVectors.longs(ids, "the ids"));
+  }
+
+  /** The vectors with one of these labels (the load query's third column): a view as {@link #filter(long[])}. */
+  public VectorSet withLabel(String... labels) {
+    if (this.labels == null) throw new IllegalArgumentException("the set has no labels: load (id, vector, label)");
+    if (labels == null || labels.length == 0) throw new IllegalArgumentException("name at least one label");
+    java.util.Set<String> want = new java.util.HashSet<>(java.util.Arrays.asList(labels));
+    boolean[] keep = new boolean[rows.length];
+    for (int i = 0; i < rows.length; i++) keep[i] = this.labels[i] != null && want.contains(this.labels[i]);
+    return view(keep);
+  }
+
+  private VectorSet view(boolean[] keep) {
+    int n = 0;
+    for (boolean k : keep)
+      if (k) n++;
+    float[][] r = new float[n][];
+    long[] id = new long[n];
+    String[] l = labels == null ? null : new String[n];
+    float[] inv = inverseNorms == null ? null : new float[n];
+    for (int i = 0, o = 0; i < keep.length; i++)
+      if (keep[i]) {
+        r[o] = rows[i];
+        id[o] = ids[i];
+        if (l != null) l[o] = labels[i];
+        if (inv != null) inv[o] = inverseNorms[i];
+        o++;
+      }
+    VectorSet v = new VectorSet(r, id, l, 0);
+    v.inverseNorms = inv;
+    return v;
+  }
+
+  /**
+   * The best perGroup vectors of each of the best groups, by label (the load query's third
+   * column: a document, a category, a seller; vectors without a label are left out): the groups
+   * ranked by their best vector, then each group's vectors best first. One chunk per document
+   * (perGroup 1) is the chunk-to-document roll-up of RAG search; more per group gives variety.
+   * Milvus' group_by_field, Qdrant's group_by.
+   */
+  public Matches nearestGroups(float[] query, int groups, int perGroup, Vectors.Metric metric) {
+    VectorEngine.checkQuery(query, rows, "the query");
+    if (labels == null) throw new IllegalArgumentException("the set has no labels to group by: load (id, vector, label)");
+    if (groups < 1 || perGroup < 1)
+      throw new IllegalArgumentException("groups and perGroup must be at least 1, not " + groups + " and " + perGroup);
+    int m = VectorEngine.code(metric);
+    float[] key = VectorEngine.keys(query, rows, terms(m), m);
+    Map<String, int[]> best = new HashMap<>();  // per label: positions, best first, -1 padded
+    for (int i = 0; i < rows.length; i++) {
+      if (labels[i] == null || Float.isNaN(key[i])) continue;
+      int[] g = best.get(labels[i]);
+      if (g == null) {
+        g = new int[perGroup];
+        java.util.Arrays.fill(g, -1);
+        best.put(labels[i], g);
+      }
+      if (g[perGroup - 1] >= 0 && key[g[perGroup - 1]] >= key[i]) continue;  // not better than the last kept
+      int at = perGroup - 1;
+      while (at > 0 && (g[at - 1] < 0 || key[g[at - 1]] < key[i])) {
+        g[at] = g[at - 1];
+        at--;
+      }
+      g[at] = i;
+    }
+    List<int[]> all = new ArrayList<>(best.values());
+    all.sort((a, b) -> {
+      int c = Float.compare(key[b[0]], key[a[0]]);
+      return c != 0 ? c : Integer.compare(a[0], b[0]);
+    });
+    int count = 0;
+    for (int g = 0; g < Math.min(groups, all.size()); g++)
+      for (int i : all.get(g))
+        if (i >= 0) count++;
+    int[] index = new int[count];
+    float[] score = new float[count];
+    long[] id = new long[count];
+    for (int g = 0, o = 0; g < Math.min(groups, all.size()); g++)
+      for (int i : all.get(g))
+        if (i >= 0) {
+          index[o] = i;
+          score[o] = VectorEngine.score(key[i], m);
+          id[o++] = ids[i];
+        }
+    return new Matches(index, score, id, m == VectorEngine.EUCLIDEAN);
+  }
+
+  public Matches nearestGroups(float[] query, int groups, int perGroup, String metric) {
+    return nearestGroups(query, groups, perGroup, Vectors.Metric.of(metric));
+  }
+
+  public Matches nearestGroups(Object query, int groups, int perGroup, String metric) {
+    return nearestGroups(GuestVectors.vector(query, "the query"), groups, perGroup, Vectors.Metric.of(metric));
   }
 
   // ------------------------------------------------------- exp note 53
@@ -387,6 +536,14 @@ public final class VectorSet {
     float[][] t = new float[rows.length][];
     for (int i = 0; i < t.length; i++) t[i] = Vectors.truncate(rows[i], dims);
     return new VectorSet(t, ids, labels, skipped);
+  }
+
+  /**
+   * The set quantized ({@link QuantizedSet}): 'int8' or 'binary' codes for a faster scan, the float
+   * vectors kept to rescore the candidates with (exact scores). Same ids and labels.
+   */
+  public QuantizedSet quantize(String type) {
+    return QuantizedSet.of(rows, ids, labels, skipped, type, true);
   }
 
   /** The principal components of the set's vectors ({@link Pca}): k directions of the largest variance. */

@@ -1,0 +1,223 @@
+--echo #
+--echo # component_mle: the vector helper's second round (exp note 75): filtered
+--echo # views of a set (filter, exclude, withLabel), the best per group
+--echo # (nearestGroups), weighted and normalized fusion (fuse with weights, blend
+--echo # with minmax, zscore, l2, dbsf), quantized sets (int8, binary; rescored with
+--echo # the floats or from the codes) against exact search; Java, JavaScript, Python.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE q_items (id BIGINT PRIMARY KEY, v VECTOR(256), doc INT, cat VARCHAR(8));
+--write_file $MYSQLTEST_VARDIR/tmp/vectors_more.sql
+-- 40,000 vectors of 256 dimensions around 400 centres (java.util.Random(7)); 5 chunks per document.
+CREATE PROCEDURE fill_q() LANGUAGE JAVA AS $$
+Random r = new Random(7);
+float[][] c = new float[400][256];
+for (float[] x : c) for (int i = 0; i < 256; i++) x[i] = (float) r.nextGaussian();
+PreparedStatement p = Mle.session().prepare("INSERT INTO q_items VALUES (?, ?, ?, ?)");
+Mle.session().startTransaction();
+for (int id = 0; id < 40000; id++) {
+  float[] v = new float[256], cc = c[r.nextInt(400)];
+  for (int i = 0; i < 256; i++) v[i] = cc[i] + 0.6f * (float) r.nextGaussian();
+  p.bind((long) id, v, id / 5, "c" + (id % 7)).execute();
+}
+Mle.session().commit();
+$$;
+-- 'ok' or the failures, then what the quantized searches found.
+CREATE PROCEDURE vectors_more_check(OUT r TEXT) LANGUAGE JAVA AS $$
+VectorSet set = Vectors.load("SELECT id, v, CAST(doc AS CHAR) FROM q_items ORDER BY id");
+Random rnd = new Random(9);
+float[][] qs = new float[20][256];
+for (int t = 0; t < 20; t++) {
+  float[] base = set.vector(rnd.nextInt(set.size()));
+  for (int i = 0; i < 256; i++) qs[t][i] = base[i] + (float) rnd.nextGaussian();
+}
+StringBuilder fail = new StringBuilder();
+// Brute force: every cosine in double.
+java.util.function.BiFunction<float[], float[], Double> cos = (a, b) -> {
+  double ab = 0, aa = 0, bb = 0;
+  for (int i = 0; i < a.length; i++) { ab += a[i] * (double) b[i]; aa += a[i] * (double) a[i]; bb += b[i] * (double) b[i]; }
+  return ab / Math.sqrt(aa * bb);
+};
+interface Pick { boolean keep(int i); }
+java.util.function.BiFunction<float[], Pick, List<Long>> brute = (q, pick) -> {
+  List<Integer> idx = new ArrayList<>();
+  for (int i = 0; i < set.size(); i++) if (pick.keep(i)) idx.add(i);
+  double[] s = new double[set.size()];
+  for (int i : idx) s[i] = cos.apply(q, set.vector(i));
+  idx.sort((a, b) -> Double.compare(s[b], s[a]));
+  List<Long> out = new ArrayList<>();
+  for (int i = 0; i < Math.min(10, idx.size()); i++) out.add(set.id(idx.get(i)));
+  return out;
+};
+java.util.function.Function<Matches, List<Long>> ids = m -> { List<Long> l = new ArrayList<>(); for (long x : m.ids()) l.add(x); return l; };
+long[] third = new long[set.size() / 3 + 1];
+for (int i = 0, o = 0; i < set.size(); i += 3) third[o++] = i;
+boolean[] mask = new boolean[set.size()];
+for (int i = 0; i < mask.length; i++) mask[i] = i % 3 == 0;
+VectorSet byIds = set.filter(third), byMask = set.filter(mask), rest = set.exclude(third), docs = set.withLabel("5", "6", "777");
+if (byIds.size() != 13334 || byMask.size() != 13334 || rest.size() != 26666 || docs.size() != 15) fail.append("view sizes ").append(byIds.size()).append(' ').append(rest.size()).append(' ').append(docs.size()).append("; ");
+for (int t = 0; t < 20; t++) {
+  float[] q = qs[t];
+  List<Long> want = brute.apply(q, i -> i % 3 == 0);
+  if (!ids.apply(byIds.nearest(q, 10, "cosine")).equals(want)) fail.append("filter ids ").append(t).append("; ");
+  if (!ids.apply(byMask.nearest(q, 10, "cosine")).equals(want)) fail.append("filter mask ").append(t).append("; ");
+  if (!ids.apply(rest.nearest(q, 10, "cosine")).equals(brute.apply(q, i -> i % 3 != 0))) fail.append("exclude ").append(t).append("; ");
+  if (!ids.apply(docs.nearest(q, 10, "cosine")).equals(brute.apply(q, i -> i / 5 == 5 || i / 5 == 6 || i / 5 == 777))) fail.append("withLabel ").append(t).append("; ");
+  // nearestGroups: the documents ranked by their best chunk, 2 chunks each.
+  double[] s = new double[set.size()];
+  for (int i = 0; i < s.length; i++) s[i] = cos.apply(q, set.vector(i));
+  Integer[] order = new Integer[s.length];
+  for (int i = 0; i < s.length; i++) order[i] = i;
+  Arrays.sort(order, (a, b) -> Double.compare(s[b], s[a]));
+  LinkedHashMap<String, List<Long>> groups = new LinkedHashMap<>();
+  for (int i : order) {
+    List<Long> g = groups.computeIfAbsent(set.label(i), x -> new ArrayList<>());
+    if (g.size() < 2) g.add(set.id(i));
+  }
+  List<Long> wantG = new ArrayList<>();
+  int taken = 0;
+  for (List<Long> g : groups.values()) { if (taken++ == 4) break; wantG.addAll(g); }
+  if (!ids.apply(set.nearestGroups(q, 4, 2, "cosine")).equals(wantG)) fail.append("nearestGroups ").append(t).append("; ");
+}
+// Quantized: recall@10 of each against the exact search.
+QuantizedSet i8 = set.quantize("int8"), bin = set.quantize("binary");
+QuantizedSet i8c = Vectors.loadQuantized("int8", "SELECT id, v FROM q_items ORDER BY id");
+QuantizedSet binc = Vectors.loadQuantized("binary", "SELECT id, v FROM q_items ORDER BY id");
+String[] names = {"int8, rescored with the floats", "binary, rescored with the floats", "int8, codes only", "binary, codes only",
+    "binary, rescored, oversample 1", "int8, euclidean, rescored", "int8, euclidean, codes only"};
+double[] recall = new double[names.length];
+for (int t = 0; t < 20; t++) {
+  float[] q = qs[t];
+  Set<Long> exact = new HashSet<>(ids.apply(set.nearest(q, 10, "cosine")));
+  Set<Long> exactE = new HashSet<>(ids.apply(set.nearest(q, 10, "euclidean")));
+  Matches[] got = {i8.nearest(q, 10, "cosine"), bin.nearest(q, 10, "cosine"), i8c.nearest(q, 10, "cosine"), binc.nearest(q, 10, "cosine"),
+      bin.nearest(q, 10, "cosine", 1), i8.nearest(q, 10, "euclidean"), i8c.nearest(q, 10, "euclidean")};
+  for (int g = 0; g < got.length; g++)
+    for (long id : got[g].ids()) if ((g >= 5 ? exactE : exact).contains(id)) recall[g] += 0.1 / 20;
+  // Rescored with the floats: the scores are the exact ones.
+  Matches e = set.nearest(q, 10, "cosine");
+  if (i8.nearest(q, 10, "cosine").size() == 10 && Math.abs(i8.nearest(q, 10, "cosine").score(0) - e.score(0)) > 1e-6) fail.append("int8 score; ");
+  Matches h = bin.nearest(q, 5, "hamming");
+  for (int i = 1; i < h.size(); i++) if (h.score(i) < h.score(i - 1) || h.score(i) != Math.rint(h.score(i))) fail.append("hamming order; ");
+}
+StringBuilder b = new StringBuilder(fail.length() > 0 ? "FAIL " + fail : "ok");
+// Bands with room on both sides (a near tie may go either way on another CPU's SIMD width).
+for (int g = 0; g < names.length; g++) b.append(String.format("%nrecall@10, %s: %s", names[g], recall[g] >= 0.995 ? "1.00"
+    : recall[g] >= 0.95 ? "at least 0.95" : recall[g] >= 0.7 ? "0.70 to 0.95" : recall[g] >= 0.3 ? "0.30 to 0.70" : "below 0.30"));
+b.append(String.format("%nbytes per vector: int8 %d, binary %d, floats %d", i8c.bytes() / i8c.size(), binc.bytes() / binc.size(), 256 * 4));
+b.append("\n").append(binc).append("\n").append(i8);
+r[0] = b.toString();
+$$;
+-- Fusion against values worked by hand.
+CREATE FUNCTION fusion_check() RETURNS TEXT LANGUAGE JAVA AS $$
+Matches text = Matches.of(new long[] {1, 2, 3}, new float[] {9, 6, 3});
+Matches vec = Matches.of(new long[] {3, 4, 1}, new float[] {0.2f, 0.4f, 0.9f}, true);  // distances
+StringBuilder b = new StringBuilder();
+Matches f = Matches.fuse(60, new Matches[] {text, vec}, new double[] {2, 1});
+b.append("weighted RRF: ").append(f).append('\n');
+b.append("minmax: ").append(Matches.blend(new Matches[] {text, vec}, new double[] {1, 1}, "minmax")).append('\n');
+b.append("as before: ").append(Matches.blend(new Matches[] {text, vec}, new double[] {1, 1})).append('\n');
+b.append("zscore: ").append(Matches.blend(new Matches[] {text, vec}, new double[] {1, 1}, "zscore")).append('\n');
+b.append("l2: ").append(Matches.blend(new Matches[] {text, vec}, new double[] {1, 1}, "l2")).append('\n');
+b.append("dbsf: ").append(Matches.blend(new Matches[] {text, vec}, new double[] {1, 1}, "dbsf"));
+return b.toString();
+$$;
+CREATE PROCEDURE js_vectors_more(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const V = Java.type('com.percona.mle.api.Vectors');
+  const M = Java.type('com.percona.mle.api.Matches');
+  const set = V.load("SELECT id, v, cat FROM q_items WHERE id < 2000");
+  const q = new Float32Array(set.vector(10));
+  const out = [];
+  out.push(`filter by ids: ${set.filter([10, 11, 12, 500]).nearest(q, 2, 'cosine').ids()}`);
+  out.push(`filter by mask: ${set.filter(Array.from({length: set.size()}, (_, i) => i < 5)).size()}`);
+  out.push(`exclude: ${set.exclude([10]).nearest(q, 1, 'cosine').ids()[0] != 10}`);
+  out.push(`withLabel: ${set.withLabel('c3').size()}, groups: ${set.nearestGroups(q, 3, 1, 'cosine').size()}`);
+  const a = M.of([1, 2], [0.9, 0.5]), b = M.of([2, 3], [5, 4]);
+  out.push(`fuse with weights: ${M.fuse(60, [a, b], [1, 3]).ids()}`);
+  out.push(`blend zscore: ${M.blend([a, b], [1, 1], 'zscore').ids()}`);
+  const qs = set.quantize('binary');
+  out.push(`quantized: ${qs.type()}, rescoring ${qs.rescoring()}, nearest ${qs.nearest(q, 1, 'cosine').ids()[0]}`);
+  r = out.join('\n');
+$$;
+CREATE PROCEDURE py_vectors_more(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import java
+    import numpy as np
+    V = java.type('com.percona.mle.api.Vectors')
+    s = V.loadQuantized('int8', 'SELECT id, v, cat FROM q_items WHERE id < 2000')
+    full = V.load('SELECT id, v, cat FROM q_items WHERE id < 2000')
+    q = np.array(full.vector(42), dtype=np.float32)
+    out = []
+    out.append('int8 codes only: %s, label of the best: %s' % (list(s.nearest(q, 3, 'cosine').ids())[0], s.label(0)))
+    out.append('the same as float: %s' % (list(s.nearest(q, 5, 'cosine').ids()) == list(full.nearest(q, 5, 'cosine').ids())))
+    out.append('mask from numpy bools: %d' % full.filter([bool(x) for x in (np.arange(full.size()) % 2 == 0)]).size())
+    out.append('per category: %s' % [full.label(i) for i in full.nearestGroups(q, 3, 1, 'cosine').indexes()])
+    r = '\n'.join(out)
+$$;
+CREATE PROCEDURE java_vectors_more_errors(OUT r TEXT) LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+VectorSet set = Vectors.load("SELECT id, v FROM q_items WHERE id < 100");
+VectorSet lab = Vectors.load("SELECT id, v, cat FROM q_items WHERE id < 100");
+float[] q = set.vector(0);
+Matches a = Matches.of(new long[] {1}, new float[] {1});
+Runnable[] cases = {
+  () -> set.filter(new boolean[3]),
+  () -> set.withLabel("c1"),
+  () -> lab.withLabel(),
+  () -> set.nearestGroups(q, 3, 1, "cosine"),
+  () -> lab.nearestGroups(q, 0, 1, "cosine"),
+  () -> Matches.fuse(60, new Matches[] {a, a}, new double[] {1}),
+  () -> Matches.fuse(60, new Matches[] {a}, new double[] {-1}),
+  () -> Matches.blend(new Matches[] {a}, new double[] {1}, "softmax"),
+  () -> set.quantize("int4"),
+  () -> set.quantize("binary").nearest(q, 3, "euclidean"),
+  () -> Vectors.loadQuantized("binary", "SELECT id, v FROM q_items WHERE id < 100").nearest(q, 3, "dot"),
+  () -> set.quantize("int8").nearest(q, 3, "hamming"),
+  () -> set.quantize("int8").nearest(new float[3], 3, "cosine"),
+  () -> set.quantize("int8").nearest(q, 3, "cosine", 0),
+  () -> set.quantize("int8").nearest(q, 0, "cosine"),
+};
+for (Runnable c : cases) {
+  try { c.run(); b.append("no error\n"); }
+  catch (IllegalArgumentException e) { b.append(e.getMessage()).append('\n'); }
+}
+r[0] = b.toString().trim();
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/vectors_more.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/vectors_more.sql
+--source include/wait_until_count_sessions.inc
+
+--connect (con1, localhost, root,,test)
+CALL fill_q();
+--echo # 1. Views, groups, quantized sets against brute force.
+CALL vectors_more_check(@r);
+SELECT @r AS checks;
+--echo # 2. Fusion.
+SELECT fusion_check() AS fusion;
+--echo # 3. JavaScript, Python.
+CALL js_vectors_more(@js);
+SELECT @js AS js;
+CALL py_vectors_more(@py);
+SELECT @py AS python;
+--echo # 4. Errors.
+CALL java_vectors_more_errors(@e);
+SELECT @e AS errors;
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+
+DROP TABLE q_items;
+DROP PROCEDURE fill_q;
+DROP PROCEDURE vectors_more_check;
+DROP FUNCTION fusion_check;
+DROP PROCEDURE js_vectors_more;
+DROP PROCEDURE py_vectors_more;
+DROP PROCEDURE java_vectors_more_errors;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

@@ -1,0 +1,81 @@
+#
+# component_mle: the vector helper's second round (exp note 75): filtered
+# views of a set (filter, exclude, withLabel), the best per group
+# (nearestGroups), weighted and normalized fusion (fuse with weights, blend
+# with minmax, zscore, l2, dbsf), quantized sets (int8, binary; rescored with
+# the floats or from the codes) against exact search; Java, JavaScript, Python.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE q_items (id BIGINT PRIMARY KEY, v VECTOR(256), doc INT, cat VARCHAR(8));
+CALL fill_q();
+# 1. Views, groups, quantized sets against brute force.
+CALL vectors_more_check(@r);
+SELECT @r AS checks;
+checks
+ok
+recall@10, int8, rescored with the floats: 1.00
+recall@10, binary, rescored with the floats: 0.70 to 0.95
+recall@10, int8, codes only: at least 0.95
+recall@10, binary, codes only: 0.30 to 0.70
+recall@10, binary, rescored, oversample 1: 0.30 to 0.70
+recall@10, int8, euclidean, rescored: 1.00
+recall@10, int8, euclidean, codes only: at least 0.95
+bytes per vector: int8 264, binary 36, floats 1024
+QuantizedSet(40000 vectors of 256 dimensions, binary, 1406 KiB of codes)
+QuantizedSet(40000 vectors of 256 dimensions, int8, rescoring with the floats, 10312 KiB of codes)
+# 2. Fusion.
+SELECT fusion_check() AS fusion;
+fusion
+weighted RRF: [{"id": 1, "score": 0.048659902}, {"id": 3, "score": 0.048139475}, {"id": 2, "score": 0.032258064}, {"id": 4, "score": 0.016129032}]
+minmax: [{"id": 1, "score": 1.0}, {"id": 3, "score": 1.0}, {"id": 4, "score": 0.7142857}, {"id": 2, "score": 0.5}]
+as before: [{"id": 1, "score": 1.0}, {"id": 3, "score": 1.0}, {"id": 4, "score": 0.7142857}, {"id": 2, "score": 0.5}]
+zscore: [{"id": 4, "score": 0.3396831}, {"id": 2, "score": 0.0}, {"id": 1, "score": -0.13398756}, {"id": 3, "score": -0.20569552}]
+l2: [{"id": 3, "score": 1.0809947}, {"id": 1, "score": 0.80178374}, {"id": 4, "score": 0.5812382}, {"id": 2, "score": 0.5345225}]
+dbsf: [{"id": 1, "score": 0.97766876}, {"id": 3, "score": 0.96571743}, {"id": 4, "score": 0.55661386}, {"id": 2, "score": 0.5}]
+# 3. JavaScript, Python.
+CALL js_vectors_more(@js);
+SELECT @js AS js;
+js
+filter by ids: 10,11
+filter by mask: 5
+exclude: true
+withLabel: 286, groups: 3
+fuse with weights: 2,3,1
+blend zscore: 1,2,3
+quantized: binary, rescoring true, nearest 10
+CALL py_vectors_more(@py);
+SELECT @py AS python;
+python
+int8 codes only: 42, label of the best: c0
+the same as float: True
+mask from numpy bools: 1000
+per category: ['c0', 'c4', 'c6']
+# 4. Errors.
+CALL java_vectors_more_errors(@e);
+SELECT @e AS errors;
+errors
+the mask has 3 values, the set 100 vectors
+the set has no labels: load (id, vector, label)
+name at least one label
+the set has no labels to group by: load (id, vector, label)
+groups and perGroup must be at least 1, not 0 and 1
+2 lists but 1 weights
+weight 0 must be a finite number, at least 0, not -1.0
+unknown normalizer 'softmax' (minmax, zscore, l2, dbsf)
+unknown quantization 'int4' (int8 or binary)
+a binary set searches by cosine, dot (with the floats) or hamming
+a binary set without its floats searches by cosine or hamming
+hamming is a metric of binary sets
+the query has 3 dimensions, the set 256
+oversample must be at least 1, not 0
+k must be at least 1, not 0
+DROP TABLE q_items;
+DROP PROCEDURE fill_q;
+DROP PROCEDURE vectors_more_check;
+DROP FUNCTION fusion_check;
+DROP PROCEDURE js_vectors_more;
+DROP PROCEDURE py_vectors_more;
+DROP PROCEDURE java_vectors_more_errors;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

@@ -93,17 +93,50 @@ public final class Matches {
    * then the lower id. A small k favours the top ranks, a large one spreads the weight.
    */
   public static Matches fuse(int k, Matches... lists) {
+    return fuse(k, lists, null);
+  }
+
+  /**
+   * Weighted reciprocal rank fusion: each list's 1 / (k + rank) times its weight (Elasticsearch's
+   * and Qdrant's weighted RRF), to trust one retriever more than another. weights: one per list,
+   * finite and not negative.
+   */
+  public static Matches fuse(int k, Matches[] lists, double[] weights) {
     if (k < 0) throw new IllegalArgumentException("k must not be negative, not " + k);
     java.util.Map<Long, double[]> by = merge(lists);  // id -> {score, best rank}
-    for (Matches m : lists) {
+    checkWeights(lists, weights);
+    for (int l = 0; l < lists.length; l++) {
+      Matches m = lists[l];
+      double w = weights == null ? 1 : weights[l];
       java.util.Set<Long> seen = new java.util.HashSet<>();
       for (int i = 0; i < m.size(); i++) {
         if (!seen.add(m.id(i))) continue;  // once per list (MVP review API-5)
         double[] e = by.get(m.id(i));
-        e[0] += 1.0 / ((double) k + i + 1);  // in double: k + i + 1 overflows int for a huge k
+        e[0] += w / ((double) k + i + 1);  // in double: k + i + 1 overflows int for a huge k
       }
     }
     return ranked(by);
+  }
+
+  /** {@link #fuse(int, Matches[], double[])} for JavaScript or Python arrays. */
+  public static Matches fuse(int k, Object lists, Object weights) {
+    return fuse(k, GuestVectors.matchesArray(lists), doubles(weights));
+  }
+
+  private static double[] doubles(Object weights) {
+    float[] w = GuestVectors.vector(weights, "the weights");
+    double[] d = new double[w.length];
+    for (int i = 0; i < w.length; i++) d[i] = w[i];
+    return d;
+  }
+
+  private static void checkWeights(Matches[] lists, double[] weights) {
+    if (weights == null) return;
+    if (lists.length != weights.length)
+      throw new IllegalArgumentException(lists.length + " lists but " + weights.length + " weights");
+    for (int l = 0; l < weights.length; l++)
+      if (!(weights[l] >= 0) || Double.isInfinite(weights[l]))  // NaN too: its ids would rank first
+        throw new IllegalArgumentException("weight " + l + " must be a finite number, at least 0, not " + weights[l]);
   }
 
   /** {@link #fuse(int, Matches...)} for a JavaScript or Python array of Matches. */
@@ -117,38 +150,84 @@ public final class Matches {
    * in a list counts once there, at its first place. Best first; ties as in {@link #fuse}. weights: one per list, finite and not negative.
    */
   public static Matches blend(Matches[] lists, double[] weights) {
+    return blend(lists, weights, "minmax");
+  }
+
+  /**
+   * {@link #blend(Matches[], double[])} with another normalizer (hybrid search: a full-text score
+   * and a vector score on different scales): 'minmax' (to [0, 1]; Elasticsearch's and
+   * OpenSearch's min_max), 'zscore' ((s - mean) / std of the list; OpenSearch), 'l2' (s / sqrt of
+   * the sum of squares; Elasticsearch's l2_norm), 'dbsf' (distribution-based: mean ± 3 std mapped
+   * to [0, 1], clipped; Qdrant). Distances are turned into similarities first (negated; for 'l2'
+   * and 'minmax', max - s). A missing id counts 0.
+   */
+  public static Matches blend(Matches[] lists, double[] weights, String normalizer) {
     if (lists == null || weights == null) throw new IllegalArgumentException("lists and weights must not be null");
-    if (lists.length != weights.length)
-      throw new IllegalArgumentException(lists.length + " lists but " + weights.length + " weights");
-    for (int l = 0; l < weights.length; l++)
-      if (!(weights[l] >= 0) || Double.isInfinite(weights[l]))  // NaN too: its ids would rank first
-        throw new IllegalArgumentException("weight " + l + " must be a finite number, at least 0, not " + weights[l]);
+    String how = normalizer == null ? "" : normalizer.trim().toLowerCase(java.util.Locale.ROOT);
+    if (!how.equals("minmax") && !how.equals("zscore") && !how.equals("l2") && !how.equals("dbsf"))
+      throw new IllegalArgumentException("unknown normalizer '" + normalizer + "' (minmax, zscore, l2, dbsf)");
+    checkWeights(lists, weights);
     java.util.Map<Long, double[]> by = merge(lists);
     for (int l = 0; l < lists.length; l++) {
       Matches m = lists[l];
-      double lo = Double.POSITIVE_INFINITY, hi = Double.NEGATIVE_INFINITY;
-      for (float s : m.score)
-        if (Float.isFinite(s)) {
-          lo = Math.min(lo, s);
-          hi = Math.max(hi, s);
-        }
       java.util.Set<Long> seen = new java.util.HashSet<>();
+      int[] at = new int[m.size()];
+      double[] v = new double[m.size()];
+      int c = 0;
+      double lo = Double.POSITIVE_INFINITY, hi = Double.NEGATIVE_INFINITY;
       for (int i = 0; i < m.size(); i++) {
         float s = m.score[i];
         if (!Float.isFinite(s) || !seen.add(m.id(i))) continue;  // once per list (MVP review API-5)
-        double x = hi > lo ? (m.distance ? hi - s : s - lo) / (hi - lo) : 1;
-        by.get(m.id(i))[0] += weights[l] * x;
+        at[c] = i;
+        v[c++] = s;
+        lo = Math.min(lo, s);
+        hi = Math.max(hi, s);
       }
+      if (c == 0) continue;
+      for (int i = 0; i < c; i++) v[i] = m.distance ? (how.equals("minmax") || how.equals("l2") ? hi - v[i] : -v[i]) : v[i];
+      double[] x = normalize(v, c, how, m.distance ? 0 : lo, m.distance ? hi - lo : hi);
+      for (int i = 0; i < c; i++) by.get(m.id(at[i]))[0] += weights[l] * x[i];
     }
     return ranked(by);
   }
 
+  /** The normalized values of v[0..c); for minmax, lo and hi of v (after a distance's flip). */
+  private static double[] normalize(double[] v, int c, String how, double lo, double hi) {
+    double[] x = new double[c];
+    switch (how) {
+      case "minmax" -> {
+        for (int i = 0; i < c; i++) x[i] = hi > lo ? (v[i] - lo) / (hi - lo) : 1;
+      }
+      case "l2" -> {
+        double ss = 0;
+        for (int i = 0; i < c; i++) ss += v[i] * v[i];
+        double norm = Math.sqrt(ss);
+        for (int i = 0; i < c; i++) x[i] = norm > 0 ? v[i] / norm : 0;
+      }
+      default -> {  // zscore, dbsf: the list's mean and (population) standard deviation
+        double mean = 0;
+        for (int i = 0; i < c; i++) mean += v[i];
+        mean /= c;
+        double ss = 0;
+        for (int i = 0; i < c; i++) ss += (v[i] - mean) * (v[i] - mean);
+        double sd = Math.sqrt(ss / c);
+        for (int i = 0; i < c; i++) {
+          if (how.equals("zscore")) x[i] = sd > 0 ? (v[i] - mean) / sd : 0;
+          else x[i] = sd > 0 ? Math.max(0, Math.min(1, (v[i] - (mean - 3 * sd)) / (6 * sd))) : 0.5;
+        }
+      }
+    }
+    return x;
+  }
+
   /** {@link #blend(Matches[], double[])} for JavaScript or Python arrays. */
   public static Matches blend(Object lists, Object weights) {
-    float[] w = GuestVectors.vector(weights, "the weights");
-    double[] d = new double[w.length];
-    for (int i = 0; i < w.length; i++) d[i] = w[i];
-    return blend(GuestVectors.matchesArray(lists), d);
+    return blend(GuestVectors.matchesArray(lists), doubles(weights), "minmax");
+  }
+
+  /** {@link #blend(Matches[], double[], String)} for JavaScript or Python arrays. */
+  public static Matches blend(Object lists, Object weights, String normalizer) {
+    return blend(GuestVectors.matchesArray(lists), doubles(weights), normalizer);
   }
 
   /** Every id of the lists: {score 0, best rank}, in first-seen order. */
