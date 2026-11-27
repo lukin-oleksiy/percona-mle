@@ -53,6 +53,17 @@ final class FrameTime {
     return (y.getYear() * 12L + y.getMonthValue()) - (x.getYear() * 12L + x.getMonthValue());
   }
 
+  /** Rows per block when times are parsed or printed on the vector pool (fixed: results do not depend on threads). */
+  static final int BLOCK = 16384;
+
+  /** body(lo, hi) over blocks of BLOCK rows, on the pool when there are many. */
+  static void blocks(int n, java.util.function.BiConsumer<Integer, Integer> body) {
+    int blocks = (n + BLOCK - 1) / BLOCK;
+    // about 300 ns a row to parse and print a time
+    VectorEngine.run(blocks, VectorEngine.parts((long) n * 300, blocks) > 1,
+        b -> body.accept(b * BLOCK, Math.min(n, (b + 1) * BLOCK)));
+  }
+
   static int timeColumn(Frame f, String name) {
     int j = f.index(name);
     if (f.typeAt(j) == null)
@@ -69,8 +80,10 @@ final class FrameTime {
     boolean dateOnly = StatsTime.dateOnly(type);
     int digits = StatsTime.digits(type);
     String[] t = f.textAt(j), out = new String[t.length];
-    for (int i = 0; i < t.length; i++)
-      out[i] = t[i] == null ? null : StatsTime.format(StatsTime.bucket(StatsTime.parse(t[i]), w, o), dateOnly, digits);
+    blocks(t.length, (lo, hi) -> {
+      for (int i = lo; i < hi; i++)
+        out[i] = t[i] == null ? null : StatsTime.format(StatsTime.bucket(StatsTime.parse(t[i]), w, o), dateOnly, digits);
+    });
     return f.replaceText(j, out);
   }
 
@@ -138,7 +151,9 @@ final class FrameTime {
     // Rows by partition (NULL first, then ascending, as groupBy), rows with a NULL time left out.
     String[] tt = f.textAt(tj);
     long[] us = new long[n];
-    for (int i = 0; i < n; i++) us[i] = StatsTime.parse(tt[i]);
+    blocks(n, (lo, hi) -> {
+      for (int i = lo; i < hi; i++) us[i] = StatsTime.parse(tt[i]);
+    });
     Map<Object, List<Integer>> by = new HashMap<>();
     double[] pn = pj < 0 ? null : f.numbersAt(pj);
     String[] pt = pj < 0 ? null : f.textAt(pj);
@@ -165,7 +180,7 @@ final class FrameTime {
         throw new IllegalArgumentException("more than " + MAX_STEPS + " rows to fill with steps of " + w.text()
             + ": a larger step, or fewer rows");
     }
-    Out out = new Out(f, c);
+    Out out = new Out(f, c, tj);
     for (Object k : keys) {
       int[] rows = by.get(k).stream().mapToInt(Integer::intValue).toArray();
       sortByTime(rows, us);
@@ -175,7 +190,7 @@ final class FrameTime {
               + (k == nullKey ? "NULL" : k)) + ": aggregate first (bucket, then groupBy)");
       fillPartition(f, rows, us, w, m, tj, pj, dateOnly, digits, out);
     }
-    return out.frame(f);
+    return out.frame(f, dateOnly, digits);
   }
 
   private static void fillPartition(Frame f, int[] rows, long[] us, StatsTime.Width w, String m, int tj, int pj,
@@ -203,10 +218,11 @@ final class FrameTime {
       while (at < n && us[rows[at]] <= g) at++;
       if (at > 0 && us[rows[at - 1]] == g) {  // a row on the step: as it is
         out.copy(f, rows[at - 1]);
+        out.setTime(g);
         continue;
       }
       out.add();
-      out.setTime(tj, StatsTime.format(g, dateOnly, digits));
+      out.setTime(g);
       if (pj >= 0) out.set(f, pj, rows[0]);
       for (int j = 0; j < c; j++) {
         if (j == tj || j == pj || m.equals("null")) continue;
@@ -248,12 +264,14 @@ final class FrameTime {
 
   /** The rows of a gap-filled frame, built column by column. */
   private static final class Out {
-    final int cols;
+    final int cols, timeColumn;
     final double[][] num;
     final String[][] text;
+    long[] times = new long[16];  // the time column as micros, printed at the end (in parallel)
     int size;
 
-    Out(Frame f, int c) {
+    Out(Frame f, int c, int timeColumn) {
+      this.timeColumn = timeColumn;
       cols = c;
       num = new double[c][];
       text = new String[c][];
@@ -269,6 +287,7 @@ final class FrameTime {
           if (num[j] != null) num[j] = Arrays.copyOf(num[j], size * 2);
           else text[j] = Arrays.copyOf(text[j], size * 2);
         }
+      if (size == times.length) times = Arrays.copyOf(times, size * 2);
       for (int j = 0; j < cols; j++)
         if (num[j] != null) num[j][size] = Double.NaN;
       size++;
@@ -288,15 +307,19 @@ final class FrameTime {
       num[j][size - 1] = v;
     }
 
-    void setTime(int j, String t) {
-      text[j][size - 1] = t;
+    void setTime(long micros) {
+      times[size - 1] = micros;
     }
 
-    Frame frame(Frame f) {
+    Frame frame(Frame f, boolean dateOnly, int digits) {
       for (int j = 0; j < cols; j++) {
         if (num[j] != null) num[j] = Arrays.copyOf(num[j], size);
         else text[j] = Arrays.copyOf(text[j], size);
       }
+      String[] t = text[timeColumn];
+      blocks(size, (lo, hi) -> {
+        for (int i = lo; i < hi; i++) t[i] = StatsTime.format(times[i], dateOnly, digits);
+      });
       return f.withColumns(num, text, size);
     }
   }

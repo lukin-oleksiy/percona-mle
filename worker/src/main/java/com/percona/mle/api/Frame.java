@@ -315,38 +315,47 @@ public final class Frame {
 
   // ------------------------------------------------------------ statistics
 
+  /** A column's summary (Stats.describe). */
   public Summary describe(String column) {
     return Stats.describe(numbers(column));
   }
 
+  /** A column's quantile q (Stats.quantile). */
   public double quantile(String column, double q) {
     return Stats.quantile(numbers(column), q);
   }
 
+  /** A column's median. */
   public double median(String column) {
     return Stats.median(numbers(column));
   }
 
+  /** A column's histogram (Stats.histogram). */
   public Histogram histogram(String column, int bins) {
     return Stats.histogram(numbers(column), bins);
   }
 
+  /** The positions of a column's outliers (Stats.outliers); select() gives their rows. */
   public int[] outliers(String column, String method, double k) {
     return Stats.outliers(numbers(column), method, k);
   }
 
+  /** A column's z-scores (Stats.zscore). */
   public double[] zscore(String column) {
     return Stats.zscore(numbers(column));
   }
 
+  /** Two columns' correlation, 'pearson' or 'spearman'. */
   public double correlation(String x, String y, String method) {
     return Stats.correlation(numbers(x), numbers(y), method);
   }
 
+  /** Two columns' sample covariance. */
   public double covariance(String x, String y) {
     return Stats.covariance(numbers(x), numbers(y));
   }
 
+  /** The least-squares line of column y on column x (Stats.linregress). */
   public Regression linregress(String x, String y) {
     return Stats.linregress(numbers(x), numbers(y));
   }

@@ -110,8 +110,9 @@ final class StatsLinear {
   }
 
   /**
-   * Eigenvalues (ascending) and eigenvectors (columns of v) of a symmetric matrix a (n x n, not
-   * changed): {values} in d, vectors in v.
+   * Eigenvalues (ascending) and eigenvectors of a symmetric matrix a (n x n, not changed): the
+   * values returned, vector i in row v[i]. The algorithms work on the transpose of EISPACK's V (W =
+   * Vᵀ), so their inner loops run along rows: a rotation or update touches two contiguous arrays.
    */
   static double[] symmetricEigen(double[][] a, double[][] v) {
     int n = a.length;
@@ -123,17 +124,17 @@ final class StatsLinear {
   }
 
   /** Householder reduction to tridiagonal form (EISPACK tred2, as JAMA). */
-  private static void tred2(int n, double[][] V, double[] d, double[] e) {
-    for (int j = 0; j < n; j++) d[j] = V[n - 1][j];
+  private static void tred2(int n, double[][] W, double[] d, double[] e) {
+    for (int j = 0; j < n; j++) d[j] = W[j][n - 1];
     for (int i = n - 1; i > 0; i--) {
       double scale = 0, h = 0;
       for (int k = 0; k < i; k++) scale += Math.abs(d[k]);
       if (scale == 0) {
         e[i] = d[i - 1];
         for (int j = 0; j < i; j++) {
-          d[j] = V[i - 1][j];
-          V[i][j] = 0;
-          V[j][i] = 0;
+          d[j] = W[j][i - 1];
+          W[j][i] = 0;
+          W[i][j] = 0;
         }
       } else {
         for (int k = 0; k < i; k++) {
@@ -148,11 +149,11 @@ final class StatsLinear {
         for (int j = 0; j < i; j++) e[j] = 0;
         for (int j = 0; j < i; j++) {
           f = d[j];
-          V[j][i] = f;
-          g = e[j] + V[j][j] * f;
+          W[i][j] = f;
+          g = e[j] + W[j][j] * f;
           for (int k = j + 1; k <= i - 1; k++) {
-            g += V[k][j] * d[k];
-            e[k] += V[k][j] * f;
+            g += W[j][k] * d[k];
+            e[k] += W[j][k] * f;
           }
           e[j] = g;
         }
@@ -166,37 +167,37 @@ final class StatsLinear {
         for (int j = 0; j < i; j++) {
           f = d[j];
           g = e[j];
-          for (int k = j; k <= i - 1; k++) V[k][j] -= (f * e[k] + g * d[k]);
-          d[j] = V[i - 1][j];
-          V[i][j] = 0;
+          for (int k = j; k <= i - 1; k++) W[j][k] -= (f * e[k] + g * d[k]);
+          d[j] = W[j][i - 1];
+          W[j][i] = 0;
         }
       }
       d[i] = h;
     }
     for (int i = 0; i < n - 1; i++) {
-      V[n - 1][i] = V[i][i];
-      V[i][i] = 1;
+      W[i][n - 1] = W[i][i];
+      W[i][i] = 1;
       double h = d[i + 1];
       if (h != 0) {
-        for (int k = 0; k <= i; k++) d[k] = V[k][i + 1] / h;
+        for (int k = 0; k <= i; k++) d[k] = W[i + 1][k] / h;
         for (int j = 0; j <= i; j++) {
           double g = 0;
-          for (int k = 0; k <= i; k++) g += V[k][i + 1] * V[k][j];
-          for (int k = 0; k <= i; k++) V[k][j] -= g * d[k];
+          for (int k = 0; k <= i; k++) g += W[i + 1][k] * W[j][k];
+          for (int k = 0; k <= i; k++) W[j][k] -= g * d[k];
         }
       }
-      for (int k = 0; k <= i; k++) V[k][i + 1] = 0;
+      for (int k = 0; k <= i; k++) W[i + 1][k] = 0;
     }
     for (int j = 0; j < n; j++) {
-      d[j] = V[n - 1][j];
-      V[n - 1][j] = 0;
+      d[j] = W[j][n - 1];
+      W[j][n - 1] = 0;
     }
-    V[n - 1][n - 1] = 1;
+    W[n - 1][n - 1] = 1;
     e[0] = 0;
   }
 
   /** Implicit QL on the tridiagonal form (EISPACK tql2, as JAMA); eigenvalues sorted ascending. */
-  private static void tql2(int n, double[][] V, double[] d, double[] e) {
+  private static void tql2(int n, double[][] W, double[] d, double[] e) {
     for (int i = 1; i < n; i++) e[i - 1] = e[i];
     e[n - 1] = 0;
     double f = 0, tst1 = 0, eps = Math.ulp(1.0);
@@ -234,9 +235,9 @@ final class StatsLinear {
             p = c * d[i] - s * g;
             d[i + 1] = h + s * (c * g + s * d[i]);
             for (int k = 0; k < n; k++) {
-              h = V[k][i + 1];
-              V[k][i + 1] = s * V[k][i] + c * h;
-              V[k][i] = c * V[k][i] - s * h;
+              h = W[i + 1][k];
+              W[i + 1][k] = s * W[i][k] + c * h;
+              W[i][k] = c * W[i][k] - s * h;
             }
           }
           p = -s * s2 * c3 * el1 * e[l] / dl1;
@@ -258,11 +259,9 @@ final class StatsLinear {
       if (k != i) {
         d[k] = d[i];
         d[i] = p;
-        for (int j = 0; j < n; j++) {
-          double t = V[j][i];
-          V[j][i] = V[j][k];
-          V[j][k] = t;
-        }
+        double[] t = W[i];  // the vectors are rows of W
+        W[i] = W[k];
+        W[k] = t;
       }
     }
   }

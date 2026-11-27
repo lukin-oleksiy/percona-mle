@@ -42,6 +42,8 @@ public final class VectorSet {
   private final int skipped;
   private float[] inverseNorms;
   private Map<Long, Integer> byId;
+  private int[] labelIds;  // per vector, its label's number (-1: no label); made on first use
+  private int labelCount;
 
   private VectorSet(float[][] rows, long[] ids, String[] labels, int skipped) {
     this.rows = rows;
@@ -318,43 +320,67 @@ public final class VectorSet {
     if (groups < 1 || perGroup < 1)
       throw new IllegalArgumentException("groups and perGroup must be at least 1, not " + groups + " and " + perGroup);
     int m = VectorEngine.code(metric);
+    if (labelIds == null) {  // each label a number, once per set: no hashing per query
+      Map<String, Integer> numbers = new HashMap<>();
+      int[] lid = new int[rows.length];
+      for (int i = 0; i < rows.length; i++)
+        lid[i] = labels[i] == null ? -1 : numbers.computeIfAbsent(labels[i], x -> numbers.size());
+      labelCount = numbers.size();
+      labelIds = lid;
+    }
     float[] key = VectorEngine.keys(query, rows, terms(m), m);
-    Map<String, int[]> best = new HashMap<>();  // per label: positions, best first, -1 padded
+    if ((long) labelCount * perGroup > Integer.MAX_VALUE - 8)
+      throw new IllegalArgumentException(labelCount + " groups x " + perGroup + " per group is too many");
+    int[] best = new int[labelCount * perGroup];  // per label: positions, best first, -1 padded
+    java.util.Arrays.fill(best, -1);
     for (int i = 0; i < rows.length; i++) {
-      if (labels[i] == null || Float.isNaN(key[i])) continue;
-      int[] g = best.get(labels[i]);
-      if (g == null) {
-        g = new int[perGroup];
-        java.util.Arrays.fill(g, -1);
-        best.put(labels[i], g);
-      }
-      if (g[perGroup - 1] >= 0 && key[g[perGroup - 1]] >= key[i]) continue;  // not better than the last kept
-      int at = perGroup - 1;
-      while (at > 0 && (g[at - 1] < 0 || key[g[at - 1]] < key[i])) {
-        g[at] = g[at - 1];
+      int gl = labelIds[i];
+      if (gl < 0 || Float.isNaN(key[i])) continue;
+      int base = gl * perGroup, last = base + perGroup - 1;
+      if (best[last] >= 0 && key[best[last]] >= key[i]) continue;  // not better than the last kept
+      int at = last;
+      while (at > base && (best[at - 1] < 0 || key[best[at - 1]] < key[i])) {
+        best[at] = best[at - 1];
         at--;
       }
-      g[at] = i;
+      best[at] = i;
     }
-    List<int[]> all = new ArrayList<>(best.values());
-    all.sort((a, b) -> {
-      int c = Float.compare(key[b[0]], key[a[0]]);
-      return c != 0 ? c : Integer.compare(a[0], b[0]);
-    });
-    int count = 0;
-    for (int g = 0; g < Math.min(groups, all.size()); g++)
-      for (int i : all.get(g))
-        if (i >= 0) count++;
+    // The best `groups` groups by their best vector: key descending, then its position. A bounded
+    // insertion, not a sort of every group (tens of thousands of documents, a few wanted).
+    int cap = Math.min(groups, labelCount);
+    int[] order = new int[cap];
+    int found = 0;
+    for (int g = 0; g < labelCount; g++) {
+      int i = best[g * perGroup];
+      if (i < 0) continue;
+      if (found == cap) {
+        int w = best[order[cap - 1] * perGroup];
+        if (!(key[i] > key[w] || (key[i] == key[w] && i < w))) continue;
+      } else found++;
+      int at = found - 1;
+      while (at > 0) {
+        int w = best[order[at - 1] * perGroup];
+        if (key[w] > key[i] || (key[w] == key[i] && w < i)) break;
+        order[at] = order[at - 1];
+        at--;
+      }
+      order[at] = g;
+    }
+    int take = found, count = 0;
+    for (int g = 0; g < take; g++)
+      for (int t = 0; t < perGroup; t++)
+        if (best[order[g] * perGroup + t] >= 0) count++;
     int[] index = new int[count];
     float[] score = new float[count];
     long[] id = new long[count];
-    for (int g = 0, o = 0; g < Math.min(groups, all.size()); g++)
-      for (int i : all.get(g))
-        if (i >= 0) {
-          index[o] = i;
-          score[o] = VectorEngine.score(key[i], m);
-          id[o++] = ids[i];
-        }
+    for (int g = 0, o = 0; g < take; g++)
+      for (int t = 0; t < perGroup; t++) {
+        int i = best[order[g] * perGroup + t];
+        if (i < 0) continue;
+        index[o] = i;
+        score[o] = VectorEngine.score(key[i], m);
+        id[o++] = ids[i];
+      }
     return new Matches(index, score, id, m == VectorEngine.EUCLIDEAN);
   }
 

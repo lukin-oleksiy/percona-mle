@@ -58,29 +58,40 @@ public final class Summary {
         kurt);
   }
 
+  /** The values present. */
   public long count() { return count; }
 
+  /** The missing values (NULL, NaN). */
   public long missing() { return missing; }
 
+  /** The mean. */
   public double mean() { return mean; }
 
+  /** The sample standard deviation (n - 1). */
   public double std() { return std; }
 
+  /** The smallest value. */
   public double min() { return min; }
 
+  /** The first quartile (linear interpolation). */
   public double q1() { return q1; }
 
+  /** The median. */
   public double median() { return median; }
 
+  /** The third quartile. */
   public double q3() { return q3; }
 
+  /** The largest value. */
   public double max() { return max; }
 
   /** q3 - q1. */
   public double iqr() { return q3 - q1; }
 
+  /** The skewness, bias-corrected as pandas' skew(). */
   public double skewness() { return skewness; }
 
+  /** The excess kurtosis, bias-corrected as pandas' kurt(). */
   public double kurtosis() { return kurtosis; }
 
   /** JSON: {"count": 9, "missing": 1, "mean": ..., ...}; NaN as null. */

@@ -62,7 +62,7 @@ public final class Pca {
       ratio[c] = trace > 0 ? var[c] / trace : Double.NaN;
       int big = 0;
       for (int i = 0; i < p; i++) {
-        comp[c][i] = v[i][col];
+        comp[c][i] = v[col][i];
         if (Math.abs(comp[c][i]) > Math.abs(comp[c][big])) big = i;
       }
       if (comp[c][big] < 0)

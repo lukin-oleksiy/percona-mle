@@ -25,7 +25,7 @@ import java.util.Map;
 
 /**
  * A {@link Frame}'s rows grouped by a column ({@link Frame#groupBy}): statistics per group that
- * SQL's GROUP BY cannot compute in MySQL (median, quantiles, a summary, correlation). Each result
+ * SQL's GROUP BY cannot compute in MySQL (median, quantiles, median absolute deviation, a summary, correlation; with sum, min, max, std, first and last for buckets of a time series). Each result
  * is a Frame: the key, then the statistic(s); groups in ascending order of the key, NULL first.
  * Column names stay distinct: a statistic of the key column itself is named after the statistic
  * too ({@code groupBy("price").median("price")}: price, price_median), and any other statistic
@@ -88,14 +88,17 @@ public final class Grouped {
     return result(new String[] {"count"}, new double[][] {c});
   }
 
+  /** The mean per group. */
   public Frame mean(String column) {
     return per(column, "mean", x -> StatsMath.mean(StatsMath.sorted(x)));
   }
 
+  /** The median per group. */
   public Frame median(String column) {
     return per(column, "median", x -> StatsMath.quantileSorted(StatsMath.sorted(x), 0.5));
   }
 
+  /** Quantile q per group. */
   public Frame quantile(String column, double q) {
     StatsMath.checkQ(q);
     return per(column, "quantile", x -> StatsMath.quantileSorted(StatsMath.sorted(x), q));
@@ -115,6 +118,7 @@ public final class Grouped {
     });
   }
 
+  /** The smallest value per group. */
   public Frame min(String column) {
     return per(column, "min", x -> {
       double[] s = StatsMath.sorted(x);
@@ -122,6 +126,7 @@ public final class Grouped {
     });
   }
 
+  /** The largest value per group. */
   public Frame max(String column) {
     return per(column, "max", x -> {
       double[] s = StatsMath.sorted(x);
@@ -174,6 +179,7 @@ public final class Grouped {
     return result(names, cols);
   }
 
+  /** Two columns' correlation per group. */
   public Frame correlation(String x, String y, String method) {
     double[] a = t.numbers(x), b = t.numbers(y);
     double[] c = new double[members.length];

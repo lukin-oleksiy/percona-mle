@@ -198,8 +198,10 @@ public final class QuantizedSet {
 
   // ------------------------------------------------------------- the set
 
+  /** The number of vectors. */
   public int size() { return ids.length; }
 
+  /** The dimensions of each vector. */
   public int dimensions() { return d; }
 
   /** 'int8' or 'binary'. */
@@ -217,8 +219,10 @@ public final class QuantizedSet {
   /** Rows the load query returned with a NULL vector. */
   public int skipped() { return skipped; }
 
+  /** The id of the vector at position i. */
   public long id(int i) { return ids[i]; }
 
+  /** The label of the vector at position i (the load query's third column), or null. */
   public String label(int i) { return labels == null ? null : labels[i]; }
 
   /** The position of the vector with this id, or -1. */

@@ -70,7 +70,7 @@ public final class TTest {
 
   static TTest oneSample(double[] x, double mu) {
     if (Double.isNaN(mu) || Double.isInfinite(mu)) throw new IllegalArgumentException("mu must be a finite number, not " + mu);
-    double[] s = StatsMath.sorted(x);
+    double[] s = StatsMath.present(x);
     int n = s.length;
     double m = StatsMath.mean(s);
     double v = n < 2 ? Double.NaN : StatsMath.centralSums(s, m)[0] / (n - 1);
@@ -86,7 +86,7 @@ public final class TTest {
   }
 
   static TTest independent(double[] a, double[] b, boolean equalVariances) {
-    double[] x = StatsMath.sorted(a), y = StatsMath.sorted(b);
+    double[] x = StatsMath.present(a), y = StatsMath.present(b);
     int n1 = x.length, n2 = y.length;
     double m1 = StatsMath.mean(x), m2 = StatsMath.mean(y);
     double v1 = n1 < 2 ? Double.NaN : StatsMath.centralSums(x, m1)[0] / (n1 - 1);

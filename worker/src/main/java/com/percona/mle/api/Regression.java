@@ -72,8 +72,10 @@ public final class Regression {
     return new Regression(slope, intercept, r, p, se, ise, n, m);
   }
 
+  /** The slope (REGR_SLOPE). */
   public double slope() { return slope; }
 
+  /** The intercept (REGR_INTERCEPT). */
   public double intercept() { return intercept; }
 
   /** Pearson's correlation of x and y. */
@@ -88,6 +90,7 @@ public final class Regression {
   /** The slope's standard error. */
   public double stderr() { return stderr; }
 
+  /** The intercept's standard error. */
   public double interceptStderr() { return interceptStderr; }
 
   /** The pairs used (REGR_COUNT). */

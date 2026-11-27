@@ -18,10 +18,11 @@
 package com.percona.mle.api;
 
 /**
- * Statistics MySQL has no SQL for (exp note 54): percentiles, median, mode, a column's summary,
- * histograms, correlation (Pearson, Spearman) and covariance, simple linear regression with its
- * p-value, z-scores, outliers, ranks; on columns passed in, or on a {@link Frame} loaded from SQL
- * (columns kept in Java, statistics per group). One Java implementation, the same from Java,
+ * Statistics MySQL has no SQL for (exp notes 54, 75): percentiles, median, mode, median absolute
+ * deviation, a column's summary, histograms, correlation (Pearson, Spearman) and covariance,
+ * simple and multiple linear regression with p-values, t-tests, principal components, z-scores,
+ * outliers, ranks, rolling windows (median, quantiles), time series; on columns passed in, or on
+ * a {@link Frame} loaded from SQL (columns kept in Java, statistics per group and per time bucket). One Java implementation, the same from Java,
  * JavaScript ({@code Java.type('com.percona.mle.api.Stats')}) and Python ({@code
  * java.type(...)}).
  *
@@ -91,6 +92,7 @@ public final class Stats {
     return quantiles(GuestColumns.doubles(x, "the column"), GuestColumns.doubles(qs, "the quantiles"));
   }
 
+  /** The median (quantile 0.5); NaN for no values. */
   public static double median(double[] x) {
     return quantile(x, 0.5);
   }

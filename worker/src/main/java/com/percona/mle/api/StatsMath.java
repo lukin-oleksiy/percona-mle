@@ -42,6 +42,18 @@ final class StatsMath {
     return s;
   }
 
+  /** The values that are not NaN, in their order (no sort: for moments). */
+  static double[] present(double[] x) {
+    int n = 0;
+    for (double v : x)
+      if (!Double.isNaN(v)) n++;
+    if (n == x.length) return x.clone();
+    double[] s = new double[n];
+    for (int i = 0, o = 0; i < x.length; i++)
+      if (!Double.isNaN(x[i])) s[o++] = x[i];
+    return s;
+  }
+
   static void checkQ(double q) {
     if (!(q >= 0 && q <= 1)) throw new IllegalArgumentException("a quantile must be in [0, 1], not " + q);
   }
