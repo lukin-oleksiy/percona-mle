@@ -59,6 +59,11 @@ public final class SqlBridge {
     return dispatcher().sqlRequest(Wire.SQL_EXECUTE_MANY, id, null, params, 0, 0, Dispatcher.RAW, null, rowWidth);
   }
 
+  /** The session's time zone (OPTIONS): where a TIMESTAMP's instant is shown as MySQL shows it. */
+  public static java.time.ZoneId sessionZone() {
+    return Values.options.zone;
+  }
+
   /** The values one SQL message may carry. */
   public static final int MAX_VALUES = Wire.MAX_VALUES;
 

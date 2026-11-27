@@ -1,0 +1,106 @@
+#
+# component_mle: the statistics helper's second round (exp note 75): rolling
+# windows, median absolute deviation, t-tests, the REGR_* sums, more per-group
+# aggregates, Frame.with; time series: bucket, gapFill, seconds, timeSeries.
+# Against values computed with pandas 3.1.1 and scipy 1.18.1; from Java,
+# JavaScript and Python.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE readings (ts DATETIME, sensor VARCHAR(4), v DOUBLE);
+INSERT INTO readings VALUES ('2026-11-27 10:00:00', 'a', 1), ('2026-11-27 10:01:00', 'a', 2),
+('2026-11-27 10:04:00', 'a', 5), ('2026-11-27 10:05:30', 'a', 8), ('2026-11-27 10:07:00', 'a', NULL),
+('2026-11-27 10:08:00', 'a', 10), ('2026-11-27 10:00:00', 'b', 100), ('2026-11-27 10:03:00', 'b', 130),
+(NULL, 'b', 999);
+CREATE TABLE days (d DATE, amount INT);
+INSERT INTO days VALUES ('2026-01-05', 1), ('2026-01-11', 2), ('2026-01-12', 3), ('2026-02-28', 4),
+('2026-03-01', 5), ('2026-04-15', 6), ('2025-12-31', 7);
+CREATE TABLE ticks (t TIMESTAMP(3), price DOUBLE);
+INSERT INTO ticks VALUES ('2026-11-27 09:59:59.950', 10), ('2026-11-27 10:00:00.100', 11),
+('2026-11-27 10:00:00.450', 12), ('2026-11-27 10:00:00.700', 13);
+# 1. Against pandas and scipy; many rows over threads against a direct computation.
+SELECT stats_more_selfcheck() AS selfcheck;
+selfcheck
+ok
+# 2. Time series: buckets, gap filling, seconds, series; Java, JavaScript, Python.
+CALL java_series(@j);
+SELECT @j AS java;
+java
+5-minute buckets: [{"ts": null, "count": 1}, {"ts": "2026-11-27 10:00:00", "count": 5}, {"ts": "2026-11-27 10:05:00", "count": 3}]
+  median per bucket: [{"ts": null, "v": 999}, {"ts": "2026-11-27 10:00:00", "v": 5}, {"ts": "2026-11-27 10:05:00", "v": 9}]
+  sum, min, max, std, first, last: [{"ts": null, "v": 999}, {"ts": "2026-11-27 10:00:00", "v": 238}, {"ts": "2026-11-27 10:05:00", "v": 18}] [{"ts": null, "v": 999}, {"ts": "2026-11-27 10:00:00", "v": 1}, {"ts": "2026-11-27 10:05:00", "v": 8}] [{"ts": null, "v": 999}, {"ts": "2026-11-27 10:00:00", "v": 130}, {"ts": "2026-11-27 10:05:00", "v": 10}] [{"ts": null, "v": null}, {"ts": "2026-11-27 10:00:00", "v": 62.45238186010202}, {"ts": "2026-11-27 10:05:00", "v": 1.4142135623730951}] [{"ts": null, "v": 999}, {"ts": "2026-11-27 10:00:00", "v": 1}, {"ts": "2026-11-27 10:05:00", "v": 8}] [{"ts": null, "v": 999}, {"ts": "2026-11-27 10:00:00", "v": 130}, {"ts": "2026-11-27 10:05:00", "v": 10}]
+from an origin of 10:02: [{"ts": null, "count": 1}, {"ts": "2026-11-27 09:57:00", "count": 3}, {"ts": "2026-11-27 10:02:00", "count": 3}, {"ts": "2026-11-27 10:07:00", "count": 2}]
+weeks (Monday): [{"d": "2025-12-29", "amount": 7}, {"d": "2026-01-05", "amount": 3}, {"d": "2026-01-12", "amount": 3}, {"d": "2026-02-23", "amount": 9}, {"d": "2026-04-13", "amount": 6}]
+months: [{"d": "2025-12-01", "amount": 7}, {"d": "2026-01-01", "amount": 6}, {"d": "2026-02-01", "amount": 4}, {"d": "2026-03-01", "amount": 5}, {"d": "2026-04-01", "amount": 6}]
+quarters: [{"d": "2025-10-01", "amount": 7}, {"d": "2026-01-01", "amount": 15}, {"d": "2026-04-01", "amount": 6}]
+250 ms buckets of TIMESTAMP(3): [{"t": "2026-11-27 09:59:59.750", "price": 10}, {"t": "2026-11-27 10:00:00.000", "price": 11}, {"t": "2026-11-27 10:00:00.250", "price": 12}, {"t": "2026-11-27 10:00:00.500", "price": 13}]
+numbers by 10: [{"x": 0, "count": 1}, {"x": 10, "count": 1}, {"x": 20, "count": 2}, {"x": 30, "count": 1}, {"x": 40, "count": 2}]
+gap fill, null: [{"ts": "2026-11-27 10:00:00", "sensor": "a", "v": 1}, {"ts": "2026-11-27 10:01:00", "sensor": "a", "v": 2}, {"ts": "2026-11-27 10:02:00", "sensor": null, "v": null}, {"ts": "2026-11-27 10:03:00", "sensor": null, "v": null}, {"ts": "2026-11-27 10:04:00", "sensor": "a", "v": 5}, {"ts": "2026-11-27 10:05:00", "sensor": null, "v": null}, {"ts": "2026-11-27 10:06:00", "sensor": null, "v": null}, {"ts": "2026-11-27 10:07:00", "sensor": "a", "v": null}, {"ts": "2026-11-27 10:08:00", "sensor": "a", "v": 10}]
+gap fill, locf: [{"ts": "2026-11-27 10:00:00", "sensor": "a", "v": 1}, {"ts": "2026-11-27 10:01:00", "sensor": "a", "v": 2}, {"ts": "2026-11-27 10:02:00", "sensor": "a", "v": 2}, {"ts": "2026-11-27 10:03:00", "sensor": "a", "v": 2}, {"ts": "2026-11-27 10:04:00", "sensor": "a", "v": 5}, {"ts": "2026-11-27 10:05:00", "sensor": "a", "v": 5}, {"ts": "2026-11-27 10:06:00", "sensor": "a", "v": 8}, {"ts": "2026-11-27 10:07:00", "sensor": "a", "v": null}, {"ts": "2026-11-27 10:08:00", "sensor": "a", "v": 10}]
+gap fill, linear: [{"ts": "2026-11-27 10:00:00", "sensor": "a", "v": 1}, {"ts": "2026-11-27 10:01:00", "sensor": "a", "v": 2}, {"ts": "2026-11-27 10:02:00", "sensor": "a", "v": 3}, {"ts": "2026-11-27 10:03:00", "sensor": "a", "v": 4}, {"ts": "2026-11-27 10:04:00", "sensor": "a", "v": 5}, {"ts": "2026-11-27 10:05:00", "sensor": "a", "v": 7}, {"ts": "2026-11-27 10:06:00", "sensor": "a", "v": 8.4}, {"ts": "2026-11-27 10:07:00", "sensor": "a", "v": null}, {"ts": "2026-11-27 10:08:00", "sensor": "a", "v": 10}]
+per sensor, linear: [{"ts": "2026-11-27 10:00:00", "sensor": "a", "v": 1}, {"ts": "2026-11-27 10:01:00", "sensor": "a", "v": 2}, {"ts": "2026-11-27 10:02:00", "sensor": "a", "v": 3}, {"ts": "2026-11-27 10:03:00", "sensor": "a", "v": 4}, {"ts": "2026-11-27 10:04:00", "sensor": "a", "v": 5}, {"ts": "2026-11-27 10:05:00", "sensor": "a", "v": 7}, {"ts": "2026-11-27 10:06:00", "sensor": "a", "v": 8.4}, {"ts": "2026-11-27 10:07:00", "sensor": "a", "v": null}, {"ts": "2026-11-27 10:08:00", "sensor": "a", "v": 10}, {"ts": "2026-11-27 10:00:00", "sensor": "b", "v": 100}, {"ts": "2026-11-27 10:01:00", "sensor": "b", "v": 110}, {"ts": "2026-11-27 10:02:00", "sensor": "b", "v": 120}, {"ts": "2026-11-27 10:03:00", "sensor": "b", "v": 130}]
+weekly sums, the weeks with none: [{"d": "2025-12-29", "amount": 7}, {"d": "2026-01-05", "amount": 3}, {"d": "2026-01-12", "amount": 3}, {"d": "2026-01-19", "amount": null}, {"d": "2026-01-26", "amount": null}, {"d": "2026-02-02", "amount": null}]
+seconds: [1.7957736E9, 1.79577366E9, 1.79577384E9] [1.79577359995E9, 1.7957736001E9, 1.79577360045E9, 1.7957736007E9]
+series of days: [2026-02-26, 2026-02-27, 2026-02-28, 2026-03-01, 2026-03-02]
+series of months from the 31st: [2026-01-31, 2026-02-28, 2026-03-31, 2026-04-30, 2026-05-31]
+series of 90 minutes: [2026-11-27 23:00:00, 2026-11-28 00:30:00, 2026-11-28 02:00:00]
+series of 250 ms: [2026-11-27 10:00:00.000, 2026-11-27 10:00:00.250, 2026-11-27 10:00:00.500]
+with a column: [{"ts": "2026-11-27 10:00:00", "sensor": "a", "v": 9, "roll": 1}, {"ts": "2026-11-27 10:01:00", "sensor": "a", "v": 9, "roll": 1.5}]
+with text: [ts, sensor, v, note]
+mad of a column: 3.0
+CALL js_series(@js);
+SELECT @js AS js;
+js
+per 5 minutes: [{"ts": "2026-11-27 10:00:00", "v": 2.6666666666666665}, {"ts": "2026-11-27 10:05:00", "v": 9}]
+gap fill: [{"ts": "2026-11-27 10:00:00", "sensor": "a", "v": 1}, {"ts": "2026-11-27 10:02:00", "sensor": "a", "v": 3}, {"ts": "2026-11-27 10:04:00", "sensor": "a", "v": 5}, {"ts": "2026-11-27 10:06:00", "sensor": "a", "v": 8.4}, {"ts": "2026-11-27 10:08:00", "sensor": "a", "v": 10}]
+rolling median of an array: NaN,3,3,2.5,3,4
+rolling max of a Float64Array: NaN,5,3,4,4
+mad: 1
+welch: {"statistic": -2.3763541031440183, "df": 6.9722557297949335, "p": 0.04928433820673058, "pLess": 0.02464216910336529, "pGreater": 0.9753578308966347, "difference": -4, "n1": 5, "n2": 6}
+ttest1: 0.444438
+with: ts,sensor,v,z
+series: 2026-12-30,2026-12-31,2027-01-01,2027-01-02
+CALL py_series(@py);
+SELECT @py AS python;
+python
+per hour and sensor: [{"sensor": "a", "count": 6}, {"sensor": "b", "count": 3}]
+locf per sensor: [{"sensor": "a", "count": 9}, {"sensor": "b", "count": 4}]
+rolling sum of numpy: [nan, 3.0, 3.0, 6.0, 12.0, 28.0]
+rolling quantile: [1.0, 1.5, 1.5, 3.0, 6.0, 8.0]
+paired: {"statistic": 1, "df": 3, "p": 0.3910022189557706, "pLess": 0.8044988905221147, "pGreater": 0.1955011094778853, "difference": 0.375, "n1": 4, "n2": 4}
+student p: 0.038334
+regr: n 3, sxx 2.000, syy 12.667, sxy 5.000
+seconds: [1795773600.0, 1795773660.0]
+# 3. Errors.
+CALL java_stats_more_errors(@e);
+SELECT @e AS errors;
+errors
+the window must be at least 1 row, not 0
+minPeriods must be from 1 to the window (2), not 3
+unknown statistic 'mode' (mean, sum, var, std, min, max, median, quantile:q, mad)
+'quantile:high': the quantile must be a number, as quantile:0.9
+a quantile must be in [0, 1], not 2.0
+mu must be a finite number, not NaN
+column 'sensor' is not a DATE, DATETIME or TIMESTAMP (CAST(... AS DATETIME) in the query makes it one)
+'5': a width is a number and a unit, as '5 MINUTE' or '1 DAY'
+'five MINUTE': the number must be a whole number, as '15 MINUTE'
+'0 MINUTE': the width must be at least 1
+'5 FORTNIGHT': unknown unit 'FORTNIGHT' (MICROSECOND, MILLISECOND, SECOND, MINUTE, HOUR, DAY, WEEK, MONTH, QUARTER, YEAR)
+'yesterday' is not a date or time as MySQL writes it ('2026-11-27' or '2026-11-27 10:05:00')
+the width must be a positive number, not 0.0
+unknown method 'spline' (null, locf or linear)
+two rows at 2026-11-27 10:00:00: aggregate first (bucket, then groupBy)
+the partition column cannot be the time column
+more than 1000000 steps of 1 MICROSECOND to fill: a larger step, or a shorter range
+the frame has 9 rows, the column 2
+the column needs a name
+'2026-13-01' is not a date or time as MySQL writes it ('2026-11-27' or '2026-11-27 10:05:00')
+more than 1000000 steps of 1 SECOND from 2026-01-01 to 2126-01-01: a larger step, or a shorter range
+DROP TABLE readings, days, ticks;
+DROP FUNCTION stats_more_selfcheck;
+DROP PROCEDURE java_series;
+DROP PROCEDURE js_series;
+DROP PROCEDURE py_series;
+DROP PROCEDURE java_stats_more_errors;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

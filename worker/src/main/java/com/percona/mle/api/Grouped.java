@@ -101,6 +101,65 @@ public final class Grouped {
     return per(column, "quantile", x -> StatsMath.quantileSorted(StatsMath.sorted(x), q));
   }
 
+  /** The sum per group of the values present (0 for none, as pandas). */
+  public Frame sum(String column) {
+    return per(column, "sum", x -> {
+      double t = 0, c = 0;  // Neumaier
+      for (double v : x)
+        if (!Double.isNaN(v)) {
+          double u = t + v;
+          c += Math.abs(t) >= Math.abs(v) ? (t - u) + v : (v - u) + t;
+          t = u;
+        }
+      return t + c;
+    });
+  }
+
+  public Frame min(String column) {
+    return per(column, "min", x -> {
+      double[] s = StatsMath.sorted(x);
+      return s.length == 0 ? Double.NaN : s[0];
+    });
+  }
+
+  public Frame max(String column) {
+    return per(column, "max", x -> {
+      double[] s = StatsMath.sorted(x);
+      return s.length == 0 ? Double.NaN : s[s.length - 1];
+    });
+  }
+
+  /** The sample standard deviation (n - 1) per group. */
+  public Frame std(String column) {
+    return per(column, "std", x -> {
+      double[] s = StatsMath.sorted(x);
+      return s.length < 2 ? Double.NaN : Math.sqrt(StatsMath.centralSums(s, StatsMath.mean(s))[0] / (s.length - 1));
+    });
+  }
+
+  /** The median absolute deviation per group ({@link Stats#mad}). */
+  public Frame mad(String column) {
+    return per(column, "mad", x -> StatsWindows.madSorted(StatsMath.sorted(x)));
+  }
+
+  /** The first value present per group, in row order (pandas' first()); for time series after a sort by time. */
+  public Frame first(String column) {
+    return per(column, "first", x -> {
+      for (double v : x)
+        if (!Double.isNaN(v)) return v;
+      return Double.NaN;
+    });
+  }
+
+  /** The last value present per group, in row order (pandas' last()). */
+  public Frame last(String column) {
+    return per(column, "last", x -> {
+      for (int i = x.length - 1; i >= 0; i--)
+        if (!Double.isNaN(x[i])) return x[i];
+      return Double.NaN;
+    });
+  }
+
   /** A Summary per group, as columns count, missing, mean, std, min, q1, median, q3, max, skewness, kurtosis. */
   public Frame describe(String column) {
     double[] x = t.numbers(column);
@@ -149,7 +208,9 @@ public final class Grouped {
       n2[j + 1] = names[j].equalsIgnoreCase(n2[0]) ? names[j] + "_" : names[j];
       num[j + 1] = cols[j];
     }
-    return new Frame(n2, num, text, members.length);
+    String[] types = new String[n2.length];
+    types[0] = t.typeAt(key);  // a time key (after bucket) stays a time column
+    return new Frame(n2, num, text, types, members.length);
   }
 
   @Override

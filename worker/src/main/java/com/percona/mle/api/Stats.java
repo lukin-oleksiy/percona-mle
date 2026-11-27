@@ -44,6 +44,17 @@ public final class Stats {
     return Frame.load(sql, params);
   }
 
+  /**
+   * The times from start to stop (inclusive) every step (PostgreSQL's generate_series): step "<n>
+   * <unit>" with MySQL's INTERVAL units, as '1 DAY' or '15 MINUTE'; MONTH, QUARTER and YEAR are
+   * calendar steps. As MySQL writes them: dates when start is a date and the step whole days or
+   * months, else date and time. For a calendar to join with: the days with no rows are the ones
+   * missing from a GROUP BY.
+   */
+  public static String[] timeSeries(String start, String stop, String step) {
+    return FrameTime.series(start, stop, step);
+  }
+
   // -------------------------------------------------------------- one column
 
   /** count, missing, mean, std, min, quartiles, max, skewness, kurtosis: see {@link Summary}. */
@@ -185,6 +196,87 @@ public final class Stats {
 
   public static double[] rank(Object x) {
     return rank(GuestColumns.doubles(x, "the column"));
+  }
+
+  /**
+   * The median absolute deviation: the median of |x - median(x)| (scipy.stats.median_abs_deviation
+   * with scale 1, DuckDB's mad); a spread that outliers barely move. Multiply by 1.4826 for the
+   * standard deviation of normal data.
+   */
+  public static double mad(double[] x) {
+    return StatsWindows.madSorted(StatsMath.sorted(check(x)));
+  }
+
+  public static double mad(Object x) {
+    return mad(GuestColumns.doubles(x, "the column"));
+  }
+
+  /**
+   * A statistic over a trailing window of rows, as pandas' {@code rolling(window).<stat>()}: value i
+   * covers rows i - window + 1 to i; missing values are left out; a window with fewer than
+   * window values gives NaN (so do the first window - 1 rows). stat: mean, sum, var, std (n - 1),
+   * min, max, median, quantile:q (as quantile:0.9), mad. A rolling mean, sum, std, min or max SQL
+   * can do too (window functions); the median, quantiles and mad it cannot.
+   */
+  public static double[] rolling(double[] x, int window, String stat) {
+    return StatsWindows.rolling(check(x), window, stat, window);
+  }
+
+  /** {@link #rolling(double[], int, String)} with a window needing only minPeriods values (1 to window). */
+  public static double[] rolling(double[] x, int window, String stat, int minPeriods) {
+    return StatsWindows.rolling(check(x), window, stat, minPeriods);
+  }
+
+  public static double[] rolling(Object x, int window, String stat) {
+    return rolling(GuestColumns.doubles(x, "the column"), window, stat);
+  }
+
+  public static double[] rolling(Object x, int window, String stat, int minPeriods) {
+    return rolling(GuestColumns.doubles(x, "the column"), window, stat, minPeriods);
+  }
+
+  // ---------------------------------------------------------------- t-tests
+
+  /** One-sample t-test of "the mean is mu" (scipy.stats.ttest_1samp): see {@link TTest}. */
+  public static TTest ttest1(double[] x, double mu) {
+    return TTest.oneSample(check(x), mu);
+  }
+
+  public static TTest ttest1(Object x, double mu) {
+    return ttest1(GuestColumns.doubles(x, "the column"), mu);
+  }
+
+  /**
+   * Paired t-test of "the mean difference a - b is 0" (scipy.stats.ttest_rel; Oracle's
+   * STATS_T_TEST_PAIRED): pairs with a missing value are left out.
+   */
+  public static TTest ttestPaired(double[] a, double[] b) {
+    return TTest.paired(check(a), check(b));
+  }
+
+  public static TTest ttestPaired(Object a, Object b) {
+    return ttestPaired(GuestColumns.doubles(a, "a"), GuestColumns.doubles(b, "b"));
+  }
+
+  /**
+   * Student's t-test of two independent samples, equal variances assumed (scipy.stats.ttest_ind's
+   * default; Oracle's STATS_T_TEST_INDEP). {@link #welch} does not assume them.
+   */
+  public static TTest ttest(double[] a, double[] b) {
+    return TTest.independent(check(a), check(b), true);
+  }
+
+  public static TTest ttest(Object a, Object b) {
+    return ttest(GuestColumns.doubles(a, "a"), GuestColumns.doubles(b, "b"));
+  }
+
+  /** Welch's t-test (scipy.stats.ttest_ind with equal_var=False; Oracle's STATS_T_TEST_INDEPU). */
+  public static TTest welch(double[] a, double[] b) {
+    return TTest.independent(check(a), check(b), false);
+  }
+
+  public static TTest welch(Object a, Object b) {
+    return welch(GuestColumns.doubles(a, "a"), GuestColumns.doubles(b, "b"));
   }
 
   // ------------------------------------------------------------ two columns

@@ -21,13 +21,23 @@ package com.percona.mle.api;
  * A least-squares line y = intercept + slope x ({@link Stats#linregress}), as
  * scipy.stats.linregress: r, r², the two-sided p-value of slope = 0 (Student's t, n - 2 degrees of
  * freedom), the standard errors of the slope and the intercept; n: the pairs used (both values
- * present). JSON with {@code String(r)} / {@code str(r)}.
+ * present). The sums SQL's REGR_* functions give (Oracle, PostgreSQL): {@link #n} (REGR_COUNT),
+ * {@link #meanX} and {@link #meanY} (REGR_AVGX, REGR_AVGY), {@link #sxx}, {@link #syy} and {@link
+ * #sxy} (REGR_SXX, REGR_SYY, REGR_SXY); {@link #slope}, {@link #intercept} and {@link #r2} are
+ * REGR_SLOPE, REGR_INTERCEPT and REGR_R2. JSON with {@code String(r)} / {@code str(r)}.
  */
 public final class Regression {
   private final double slope, intercept, r, p, stderr, interceptStderr;
   private final long n;
+  private final double sxx, syy, sxy, meanX, meanY;
 
-  Regression(double slope, double intercept, double r, double p, double stderr, double interceptStderr, long n) {
+  Regression(double slope, double intercept, double r, double p, double stderr, double interceptStderr, long n,
+      double[] comoments) {
+    this.sxx = comoments[0];
+    this.syy = comoments[1];
+    this.sxy = comoments[2];
+    this.meanX = comoments[3];
+    this.meanY = comoments[4];
     this.slope = slope;
     this.intercept = intercept;
     this.r = r;
@@ -59,7 +69,7 @@ public final class Regression {
       se = Math.sqrt((1 - r * r) * ssym / ssxm / df);
       ise = se * Math.sqrt(ssxm + xmean * xmean);
     }
-    return new Regression(slope, intercept, r, p, se, ise, n);
+    return new Regression(slope, intercept, r, p, se, ise, n, m);
   }
 
   public double slope() { return slope; }
@@ -80,8 +90,23 @@ public final class Regression {
 
   public double interceptStderr() { return interceptStderr; }
 
-  /** The pairs used. */
+  /** The pairs used (REGR_COUNT). */
   public long n() { return n; }
+
+  /** The mean of x over the pairs used (REGR_AVGX). */
+  public double meanX() { return meanX; }
+
+  /** The mean of y over the pairs used (REGR_AVGY). */
+  public double meanY() { return meanY; }
+
+  /** The sum of (x - meanX)² (REGR_SXX). */
+  public double sxx() { return sxx; }
+
+  /** The sum of (y - meanY)² (REGR_SYY). */
+  public double syy() { return syy; }
+
+  /** The sum of (x - meanX)(y - meanY) (REGR_SXY). */
+  public double sxy() { return sxy; }
 
   /** intercept + slope x. */
   public double predict(double x) { return intercept + slope * x; }
