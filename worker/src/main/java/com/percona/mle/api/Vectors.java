@@ -431,6 +431,16 @@ public final class Vectors {
     return kmeans(GuestVectors.matrix(rows, "the rows"), k, metric, maxIterations, seed);
   }
 
+  /** The principal components of rows of vectors ({@link Pca}): k directions of the largest variance. */
+  public static Pca pca(float[][] rows, int k) {
+    if (rows == null) throw new IllegalArgumentException("the rows must not be null");
+    return Pca.ofRows(rows, k);
+  }
+
+  public static Pca pca(Object rows, int k) {
+    return pca(GuestVectors.matrix(rows, "the rows"), k);
+  }
+
   // ---------------------------------------------------------------- from SQL
 
   /**

@@ -1,0 +1,185 @@
+--echo #
+--echo # component_mle: models in the statistics helper (exp note 75): multiple
+--echo # linear regression (Stats.ols, Frame.ols: LinearModel) and principal
+--echo # components (Stats.pca, Frame.pca, Vectors.pca, VectorSet.pca: Pca), against
+--echo # statsmodels 0.15.0 and scikit-learn 1.9.1; enough rows that the blocked
+--echo # QR and the covariance kernel run on threads; Java, JavaScript, Python.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE homes (id INT PRIMARY KEY, area DOUBLE, rooms INT, age INT, price DOUBLE);
+INSERT INTO homes VALUES (1, 50, 2, 30, 150), (2, 70, 3, 20, 210), (3, 90, 3, 5, 300), (4, 60, 2, 40, 160),
+  (5, 120, 5, 10, 390), (6, 80, 3, 25, 230), (7, 100, 4, 15, 320), (8, 65, 2, NULL, 190),
+  (9, 110, 4, 8, 360), (10, 75, 3, 35, 205);
+--write_file $MYSQLTEST_VARDIR/tmp/stats_models.sql
+-- 'ok' or the failures.
+CREATE FUNCTION stats_models_selfcheck() RETURNS TEXT LANGUAGE JAVA AS $$
+double N = Double.NaN;
+double[] a = {2.5, 3.1, N, 4.7, 3.1, 8.2, 1.0, 5.5, 3.1, 9.9, 6.4, 2.2, 7.7, 4.4, 3.3, 15.0, 0.5, 5.5, 6.1, 4.0};
+double[] b = {1.0, 2.0, 3.5, N, 2.9, 7.1, 0.4, 5.0, 3.3, 9.0, 6.6, 1.5, 8.0, 4.1, 2.7, 12.5, 1.1, 6.0, 5.2, 3.9};
+double[] c = new double[20];
+for (int i = 0; i < 20; i++) c[i] = i % 7 + 0.25 * i;
+StringBuilder fail = new StringBuilder();
+interface Eq { void that(String what, double got, double want, double rel); }
+Eq eq = (what, got, want, rel) -> {
+  boolean ok = Double.isNaN(want) ? Double.isNaN(got) : Math.abs(got - want) <= rel * Math.max(1e-300, Math.abs(want));
+  if (!ok) fail.append(what).append(": ").append(got).append(" want ").append(want).append("; ");
+};
+interface Arr { void that(String what, double[] got, double[] want, double rel); }
+Arr arr = (what, got, want, rel) -> { for (int i = 0; i < want.length; i++) eq.that(what + "[" + i + "]", got[i], want[i], rel); };
+// statsmodels: OLS(b, add_constant([a, c])), rows with a missing value dropped.
+LinearModel m = Stats.ols(b, new double[][] {a, c});
+arr.that("coef", m.coefficients(), new double[] {-0.5062484269779052, 0.8851744552584313, 0.10604589342957643}, 1e-10);
+arr.that("se", m.stderr(), new double[] {0.3995318377857443, 0.04425879424078222, 0.0559376187559253}, 1e-10);
+arr.that("t", m.t(), new double[] {-1.267104093089546, 19.999967700041594, 1.8957884834585188}, 1e-10);
+arr.that("p", m.p(), new double[] {0.22443834965427725, 3.155266388072965e-12, 0.07742176904474081}, 1e-8);
+eq.that("r2", m.r2(), 0.9645868101353172, 1e-12); eq.that("adj", m.adjustedR2(), 0.9598650514866929, 1e-12);
+eq.that("F", m.f(), 204.2854965525057, 1e-10); eq.that("F p", m.fP(), 1.314431199310164e-11, 1e-8);
+eq.that("llf", m.logLikelihood(), -15.903145036936504, 1e-12); eq.that("aic", m.aic(), 37.80629007387301, 1e-12);
+eq.that("bic", m.bic(), 40.4774053475615, 1e-12); eq.that("ssr", m.ssr(), 6.168839956467152, 1e-10);
+eq.that("n", m.n(), 18, 0); eq.that("df", m.dfResidual(), 15, 0); eq.that("x2", m.coefficient("x2"), 0.10604589342957643, 1e-10);
+// 200,000 rows: 98 blocks of the QR on threads.
+int n = 200_000;
+double[] x1 = new double[n], x2 = new double[n], x3 = new double[n], y = new double[n];
+for (int i = 0; i < n; i++) {
+  x1[i] = Math.sin(i); x2[i] = Math.cos(i * 0.7); x3[i] = (i % 17) / 17.0;
+  y[i] = 2 + 3 * x1[i] - 1.5 * x2[i] + 0.5 * x3[i] + 0.1 * Math.sin(i * 1.3 + 0.2);
+}
+LinearModel big = Stats.ols(y, new double[][] {x1, x2, x3});
+arr.that("big coef", big.coefficients(), new double[] {2.000000154322664, 3.000001078450619, -1.499998377554288, 0.5000002634117721}, 1e-12);
+arr.that("big se", big.stderr(), new double[] {0.00030276505922535577, 0.00022360865577292688, 0.00022360796985912334, 0.0005486812574000643}, 1e-8);
+eq.that("big r2", big.r2(), 0.999115152019358, 1e-12); eq.that("big F", big.f(), 75274336.50176363, 1e-8);
+double[] pr = big.predict(new double[][] {{0, 1}, {0, 0}, {0, 0}});
+eq.that("predict", pr[1] - pr[0], 3.000001078450619, 1e-12);
+// scikit-learn: PCA(2, svd_solver='full') of the columns a, b, c (complete rows).
+Pca p = Stats.pca(new double[][] {a, b, c}, 2);
+double[][] pc = p.components();
+arr.that("pc0", pc[0], new double[] {0.7363800801635877, 0.6714611424777724, 0.08297175230590904}, 1e-10);
+arr.that("pc1", pc[1], new double[] {-0.1151713889272235, 0.0035606201711591576, 0.9933392538083708}, 1e-9);
+arr.that("pca var", p.explainedVariance(), new double[] {22.482606261834878, 7.6979848955676005}, 1e-12);
+arr.that("pca ratio", p.explainedVarianceRatio(), new double[] {0.7400142487517958, 0.25337892071109064}, 1e-12);
+double[][] sc = p.transform(new double[][] {{2.5}, {1.0}, {0}});
+eq.that("score0", sc[0][0], -4.753811102943509, 1e-10); eq.that("score1", sc[1][0], -5.137169998809004, 1e-10);
+// 3,000 vectors of 128 dimensions: the covariance from SIMD tiles on threads (in float).
+int vn = 3000, d = 128;
+float[][] v = new float[vn][d];
+for (int i = 0; i < vn; i++)
+  for (int j = 0; j < d; j++) v[i][j] = (float) (Math.sin(i * 0.37 + j * 1.1) * (1 + j % 5) + Math.cos(i * 0.011 * (j + 1)));
+Pca vp = Vectors.pca(v, 3);
+arr.that("vpca var", vp.explainedVariance(), new double[] {353.7715970870776, 341.80840015589087, 0.5450058371078501}, 1e-4);
+arr.that("vpca ratio", vp.explainedVarianceRatio(), new double[] {0.4663690051018754, 0.450598196205473, 0.0007184687298798051}, 1e-4);
+double[][] vc = vp.components();
+arr.that("vpca c0", Arrays.copyOf(vc[0], 4), new double[] {0.014739858686276912, 0.07517248320815184, 0.05813407059293085, -0.07991793840015299}, 1e-3);
+double s0 = 0, s1 = 0; for (int j = 0; j < d; j++) { s0 += vc[0][j]; s1 += vc[1][j]; }
+eq.that("vpca c0 sum", s0, 0.03486310064667936, 1e-3); eq.that("vpca c1 sum", s1, 0.09748438925141434, 1e-3);
+float[] row5 = vp.project(new float[][] {v[5]})[0];
+eq.that("project 0", row5[0], 3.296501875343084, 1e-4); eq.that("project 1", row5[1], -25.802550171320824, 1e-4);
+eq.that("project 2", row5[2], 1.041592896320538, 1e-3);
+return fail.length() > 0 ? "FAIL " + fail : "ok";
+$$;
+CREATE PROCEDURE java_models(OUT r TEXT) LANGUAGE JAVA AS $$
+Frame f = Stats.load("SELECT area, rooms, age, price FROM homes");
+LinearModel m = f.ols("price", "area", "rooms", "age");
+Pca p = f.pca(2, "area", "rooms", "age");
+double[] fitted = m.predict(f);
+r[0] = String.join("\n",
+    "names: " + Arrays.toString(m.names()) + ", n " + m.n() + " (one row without age)",
+    "r2 " + String.format("%.4f", m.r2()) + ", area coefficient " + String.format("%.3f", m.coefficient("area")),
+    "fitted price of row 1: " + String.format("%.2f", fitted[0]) + ", row 8 (no age): " + fitted[7],
+    "pca names: " + Arrays.toString(p.names()) + ", first ratio " + String.format("%.4f", p.explainedVarianceRatio()[0]),
+    "scores of row 1: " + String.format("%.3f %.3f", p.transform(f)[0][0], p.transform(f)[1][0]));
+$$;
+CREATE PROCEDURE js_models(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const S = Java.type('com.percona.mle.api.Stats');
+  const V = Java.type('com.percona.mle.api.Vectors');
+  const out = [];
+  const m = S.ols([3, 5, 7.1, 8.9, 11], [[1, 2, 3, 4, 5], [0, 1, 0, 1, 0]]);
+  out.push(`ols: ${Array.from(m.coefficients()).map(v => v.toFixed(4))} r2 ${m.r2().toFixed(5)}`);
+  out.push(`predict: ${Array.from(m.predict([[6], [1]])).map(v => v.toFixed(3))}`);
+  const p = S.pca([new Float64Array([1, 2, 3, 4]), [2, 4.1, 5.9, 8.2]], 1);
+  out.push(`pca: ratio ${p.explainedVarianceRatio()[0].toFixed(5)}`);
+  const vp = V.pca([new Float32Array([1, 0, 0]), new Float32Array([0, 1, 0]), new Float32Array([1, 1, 0]), new Float32Array([2, 2, 0.1])], 2);
+  out.push(`vector pca: ${vp.explainedVarianceRatio()[0].toFixed(4)}, 2-D: ${vp.project([new Float32Array([1, 1, 0])])[0].length}`);
+  r = out.join('\n');
+$$;
+CREATE PROCEDURE py_models(OUT r TEXT) LANGUAGE PYTHON AS $$
+    import java
+    import numpy as np
+    S = java.type('com.percona.mle.api.Stats')
+    V = java.type('com.percona.mle.api.Vectors')
+    out = []
+    X = np.array([[1.0, 0.0], [2.0, 1.0], [3.0, 0.0], [4.0, 1.0], [5.0, 0.0]])
+    m = S.ols(np.array([3.0, 5.0, 7.1, 8.9, 11.0]), X)
+    out.append('ols of a 2-D numpy array: %s' % [round(v, 4) for v in m.coefficients()])
+    out.append('p-values: %s' % [round(v, 4) for v in m.p()])
+    p = S.pca(np.array([[1.0, 2.0], [2.0, 4.1], [3.0, 5.9], [4.0, 8.2]]), 2)
+    out.append('pca: %s' % [round(v, 5) for v in p.explainedVarianceRatio()])
+    s = V.load('SELECT id, STRING_TO_VECTOR(CONCAT("[", area, ",", rooms, ",", price, "]")) FROM homes')
+    vp = s.pca(2)
+    small = s.project(vp)
+    out.append('set: %d vectors of %d, projected to %d; nearest to home 3 in 2-D: %s' % (s.size(), s.dimensions(), small.dimensions(), list(small.nearestTo(3, 2, 'EUCLIDEAN').ids())))
+    r = '\n'.join(out)
+$$;
+CREATE PROCEDURE java_models_errors(OUT r TEXT) LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+double[] x = {1, 2, 3, 4};
+Frame f = Stats.load("SELECT area, rooms, age, price FROM homes");
+Runnable[] cases = {
+  () -> Stats.ols(x, new double[0][]),
+  () -> Stats.ols(x, new double[][] {{1, 2, 3}}),
+  () -> Stats.ols(x, new double[][] {{1, 2, 3, 4}, {2, 4, 6, 8}}),
+  () -> Stats.ols(x, new double[][] {{1, 1, 1, 1}}),
+  () -> Stats.ols(new double[] {1, 2, 3}, new double[][] {{1, 2, 4}, {0, 1, 1}}),
+  () -> f.ols("price"),
+  () -> f.ols("price", "size"),
+  () -> Stats.ols(x, new double[][] {x}).predict(new double[][] {x, x}),
+  () -> Stats.pca(new double[][] {x, x}, 3),
+  () -> Stats.pca(new double[][] {{1}, {2}}, 1),
+  () -> f.pca(1),
+  () -> Vectors.pca(new float[][] {{1, 2}}, 1),
+  () -> Vectors.pca(new float[][] {{1, 2}, {3, 4}}, 1).project(new float[][] {{1, 2, 3}}),
+  () -> Vectors.pca(new float[][] {{1, 2}, {3, 4}}, 1).transform(f),
+};
+for (Runnable c : cases) {
+  try { c.run(); b.append("no error\n"); }
+  catch (IllegalArgumentException e) { b.append(e.getMessage()).append('\n'); }
+}
+r[0] = b.toString().trim();
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/stats_models.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/stats_models.sql
+--source include/wait_until_count_sessions.inc
+
+--connect (con1, localhost, root,,test)
+--echo # 1. Against statsmodels and scikit-learn; many rows over threads.
+SELECT stats_models_selfcheck() AS selfcheck;
+
+--echo # 2. On a Frame; Java, JavaScript, Python.
+CALL java_models(@j);
+SELECT @j AS java;
+CALL js_models(@js);
+SELECT @js AS js;
+CALL py_models(@py);
+SELECT @py AS python;
+
+--echo # 3. Errors.
+CALL java_models_errors(@e);
+SELECT @e AS errors;
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+
+DROP TABLE homes;
+DROP FUNCTION stats_models_selfcheck;
+DROP PROCEDURE java_models;
+DROP PROCEDURE js_models;
+DROP PROCEDURE py_models;
+DROP PROCEDURE java_models_errors;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

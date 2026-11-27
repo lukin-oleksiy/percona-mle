@@ -324,6 +324,39 @@ public final class Stats {
     return linregress(GuestColumns.doubles(x, "x"), GuestColumns.doubles(y, "y"));
   }
 
+  // ------------------------------------------------------------------ models
+
+  /**
+   * Multiple linear regression by ordinary least squares, y on the x columns with a constant
+   * (statsmodels' OLS): see {@link LinearModel}. The x columns are named x1, x2, ...; {@link
+   * Frame#ols} names them by their columns.
+   */
+  public static LinearModel ols(double[] y, double[][] x) {
+    if (x == null) throw new IllegalArgumentException("the x columns must not be null");
+    String[] names = new String[x.length];
+    for (int j = 0; j < names.length; j++) names[j] = "x" + (j + 1);
+    return LinearModel.fit(check(y), x, names);
+  }
+
+  /** {@link #ols(double[], double[][])} for JavaScript or Python columns (a list of columns, or a 2-D numpy array of rows). */
+  public static LinearModel ols(Object y, Object x) {
+    return ols(GuestColumns.doubles(y, "y"), GuestColumns.columns(x, "the x columns"));
+  }
+
+  /**
+   * Principal component analysis of columns (scikit-learn's PCA; centred, not scaled: scale the
+   * columns first with {@link #zscore} when their units differ): see {@link Pca}. Rows with a
+   * missing value are left out.
+   */
+  public static Pca pca(double[][] columns, int k) {
+    if (columns == null) throw new IllegalArgumentException("the columns must not be null");
+    return Pca.ofColumns(columns, k, null);
+  }
+
+  public static Pca pca(Object columns, int k) {
+    return pca(GuestColumns.columns(columns, "the columns"), k);
+  }
+
   // ---------------------------------------------------------------- helpers
 
   private static double[] check(double[] x) {

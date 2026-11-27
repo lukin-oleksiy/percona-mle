@@ -389,6 +389,20 @@ public final class VectorSet {
     return new VectorSet(t, ids, labels, skipped);
   }
 
+  /** The principal components of the set's vectors ({@link Pca}): k directions of the largest variance. */
+  public Pca pca(int k) {
+    return Pca.ofRows(rows, k);
+  }
+
+  /**
+   * The set in the coordinates of a PCA's components (k dimensions each), same ids and labels: a
+   * 2-D or 3-D map of the set, or a smaller set to search.
+   */
+  public VectorSet project(Pca pca) {
+    if (pca == null) throw new IllegalArgumentException("the PCA must not be null");
+    return new VectorSet(pca.project(rows), ids, labels, skipped);
+  }
+
   /** The per-row terms of a metric, computed once. */
   private float[] terms(int metric) {
     if (metric == VectorEngine.COSINE) {

@@ -1,0 +1,66 @@
+#
+# component_mle: models in the statistics helper (exp note 75): multiple
+# linear regression (Stats.ols, Frame.ols: LinearModel) and principal
+# components (Stats.pca, Frame.pca, Vectors.pca, VectorSet.pca: Pca), against
+# statsmodels 0.15.0 and scikit-learn 1.9.1; enough rows that the blocked
+# QR and the covariance kernel run on threads; Java, JavaScript, Python.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE homes (id INT PRIMARY KEY, area DOUBLE, rooms INT, age INT, price DOUBLE);
+INSERT INTO homes VALUES (1, 50, 2, 30, 150), (2, 70, 3, 20, 210), (3, 90, 3, 5, 300), (4, 60, 2, 40, 160),
+(5, 120, 5, 10, 390), (6, 80, 3, 25, 230), (7, 100, 4, 15, 320), (8, 65, 2, NULL, 190),
+(9, 110, 4, 8, 360), (10, 75, 3, 35, 205);
+# 1. Against statsmodels and scikit-learn; many rows over threads.
+SELECT stats_models_selfcheck() AS selfcheck;
+selfcheck
+ok
+# 2. On a Frame; Java, JavaScript, Python.
+CALL java_models(@j);
+SELECT @j AS java;
+java
+names: [const, area, rooms, age], n 9 (one row without age)
+r2 0.9948, area coefficient 3.078
+fitted price of row 1: 140.40, row 8 (no age): NaN
+pca names: [area, rooms, age], first ratio 0.9292
+scores of row 1: -34.588 -6.047
+CALL js_models(@js);
+SELECT @js AS js;
+js
+ols: 1.0633,1.9900,-0.0833 r2 0.99973
+predict: 12.920
+pca: ratio 0.99969
+vector pca: 0.7503, 2-D: 2
+CALL py_models(@py);
+SELECT @py AS python;
+python
+ols of a 2-D numpy array: [1.0633, 1.99, -0.0833]
+p-values: [0.0058, 0.0001, 0.3377]
+pca: [0.99969, 0.00031]
+set: 10 vectors of 3, projected to 2; nearest to home 3 in 2-D: [7, 9]
+# 3. Errors.
+CALL java_models_errors(@e);
+SELECT @e AS errors;
+errors
+a model needs at least one x column
+y has 4 values, x column x1 3
+column x2 is constant or a linear combination of the columns before it: leave it out
+column x1 is constant or a linear combination of the columns before it: leave it out
+a model with 3 coefficients needs more than 3 complete rows, not 3
+name at least one x column
+no column 'size' (area, rooms, age, price)
+the model has 1 x columns, not 2
+k must be from 1 to 2, not 3
+PCA needs at least 2 complete rows, not 1
+name the columns
+PCA needs at least 2 vectors, not 1
+the vectors have 3 dimensions, the PCA 2
+this PCA was made from vectors: project() them
+DROP TABLE homes;
+DROP FUNCTION stats_models_selfcheck;
+DROP PROCEDURE java_models;
+DROP PROCEDURE js_models;
+DROP PROCEDURE py_models;
+DROP PROCEDURE java_models_errors;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

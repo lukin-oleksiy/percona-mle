@@ -244,6 +244,34 @@ public final class Frame {
     return Stats.rolling(numbers(column), window, stat, minPeriods);
   }
 
+  /**
+   * Multiple linear regression of column y on the x columns, with a constant ({@link
+   * LinearModel}): {@code f.ols('price', 'area', 'rooms')}. Rows with a missing value in any of
+   * them are left out.
+   */
+  public LinearModel ols(String y, String... x) {
+    if (x == null || x.length == 0) throw new IllegalArgumentException("name at least one x column");
+    double[][] cols = new double[x.length][];
+    String[] names = new String[x.length];
+    for (int j = 0; j < x.length; j++) {
+      cols[j] = numbers(x[j]);
+      names[j] = this.names[index(x[j])];
+    }
+    return LinearModel.fit(numbers(y), cols, names);
+  }
+
+  /** Principal components of the named columns ({@link Pca}); {@code pca.transform(frame)} scores rows. */
+  public Pca pca(int k, String... columns) {
+    if (columns == null || columns.length == 0) throw new IllegalArgumentException("name the columns");
+    double[][] cols = new double[columns.length][];
+    String[] names = new String[columns.length];
+    for (int j = 0; j < columns.length; j++) {
+      cols[j] = numbers(columns[j]);
+      names[j] = this.names[index(columns[j])];
+    }
+    return Pca.ofColumns(cols, k, names);
+  }
+
   /** The median absolute deviation of a column ({@link Stats#mad}). */
   public double mad(String column) {
     return Stats.mad(numbers(column));
@@ -468,7 +496,7 @@ public final class Frame {
     return b.append(']').toString();
   }
 
-  private static StringBuilder quote(StringBuilder b, String s) {
+  static StringBuilder quote(StringBuilder b, String s) {
     b.append('"');
     for (int i = 0; i < s.length(); i++) {
       char c = s.charAt(i);

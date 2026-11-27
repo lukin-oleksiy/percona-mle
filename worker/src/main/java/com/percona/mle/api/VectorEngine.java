@@ -484,6 +484,40 @@ final class VectorEngine {
     }
   }
 
+  /**
+   * acc[i][j] += the dot product of m[i] and m[j] over their first len values, for j >= i (the
+   * upper triangle): a Gram matrix m mᵀ, summed chunk by chunk into acc in double (PCA's
+   * covariance: m holds a chunk of centred rows transposed). The same 4 x NR register tiles as the
+   * batch search; each task owns a block of rows of acc, so the sums do not depend on the threads.
+   */
+  static void gramAdd(float[][] m, int len, double[][] acc) {
+    final int k = m.length;
+    if (k == 0 || len == 0) return;
+    final int panels = (k + NR - 1) / NR;
+    final float[][] pk = new float[panels][len * NR];
+    final boolean parallel = (long) k * k * len / 2 >= PARALLEL_MIN;
+    run(panels, parallel, p -> pack(m, 0, k, p, pk[p], len));
+    final float[] zero = new float[len];
+    final int rb = 16;  // rows of acc per task
+    final int tasks = (k + rb - 1) / rb;
+    run(tasks, parallel, t -> {
+      final float[] tile = new float[4 * NR];
+      final int lo = t * rb, hi = Math.min(k, lo + rb);
+      for (int p = lo / NR; p < panels; p++) {  // panels with columns j >= lo
+        stopIfKilled();
+        final int j0 = p * NR, cols = Math.min(NR, k - j0);
+        for (int a = lo; a < hi; a += 4) {
+          tile(m[a], a + 1 < hi ? m[a + 1] : zero, a + 2 < hi ? m[a + 2] : zero, a + 3 < hi ? m[a + 3] : zero, pk[p],
+              len, tile);
+          for (int r = 0; r < 4 && a + r < hi; r++) {
+            final double[] row = acc[a + r];
+            for (int c = Math.max(0, a + r - j0); c < cols; c++) row[j0 + c] += tile[r * NR + c];
+          }
+        }
+      }
+    });
+  }
+
   /** Packs rows [c0 + p*NR, ...) of the chunk ending at c1 into panel p (k-major; missing columns zero). */
   private static void pack(float[][] rows, int c0, int c1, int p, float[] panel, int d) {
     final int j0 = c0 + p * NR, cols = Math.min(NR, c1 - j0);
