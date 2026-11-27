@@ -160,6 +160,15 @@ class CacheTableTest {
   }
 
   @Test
+  void aLoadThatAsksForItsOwnNameFailsInsteadOfWaiting() {
+    CacheTable t = table(10_000, 0);
+    assertThrows(IllegalStateException.class, () -> t.cached(k("a"), "vectors", "SELECT 1", List.of(), new Object[0],
+        () -> load(t, "a", own(1))));
+    assertEquals(0, t.size());
+    assertSame(t.cached(k("a"), "vectors", "SELECT 1", List.of(), new Object[0], () -> own(2)), t.kept(k("a")));
+  }
+
+  @Test
   void idleSetsExpireAtTheirDeadline() {
     CacheTable t = table(10_000, 60);
     load(t, "a", own(10));

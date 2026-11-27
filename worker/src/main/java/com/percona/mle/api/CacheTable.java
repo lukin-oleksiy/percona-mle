@@ -95,6 +95,8 @@ final class CacheTable {
   /** Access order: the first is the least recently used. */
   private final LinkedHashMap<Key, Entry> entries = new LinkedHashMap<>(16, 0.75f, true);
   private final Map<Key, CompletableFuture<Void>> loading = new java.util.HashMap<>();
+  /** The thread loading each name: a load query that asks for its own name (a function in it) fails, not waits. */
+  private final Map<Key, Thread> loaders = new java.util.HashMap<>();
   private Info refused;
   private long freed;
   private boolean giveBackDue;
@@ -130,7 +132,12 @@ final class CacheTable {
           return e.value;
         }
         wait = loading.get(key);
-        if (wait == null) loading.put(key, mine = new CompletableFuture<>());
+        if (wait == null) {
+          loading.put(key, mine = new CompletableFuture<>());
+          loaders.put(key, Thread.currentThread());
+        } else if (loaders.get(key) == Thread.currentThread()) {
+          throw new IllegalStateException("'" + key.name() + "' is being loaded by this call: its query cannot use it");
+        }
       }
       if (mine == null) {  // another thread loads this name: wait, then look again
         try {
@@ -146,12 +153,14 @@ final class CacheTable {
       } catch (RuntimeException | Error t) {
         synchronized (this) {
           loading.remove(key);
+          loaders.remove(key);
         }
         mine.completeExceptionally(t);
         throw t;
       }
       synchronized (this) {
         loading.remove(key);
+        loaders.remove(key);
         put(new Entry(key, kind, sql, params, raw, value, clock.getAsLong(), defaultIdleNs), null);
       }
       mine.complete(null);
