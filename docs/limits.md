@@ -46,6 +46,17 @@ values map to each language is in its Appendix B.
   function reaches the client as the component's routine error, not with
   its own number (Appendix A: the server lets the host raise no condition
   of its choice there; the same refusal reads differently in a trigger).
+* **Large results in mysqld.** The server's statement service holds a
+  routine's whole result in memory and frees it after the statement, so
+  every large result (top-10 of 100k vectors) is paged in again, 4 KiB at
+  a time. Starting mysqld with `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` in
+  its environment puts its allocations on transparent huge pages (THP in
+  `madvise` or `always` mode): top-10 of 100k vectors took 44 % less time
+  in the CPython worker, but mysqld held 69–145 MiB more and `sysbench
+  oltp_read_write` (64 threads) ran 3–4 % slower. The server keeps the
+  default until the workloads are known. Candidate improvements: huge
+  pages for the statement service's large result blocks only, or keeping
+  those blocks for the next run of a kept statement.
 
 ## Vectors and statistics
 
