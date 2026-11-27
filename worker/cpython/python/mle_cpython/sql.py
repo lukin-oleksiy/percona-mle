@@ -28,7 +28,6 @@ import json as _json
 import math as _math
 import random as _random
 import re as _re
-import secrets as _secrets
 import threading as _threading
 import time as _time
 import types as _types
@@ -273,6 +272,9 @@ class Options:
 
 
 _NO_OPTIONS = Options()
+# The effective options of a statement with none of its own and no set_options, by the session's
+# decimal type (index into _DECIMAL_TYPES): Options(decimal_type=...).over(None).
+_DEFAULT_EFFECTIVE = tuple(Options(decimal_type=t).over(None) for t in _DECIMAL_TYPES)
 
 
 def _options(v):
@@ -1344,8 +1346,10 @@ def _sleep(seconds):
 
 
 _GREGORIAN_OFFSET = 0x01B21DD213814000  # 100 ns units, 1582 to 1970
-_NODE = (_secrets.randbits(48) & 0xFFFFFFFFFFFF) | 0x010000000000  # multicast bit
-_CLOCK_SEQ = _secrets.randbits(14)
+# The OS's randomness, as secrets.randbits (whose import, hmac and OpenSSL, cost ~2 ms of a new worker).
+_SYSTEM_RANDOM = _random.SystemRandom()
+_NODE = (_SYSTEM_RANDOM.getrandbits(48) & 0xFFFFFFFFFFFF) | 0x010000000000  # multicast bit
+_CLOCK_SEQ = _SYSTEM_RANDOM.getrandbits(14)
 _uuid_last = 0
 _uuid_lock = _threading.Lock()
 
@@ -1458,8 +1462,12 @@ class Session:
 
     def _effective(self, o):
         """The options of a statement: o over this call's session options over the defaults."""
+        call = self._call() if self._call_options else None
+        if o is None and call is None:
+            # The common case, one shared object per decimal type: an Options is changed only while
+            # _options() makes it (exp note 69: two objects and a request() tuple per statement).
+            return _DEFAULT_EFFECTIVE[self._api.decimal_type]
         defaults = Options(decimal_type=_DECIMAL_TYPES[self._api.decimal_type])
-        call = self._call()
         base = defaults if call is None else call.over(defaults)
         return base.over(None) if o is None else o.over(base)
 

@@ -21,7 +21,6 @@ import ast
 import gc
 import io
 import os
-import platform
 import re
 import signal
 import struct
@@ -306,7 +305,8 @@ class Dispatcher:
     def serve(self):
         """READY, then the request loop (C++): top-level calls of simple routines run there, every
         other request comes to handle(), and every request's end to finish()."""
-        _mlewire.ready(self.info, 'CPython %s' % platform.python_version())
+        # The version as platform.python_version() gives it, without importing platform (exp note 69).
+        _mlewire.ready(self.info, 'CPython %s' % sys.version.split()[0])
         _mlewire.serve(self.handle, self.finish, self.values, self.failed, self.vector_arg)
 
     # -- requests
