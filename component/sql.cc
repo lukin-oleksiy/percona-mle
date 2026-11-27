@@ -156,12 +156,12 @@ void read_warnings(my_h_statement h, std::vector<mle::Warning> *warnings) {
   }
 }
 
-/** Whether running sql may change the session's sql_mode, schema or
-    character sets for the rest of the request (protocol.md Appendix A,
-    "Statements within a call"): it begins, after spaces and comments, with
-    SET, USE, EXECUTE or DROP (any case), or with an executable comment. A
-    routine the statement calls cannot: the server restores them when it
-    returns. */
+/** Whether running sql may change what a kept statement was prepared for
+    (protocol.md Appendix A, "Statements within a call"): it begins, after
+    spaces and comments, with SET, USE, EXECUTE, DROP or CALL (any case), or
+    with an executable comment. The server restores sql_mode, the schema and
+    the character sets when a routine it calls returns, but not the other
+    variables the routine may set (div_precision_increment, ...). */
 bool may_change_environment(std::string_view sql) {
   const size_t n = sql.size();
   size_t i = 0;
@@ -193,7 +193,7 @@ bool may_change_environment(std::string_view sql) {
                         return toupper(static_cast<unsigned char>(a)) == b;
                       });
   };
-  return is("SET") || is("USE") || is("EXECUTE") || is("DROP");
+  return is("SET") || is("USE") || is("EXECUTE") || is("DROP") || is("CALL");
 }
 
 /** The kind of value a marker is bound with, as far as the server derives

@@ -2175,11 +2175,12 @@ different kinds is not kept. Each request keeps at most
 `mle.sql_statement_cache` such statements (the least recently used is
 closed first) and closes them when its RESULT arrives. The server prepares
 a kept statement again itself after a change of the tables it uses. The
-server restores a routine's `sql_mode`, schema and character sets when a
-routine it calls returns, so only the request's own statements change
-them: the host forgets all kept statements of the request after it runs a
-statement that begins with `SET`, `USE`, `EXECUTE` or `DROP`, or with an
-executable comment. A kept statement's last results stay counted in the
+host forgets all kept statements of the request after it runs a statement
+that begins with `SET`, `USE`, `EXECUTE`, `DROP` or `CALL`, or with an
+executable comment: these may change `sql_mode`, the schema, the character
+sets or another variable a statement was prepared for (the server restores
+only the first three when a routine it calls returns; a procedure may set
+`div_precision_increment`, for example). A kept statement's last results stay counted in the
 session's memory of buffered results until it runs again or is closed;
 kept statements are closed first when that memory runs short. They also
 count in the server's `max_prepared_stmt_count`: when a preparation fails

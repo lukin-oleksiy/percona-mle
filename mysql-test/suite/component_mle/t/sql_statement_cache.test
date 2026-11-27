@@ -4,8 +4,9 @@
 --echo # runSql with parameters or a prepare() is kept when its id closes and
 --echo # used again for the same text in the same CALL: a loop prepares once.
 --echo # mle.sql_statement_cache bounds them (0: none). After a statement that
---echo # may change sql_mode, the schema or the character sets (SET, USE,
---echo # EXECUTE, DROP, an executable comment) nothing prepared before is kept.
+--echo # may change sql_mode, the schema, the character sets or another variable
+--echo # (SET, USE, EXECUTE, DROP, CALL, an executable comment) nothing prepared
+--echo # before is kept.
 --echo # Results are those of a new preparation, in every worker.
 --echo #
 --source ../include/have_mle_component.inc
@@ -171,6 +172,34 @@ CREATE PROCEDURE js_modes(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
 $$;
 CALL js_modes(@r);
 SELECT @r, @@sql_mode = (SELECT @@GLOBAL.sql_mode) AS mode_restored;
+
+--echo #
+--echo # 4b. A procedure the routine calls sets a variable the server does not
+--echo #    restore (div_precision_increment): the statement after the CALL is
+--echo #    prepared again and divides with the new precision, as with the cache
+--echo #    off.
+--echo #
+CREATE PROCEDURE set_precision(IN p INT) SET div_precision_increment = p;
+CREATE PROCEDURE js_precision(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const out = []
+  const third = () => out.push(String(session.runSql('SELECT ? / 3 AS v', [1]).fetchOne().v))
+  third()
+  session.runSql('CALL set_precision(8)')
+  third()
+  session.runSql('CALL set_precision(2)')
+  third()
+  r = out.join(' ')
+$$;
+CALL js_precision(@r);
+SELECT @r;
+SET div_precision_increment = DEFAULT;
+SET GLOBAL mle.sql_statement_cache = 0;
+CALL js_precision(@r);
+SELECT @r AS cache_off;
+SET GLOBAL mle.sql_statement_cache = DEFAULT;
+SET div_precision_increment = DEFAULT;
+DROP PROCEDURE js_precision;
+DROP PROCEDURE set_precision;
 
 --echo #
 --echo # 5. USE in the routine (where the server runs it): the statement after it

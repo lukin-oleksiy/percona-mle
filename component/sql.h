@@ -68,11 +68,12 @@
   again at its first execution with values of other kinds. A parked
   statement's last results stay counted in the session's budget until it
   runs again or is closed, and are the first to go when the budget is short.
-  The server restores sql_mode, the schema and the character sets when a
-  routine it calls returns, so only this request's own statements change
-  them: after one that begins with SET, USE, EXECUTE or DROP, or with an
-  executable comment, nothing prepared before is kept (a debug build checks
-  sql_mode and the schema at every reuse).
+  After a statement that begins with SET, USE, EXECUTE, DROP or CALL, or
+  with an executable comment, nothing prepared before is kept: these may
+  change sql_mode, the schema, the character sets or another variable a
+  statement is prepared for (a routine CALL runs is restored only its
+  sql_mode, schema and character sets). A debug build checks sql_mode and
+  the schema at every reuse.
 
   The server's execution time (exec_us) is measured only when
   mle.sql_exec_time is ON: it costs two clock reads per statement.
