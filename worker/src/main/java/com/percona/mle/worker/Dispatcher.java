@@ -294,7 +294,10 @@ final class Dispatcher {
       // (back to back, the same account) does not wait ~20 ms for it (exp note 38).
       if (gcWhenIdle) {
         gcWhenIdle = false;
-        if (!mb.awaitPending(IDLE_GC_NS)) System.gc();
+        if (!mb.awaitPending(IDLE_GC_NS)) {
+          System.gc();
+          Native.mallocTrim();
+        }
         // Idle after a RESET (§3.1): the host's memory figures, after the GC if there was one.
         mb.stats(Wire.STATE_IDLE);
       } else if (trimWhenIdle && IDLE_TRIM_NS > 0 && polyglot.pythonStarted()) {

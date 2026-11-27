@@ -95,10 +95,15 @@ ADD_CUSTOM_COMMAND(OUTPUT ${MLE_PYTHON_VENV_STAMP}
     -Dmle.build.dir=${CMAKE_CURRENT_BINARY_DIR}/maven-python
     -Dmle.venv.dir=${CMAKE_CURRENT_BINARY_DIR}/python-venv
     generate-resources
+  # GraalPy's bytecode for numpy: workers cannot write it (Setup.java).
+  COMMAND ${MLE_JAVA_HOME}/bin/java
+    -Dpolyglot.engine.userResourceCache=${MLE_RESOURCE_CACHE}
+    --enable-native-access=ALL-UNNAMED
+    -cp ${MLE_WORKER_JAR} com.percona.mle.worker.Setup --compile-python ${MLE_PYTHON_VENV}
   COMMAND ${CMAKE_COMMAND} -E touch ${MLE_PYTHON_VENV_STAMP}
   # After the jar: two Maven runs must not share ~/.m2 at the same time.
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/python/pom.xml ${MLE_WORKER_JAR}
-  COMMENT "Building the GraalPy venv for MLE workers (numpy)"
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/python/pom.xml ${MLE_WORKER_JAR} ${MLE_RESOURCE_STAMP}
+  COMMENT "Building the GraalPy venv for MLE workers (numpy, its bytecode)"
   VERBATIM
   )
 

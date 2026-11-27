@@ -59,8 +59,10 @@ public final class Main {
         // mle.pool_prewarm (15 §2): python, or numpy (Python and numpy).
         if (prewarm.contains("python") || prewarm.contains("numpy")) polyglot.prewarmPython(prewarm.contains("numpy"));
         // Starting leaves garbage and a grown heap; a worker often waits in the pool, so give
-        // the memory back now (with the small-heap settings of the worker class).
+        // the memory back now (with the small-heap settings of the worker class), and what
+        // starting freed into malloc's arenas (exp note 69).
         System.gc();
+        Native.mallocTrim();
         info = "ready in " + (System.nanoTime() - t0) / 1_000_000 + " ms";
       } catch (Throwable t) {
         status = Wire.INTERNAL;
@@ -82,8 +84,10 @@ public final class Main {
       // A worker started for a waiting session gets its first request at once (the grace
       // below) and skips it; a pool worker warms up while it waits in the pool.
       if (System.getProperty("mle.prewarm", "").contains("vectors")
-          && !mb.awaitPending(50_000_000L) && VectorWarmup.run(mb::pending))
+          && !mb.awaitPending(50_000_000L) && VectorWarmup.run(mb::pending)) {
         System.gc();  // as after starting: the warm-up's garbage, before waiting in the pool
+        Native.mallocTrim();
+      }
       d.loop();
     } catch (Throwable t) {
       console.log().println("mle worker: fatal: " + t);

@@ -17,18 +17,35 @@
 
 package com.percona.mle.worker;
 
+import java.nio.file.Path;
 import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.Value;
 
 /**
  * Build/installation step: creates the polyglot Context once outside the lockdown, so that the
  * languages' resources (e.g. the Python standard library) are extracted into the resource cache
  * given by -Dpolyglot.engine.userResourceCache. Workers can only read it.
+ *
+ * <p>{@code --compile-python <venv>}: GraalPy's bytecode for the venv's packages (numpy). The
+ * venv's installer writes none, and workers cannot write it (python.DontWriteBytecodeFlag, a
+ * read-only file system), so without it every worker compiled numpy's sources on import: about
+ * 0.7 s of a new connection's first {@code import numpy} (exp note 69). Unchecked-hash bytecode:
+ * valid whatever the installed files' times.
  */
 public final class Setup {
   private Setup() {}
 
   public static void main(String[] args) {
     int status = 0;
+    if (args.length == 2 && args[0].equals("--compile-python")) {
+      try {
+        status = compilePython(Path.of(args[1])) ? 0 : 1;
+      } catch (Throwable t) {
+        t.printStackTrace();
+        status = 1;
+      }
+      Runtime.getRuntime().halt(status);
+    }
     try (Context c = Polyglot.builder(null).build()) {
       c.eval("js", "1");
       if (Polyglot.PYTHON) c.eval("python", "import json, decimal, datetime, array");
@@ -38,5 +55,22 @@ public final class Setup {
     }
     // GraalPy leaves non-daemon threads behind.
     Runtime.getRuntime().halt(status);
+  }
+
+  /** Compiles the site-packages of the venv (its bin/python names it, as for workers). */
+  private static boolean compilePython(Path venv) {
+    try (Context c = Context.newBuilder("python").allowAllAccess(true)
+        .option("python.Executable", venv.resolve("bin/python").toString())
+        .option("python.ForceImportSite", "true")
+        .option("python.PosixModuleBackend", "java")
+        .build()) {
+      Value ok = c.eval("python", """
+          import compileall, py_compile, site
+          all([compileall.compile_dir(d, quiet=1,
+                   invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+               for d in site.getsitepackages()])
+          """);
+      return ok.asBoolean();
+    }
   }
 }
