@@ -61,9 +61,11 @@ id	cosine
 1	0.9988
 2	0.9982
 3	0
-SELECT py_vec_ro(v) FROM items WHERE id = 1;
-py_vec_ro(v)
-read-only: assignment destination is read-only
+SELECT id, py_vec_ro(v) FROM items ORDER BY id;
+id	py_vec_ro(v)
+1	read-only: assignment destination is read-only
+2	read-only: assignment destination is read-only
+3	read-only: assignment destination is read-only
 SELECT VECTOR_TO_STRING(py_double(v)) FROM items ORDER BY id;
 VECTOR_TO_STRING(py_double(v))
 [2.00000e+00,0.00000e+00,0.00000e+00]

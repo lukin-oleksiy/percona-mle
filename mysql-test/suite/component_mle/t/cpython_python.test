@@ -211,7 +211,8 @@ SELECT py_add(2, 3), py_np(), py_runtime();
 SELECT py_types(18446744073709551615, 12.345, 'héllo', '2026-11-19 12:34:56', '-838:59:59', '{"a": [1, 2]}',
                 0x41ff, 1.5) AS t;
 SELECT id, py_cosine(v, STRING_TO_VECTOR('[1, 0.05, 0]')) AS cosine FROM items ORDER BY id;
-SELECT py_vec_ro(v) FROM items WHERE id = 1;
+# Every row: the second and third get the reused array of the C++ fast path (exp note 69).
+SELECT id, py_vec_ro(v) FROM items ORDER BY id;
 SELECT VECTOR_TO_STRING(py_double(v)) FROM items ORDER BY id;
 CALL py_sql(@r);
 SELECT @r;

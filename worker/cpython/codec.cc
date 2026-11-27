@@ -27,8 +27,11 @@
 
 #include <datetime.h>
 
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -252,6 +255,18 @@ Ref py_decode_rows(PyObject *args) {
 
 namespace {
 
+/** A large typed column (a VECTOR matrix: 300 MB for 100,000 VECTOR(768)) on 2 MiB pages.
+    On 4 KiB pages every page of the fresh buffer faults on its own, about a third of
+    fetch_columns' time; numpy asks the same for its own large arrays. A hint for the kernel's
+    transparent huge pages (the distributions' "madvise" mode): errors are ignored. */
+void advise_huge_pages(std::byte *p, size_t n) {
+  constexpr uintptr_t kHuge = uintptr_t{2} << 20;
+  if (n < 2 * kHuge) return;
+  const auto begin = (reinterpret_cast<uintptr_t>(p) + kHuge - 1) & ~(kHuge - 1);
+  const auto end = (reinterpret_cast<uintptr_t>(p) + n) & ~(kHuge - 1);
+  if (end > begin) (void)madvise(reinterpret_cast<void *>(begin), end - begin, MADV_HUGEPAGE);
+}
+
 /** A column of fetch_columns while it is filled (the Python Collector's attributes). */
 enum class Mode : long { kSkip = 0, kVector = 1, kInt64 = 2, kFloat64 = 3, kList = 4 };
 
@@ -289,6 +304,7 @@ struct Column {
     if (need > have) {
       const size_t want = std::max({need, have * 2, size_t(std::max<Py_ssize_t>(expect, 0)) * item_size});
       if (PyByteArray_Resize(data.get(), Py_ssize_t(want)) != 0) throw PyErrorSet{};
+      advise_huge_pages(reinterpret_cast<std::byte *>(PyByteArray_AS_STRING(data.get())), want);
     }
     return reinterpret_cast<std::byte *>(PyByteArray_AS_STRING(data.get())) + size_t(count) * item_size;
   }

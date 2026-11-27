@@ -21,8 +21,11 @@
 
 #include <array>
 #include <cmath>
+#include <cstring>
+#include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -205,6 +208,37 @@ struct FastRoutine {
     routine away (§8.3). */
 std::unordered_map<uint64_t, std::shared_ptr<const FastRoutine>> g_fast;
 
+/** The fast path's VECTOR arguments: the reused read-only numpy array that the worker's
+    vector_arg made for (depth, argument, dimensions), and where its elements are. A hit copies
+    the message's elements there without calling Python (about 1 µs a row less; exp note 69).
+    Emptied at RESET, as the worker's vector_buffers. */
+struct VectorArg {
+  Ref view;
+  void *data = nullptr;
+};
+std::map<std::tuple<uint32_t, uint32_t, uint32_t>, VectorArg> g_vector_args;
+
+/** A VECTOR argument of the fast path: the cached array with the message's elements, or the one
+    vector_arg returns (cached when it is a read-only buffer of the elements: numpy's reused view;
+    without numpy it returns a new array each time). */
+Ref vector_argument(const Request &q, uint32_t i, uint32_t dims, const std::byte *src, PyObject *body,
+                    size_t pos) {
+  const auto key = std::make_tuple(q.depth, i, dims);
+  if (const auto it = g_vector_args.find(key); it != g_vector_args.end()) {
+    std::memcpy(it->second.data, src, size_t{dims} * 4);
+    return Ref::borrow(it->second.view.get());
+  }
+  Ref v = Ref::steal(PyObject_CallFunction(g_loop.vector_arg, "IIOn", i, dims, body, Py_ssize_t(pos)));
+  Py_buffer b;
+  if (PyObject_GetBuffer(v.get(), &b, PyBUF_SIMPLE) == 0) {
+    if (b.readonly && b.len == Py_ssize_t(size_t{dims} * 4)) g_vector_args[key] = {Ref::borrow(v.get()), b.buf};
+    PyBuffer_Release(&b);
+  } else {
+    PyErr_Clear();
+  }
+  return v;
+}
+
 constexpr uint32_t kFastParams = 64;
 
 /** The routine's value as the declared type, for the common cases only (exact int, float, str or
@@ -307,7 +341,7 @@ bool fast_call(Request &q, const Message &m, Ref &assembled) {
         const size_t pos = r.pos();
         r.take(size_t{dims} * 4);
         if (!body) body = body_object(m, assembled);
-        argv[i] = Ref::steal(PyObject_CallFunction(g_loop.vector_arg, "IIOn", i, dims, body.get(), Py_ssize_t(pos)));
+        argv[i] = vector_argument(q, i, dims, m.body.data() + pos, body.get(), pos);
       } else {
         r = at;
         argv[i] = decode_value(r, nullptr, nullptr);
@@ -392,6 +426,7 @@ void dispatch(const Message &m, Ref &assembled) {
   if (op == w::Op::kPrepare || op == w::Op::kDrop) forget_routine(q.routine_id);
   if (op == w::Op::kReset) {
     g_fast.clear();
+    g_vector_args.clear();
   }
   if (top) {
     // The worker begins to serve the request: it has received it completely (§11.1).
