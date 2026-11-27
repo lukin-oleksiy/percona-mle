@@ -79,8 +79,8 @@ session that uses two kinds holds two workers. Each kind has its own pool and li
 
 **The CPython worker** (`-DMLE_CPYTHON=ON`, the default when Python 3.12 or later with its headers is found,
 e.g. `python3-dev`): `mle_cpython_worker` embeds the distribution's CPython and runs `LANGUAGE CPYTHON`, with
-the same launcher, sandbox, protocol and SQL API (exp design note 62). A worker takes 12–18 MB (PSS; 23–34 MB
-with numpy) instead of hundreds, answers a new connection's first call in about 75 ms, and frees numpy memory at
+the same launcher, sandbox, protocol and SQL API (exp design note 62). A worker takes 11–16 MB (PSS; 22–31 MB
+with numpy) instead of hundreds, answers a new connection's first call in about 60 ms, and frees numpy memory at
 once. The build installs numpy
 (`MLE_CPYTHON_NUMPY`, default `numpy==2.4.4`) from PyPI into `cpython/site-packages`. In a build tree the
 worker's Python code (`worker/cpython/python`) is linked, not copied: an edit needs no build, the next worker
@@ -127,10 +127,10 @@ stored procedure (about 8 minutes); `perf/README.md` and `perf/e2e/README.md` sa
     perf/bench.py --server <release server build> --mle ../BUILD-mle-release --wait-quiet --json bench.json
     perf/e2e/e2e.py --server <release server build> --mle ../BUILD-mle-release --wait-quiet --json e2e.json
 
-**The run below:** 26 Nov 2026, full runs (not `--quick`), one run of each tool; the JSON with every measurement is
-in `perf/results/2026-11-26/`. A developer laptop, not a dedicated machine: HP ZBook Power G10 A, AMD Ryzen 9
+**The run below:** 27 Nov 2026, full runs (not `--quick`), one run of each tool; the JSON with every measurement is
+in `perf/results/2026-11-27/`. A developer laptop, not a dedicated machine: HP ZBook Power G10 A, AMD Ryzen 9
 7940HS (8 cores, 16 threads), 64 GB, Ubuntu 26.04.1, kernel 7.0, CPU governor `performance`. Release builds
-(RelWithDebInfo): MLE `3b5a8e2` (component and workers as on `main`), Percona Server 26.7.0 with js_lang and the
+(RelWithDebInfo): MLE `1b6235a` (component and workers as on `main`), Percona Server 26.7.0 with js_lang and the
 language router. GraalVM CE 25.6.5.1 (JDK 25.0.5.1), GraalPy 25.6.5 (Python 3.13), CPython 3.14.4, numpy 2.4.4, libnode
 127. MLE defaults, except `mle.heap_max` 2 GB and `mle.memory_max` 4 GB in the end-to-end run. bench.py times
 statements in the server and reports the best of 5 runs after a warm-up; lower is better everywhere except requests
@@ -139,14 +139,21 @@ per second.
 Against GraalVM 25.5.5 (the code before the update, `perf/regression.py` on the same machine): no case slower;
 Python routines with DECIMAL values 13–36 % faster.
 
+Against the run of 26 Nov (`3b5a8e2`, `perf/results/2026-11-26/`): a small statement from a routine 33–46 % faster
+(the host keeps a call's prepared statements); in CPython, numpy's 10 nearest 30 %, a `VECTOR` argument 33 % and a new
+worker 25 % faster; GraalPy with numpy 13 % smaller and its new worker 19 % sooner. The applications of e2e.py were
+3–12 % faster too, so part of the change is the machine's: compare columns of the same run.
+GraalJS's sort of 200,000
+objects (100 → 119 ms) is the spread of its runs: the median moved from 118 to 122 ms.
+
 ### Calls (bench.py)
 
 µs per row over 1,000,000 rows, net of a plain scan of the same rows:
 
 | | SQL (PSM) | js_lang | V8 worker | GraalJS | GraalPy | CPython | Java |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `a + b` | 1.06 | 1.21 | 1.34 | 1.27 | 1.25 | 1.31 | 1.20 |
-| Levenshtein of two strings | 91.1 | 2.19 | 2.41 | 2.40 | 2.70 | 8.77 | 1.51 |
+| `a + b` | 1.04 | 1.16 | 1.31 | 1.26 | 1.26 | 1.28 | 1.21 |
+| Levenshtein of two strings | 91.0 | 2.14 | 2.29 | 2.42 | 2.61 | 8.89 | 1.52 |
 
 A call into a worker costs 0.1–0.3 µs more than an SQL stored function's, about what js_lang's V8 inside mysqld costs;
 per-row logic runs 10–60 times faster than in an SQL stored function.
@@ -155,47 +162,47 @@ JavaScript, one call (ms):
 
 | | js_lang | V8 worker | GraalJS |
 |---|---:|---:|---:|
-| `Math.sqrt(i) * Math.sin(i)`, 5,000,000 times | 221 | 220 | 129 |
-| make and sort 200,000 objects | 52.0 | 57.4 | 100 |
-| `JSON.stringify` 200,000 small objects, `JSON.parse` the array | 82.9 | 91.8 | 132 |
+| `Math.sqrt(i) * Math.sin(i)`, 5,000,000 times | 216 | 219 | 123 |
+| make and sort 200,000 objects | 49.9 | 51.7 | 119 |
+| `JSON.stringify` 200,000 small objects, `JSON.parse` the array | 80.4 | 91.7 | 127 |
 
 ### SQL from routines (bench.py)
 
 | | SQL (PSM) | V8 worker | GraalJS | GraalPy | CPython | Java |
 |---|---:|---:|---:|---:|---:|---:|
-| read 100,000 rows one by one (ms) | 93.0 | 29.8 | 24.6 | 26.6 | 35.5 | 19.3 |
-| a small statement (µs each) | | 6.59 | 5.81 | 6.66 | 10.3 | 5.97 |
-| `executeMany`, 1,000 rows (ms) | | 13.2 | 14.2 | 14.8 | 13.5 | 13.3 |
+| read 100,000 rows one by one (ms) | 91.7 | 26.7 | 24.2 | 26.6 | 35.0 | 19.7 |
+| a small statement (µs each) | | 3.78 | 3.72 | 4.28 | 6.87 | 3.21 |
+| `executeMany`, 1,000 rows (ms) | | 11.9 | 12.8 | 14.1 | 13.3 | 13.3 |
 
 ### Vectors (bench.py)
 
 | | ms |
 |---|---:|
-| 10 nearest of 100,000 `VECTOR(768)`: SQL, exact | 102 |
-| the same with an HNSW index (`M = 16`, default search settings; 5 of the exact 10 found) | 0.30 |
-| the same in GraalPy, numpy | 279 |
-| the same in CPython, numpy | 370 |
-| the same in Java, the Vector API | 240 |
-| related items of 10,000 vectors (cosine), the built-in library from Java / JavaScript / Python | 216 / 218 / 218 |
-| the same, the library on one thread (`mle.vector_threads` is 4) | 824 |
-| the same in numpy, one BLAS thread: GraalPy / CPython | 1,928 / 1,937 |
+| 10 nearest of 100,000 `VECTOR(768)`: SQL, exact | 99.7 |
+| the same with an HNSW index (`M = 16`, default search settings; 5 of the exact 10 found) | 0.23 |
+| the same in GraalPy, numpy | 272 |
+| the same in CPython, numpy | 261 |
+| the same in Java, the Vector API | 236 |
+| related items of 10,000 vectors (cosine), the built-in library from Java / JavaScript / Python | 212 / 211 / 215 |
+| the same, the library on one thread (`mle.vector_threads` is 4) | 802 |
+| the same in numpy, one BLAS thread: GraalPy / CPython | 1,969 / 1,894 |
 
-A `VECTOR(768)` argument costs 4.3 µs per row in GraalPy and 3.7 µs in CPython.
+A `VECTOR(768)` argument costs 4.2 µs per row in GraalPy and 2.5 µs in CPython.
 
 ### A new connection's first call (bench.py)
 
-ms at the client, median of 7 new `mysql` processes; a plain connection with no routine takes 6.6 ms:
+ms at the client, median of 7 new `mysql` processes; a plain connection with no routine takes 5.2 ms:
 
 | | new worker (pool off) | worker from the pool |
 |---|---:|---:|
-| js_lang (in mysqld) | 6.6 | |
-| V8 worker | 32 | 8.9 |
-| CPython | 77 | 17 |
-| CPython, `import numpy` | 271 | 206 |
-| GraalJS | 753 | 177 |
-| Java | 689 | 55 |
-| GraalPy | 2,179 | 1,872 |
-| GraalPy, `import numpy` | 5,080 | 4,817 |
+| js_lang (in mysqld) | 6.2 | |
+| V8 worker | 30 | 8.8 |
+| CPython | 58 | 15 |
+| CPython, `import numpy` | 228 | 188 |
+| GraalJS | 713 | 150 |
+| Java | 626 | 53 |
+| GraalPy | 2,104 | 1,708 |
+| GraalPy, `import numpy` | 4,131 | 3,798 |
 
 A worker from the pool has the polyglot engine ready and sets JavaScript and GraalPy up on their first use, which
 keeps Java and Python workers smaller; `mle.pool_prewarm` sets them up in advance (`js`: GraalJS's first call in
@@ -207,47 +214,49 @@ PSS in MiB per worker, one worker alone and each of eight at once (they share co
 
 | | one | each of eight |
 |---|---:|---:|
-| V8 worker | 40 | 10 |
-| CPython | 18 | 12 |
-| CPython, numpy | 34 | 23 |
-| Java | 268 | 145 |
-| GraalJS | 332 | 204 |
-| GraalPy | 542 | 423 |
-| GraalPy, numpy | 704 | 584 |
+| V8 worker | 38 | 10 |
+| CPython | 16 | 11 |
+| CPython, numpy | 31 | 22 |
+| Java | 269 | 143 |
+| GraalJS | 325 | 210 |
+| GraalPy | 576 | 425 |
+| GraalPy, numpy | 590 | 510 |
 
 js_lang costs 0.5 MiB per session inside mysqld. The JVM worker maps its AOT cache at the cache's own address
-(`-XX:ArchiveRelocationMode=0`); relocated, as the JDK does by default, each of eight GraalJS workers takes 275 MiB
-instead of 204, and GraalPy with numpy 637 instead of 584.
+(`-XX:ArchiveRelocationMode=0`); relocated, as the JDK does by default, each of eight GraalJS workers takes 277 MiB
+instead of 210, and GraalPy with numpy 573 instead of 510.
 
 ### An application against the same logic in MLE (e2e.py)
 
-Clients in a network namespace with 1 ms added delay (round trip 1.14 ms, an application server on a LAN); clients
+Clients in a network namespace with 1 ms added delay (round trip 1.21 ms, an application server on a LAN); clients
 and server on the same laptop. Median ms per request with one client (change against the application in the same
 language), and requests per second with several clients:
 
 | Case | Java app | `LANGUAGE JAVA` | Python app (numpy) | `LANGUAGE PYTHON` (GraalPy) | `LANGUAGE CPYTHON` |
 |---|---:|---:|---:|---:|---:|
-| `chatty`: 3 dependent queries, 200 HNSW candidates | 6.87 | 4.02 (−41 %) | 8.32 | 6.67 (−20 %) | 5.57 (−33 %) |
-| `mmr500`: re-rank 500 candidates with their vectors | 4.97 | 4.11 (−17 %) | 7.82 | 7.85 (0 %) | 7.39 (−5 %) |
-| `rescore1000`: rescore 1,000 candidates | 5.76 | 5.08 (−12 %) | 6.94 | 7.72 (+11 %) | 7.45 (+7 %) |
-| `bulk`: ~5,000 vectors of a category | 28.4 | 18.0 (−37 %) | 44.7 | 22.0 (−51 %) | 26.7 (−40 %) |
-| `wb200`: read 200 rows, score, upsert, commit | 7.50 | 4.79 (−36 %) | 7.56 | 7.31 (−3 %) | 7.11 (−6 %) |
-| `wb1000`: the same with 1,000 rows | 15.1 | 11.0 (−28 %) | 20.1 | 15.2 (−24 %) | 15.8 (−21 %) |
-| `wbvec200`: write back 200 rows with a `VECTOR(768)` each | 16.2 | 12.9 (−20 %) | 28.7 | 15.1 (−48 %) | 16.7 (−42 %) |
-| `chatty`, 8 clients (req/s) | 1,194 | 1,593 | 895 | 870 | 1,226 |
-| `mmr500`, 8 clients (req/s) | 1,102 | 1,390 | 728 | 831 | 920 |
-| `wb200`, 4 clients (req/s) | 543 | 714 | 517 | 531 | 552 |
+| `chatty`: 3 dependent queries, 200 HNSW candidates | 6.65 | 3.67 (−45 %) | 8.03 | 6.44 (−20 %) | 5.10 (−37 %) |
+| `mmr500`: re-rank 500 candidates with their vectors | 4.64 | 3.93 (−15 %) | 6.96 | 7.48 (+7 %) | 6.93 (0 %) |
+| `rescore1000`: rescore 1,000 candidates | 5.47 | 4.73 (−14 %) | 6.33 | 7.35 (+16 %) | 7.10 (+12 %) |
+| `bulk`: ~5,000 vectors of a category | 25.9 | 16.5 (−36 %) | 39.4 | 20.3 (−48 %) | 20.4 (−48 %) |
+| `wb200`: read 200 rows, score, upsert, commit | 7.19 | 4.42 (−38 %) | 6.88 | 6.28 (−9 %) | 6.25 (−9 %) |
+| `wb1000`: the same with 1,000 rows | 13.9 | 10.2 (−27 %) | 17.6 | 14.0 (−21 %) | 14.7 (−16 %) |
+| `wbvec200`: write back 200 rows with a `VECTOR(768)` each | 15.6 | 12.2 (−22 %) | 26.2 | 13.9 (−47 %) | 15.0 (−43 %) |
+| `chatty`, 8 clients (req/s) | 1,223 | 1,660 | 905 | 884 | 1,295 |
+| `mmr500`, 8 clients (req/s) | 1,188 | 1,486 | 784 | 878 | 955 |
+| `wb200`, 4 clients (req/s) | 545 | 860 | 526 | 562 | 558 |
 
 MLE wins where the application needs several round trips or moves many rows; where one query brings all the data
-and the work is numpy's, the Python application is about as fast (`mmr500`) or faster (`rescore1000`).
+and the work is numpy's, the Python application is about as fast (`mmr500`) or 12–16 % faster (`rescore1000`).
 
 ### The protocol specification against the code before it
 
 `perf/regression.py`, the specified protocol (1.0) against the code before the specification (`2a87613`):
 calls 13–16 % faster, `TIMESTAMP` values 13–23 %, per-row logic, libraries and prepared and nested calls 4–10 %; the
 other cases (rows, statements, writes, vectors, connections, cold start, idle memory) equal within measurement.
-One cost is open: the component's subscription to query events adds about 0.1 µs to every statement on the server,
-MLE or not (`docs/protocol-review.md` §22).
+The component's subscription to query events adds about 0.1 µs to every statement on the server, MLE or not;
+measured and accepted (`docs/limits.md`, "Every statement pays a little while the component is installed").
+Since then the protocol carries a body of up to 40 bytes in the poster's own cache line: calls from Java and Python 1–3 % faster,
+the others equal within measurement.
 
 ## First call and memory: pools, pre-warming, reuse
 
