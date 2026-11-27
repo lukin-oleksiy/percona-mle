@@ -34,6 +34,15 @@ values map to each language is in its Appendix B.
   ended only when the grace period (`mle.interrupt_grace_ms`) ends the worker.
 * **Python, zero dates.** A zero or partial date and the zero TIMESTAMP
   are `None` in Python (B.4), which guest code cannot tell from NULL.
+* **Routines compiled again in every session.** A session's first call of
+  a routine compiles it, even in a worker that comes warm from the worker
+  cache: a worker keeps no compiled code from the previous session. The
+  cost grows with the body: for a 600-line routine, about 100 ms in
+  GraalPy (`LANGUAGE PYTHON`), 11 ms in CPython, 5 ms in GraalJS and
+  0.4 ms in V8, against 0.5–3.6 ms for a one-line routine. A connection
+  that stays open pays it once per routine. Candidate improvement: keep
+  compiled code in the worker, keyed by the routine's text, through the
+  reset between sessions.
 
 ## SQL from routines
 
