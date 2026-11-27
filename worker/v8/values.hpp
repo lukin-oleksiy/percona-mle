@@ -206,9 +206,11 @@ bool write_utf8(v8::Isolate *iso, Writer &w, v8::Local<v8::String> s);
 /** The UTF-8 of a V8 string that is code or a name (SQL text, a library's name), which is never
     repaired; nullopt if it has an unpaired surrogate. */
 std::optional<std::string> utf8_exact(v8::Isolate *iso, v8::Local<v8::String> s);
-/** A V8 string of UTF-8 text (internalized when short); ill-formed sequences are repaired as §7.1
-    says (U+FFFD per maximal subpart). ConversionError if it is longer than V8's strings can be. */
-v8::Local<v8::String> v8_string(v8::Isolate *iso, std::string_view s);
+/** A V8 string of UTF-8 text; ill-formed sequences are repaired as §7.1 says (U+FFFD per maximal
+    subpart). ConversionError if it is longer than V8's strings can be. key: a short text is
+    internalized (a name, a label); a data value is not: interning every short value of a row
+    hashes it into the isolate's string table (exp note 69). */
+v8::Local<v8::String> v8_string(v8::Isolate *iso, std::string_view s, bool key = true);
 
 /** The domain of a Civil value under its tag (§7.2). */
 bool valid_temporal(const Temporal &t);

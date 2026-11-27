@@ -351,11 +351,11 @@ std::optional<std::string> utf8_exact(v8::Isolate *iso, Local<v8::String> s) {
   return out;
 }
 
-Local<v8::String> v8_string(v8::Isolate *iso, std::string_view s) {
+Local<v8::String> v8_string(v8::Isolate *iso, std::string_view s, bool key) {
   Local<v8::String> out;
   if (s.size() > static_cast<size_t>(v8::String::kMaxLength) ||
       !v8::String::NewFromUtf8(iso, s.data(),
-                               s.size() < 32 ? v8::NewStringType::kInternalized : v8::NewStringType::kNormal,
+                               key && s.size() < 32 ? v8::NewStringType::kInternalized : v8::NewStringType::kNormal,
                                static_cast<int>(s.size()))
            .ToLocal(&out))
     throw ConversionError{"a text of " + std::to_string(s.size()) + " bytes is longer than a JavaScript string can be"};
@@ -704,7 +704,7 @@ Local<Value> Values::value(Reader &r, const ParamType &t, bool argument) {
       const std::string_view s = r.str();
       if (rules()->decimal_type == DecimalType::kNumber)
         return v8::Number::New(m_iso, std::strtod(std::string(s).c_str(), nullptr));
-      return v8_string(m_iso, s);
+      return v8_string(m_iso, s, false);
     }
     case w::Tag::kString: {
       // An lstr: ill-formed UTF-8 of the server's data is repaired by v8_string (§7.1).
@@ -722,7 +722,7 @@ Local<Value> Values::value(Reader &r, const ParamType &t, bool argument) {
         }
         return set;
       }
-      return v8_string(m_iso, s);
+      return v8_string(m_iso, s, false);
     }
     case w::Tag::kBytes: {
       const auto n = r.get<uint32_t>();
