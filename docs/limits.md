@@ -82,6 +82,13 @@ values map to each language is in its Appendix B.
 
 ## Administration
 
+* **Every statement pays a little while the component is installed.** The
+  component follows the server's query events, to see statements that
+  change a library, a routine, a right or an account; the server builds
+  and delivers that event for every statement, MLE or not. Measured: about
+  700 instructions (0.1–0.2 µs) per statement, 1 % of a sysbench point
+  select, not visible in throughput. Candidate improvement: a server-side
+  filter that delivers only the statement types a component asks for.
 * **The system time zone.** `time_zone = SYSTEM` reaches the workers as
   the IANA name of mysqld's zone; if none can be found, as the current
   offset, which is wrong after the next change of daylight saving time
