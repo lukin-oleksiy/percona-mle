@@ -1,0 +1,58 @@
+--echo #
+--echo # component_mle: the worker's seccomp filter for calls that act on a process
+--echo # (independent review C113): sched_setaffinity, sched_setscheduler,
+--echo # sched_setparam, sched_setattr and setpriority only for the worker itself;
+--echo # tkill never. Another process of mysqld's OS user (the launcher, the worker's
+--echo # parent) is refused with EPERM. The refused forms use arguments the kernel
+--echo # itself would refuse (no mask, no parameters, nice -20 without CAP_SYS_NICE):
+--echo # had seccomp let one through, its errno would show it and nothing changes.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+--write_file $MYSQLTEST_VARDIR/tmp/seccomp_process.sql
+CREATE FUNCTION py_sched() RETURNS TEXT LANGUAGE PYTHON AS $$
+    import ctypes, os
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    nr = {'x86_64': {'sched_setaffinity': 203, 'sched_setscheduler': 144, 'sched_setparam': 142,
+                     'sched_setattr': 314, 'tkill': 200, 'gettid': 186},
+          'aarch64': {'sched_setaffinity': 122, 'sched_setscheduler': 119, 'sched_setparam': 118,
+                      'sched_setattr': 274, 'tkill': 130, 'gettid': 178}}[os.uname().machine]
+    def call(name, f, *args):
+        ctypes.set_errno(0)
+        if f(*args) == 0:
+            return name + ':ok'
+        err = ctypes.get_errno()
+        return name + (':refused' if err == 1 else ':ALLOWED(kernel errno %d)' % err)
+    other = libc.getppid()  # GraalPy's Java POSIX backend has no os.getppid
+    mask = (ctypes.c_ulong * 16)()
+    libc.sched_getaffinity(0, ctypes.sizeof(mask), mask)
+    param = ctypes.c_int(0)
+    return '\n'.join([
+        # Itself: allowed, and nothing changes (its own mask, SCHED_OTHER with priority 0).
+        call('sched_setaffinity(self)', libc.syscall, nr['sched_setaffinity'], 0, ctypes.sizeof(mask), mask),
+        call('sched_setparam(self)', libc.syscall, nr['sched_setparam'], 0, ctypes.byref(param)),
+        call('sched_setscheduler(self)', libc.syscall, nr['sched_setscheduler'], 0, 0, ctypes.byref(param)),
+        # Another process of the same OS user: refused.
+        call('sched_setaffinity(other)', libc.syscall, nr['sched_setaffinity'], other, 0, None),
+        call('sched_setscheduler(other)', libc.syscall, nr['sched_setscheduler'], other, 0, None),
+        call('sched_setparam(other)', libc.syscall, nr['sched_setparam'], other, None),
+        call('sched_setattr(other)', libc.syscall, nr['sched_setattr'], other, None, 0),
+        call('setpriority(PROCESS,other)', libc.setpriority, 0, other, -20),
+        # tkill: refused even for its own thread (signal 0 only checks).
+        call('tkill(self,0)', libc.syscall, nr['tkill'], libc.syscall(nr['gettid']), 0)])
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/seccomp_process.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/seccomp_process.sql
+--connect (con1, localhost, root,,test)
+SELECT py_sched() AS probes;
+DROP FUNCTION py_sched;
+--disconnect con1
+--connection default
+REVOKE CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+--source include/wait_until_count_sessions.inc
+UNINSTALL COMPONENT "file://component_mle";

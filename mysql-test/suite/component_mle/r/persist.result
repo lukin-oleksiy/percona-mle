@@ -1,0 +1,35 @@
+#
+# component_mle: SET PERSIST of mle.* variables survives a restart (exp note 42:
+# reported 17 Nov from a benchmark server, not reproduced 28 Nov; kept as a test).
+# Plain and 64-bit settings, one that restarts the engine (memory_max).
+#
+INSTALL COMPONENT "file://component_mle";
+SELECT @@mle.pool_size, @@mle.vector_threads, @@mle.worker_cache_size, @@mle.sql_result_max, @@mle.memory_max;
+@@mle.pool_size	@@mle.vector_threads	@@mle.worker_cache_size	@@mle.sql_result_max	@@mle.memory_max
+2	4	4	67108864	2147483648
+SET PERSIST mle.pool_size = 3;
+SET PERSIST mle.vector_threads = 2;
+SET PERSIST mle.worker_cache_size = 7;
+SET PERSIST mle.sql_result_max = 1073741824;
+SET PERSIST mle.memory_max = 3 * 1024 * 1024 * 1024;
+SELECT @@mle.pool_size, @@mle.vector_threads, @@mle.worker_cache_size, @@mle.sql_result_max, @@mle.memory_max;
+@@mle.pool_size	@@mle.vector_threads	@@mle.worker_cache_size	@@mle.sql_result_max	@@mle.memory_max
+3	2	7	1073741824	3221225472
+# restart
+SELECT @@mle.pool_size, @@mle.vector_threads, @@mle.worker_cache_size, @@mle.sql_result_max, @@mle.memory_max;
+@@mle.pool_size	@@mle.vector_threads	@@mle.worker_cache_size	@@mle.sql_result_max	@@mle.memory_max
+3	2	7	1073741824	3221225472
+SELECT VARIABLE_NAME, VARIABLE_SOURCE FROM performance_schema.variables_info WHERE VARIABLE_NAME IN ('mle.pool_size','mle.vector_threads','mle.worker_cache_size','mle.sql_result_max','mle.memory_max') ORDER BY 1;
+VARIABLE_NAME	VARIABLE_SOURCE
+mle.memory_max	PERSISTED
+mle.pool_size	PERSISTED
+mle.sql_result_max	PERSISTED
+mle.vector_threads	PERSISTED
+mle.worker_cache_size	PERSISTED
+RESET PERSIST;
+SET GLOBAL mle.pool_size = DEFAULT;
+SET GLOBAL mle.vector_threads = DEFAULT;
+SET GLOBAL mle.worker_cache_size = DEFAULT;
+SET GLOBAL mle.sql_result_max = DEFAULT;
+SET GLOBAL mle.memory_max = DEFAULT;
+UNINSTALL COMPONENT "file://component_mle";

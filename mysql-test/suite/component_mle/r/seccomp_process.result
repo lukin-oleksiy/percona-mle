@@ -1,0 +1,25 @@
+#
+# component_mle: the worker's seccomp filter for calls that act on a process
+# (independent review C113): sched_setaffinity, sched_setscheduler,
+# sched_setparam, sched_setattr and setpriority only for the worker itself;
+# tkill never. Another process of mysqld's OS user (the launcher, the worker's
+# parent) is refused with EPERM. The refused forms use arguments the kernel
+# itself would refuse (no mask, no parameters, nice -20 without CAP_SYS_NICE):
+# had seccomp let one through, its errno would show it and nothing changes.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE ON *.* TO root@localhost;
+SELECT py_sched() AS probes;
+probes
+sched_setaffinity(self):ok
+sched_setparam(self):ok
+sched_setscheduler(self):ok
+sched_setaffinity(other):refused
+sched_setscheduler(other):refused
+sched_setparam(other):refused
+sched_setattr(other):refused
+setpriority(PROCESS,other):refused
+tkill(self,0):refused
+DROP FUNCTION py_sched;
+REVOKE CREATE_PYTHON_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

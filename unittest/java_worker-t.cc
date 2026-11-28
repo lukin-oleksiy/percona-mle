@@ -22,6 +22,8 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
+
 #include <linux/futex.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -146,6 +148,59 @@ TEST(MleJavaWorkerArgs, StackSizeIsTheWholeValue) {
   EXPECT_EQ(run("--stack=1M"), 20);
   EXPECT_EQ(run("--stack=1024"), 20);       // below 256 KiB
   EXPECT_NE(run("--stack=1048576"), 20);    // accepted: fails later, without a JVM
+}
+
+TEST(MleJavaWorkerDiagnostics, ExtraOptionsAndTheDebugDirectory) {
+  // Independent review C136: the diagnostic settings (README: MLE_JVM_OPTIONS -> extra JVM
+  // options, MLE_DEBUG_WRITE_DIR -> LauncherConfig::debug_write_dir) reach the worker: a -D option
+  // is seen by routine code, a file can be written in the debug directory and nowhere else.
+  char tmpl[] = "/tmp/mle-debug-XXXXXX";
+  ASSERT_NE(mkdtemp(tmpl), nullptr);
+  const std::string dir = tmpl;
+  JvmClassOptions o;
+  o.name = "diag";
+  o.prewarm = "java";
+  o.heap = "256m";
+  o.extra_jvm_options = {"-Dmle.test.diagnostic=on"};
+  LauncherConfig c;
+  c.launcher_exe = MLE_LAUNCHER_EXE;
+  c.classes = {jvm_worker_class(build_layout(), o)};
+  c.debug_write_dir = dir;
+  std::string err;
+  auto l = Launcher::start(c, &err);
+  ASSERT_NE(l, nullptr) << err;
+  auto w = l->acquire("diag", &err);
+  ASSERT_NE(w, nullptr) << err;
+  TestHost h(std::move(w));
+  ReadyMsg ready;
+  ASSERT_TRUE(h.wait_ready(&ready, &err)) << err;
+  PrepareMsg p;
+  p.routine_id = 1;
+  p.language = "java";
+  p.entry = "Diag.f";
+  p.source =
+      "public class Diag {\n"
+      "  static String write(String path) {\n"
+      "    try { java.nio.file.Files.writeString(java.nio.file.Path.of(path), \"x\"); return \"written\"; }\n"
+      "    catch (Exception e) { return \"refused\"; }\n"
+      "  }\n"
+      "  public static String f(String dir) {\n"
+      "    return System.getProperty(\"mle.test.diagnostic\") + \" \" + write(dir + \"/out.txt\") + \" \"\n"
+      "        + write(\"/tmp/mle-outside-\" + ProcessHandle.current().pid() + \".txt\");\n"
+      "  }\n"
+      "}\n";
+  p.params = {{"p1", wire::ParamMode::kIn, type_of(Tag::kString)}};
+  p.returns = type_of(Tag::kString);
+  ResultMsg res;
+  ASSERT_EQ(h.prepare(p, &res), 0u) << error_of(res);
+  ASSERT_EQ(h.call(1, {Value::string(dir)}, &res), 0u) << error_of(res);
+  EXPECT_EQ(*res.ret, Value::string("on written refused"));
+  std::ifstream f(dir + "/out.txt");
+  std::string text;
+  std::getline(f, text);
+  EXPECT_EQ(text, "x");
+  std::remove((dir + "/out.txt").c_str());
+  rmdir(dir.c_str());
 }
 
 TEST_F(MleJavaWorker, AddTwoLongs) {

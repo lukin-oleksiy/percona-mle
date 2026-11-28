@@ -1,0 +1,212 @@
+--echo #
+--echo # component_mle: executeMany branches without a test before (independent
+--echo # review C123, C125). Multi-row INSERTs (PreparedStatement.executeRewritten):
+--echo # an error that is not a row's (a lock wait timeout) is not replayed row by
+--echo # row; a statement of 70 markers per row runs in chunks of 65535 / 70 = 936
+--echo # rows; rows large enough to fill a message's bytes split a chunk; a
+--echo # prepared statement keeps 4 chunk statements and deallocates the least
+--echo # recently used one for a fifth. Row by row (executeRows, batchRewrite off):
+--echo # a batch over several messages, an error in a later message reports the
+--echo # batch's row index.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE lk (id INT PRIMARY KEY, a VARCHAR(20), x DOUBLE) ENGINE=InnoDB;
+CREATE TABLE big (id INT PRIMARY KEY, t MEDIUMTEXT) ENGINE=InnoDB;
+CREATE TABLE lru (id INT PRIMARY KEY, a VARCHAR(20)) ENGINE=InnoDB;
+CREATE TABLE rr (id INT PRIMARY KEY, s VARCHAR(200)) ENGINE=InnoDB;
+
+--write_file $MYSQLTEST_VARDIR/tmp/sql_batch_review.sql
+-- Statements counted by Com_insert, as in sql_batch.test.
+CREATE PROCEDURE py_chunks(OUT r TEXT) LANGUAGE PYTHON AS $$
+    def statements():
+        return int(session.run_sql("SHOW SESSION STATUS LIKE 'Com_insert'").fetch_one()[1])
+    out = []
+    def run(label, sql, data):
+        before = statements()
+        try:
+            got = 'affected %d' % session.execute_many(sql, data).get_affected_items_count()
+        except SqlError as e:
+            got = 'error %d row %s' % (e.code, e.row)
+        out.append('%s: %s, statements %d' % (label, got, statements() - before))
+    # 70 markers per row: at most 936 rows per statement (65,535 markers), not 1,000. The rows
+    # are small (NULLs, short strings): the bytes of a message do not limit them.
+    session.run_sql("CREATE TABLE wide (id INT PRIMARY KEY, "
+                    + ', '.join('c%d VARCHAR(4)' % i for i in range(1, 70)) + ") ENGINE=InnoDB")
+    ins = ("INSERT INTO wide (id, " + ', '.join('c%d' % i for i in range(1, 70)) + ") VALUES ("
+           + ', '.join(['?'] * 70) + ")")
+    def wide(start, n):
+        return [[start + i] + [None] * 67 + ['a', 'z%d' % (i % 10)] for i in range(n)]
+    run('70 markers, 2000 rows (936 + 936 + 128)', ins, wide(1, 2000))
+    run('70 markers, 1887 rows (936 + 936, then 15 row by row)', ins, wide(10001, 1887))
+    c = session.run_sql("SELECT COUNT(*) AS n, COUNT(c69) AS z, COUNT(c1) AS c1, MAX(id) AS m FROM wide").fetch_one()
+    out.append('wide: %d rows, %d c69, %d c1, max id %d' % (c.n, c.z, c.c1, c.m))
+    session.run_sql("DROP TABLE wide")
+    # Rows of ~30 KB in the estimate of PreparedStatement.size (8 + 3 per character, 24 for the
+    # int): 26 rows fill the 768 KB of a message (3/4 of the 1 MiB arena), so 312 rows run in 12
+    # statements of 26 rows; 300 rows in 11 of 26 and the last 14 row by row.
+    x = 'x' * 10000
+    run('312 rows of 10,000 characters (12 x 26)', "INSERT INTO big VALUES (?, ?)", [[i, x] for i in range(1, 313)])
+    run('300 rows of 10,000 characters (11 x 26, then 14 row by row)', "INSERT INTO big VALUES (?, ?)",
+        [[i, x] for i in range(1001, 1301)])
+    c = session.run_sql("SELECT COUNT(*) AS n, SUM(LENGTH(t)) AS l, SUM(t = REPEAT('x', 10000)) AS same FROM big").fetch_one()
+    out.append('big: %d rows, %d characters, %d intact' % (c.n, c.l, c.same))
+    r = '\n'.join(out)
+$$;
+-- 1300 rows into lk: rows 0-999 in one statement, rows 1000-1299 in a second that waits for the
+-- lock on id 1101 (row 1100) held by another connection and fails with 1205.
+CREATE PROCEDURE py_lock(OUT r TEXT) LANGUAGE PYTHON AS $$
+    def statements():
+        return int(session.run_sql("SHOW SESSION STATUS LIKE 'Com_insert'").fetch_one()[1])
+    before = statements()
+    try:
+        session.execute_many("INSERT INTO lk (id, a, x) VALUES (?, ?, ?)", [[i, 'r', i * 0.5] for i in range(1, 1301)])
+        out = ['no error']
+    except SqlError as e:
+        out = ['error %d %s row %s: %s' % (e.code, e.sql_state, e.row, e.message)]
+    out.append('statements %d' % (statements() - before))
+    c = session.run_sql("SELECT COUNT(*) AS n, MAX(id) AS m FROM lk").fetch_one()
+    out.append('kept %d rows, up to id %d' % (c.n, c.m))
+    r = '\n'.join(out)
+$$;
+-- One prepared statement, batches of 300, 301, 302, 303, 304 rows (one chunk statement each),
+-- then 301, 300, 302, 304: the chunk statements alive (Prepared_stmt_count less the statement
+-- itself) and the server's preparations for each batch (performance_schema).
+CREATE PROCEDURE py_lru(OUT r TEXT) LANGUAGE PYTHON AS $$
+    def alive():
+        return int(session.run_sql("SHOW GLOBAL STATUS LIKE 'Prepared_stmt_count'").fetch_one()[1])
+    def prepares():
+        return int(session.run_sql(
+            "SELECT COUNT_STAR FROM performance_schema.events_statements_summary_by_thread_by_event_name "
+            "WHERE THREAD_ID = PS_CURRENT_THREAD_ID() AND EVENT_NAME = 'statement/stmt_handle/prepare'").fetch_one()[0])
+    sql = "INSERT INTO lru (id, a) VALUES (?, ?)"
+    # The engine lookup of the table, once per worker: not in the counts below.
+    session.execute_many(sql, [[i, 'w'] for i in range(1, 301)])
+    session.run_sql("DELETE FROM lru")
+    base = alive()
+    # The probes' own preparations, to take away.
+    p0 = prepares()
+    probe = prepares() - p0
+    st = session.prepare(sql)
+    out = ['statement: alive %d' % (alive() - base)]
+    start = 0
+    for n in (300, 301, 302, 303, 304, 301, 300, 302, 304):
+        p0 = prepares()
+        got = st.execute_many([[start + i, 'v'] for i in range(n)]).get_affected_items_count()
+        prepared = prepares() - p0 - probe
+        out.append('%d rows: affected %d, chunk statements alive %d, prepared %d'
+                   % (n, got, alive() - base - 1, prepared))
+        start += 1000
+    st.deallocate()
+    out.append('deallocated: alive %d' % (alive() - base))
+    out.append('rows %d' % session.run_sql("SELECT COUNT(*) FROM lru").fetch_one()[0])
+    r = '\n'.join(out)
+$$;
+-- Row by row (batchRewrite off) over several messages: rows of 332 bytes in the estimate of
+-- PreparedStatement.size (24 for the Integer, 8 + 3 x 100 for the string), 2,368 rows per
+-- message of 768 KB: 12,000 rows in 6 messages (rows 0, 2368, 4736, 7104, 9472, 11840 first).
+-- A duplicate key at the last row of message 4, the first of message 5, the last row of all,
+-- the first of message 2 and row 0: the error's row is the batch's, the rows before it stay
+-- (in the caller's transaction).
+CREATE PROCEDURE java_rows(OUT r TEXT) LANGUAGE JAVA AS $$
+Session s = Mle.session();
+SqlOptions off = new SqlOptions().batchRewrite(false);
+String x = "x".repeat(100);
+java.util.function.LongSupplier inserts =
+    () -> Long.parseLong(String.valueOf(s.runSql("SHOW SESSION STATUS LIKE 'Com_insert'").fetchOne().get(1)));
+s.runSql("INSERT INTO rr VALUES (0, 'sentinel')");
+List<Object[]> rows = new ArrayList<>();
+for (int i = 0; i < 12000; i++) rows.add(new Object[] {i + 1, x});
+// In a transaction, rolled back after each case (a commit per row would cost a log flush each).
+s.startTransaction();
+long before = inserts.getAsLong();
+SqlResult res = s.executeMany("INSERT INTO rr VALUES (?, ?)", rows, off);
+StringBuilder b = new StringBuilder("12000 rows: affected " + res.getAffectedItemsCount() + ", statements "
+    + (inserts.getAsLong() - before));
+Row c = s.runSql("SELECT COUNT(*), SUM(LENGTH(s)), MAX(id) FROM rr WHERE id > 0").fetchOne();
+b.append(", kept ").append(c.get(0)).append(" rows, ").append(c.get(1)).append(" characters, max id ").append(c.get(2));
+s.rollback();
+for (int bad : new int[] {9471, 9472, 11999, 2368, 0}) {
+  s.startTransaction();
+  List<Object[]> rs = new ArrayList<>(rows);
+  rs.set(bad, new Object[] {0, "dup"});
+  PreparedStatement p = s.prepare("INSERT INTO rr VALUES (?, ?)", off);
+  b.append("\nduplicate at row ").append(bad).append(": ");
+  try {
+    p.executeMany(rs);
+    b.append("no error");
+  } catch (MleSqlException e) {
+    b.append("error ").append(e.getErrorCode()).append(" row ").append(e.getRow());
+  }
+  p.deallocate();
+  c = s.runSql("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM rr WHERE id > 0").fetchOne();
+  b.append(", kept ").append(c.get(0)).append(" rows, up to id ").append(c.get(1));
+  s.rollback();
+}
+b.append("\nafter the rollbacks: ").append(s.runSql("SELECT COUNT(*) FROM rr").fetchOne().get(0)).append(" row");
+r[0] = b.toString();
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/sql_batch_review.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/sql_batch_review.sql
+
+--connect (con1, localhost, root,,test)
+
+--echo #
+--echo # 1. The marker cap (70 markers: 936 rows per statement) and the byte
+--echo #    budget of a message (rows of 10,000 characters: 26 per statement); a
+--echo #    tail of fewer than 16 rows runs row by row.
+--echo #
+CALL py_chunks(@r);
+SELECT @r;
+
+--echo #
+--echo # 2. A lock wait timeout (1205) in the second chunk: not one of a row's
+--echo #    errors, so the chunk is not replayed row by row (which would wait for
+--echo #    the lock again); the error carries the chunk's first row (1000) and
+--echo #    says so. The first chunk's 1,000 rows stay.
+--echo #
+--connection default
+BEGIN;
+INSERT INTO lk VALUES (1101, 'held', 0);
+--connection con1
+SET SESSION innodb_lock_wait_timeout = 1;
+CALL py_lock(@r);
+SELECT @r;
+SET SESSION innodb_lock_wait_timeout = DEFAULT;
+--connection default
+ROLLBACK;
+--connection con1
+
+--echo #
+--echo # 3. The chunk statements of one prepared statement: 4 kept, the least
+--echo #    recently used deallocated for a fifth and prepared again when its size
+--echo #    comes back; all deallocated with the statement. Kept statements of the
+--echo #    session (mle.sql_statement_cache) would hide the preparations: none.
+--echo #
+SET GLOBAL mle.sql_statement_cache = 0;
+CALL py_lru(@r);
+SELECT @r;
+SET GLOBAL mle.sql_statement_cache = DEFAULT;
+
+--echo #
+--echo # 4. Row by row over 6 messages (batchRewrite off, the multi-row path
+--echo #    of sql_batch's Java case no longer runs): 12,000 statements; a
+--echo #    duplicate key at the message boundaries reports the batch's row.
+--echo #
+CALL java_rows(@r);
+SELECT @r;
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP PROCEDURE py_chunks;
+DROP PROCEDURE py_lock;
+DROP PROCEDURE py_lru;
+DROP PROCEDURE java_rows;
+DROP TABLE lk, big, lru, rr;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

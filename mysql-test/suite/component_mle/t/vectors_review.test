@@ -1,0 +1,197 @@
+--echo #
+--echo # component_mle: Vectors.nearest with several queries at once (the tiled
+--echo # batch) over more rows than one CHUNK of packed rows (VectorEngine.CHUNK,
+--echo # at most 8,192 rows), independent review C131: each query's matches are
+--echo # those of the single-query nearest() and of a reference in double
+--echo # precision; rows planted in the second and third chunks are found; the
+--echo # same with 1 thread as with 4; a VectorSet from SQL the same.
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE vr (id BIGINT PRIMARY KEY, v VECTOR(8));
+
+--write_file $MYSQLTEST_VARDIR/tmp/vectors_review.sql
+-- 'ok <checks> <digest of the indexes>' or the first failure. Rows: 3 x 8,192 + 77 (three
+-- chunks whatever the tile width; the last one not a whole panel). Planted: an exact copy of
+-- query 0 at rows 8200 and 20000 (second and third chunks), and one row repeated at rows 8150,
+-- 8250 and 16400 (both sides of the first chunk boundary and in the third chunk) that query 1
+-- equals. 4, 6 (a short query block) and 133 queries (more than one block of 128; split over
+-- threads).
+CREATE FUNCTION vec_batch_chunks() RETURNS TEXT LANGUAGE JAVA AS $$
+final int chunkMax = Integer.getInteger("mle.vectorChunkRows", 8192);
+final int n = 3 * 8192 + 77;
+if (n <= 2 * chunkMax) return "FAIL: rows " + n + " fit in two chunks of " + chunkMax;
+Random r = new Random(11);
+long[] digest = {17};
+int[] checks = {0};
+StringBuilder fail = new StringBuilder();
+for (int d : new int[] {8, 13, 100}) {
+  float[][] rows = new float[n][d];
+  for (float[] v : rows) for (int i = 0; i < d; i++) v[i] = (float) r.nextGaussian();
+  for (int nq : new int[] {4, 6, 133}) {
+    float[][] qs = new float[nq][d];
+    for (float[] v : qs) for (int i = 0; i < d; i++) v[i] = (float) r.nextGaussian();
+    rows[8200] = qs[0].clone();
+    rows[20000] = qs[0].clone();
+    rows[8250] = rows[8150].clone();
+    rows[16400] = rows[8150].clone();
+    qs[1] = rows[8150].clone();
+    for (Vectors.Metric m : Vectors.Metric.values())
+      for (int k : new int[] {1, 10, 300}) {
+        String w = "d=" + d + " nq=" + nq + " " + m + " k=" + k;
+        Matches[] b = Vectors.nearest(qs, rows, k, m);
+        if (b.length != nq) { fail.append(w).append(": ").append(b.length).append(" results"); break; }
+        for (int q = 0; q < nq && fail.length() == 0; q++) {
+          Matches s = Vectors.nearest(qs[q], rows, k, m);
+          if (b[q].size() != s.size() || s.size() != k) {
+            fail.append(w).append(" query ").append(q).append(": ").append(b[q].size()).append(" matches, single ")
+                .append(s.size());
+            break;
+          }
+          for (int i = 0; i < k; i++) {
+            float tol = 1e-4f * (float) Math.max(1, Math.sqrt(d)) * Math.max(1, Math.abs(s.score(i)));
+            // The same rows in the same order; rows may swap only where their scores tie.
+            if (Math.abs(b[q].score(i) - s.score(i)) > tol) {
+              fail.append(w).append(" query ").append(q).append(" position ").append(i).append(": row ")
+                  .append(b[q].index(i)).append(" score ").append(b[q].score(i)).append(", single row ")
+                  .append(s.index(i)).append(" score ").append(s.score(i));
+              break;
+            }
+            digest[0] = digest[0] * 31 + b[q].index(i);
+          }
+          checks[0]++;
+        }
+        if (fail.length() > 0) break;
+        // The planted rows, by EUCLIDEAN (distance 0; ties in row order).
+        if (m == Vectors.Metric.EUCLIDEAN && k >= 3) {
+          String got0 = b[0].index(0) + "," + b[0].index(1) + " " + b[0].score(0) + "," + b[0].score(1);
+          String got1 = b[1].index(0) + "," + b[1].index(1) + "," + b[1].index(2) + " " + b[1].score(2);
+          if (!got0.equals("8200,20000 0.0,0.0") || !got1.equals("8150,8250,16400 0.0")) {
+            fail.append(w).append(": planted rows ").append(got0).append(" / ").append(got1);
+            break;
+          }
+          checks[0]++;
+        }
+        // Against double precision for the first queries (scores; rows where scores do not tie).
+        for (int q = 0; q < Math.min(nq, 3) && fail.length() == 0; q++) {
+          double[] exact = new double[n];
+          for (int j = 0; j < n; j++) {
+            double dot = 0, qq = 0, rr = 0, dd = 0;
+            for (int i = 0; i < d; i++) {
+              dot += (double) qs[q][i] * rows[j][i]; qq += (double) qs[q][i] * qs[q][i];
+              rr += (double) rows[j][i] * rows[j][i];
+              double x = (double) qs[q][i] - rows[j][i]; dd += x * x;
+            }
+            exact[j] = switch (m) {
+              case DOT -> dot;
+              case COSINE -> qq > 0 && rr > 0 ? dot / Math.sqrt(qq) / Math.sqrt(rr) : 0;
+              case EUCLIDEAN -> Math.sqrt(dd);
+            };
+          }
+          Integer[] order = new Integer[n];
+          for (int j = 0; j < n; j++) order[j] = j;
+          Comparator<Integer> c = m == Vectors.Metric.EUCLIDEAN ? Comparator.comparingDouble((Integer j) -> exact[j])
+              : Comparator.comparingDouble((Integer j) -> -exact[j]);
+          Arrays.sort(order, c.thenComparingInt(j -> j));
+          double tol = 1e-4 * Math.max(1, Math.sqrt(d));
+          for (int i = 0; i < k; i++) {
+            double want = exact[order[i]];
+            if (Math.abs(exact[b[q].index(i)] - want) > tol * Math.max(1, Math.abs(want))
+                || Math.abs(b[q].score(i) - want) > tol * Math.max(1, Math.abs(want))) {
+              fail.append(w).append(" query ").append(q).append(" position ").append(i).append(": row ")
+                  .append(b[q].index(i)).append(" score ").append(b[q].score(i)).append(", reference row ")
+                  .append(order[i]).append(" score ").append(want);
+              break;
+            }
+          }
+          checks[0]++;
+        }
+        if (fail.length() > 0) break;
+      }
+    if (fail.length() > 0) break;
+  }
+  if (fail.length() > 0) break;
+}
+return fail.length() > 0 ? "FAIL " + fail : "ok " + checks[0] + " " + Long.toHexString(digest[0]);
+$$;
+-- The table: the same row count, 8 dimensions, the planted rows as above.
+CREATE PROCEDURE vr_fill() LANGUAGE JAVA AS $$
+final int n = 3 * 8192 + 77;
+Random r = new Random(12);
+float[][] rows = new float[n][8];
+for (float[] v : rows) for (int i = 0; i < 8; i++) v[i] = (float) r.nextGaussian();
+rows[8250] = rows[8150].clone();
+rows[16400] = rows[8150].clone();
+List<Object[]> batch = new ArrayList<>();
+for (int j = 0; j < n; j++) batch.add(new Object[] {(long) j + 1, rows[j]});
+Mle.session().executeMany("INSERT INTO vr VALUES (?, ?)", batch);
+$$;
+-- A VectorSet of the table's rows: the batch against single queries (ids, scores), and the
+-- repeated row's ids first for a query equal to it.
+CREATE PROCEDURE vr_check(OUT res TEXT) LANGUAGE JAVA AS $$
+VectorSet s = Vectors.load("SELECT id, v FROM vr ORDER BY id");
+Random r = new Random(13);
+float[][] qs = new float[9][8];
+for (float[] v : qs) for (int i = 0; i < 8; i++) v[i] = (float) r.nextGaussian();
+qs[3] = Mle.session().runSql("SELECT v FROM vr WHERE id = 8151").fetchOne().get(0) instanceof float[] f ? f.clone() : null;
+StringBuilder b = new StringBuilder(s.toString());
+for (Vectors.Metric m : Vectors.Metric.values()) {
+  Matches[] all = s.nearest(qs, 20, m);
+  int same = 0;
+  for (int q = 0; q < qs.length; q++) {
+    Matches one = s.nearest(qs[q], 20, m);
+    boolean ok = one.size() == all[q].size();
+    for (int i = 0; ok && i < one.size(); i++)
+      ok = Math.abs(one.score(i) - all[q].score(i)) <= 1e-4f * Math.max(1, Math.abs(one.score(i)))
+          && (one.id(i) == all[q].id(i) || Math.abs(one.score(i) - all[q].score(i)) <= 1e-6f);
+    if (ok) same++;
+  }
+  b.append(" | ").append(m).append(": ").append(same).append(" of ").append(qs.length).append(" as single");
+  if (m == Vectors.Metric.EUCLIDEAN)
+    b.append(", repeated row ").append(all[3].id(0)).append(' ').append(all[3].id(1)).append(' ').append(all[3].id(2));
+}
+res[0] = b.toString();
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/vectors_review.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/vectors_review.sql
+
+--connect (con1, localhost, root,,test)
+SELECT @@mle.vector_threads;
+--echo # 1. Batches over three chunks against single queries and the reference
+--echo #    (4 threads).
+--let $d4 = `SELECT vec_batch_chunks()`
+--replace_regex /ok ([0-9]+) [0-9a-f]+/ok \1 DIGEST/
+--eval SELECT '$d4' AS batch_over_chunks
+--echo # 2. A VectorSet of 24,653 rows from SQL.
+CALL vr_fill();
+SELECT COUNT(*) FROM vr;
+CALL vr_check(@r);
+SELECT @r;
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+
+--echo # 3. mle.vector_threads = 1: the same rows for every query.
+SET GLOBAL mle.vector_threads = 1;
+--connect (con1, localhost, root,,test)
+--let $d1 = `SELECT vec_batch_chunks()`
+--replace_regex /ok ([0-9]+) [0-9a-f]+/ok \1 DIGEST/
+--eval SELECT '$d1' AS batch_over_chunks
+--let $assert_text = The same results with 1 thread as with 4
+--let $assert_cond = "$d1" = "$d4"
+--source include/assert.inc
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+SET GLOBAL mle.vector_threads = DEFAULT;
+
+DROP FUNCTION vec_batch_chunks;
+DROP PROCEDURE vr_fill;
+DROP PROCEDURE vr_check;
+DROP TABLE vr;
+REVOKE CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

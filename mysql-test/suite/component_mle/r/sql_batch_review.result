@@ -1,0 +1,93 @@
+#
+# component_mle: executeMany branches without a test before (independent
+# review C123, C125). Multi-row INSERTs (PreparedStatement.executeRewritten):
+# an error that is not a row's (a lock wait timeout) is not replayed row by
+# row; a statement of 70 markers per row runs in chunks of 65535 / 70 = 936
+# rows; rows large enough to fill a message's bytes split a chunk; a
+# prepared statement keeps 4 chunk statements and deallocates the least
+# recently used one for a fifth. Row by row (executeRows, batchRewrite off):
+# a batch over several messages, an error in a later message reports the
+# batch's row index.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE lk (id INT PRIMARY KEY, a VARCHAR(20), x DOUBLE) ENGINE=InnoDB;
+CREATE TABLE big (id INT PRIMARY KEY, t MEDIUMTEXT) ENGINE=InnoDB;
+CREATE TABLE lru (id INT PRIMARY KEY, a VARCHAR(20)) ENGINE=InnoDB;
+CREATE TABLE rr (id INT PRIMARY KEY, s VARCHAR(200)) ENGINE=InnoDB;
+#
+# 1. The marker cap (70 markers: 936 rows per statement) and the byte
+#    budget of a message (rows of 10,000 characters: 26 per statement); a
+#    tail of fewer than 16 rows runs row by row.
+#
+CALL py_chunks(@r);
+SELECT @r;
+@r
+70 markers, 2000 rows (936 + 936 + 128): affected 2000, statements 3
+70 markers, 1887 rows (936 + 936, then 15 row by row): affected 1887, statements 17
+wide: 3887 rows, 3887 c69, 0 c1, max id 11887
+312 rows of 10,000 characters (12 x 26): affected 312, statements 12
+300 rows of 10,000 characters (11 x 26, then 14 row by row): affected 300, statements 25
+big: 612 rows, 6120000 characters, 612 intact
+#
+# 2. A lock wait timeout (1205) in the second chunk: not one of a row's
+#    errors, so the chunk is not replayed row by row (which would wait for
+#    the lock again); the error carries the chunk's first row (1000) and
+#    says so. The first chunk's 1,000 rows stay.
+#
+BEGIN;
+INSERT INTO lk VALUES (1101, 'held', 0);
+SET SESSION innodb_lock_wait_timeout = 1;
+CALL py_lock(@r);
+SELECT @r;
+@r
+error 1205 HY000 row 1000: Lock wait timeout exceeded; try restarting transaction (executeMany: rows 1000 to 1299 ran as one statement and are not run again row by row, so the failing row is not known: the error is not one of a row's values)
+statements 2
+kept 1000 rows, up to id 1000
+SET SESSION innodb_lock_wait_timeout = DEFAULT;
+ROLLBACK;
+#
+# 3. The chunk statements of one prepared statement: 4 kept, the least
+#    recently used deallocated for a fifth and prepared again when its size
+#    comes back; all deallocated with the statement. Kept statements of the
+#    session (mle.sql_statement_cache) would hide the preparations: none.
+#
+SET GLOBAL mle.sql_statement_cache = 0;
+CALL py_lru(@r);
+SELECT @r;
+@r
+statement: alive 1
+300 rows: affected 300, chunk statements alive 1, prepared 1
+301 rows: affected 301, chunk statements alive 2, prepared 1
+302 rows: affected 302, chunk statements alive 3, prepared 1
+303 rows: affected 303, chunk statements alive 4, prepared 1
+304 rows: affected 304, chunk statements alive 4, prepared 1
+301 rows: affected 301, chunk statements alive 4, prepared 0
+300 rows: affected 300, chunk statements alive 4, prepared 1
+302 rows: affected 302, chunk statements alive 4, prepared 1
+304 rows: affected 304, chunk statements alive 4, prepared 0
+deallocated: alive 0
+rows 2717
+SET GLOBAL mle.sql_statement_cache = DEFAULT;
+#
+# 4. Row by row over 6 messages (batchRewrite off, the multi-row path
+#    of sql_batch's Java case no longer runs): 12,000 statements; a
+#    duplicate key at the message boundaries reports the batch's row.
+#
+CALL java_rows(@r);
+SELECT @r;
+@r
+12000 rows: affected 12000, statements 12000, kept 12000 rows, 1200000 characters, max id 12000
+duplicate at row 9471: error 1062 row 9471, kept 9471 rows, up to id 9471
+duplicate at row 9472: error 1062 row 9472, kept 9472 rows, up to id 9472
+duplicate at row 11999: error 1062 row 11999, kept 11999 rows, up to id 11999
+duplicate at row 2368: error 1062 row 2368, kept 2368 rows, up to id 2368
+duplicate at row 0: error 1062 row 0, kept 0 rows, up to id 0
+after the rollbacks: 1 row
+DROP PROCEDURE py_chunks;
+DROP PROCEDURE py_lock;
+DROP PROCEDURE py_lru;
+DROP PROCEDURE java_rows;
+DROP TABLE lk, big, lru, rr;
+REVOKE CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

@@ -1,0 +1,41 @@
+#
+# component_mle: Vectors.nearest with several queries at once (the tiled
+# batch) over more rows than one CHUNK of packed rows (VectorEngine.CHUNK,
+# at most 8,192 rows), independent review C131: each query's matches are
+# those of the single-query nearest() and of a reference in double
+# precision; rows planted in the second and third chunks are found; the
+# same with 1 thread as with 4; a VectorSet from SQL the same.
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE vr (id BIGINT PRIMARY KEY, v VECTOR(8));
+SELECT @@mle.vector_threads;
+@@mle.vector_threads
+4
+# 1. Batches over three chunks against single queries and the reference
+#    (4 threads).
+SELECT 'ok 4122 DIGEST' AS batch_over_chunks;
+batch_over_chunks
+ok 4122 DIGEST
+# 2. A VectorSet of 24,653 rows from SQL.
+CALL vr_fill();
+SELECT COUNT(*) FROM vr;
+COUNT(*)
+24653
+CALL vr_check(@r);
+SELECT @r;
+@r
+VectorSet(24653 vectors of 8 dimensions) | COSINE: 9 of 9 as single | DOT: 9 of 9 as single | EUCLIDEAN: 9 of 9 as single, repeated row 8151 8251 16401
+# 3. mle.vector_threads = 1: the same rows for every query.
+SET GLOBAL mle.vector_threads = 1;
+SELECT 'ok 4122 DIGEST' AS batch_over_chunks;
+batch_over_chunks
+ok 4122 DIGEST
+include/assert.inc [The same results with 1 thread as with 4]
+SET GLOBAL mle.vector_threads = DEFAULT;
+DROP FUNCTION vec_batch_chunks;
+DROP PROCEDURE vr_fill;
+DROP PROCEDURE vr_check;
+DROP TABLE vr;
+REVOKE CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
