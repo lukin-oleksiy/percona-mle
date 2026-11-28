@@ -459,7 +459,9 @@ final class Values {
     }
     switch (t.tag()) {
       case Wire.T_I64, Wire.T_U64 -> {
-        boolean unsigned = t.unsigned() || t.tag() == Wire.T_U64;
+        // BIT: a Java integer is its bits (a negative Long is a BIT(64) value of 2^63 or more).
+        boolean bit = "BIT".equals(t.typeName());
+        boolean unsigned = t.unsigned() || t.tag() == Wire.T_U64 || bit;
         // The usual case without a BigInteger (exp note 37: it was 40 % of the garbage per call):
         // a Java integer always fits 64 signed bits, and fits unsigned unless negative.
         long small = 0;
@@ -472,7 +474,7 @@ final class Values {
           default -> isSmall = false;
         }
         if (isSmall) {
-          if (unsigned && small < 0) throw range(v, t);
+          if (unsigned && small < 0 && !(bit && v instanceof Long)) throw range(v, t);
           w.u8(unsigned ? Wire.T_U64 : Wire.T_I64);
           w.u64(small);
           return;
@@ -618,6 +620,18 @@ final class Values {
   /** Converts a neutral argument to a parameter type. callArena owns MemorySegment arguments. */
   interface Converter {
     Object convert(Object v, Arena callArena);
+  }
+
+  /**
+   * converter(c) for a parameter of SQL type t: a BIT parameter of Java type Long takes all 64 bits
+   * (the host sends BIT as U64; a BIT(64) value of 2^63 or more is a negative Long, as the user
+   * guide says); null if the parameter type is not supported.
+   */
+  static Converter converter(Class<?> c, ParamType t) {
+    if (t != null && "BIT".equals(t.typeName()) && (c == long.class || c == Long.class))
+      return nonNull(c, (v, a) -> v instanceof BigInteger b && b.signum() >= 0 && b.bitLength() <= 64
+          ? b.longValue() : exactLong(v, c));
+    return converter(c);
   }
 
   /** null if the parameter type is not supported. */

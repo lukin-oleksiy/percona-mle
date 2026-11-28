@@ -1,0 +1,360 @@
+#
+# component_mle: type conversions without a test before (independent
+# review C109): TIMESTAMP routine arguments, returns and OUT parameters,
+# and TIMESTAMP table columns read by a routine's SQL; TINYINT, SMALLINT,
+# MEDIUMINT and INT UNSIGNED arguments, returns, OUT parameters and
+# columns (with their largest values); BIT, ENUM, SET and GEOMETRY (POINT)
+# columns read from a table. JavaScript, Python and Java (protocol.md
+# Appendix B.4, the user guide's type tables).
+#
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+CREATE TABLE tr (id INT PRIMARY KEY, ts TIMESTAMP(6) NULL, tu TINYINT UNSIGNED, su SMALLINT UNSIGNED,
+mu MEDIUMINT UNSIGNED, iu INT UNSIGNED, b1 BIT(1), b8 BIT(8), b64 BIT(64), e ENUM('red', 'green'),
+st SET('x', 'y', 'z'), g POINT, gl GEOMETRY);
+SET @old_mode = @@SESSION.sql_mode;
+SET SESSION sql_mode = '';
+SET SESSION time_zone = '+05:30';
+# Row 1: the largest values; row 2: the smallest (and the zero timestamp);
+# row 3: NULLs.
+INSERT INTO tr VALUES
+(1, '2024-07-01 17:30:00.123456', 255, 65535, 16777215, 4294967295, b'1', b'11111111',
+0xFFFFFFFFFFFFFFFF, 'green', 'x,z', ST_PointFromText('POINT(1.5 -2)'),
+ST_GeomFromText('LINESTRING(0 0, 1 1)')),
+(2, '0000-00-00 00:00:00', 0, 0, 0, 0, b'0', b'0', 0, 'red', '', ST_PointFromText('POINT(0 0)'), NULL),
+(3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+SET SESSION sql_mode = @old_mode;
+# What the server shows in +05:30 (the routines below must agree).
+SELECT id, ts, tu, su, mu, iu, b1 + 0 AS b1, b8 + 0 AS b8, b64 + 0 AS b64, e, st, HEX(g) AS g, HEX(gl) AS gl
+FROM tr ORDER BY id;
+id	ts	tu	su	mu	iu	b1	b8	b64	e	st	g	gl
+1	2024-07-01 17:30:00.123456	255	65535	16777215	4294967295	1	255	18446744073709551615	green	x,z	000000000101000000000000000000F83F00000000000000C0	0000000001020000000200000000000000000000000000000000000000000000000000F03F000000000000F03F
+2	0000-00-00 00:00:00.000000	0	0	0	0	0	0	0	red		00000000010100000000000000000000000000000000000000	NULL
+3	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+SET SESSION time_zone = DEFAULT;
+# MLE sessions block UNINSTALL until they disconnect: work in con1. The
+# session's zone (fixed at its first routine) is +05:30.
+SET time_zone = '+05:30';
+#
+# 1. Columns read by SQL from a routine: JavaScript. TIMESTAMP as a Date
+#    of the instant (the zero timestamp an Invalid Date); the unsigned
+#    integers and BIT as numbers (BIT(64) beyond 2^53: see the result);
+#    ENUM and SET as text; GEOMETRY as its bytes (the server's SRID and WKB).
+#
+CALL js_cols('SELECT * FROM test.tr ORDER BY id', @r);
+SELECT @r;
+@r
+id: INT: number 1
+ts: TIMESTAMP: Date 2024-07-01T12:00:00.123Z
+tu: TINYINT: number 255
+su: SMALLINT: number 65535
+mu: MEDIUMINT: number 16777215
+iu: INT: number 4294967295
+b1: BIT: number 1
+b8: BIT: number 255
+b64: BIT: bigint 18446744073709551615
+e: ENUM: string green
+st: SET: string x,z
+g: GEOMETRY: Uint8Array 000000000101000000000000000000F83F00000000000000C0
+gl: GEOMETRY: Uint8Array 0000000001020000000200000000000000000000000000000000000000000000000000F03F000000000000F03F
+--
+id: INT: number 2
+ts: TIMESTAMP: Date Invalid Date
+tu: TINYINT: number 0
+su: SMALLINT: number 0
+mu: MEDIUMINT: number 0
+iu: INT: number 0
+b1: BIT: number 0
+b8: BIT: number 0
+b64: BIT: number 0
+e: ENUM: string red
+st: SET: string 
+g: GEOMETRY: Uint8Array 00000000010100000000000000000000000000000000000000
+gl: GEOMETRY: null
+--
+id: INT: number 3
+ts: TIMESTAMP: null
+tu: TINYINT: null
+su: SMALLINT: null
+mu: MEDIUMINT: null
+iu: INT: null
+b1: BIT: null
+b8: BIT: null
+b64: BIT: null
+e: ENUM: null
+st: SET: null
+g: GEOMETRY: null
+gl: GEOMETRY: null
+#
+# 2. The same columns in Python: TIMESTAMP as an aware datetime in the
+#    session's zone (the zero timestamp None), integers and BIT as int,
+#    ENUM and SET as str, GEOMETRY as bytes. Read with a parameter too (a
+#    prepared statement's result).
+#
+CALL py_cols('SELECT * FROM test.tr ORDER BY id', NULL, @r);
+SELECT @r;
+@r
+id: INT: int 1
+ts: TIMESTAMP: datetime datetime.datetime(2024, 7, 1, 17, 30, 0, 123456, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800)))
+tu: TINYINT: int 255
+su: SMALLINT: int 65535
+mu: MEDIUMINT: int 16777215
+iu: INT: int 4294967295
+b1: BIT: int 1
+b8: BIT: int 255
+b64: BIT: int 18446744073709551615
+e: ENUM: str 'green'
+st: SET: str 'x,z'
+g: GEOMETRY: bytes 000000000101000000000000000000F83F00000000000000C0
+gl: GEOMETRY: bytes 0000000001020000000200000000000000000000000000000000000000000000000000F03F000000000000F03F
+--
+id: INT: int 2
+ts: TIMESTAMP: None
+tu: TINYINT: int 0
+su: SMALLINT: int 0
+mu: MEDIUMINT: int 0
+iu: INT: int 0
+b1: BIT: int 0
+b8: BIT: int 0
+b64: BIT: int 0
+e: ENUM: str 'red'
+st: SET: str ''
+g: GEOMETRY: bytes 00000000010100000000000000000000000000000000000000
+gl: GEOMETRY: None
+--
+id: INT: int 3
+ts: TIMESTAMP: None
+tu: TINYINT: None
+su: SMALLINT: None
+mu: MEDIUMINT: None
+iu: INT: None
+b1: BIT: None
+b8: BIT: None
+b64: BIT: None
+e: ENUM: None
+st: SET: None
+g: GEOMETRY: None
+gl: GEOMETRY: None
+CALL py_cols('SELECT id, ts, iu, b64, e, g FROM test.tr WHERE id <= ? ORDER BY id', 2, @r);
+SELECT @r;
+@r
+id: INT: int 1
+ts: TIMESTAMP: datetime datetime.datetime(2024, 7, 1, 17, 30, 0, 123456, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800)))
+iu: INT: int 4294967295
+b64: BIT: int 18446744073709551615
+e: ENUM: str 'green'
+g: GEOMETRY: bytes 000000000101000000000000000000F83F00000000000000C0
+--
+id: INT: int 2
+ts: TIMESTAMP: None
+iu: INT: int 0
+b64: BIT: int 0
+e: ENUM: str 'red'
+g: GEOMETRY: bytes 00000000010100000000000000000000000000000000000000
+#
+# 3. The same columns in Java: TIMESTAMP as an Instant, integers and BIT
+#    as Long (BIT(64) beyond Long: see the result), ENUM and SET as
+#    String, GEOMETRY as byte[]. The zero timestamp is a conversion error.
+#
+CALL j_cols('SELECT * FROM test.tr WHERE id <> 2 ORDER BY id', @r);
+SELECT @r;
+@r
+id: INT: Long 1
+ts: TIMESTAMP: Instant 2024-07-01T12:00:00.123456Z
+tu: TINYINT: Long 255
+su: SMALLINT: Long 65535
+mu: MEDIUMINT: Long 16777215
+iu: INT: Long 4294967295
+b1: BIT: Long 1
+b8: BIT: Long 255
+b64: BIT: BigInteger 18446744073709551615
+e: ENUM: String green
+st: SET: String x,z
+g: GEOMETRY: byte[] 000000000101000000000000000000F83F00000000000000C0
+gl: GEOMETRY: byte[] 0000000001020000000200000000000000000000000000000000000000000000000000F03F000000000000F03F
+--
+id: INT: Long 3
+ts: TIMESTAMP: null null
+tu: TINYINT: null null
+su: SMALLINT: null null
+mu: MEDIUMINT: null null
+iu: INT: null null
+b1: BIT: null null
+b8: BIT: null null
+b64: BIT: null null
+e: ENUM: null null
+st: SET: null null
+g: GEOMETRY: null null
+gl: GEOMETRY: null null
+CALL j_cols('SELECT id, tu, su, mu, iu, b1, b8, b64, e, st, g FROM test.tr WHERE id = 2', @r);
+SELECT @r;
+@r
+id: INT: Long 2
+tu: TINYINT: Long 0
+su: SMALLINT: Long 0
+mu: MEDIUMINT: Long 0
+iu: INT: Long 0
+b1: BIT: Long 0
+b8: BIT: Long 0
+b64: BIT: Long 0
+e: ENUM: String red
+st: SET: String 
+g: GEOMETRY: byte[] 00000000010100000000000000000000000000000000000000
+CALL j_cols('SELECT ts FROM test.tr WHERE id = 2', @r);
+Got one of the listed errors
+#
+# 4. Unsigned integer arguments with their largest and smallest values.
+#
+SELECT js_uargs(255, 65535, 16777215, 4294967295) AS largest, js_uargs(0, 0, 0, 0) AS smallest,
+js_uargs(NULL, NULL, NULL, NULL) AS nulls;
+largest	smallest	nulls
+number 255, number 65535, number 16777215, number 4294967295	number 0, number 0, number 0, number 0	null, null, null, null
+SELECT py_uargs(255, 65535, 16777215, 4294967295) AS largest, py_uargs(0, 0, 0, 0) AS smallest;
+largest	smallest
+int 255, int 65535, int 16777215, int 4294967295	int 0, int 0, int 0, int 0
+SELECT j_uargs(255, 65535, 16777215, 4294967295) AS largest, j_uargs(0, 0, 0, 0) AS smallest;
+largest	smallest
+Integer 255, Integer 65535, Integer 16777215, Long 4294967295	Integer 0, Integer 0, Integer 0, Long 0
+# BIT arguments: BIT(64) with all bits set is beyond a signed 64-bit integer.
+SELECT js_bits(b'1', b'11111111', b'101') AS js, py_bits(b'1', b'11111111', b'101') AS py,
+j_bits(b'1', b'11111111', b'101') AS j;
+js	py	j
+number 1, number 255, number 5	int 1, int 255, int 5	Long 1, Long 255, Long 5
+SELECT js_bits(b1, b8, b64) AS js FROM test.tr WHERE id = 1;
+js
+number 1, number 255, bigint 18446744073709551615
+SELECT py_bits(b1, b8, b64) AS py FROM test.tr WHERE id = 1;
+py
+int 1, int 255, int 18446744073709551615
+SELECT j_bits(b1, b8, b64) AS j FROM test.tr WHERE id = 1;
+j
+Long 1, Long 255, Long -1
+# Java BIT: all 64 bits both ways (a negative Long is a BIT(64) value of 2^63 or more).
+SELECT HEX(j_bit_back(b64)) AS back, HEX(j_bit_minus1()) AS minus1 FROM test.tr WHERE id = 1;
+back	minus1
+FFFFFFFFFFFFFFFF	FFFFFFFFFFFFFFFF
+CALL j_bit_out(b'1000000000000000000000000000000000000000000000000000000000000001', @o);
+SELECT HEX(@o) AS out_param;
+out_param
+8000000000000001
+# Arguments come back through arithmetic in the guest (no wrap at 2^31 or 2^32).
+SELECT js_usum(4294967295, 4294967295) AS js, py_usum(4294967295, 4294967295) AS py,
+j_usum(4294967295, 4294967295) AS j;
+js	py	j
+8589934590	8589934590	8589934590
+#
+# 5. Unsigned results: the largest value fits; one more, or a negative
+#    number, is an MLE-Type error.
+#
+SELECT js_rtu(255), js_rsu(65535), js_riu(4294967295), js_rtu(0), js_riu(0);
+js_rtu(255)	js_rsu(65535)	js_riu(4294967295)	js_rtu(0)	js_riu(0)
+255	65535	4294967295	0	0
+SELECT py_rtu(255), py_rsu(65535), py_riu(4294967295), py_rtu(0), py_riu(0);
+py_rtu(255)	py_rsu(65535)	py_riu(4294967295)	py_rtu(0)	py_riu(0)
+255	65535	4294967295	0	0
+SELECT j_rtu(255), j_rsu(65535), j_riu(4294967295), j_rtu(0), j_riu(0);
+j_rtu(255)	j_rsu(65535)	j_riu(4294967295)	j_rtu(0)	j_riu(0)
+255	65535	4294967295	0	0
+SELECT js_rtu(256);
+ERROR HY000: MLE-Type> Cannot convert value '256' to TINYINT from MLE in 'js_rtu(256)'
+SELECT js_rtu(-1);
+ERROR HY000: MLE-Type> Cannot convert value '-1' to TINYINT from MLE in 'js_rtu(-1)'
+SELECT js_rsu(65536);
+ERROR HY000: MLE-Type> Cannot convert value '65536' to SMALLINT from MLE in 'js_rsu(65536)'
+SELECT js_riu(4294967296);
+ERROR HY000: MLE-Type> Cannot convert value '4294967296' to INT from MLE in 'js_riu(4294967296)'
+SELECT js_riu(-1);
+ERROR HY000: MLE-Type> Cannot convert value '-1' to INT from MLE in 'js_riu(-1)'
+SELECT py_rtu(256);
+Got one of the listed errors
+SELECT py_rtu(-1);
+Got one of the listed errors
+SELECT py_rsu(65536);
+Got one of the listed errors
+SELECT py_riu(4294967296);
+Got one of the listed errors
+SELECT py_riu(-1);
+Got one of the listed errors
+SELECT j_rtu(256);
+Got one of the listed errors
+SELECT j_rtu(-1);
+Got one of the listed errors
+SELECT j_rsu(65536);
+Got one of the listed errors
+SELECT j_riu(4294967296);
+Got one of the listed errors
+SELECT j_riu(-1);
+Got one of the listed errors
+#
+# 6. Unsigned and TIMESTAMP OUT parameters. A TIMESTAMP goes back as an
+#    instant: 08:00 UTC is 13:30 in the session's zone.
+#
+CALL js_outs(@tu, @iu, @ts);
+SELECT 'js' AS lang, @tu, @iu, @ts;
+lang	@tu	@iu	@ts
+js	255	4294967295	2024-01-15 13:30:00.250000
+CALL py_outs(@tu, @iu, @ts);
+SELECT 'py' AS lang, @tu, @iu, @ts;
+lang	@tu	@iu	@ts
+py	255	4294967295	2024-01-15 13:30:00.250000
+CALL j_outs(@tu, @iu, @ts);
+SELECT 'java' AS lang, @tu, @iu, @ts;
+lang	@tu	@iu	@ts
+java	255	4294967295	2024-01-15 13:30:00.250000
+#
+# 7. JavaScript TIMESTAMP arguments and returns (Python's and Java's are in
+#    types_and_zones): the argument is a Date of the instant; a Date
+#    returned for TIMESTAMP goes back as an instant, shown in the session's
+#    zone; the zero timestamp argument is an Invalid Date.
+#
+SELECT js_ts_arg('2024-07-01 17:30:00.250') AS arg, js_ts_arg(NULL) AS null_arg,
+js_ts_ret(1719835200123) AS ret, js_ts_plus('2024-07-01 17:30:00.250') AS plus_minute;
+arg	null_arg	ret	plus_minute
+2024-07-01T12:00:00.250Z	null	2024-07-01 17:30:00.123	2024-07-01 17:31:00.250
+SELECT js_ts_arg(ts) AS from_column FROM test.tr WHERE id = 1;
+from_column
+2024-07-01T12:00:00.123Z
+SET SESSION sql_mode = '';
+SELECT js_ts_arg(ts) AS zero FROM test.tr WHERE id = 2;
+zero
+Invalid Date
+SET SESSION sql_mode = DEFAULT;
+# The same instant into a TIMESTAMP column through SQL: the server's text.
+CALL js_ts_insert();
+SELECT ts FROM tr WHERE id = 4;
+ts
+2024-07-01 17:30:00.123000
+DROP PROCEDURE js_cols;
+DROP PROCEDURE py_cols;
+DROP PROCEDURE j_cols;
+DROP FUNCTION js_uargs;
+DROP FUNCTION py_uargs;
+DROP FUNCTION j_uargs;
+DROP FUNCTION js_bits;
+DROP FUNCTION py_bits;
+DROP FUNCTION j_bits;
+DROP FUNCTION j_bit_back;
+DROP FUNCTION j_bit_minus1;
+DROP PROCEDURE j_bit_out;
+DROP FUNCTION js_usum;
+DROP FUNCTION py_usum;
+DROP FUNCTION j_usum;
+DROP FUNCTION js_rtu;
+DROP FUNCTION js_rsu;
+DROP FUNCTION js_riu;
+DROP FUNCTION py_rtu;
+DROP FUNCTION py_rsu;
+DROP FUNCTION py_riu;
+DROP FUNCTION j_rtu;
+DROP FUNCTION j_rsu;
+DROP FUNCTION j_riu;
+DROP PROCEDURE js_outs;
+DROP PROCEDURE py_outs;
+DROP PROCEDURE j_outs;
+DROP FUNCTION js_ts_arg;
+DROP FUNCTION js_ts_ret;
+DROP FUNCTION js_ts_plus;
+DROP PROCEDURE js_ts_insert;
+DROP TABLE tr;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";

@@ -454,9 +454,10 @@ final class JavaRoutines {
         if (!type.isArray())
           throw new CompileException("parameter " + (i + 1) + " (" + names[i] + ") is OUT or INOUT: its Java type "
               + "must be an array (the value is element 0), not " + type.getName());
-        converters[i] = arrayConverter(type.getComponentType(), params.get(i).mode() == Wire.MODE_OUT);
+        converters[i] = arrayConverter(type.getComponentType(), params.get(i).mode() == Wire.MODE_OUT,
+            params.get(i).type());
       } else {
-        converters[i] = Values.converter(type);
+        converters[i] = Values.converter(type, params.get(i).type());
       }
       if (converters[i] == null)
         throw new CompileException("parameter " + (i + 1) + " of " + m.getName() + " has the unsupported type "
@@ -514,8 +515,8 @@ final class JavaRoutines {
   }
 
   /** OUT/INOUT: a one-element array of the component type; OUT starts as null (0 for primitives). */
-  private static Values.Converter arrayConverter(Class<?> component, boolean outOnly) {
-    Values.Converter element = Values.converter(component);
+  private static Values.Converter arrayConverter(Class<?> component, boolean outOnly, Values.ParamType t) {
+    Values.Converter element = Values.converter(component, t);
     if (element == null) return null;
     return (v, a) -> {
       Object array = java.lang.reflect.Array.newInstance(component, 1);

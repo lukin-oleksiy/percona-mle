@@ -1,0 +1,320 @@
+--echo #
+--echo # component_mle: type conversions without a test before (independent
+--echo # review C109): TIMESTAMP routine arguments, returns and OUT parameters,
+--echo # and TIMESTAMP table columns read by a routine's SQL; TINYINT, SMALLINT,
+--echo # MEDIUMINT and INT UNSIGNED arguments, returns, OUT parameters and
+--echo # columns (with their largest values); BIT, ENUM, SET and GEOMETRY (POINT)
+--echo # columns read from a table. JavaScript, Python and Java (protocol.md
+--echo # Appendix B.4, the user guide's type tables).
+--echo #
+--source ../include/have_mle_component.inc
+--source include/count_sessions.inc
+
+INSTALL COMPONENT "file://component_mle";
+GRANT CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* TO root@localhost;
+
+CREATE TABLE tr (id INT PRIMARY KEY, ts TIMESTAMP(6) NULL, tu TINYINT UNSIGNED, su SMALLINT UNSIGNED,
+  mu MEDIUMINT UNSIGNED, iu INT UNSIGNED, b1 BIT(1), b8 BIT(8), b64 BIT(64), e ENUM('red', 'green'),
+  st SET('x', 'y', 'z'), g POINT, gl GEOMETRY);
+SET @old_mode = @@SESSION.sql_mode;
+SET SESSION sql_mode = '';
+SET SESSION time_zone = '+05:30';
+--echo # Row 1: the largest values; row 2: the smallest (and the zero timestamp);
+--echo # row 3: NULLs.
+INSERT INTO tr VALUES
+  (1, '2024-07-01 17:30:00.123456', 255, 65535, 16777215, 4294967295, b'1', b'11111111',
+   0xFFFFFFFFFFFFFFFF, 'green', 'x,z', ST_PointFromText('POINT(1.5 -2)'),
+   ST_GeomFromText('LINESTRING(0 0, 1 1)')),
+  (2, '0000-00-00 00:00:00', 0, 0, 0, 0, b'0', b'0', 0, 'red', '', ST_PointFromText('POINT(0 0)'), NULL),
+  (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+SET SESSION sql_mode = @old_mode;
+--echo # What the server shows in +05:30 (the routines below must agree).
+SELECT id, ts, tu, su, mu, iu, b1 + 0 AS b1, b8 + 0 AS b8, b64 + 0 AS b64, e, st, HEX(g) AS g, HEX(gl) AS gl
+  FROM tr ORDER BY id;
+SET SESSION time_zone = DEFAULT;
+
+--echo # MLE sessions block UNINSTALL until they disconnect: work in con1. The
+--echo # session's zone (fixed at its first routine) is +05:30.
+--connect (con1, localhost, root,,test)
+SET time_zone = '+05:30';
+
+--write_file $MYSQLTEST_VARDIR/tmp/types_review.sql
+CREATE PROCEDURE js_cols(IN q TEXT, OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+  const show = (v) => v === null ? 'null'
+      : v instanceof Date ? 'Date ' + (isNaN(v) ? 'Invalid Date' : v.toISOString())
+      : v instanceof Set ? 'Set ' + [...v].join('|')
+      : v instanceof Uint8Array ? 'Uint8Array ' + Array.from(v, (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase()
+      : typeof v + ' ' + String(v)
+  const res = session.runSql(q)
+  const cols = res.getColumns()
+  r = res.fetchAll().map((row) => cols.map((c) =>
+      c.getColumnLabel() + ': ' + c.getType() + ': ' + show(row[c.getColumnLabel()])).join('\n')).join('\n--\n')
+$$;
+CREATE PROCEDURE py_cols(IN q TEXT, IN p INT, OUT r TEXT) LANGUAGE PYTHON AS $$
+    res = session.run_sql(q, [p]) if p is not None else session.run_sql(q)
+    out = []
+    for row in res.fetch_all():
+        line = []
+        for c in res.get_columns():
+            v = row.get_field(c.get_column_label())
+            shown = 'None' if v is None else type(v).__name__ + ' ' + (v.hex().upper() if isinstance(v, bytes) else repr(v))
+            line.append('%s: %s: %s' % (c.get_column_label(), c.get_type(), shown))
+        out.append('\n'.join(line))
+    r = '\n--\n'.join(out)
+$$;
+CREATE PROCEDURE j_cols(IN q TEXT, OUT r TEXT) LANGUAGE JAVA AS $$
+SqlResult res = Mle.session().runSql(q);
+StringBuilder b = new StringBuilder();
+for (Row row : res) {
+  if (b.length() > 0) b.append("\n--\n");
+  for (int i = 0; i < row.getLength(); i++) {
+    Object v = row.get(i);
+    String shown = v instanceof byte[] x ? java.util.HexFormat.of().withUpperCase().formatHex(x) : String.valueOf(v);
+    if (i > 0) b.append('\n');
+    b.append(res.getColumns().get(i).getColumnLabel()).append(": ").append(res.getColumns().get(i).getType())
+     .append(": ").append(v == null ? "null" : v.getClass().getSimpleName()).append(' ').append(shown);
+  }
+}
+r[0] = b.toString();
+$$;
+CREATE FUNCTION js_uargs(tu TINYINT UNSIGNED, su SMALLINT UNSIGNED, mu MEDIUMINT UNSIGNED, iu INT UNSIGNED)
+  RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  return [tu, su, mu, iu].map((x) => x === null ? 'null' : typeof x + ' ' + x).join(', ')
+$$;
+CREATE FUNCTION py_uargs(tu TINYINT UNSIGNED, su SMALLINT UNSIGNED, mu MEDIUMINT UNSIGNED, iu INT UNSIGNED)
+  RETURNS TEXT LANGUAGE PYTHON AS $$
+    return ', '.join('%s %r' % (type(x).__name__, x) for x in (tu, su, mu, iu))
+$$;
+CREATE FUNCTION j_uargs(tu TINYINT UNSIGNED, su SMALLINT UNSIGNED, mu MEDIUMINT UNSIGNED, iu INT UNSIGNED)
+  RETURNS TEXT LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+for (Object x : new Object[] {tu, su, mu, iu}) {
+  if (b.length() > 0) b.append(", ");
+  b.append(x == null ? "null" : x.getClass().getSimpleName() + " " + x);
+}
+return b.toString();
+$$;
+CREATE FUNCTION js_bits(b1 BIT(1), b8 BIT(8), b64 BIT(64)) RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  return [b1, b8, b64].map((x) => x === null ? 'null' : typeof x + ' ' + x).join(', ')
+$$;
+CREATE FUNCTION py_bits(b1 BIT(1), b8 BIT(8), b64 BIT(64)) RETURNS TEXT LANGUAGE PYTHON AS $$
+    return ', '.join('None' if x is None else '%s %r' % (type(x).__name__, x) for x in (b1, b8, b64))
+$$;
+CREATE FUNCTION j_bits(b1 BIT(1), b8 BIT(8), b64 BIT(64)) RETURNS TEXT LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+for (Object x : new Object[] {b1, b8, b64}) {
+  if (b.length() > 0) b.append(", ");
+  b.append(x == null ? "null" : x.getClass().getSimpleName() + " " + x);
+}
+return b.toString();
+$$;
+CREATE FUNCTION j_bit_back(b BIT(64)) RETURNS BIT(64) LANGUAGE JAVA AS $$ return b; $$;
+CREATE FUNCTION j_bit_minus1() RETURNS BIT(64) LANGUAGE JAVA AS $$ return -1L; $$;
+CREATE PROCEDURE j_bit_out(IN b BIT(64), OUT o BIT(64)) LANGUAGE JAVA AS $$ o[0] = b; $$;
+CREATE FUNCTION js_usum(a INT UNSIGNED, b INT UNSIGNED) RETURNS BIGINT LANGUAGE JAVASCRIPT
+  AS $$ return a + b $$;
+CREATE FUNCTION py_usum(a INT UNSIGNED, b INT UNSIGNED) RETURNS BIGINT LANGUAGE PYTHON AS $$
+    return a + b
+$$;
+CREATE FUNCTION j_usum(a INT UNSIGNED, b INT UNSIGNED) RETURNS BIGINT LANGUAGE JAVA
+  AS $$ return a + b; $$;
+CREATE FUNCTION js_rtu(x BIGINT) RETURNS TINYINT UNSIGNED LANGUAGE JAVASCRIPT AS $$ return x $$;
+CREATE FUNCTION js_rsu(x BIGINT) RETURNS SMALLINT UNSIGNED LANGUAGE JAVASCRIPT AS $$ return x $$;
+CREATE FUNCTION js_riu(x BIGINT) RETURNS INT UNSIGNED LANGUAGE JAVASCRIPT AS $$ return x $$;
+CREATE FUNCTION py_rtu(x BIGINT) RETURNS TINYINT UNSIGNED LANGUAGE PYTHON AS $$
+    return x
+$$;
+CREATE FUNCTION py_rsu(x BIGINT) RETURNS SMALLINT UNSIGNED LANGUAGE PYTHON AS $$
+    return x
+$$;
+CREATE FUNCTION py_riu(x BIGINT) RETURNS INT UNSIGNED LANGUAGE PYTHON AS $$
+    return x
+$$;
+CREATE FUNCTION j_rtu(x INT) RETURNS TINYINT UNSIGNED LANGUAGE JAVA AS $$ return x; $$;
+CREATE FUNCTION j_rsu(x INT) RETURNS SMALLINT UNSIGNED LANGUAGE JAVA AS $$ return x; $$;
+CREATE FUNCTION j_riu(x BIGINT) RETURNS INT UNSIGNED LANGUAGE JAVA AS $$ return x; $$;
+CREATE PROCEDURE js_outs(OUT tu TINYINT UNSIGNED, OUT iu INT UNSIGNED, OUT ts TIMESTAMP(6)) LANGUAGE JAVASCRIPT AS $$
+  tu = 255
+  iu = 4294967295
+  ts = new Date(Date.UTC(2024, 0, 15, 8, 0, 0, 250))
+$$;
+CREATE PROCEDURE py_outs(OUT tu TINYINT UNSIGNED, OUT iu INT UNSIGNED, OUT ts TIMESTAMP(6)) LANGUAGE PYTHON AS $$
+    import datetime
+    tu = 255
+    iu = 4294967295
+    ts = datetime.datetime(2024, 1, 15, 8, 0, 0, 250000, tzinfo=datetime.timezone.utc)
+$$;
+CREATE PROCEDURE j_outs(OUT tu TINYINT UNSIGNED, OUT iu INT UNSIGNED, OUT ts TIMESTAMP(6)) LANGUAGE JAVA AS $$
+tu[0] = 255;
+iu[0] = 4294967295L;
+ts[0] = java.time.Instant.parse("2024-01-15T08:00:00.250Z");
+$$;
+CREATE FUNCTION js_ts_arg(ts TIMESTAMP(3)) RETURNS TEXT LANGUAGE JAVASCRIPT AS $$
+  return ts === null ? 'null' : isNaN(ts) ? 'Invalid Date' : ts.toISOString()
+$$;
+CREATE FUNCTION js_ts_ret(ms BIGINT) RETURNS TIMESTAMP(3) LANGUAGE JAVASCRIPT AS $$ return new Date(ms) $$;
+CREATE FUNCTION js_ts_plus(ts TIMESTAMP(3)) RETURNS TIMESTAMP(3) LANGUAGE JAVASCRIPT AS $$
+  return new Date(ts.getTime() + 60000)
+$$;
+CREATE PROCEDURE js_ts_insert() LANGUAGE JAVASCRIPT AS $$
+  session.runSql("INSERT INTO test.tr (id, ts) VALUES (4, ?)", [new Date(Date.UTC(2024, 6, 1, 12, 0, 0, 123))])
+$$;
+EOF
+--exec $MYSQL test < $MYSQLTEST_VARDIR/tmp/types_review.sql 2>&1
+--remove_file $MYSQLTEST_VARDIR/tmp/types_review.sql
+
+--echo #
+--echo # 1. Columns read by SQL from a routine: JavaScript. TIMESTAMP as a Date
+--echo #    of the instant (the zero timestamp an Invalid Date); the unsigned
+--echo #    integers and BIT as numbers (BIT(64) beyond 2^53: see the result);
+--echo #    ENUM and SET as text; GEOMETRY as its bytes (the server's SRID and WKB).
+--echo #
+CALL js_cols('SELECT * FROM test.tr ORDER BY id', @r);
+SELECT @r;
+
+--echo #
+--echo # 2. The same columns in Python: TIMESTAMP as an aware datetime in the
+--echo #    session's zone (the zero timestamp None), integers and BIT as int,
+--echo #    ENUM and SET as str, GEOMETRY as bytes. Read with a parameter too (a
+--echo #    prepared statement's result).
+--echo #
+CALL py_cols('SELECT * FROM test.tr ORDER BY id', NULL, @r);
+SELECT @r;
+CALL py_cols('SELECT id, ts, iu, b64, e, g FROM test.tr WHERE id <= ? ORDER BY id', 2, @r);
+SELECT @r;
+
+--echo #
+--echo # 3. The same columns in Java: TIMESTAMP as an Instant, integers and BIT
+--echo #    as Long (BIT(64) beyond Long: see the result), ENUM and SET as
+--echo #    String, GEOMETRY as byte[]. The zero timestamp is a conversion error.
+--echo #
+CALL j_cols('SELECT * FROM test.tr WHERE id <> 2 ORDER BY id', @r);
+SELECT @r;
+CALL j_cols('SELECT id, tu, su, mu, iu, b1, b8, b64, e, st, g FROM test.tr WHERE id = 2', @r);
+SELECT @r;
+--error ER_LANGUAGE_COMPONENT_RUNTIME,ER_LANGUAGE_COMPONENT
+CALL j_cols('SELECT ts FROM test.tr WHERE id = 2', @r);
+
+--echo #
+--echo # 4. Unsigned integer arguments with their largest and smallest values.
+--echo #
+SELECT js_uargs(255, 65535, 16777215, 4294967295) AS largest, js_uargs(0, 0, 0, 0) AS smallest,
+  js_uargs(NULL, NULL, NULL, NULL) AS nulls;
+SELECT py_uargs(255, 65535, 16777215, 4294967295) AS largest, py_uargs(0, 0, 0, 0) AS smallest;
+SELECT j_uargs(255, 65535, 16777215, 4294967295) AS largest, j_uargs(0, 0, 0, 0) AS smallest;
+--echo # BIT arguments: BIT(64) with all bits set is beyond a signed 64-bit integer.
+SELECT js_bits(b'1', b'11111111', b'101') AS js, py_bits(b'1', b'11111111', b'101') AS py,
+  j_bits(b'1', b'11111111', b'101') AS j;
+SELECT js_bits(b1, b8, b64) AS js FROM test.tr WHERE id = 1;
+SELECT py_bits(b1, b8, b64) AS py FROM test.tr WHERE id = 1;
+SELECT j_bits(b1, b8, b64) AS j FROM test.tr WHERE id = 1;
+--echo # Java BIT: all 64 bits both ways (a negative Long is a BIT(64) value of 2^63 or more).
+SELECT HEX(j_bit_back(b64)) AS back, HEX(j_bit_minus1()) AS minus1 FROM test.tr WHERE id = 1;
+CALL j_bit_out(b'1000000000000000000000000000000000000000000000000000000000000001', @o);
+SELECT HEX(@o) AS out_param;
+--echo # Arguments come back through arithmetic in the guest (no wrap at 2^31 or 2^32).
+SELECT js_usum(4294967295, 4294967295) AS js, py_usum(4294967295, 4294967295) AS py,
+  j_usum(4294967295, 4294967295) AS j;
+
+--echo #
+--echo # 5. Unsigned results: the largest value fits; one more, or a negative
+--echo #    number, is an MLE-Type error.
+--echo #
+SELECT js_rtu(255), js_rsu(65535), js_riu(4294967295), js_rtu(0), js_riu(0);
+SELECT py_rtu(255), py_rsu(65535), py_riu(4294967295), py_rtu(0), py_riu(0);
+SELECT j_rtu(255), j_rsu(65535), j_riu(4294967295), j_rtu(0), j_riu(0);
+--error ER_LANGUAGE_COMPONENT
+SELECT js_rtu(256);
+--error ER_LANGUAGE_COMPONENT
+SELECT js_rtu(-1);
+--error ER_LANGUAGE_COMPONENT
+SELECT js_rsu(65536);
+--error ER_LANGUAGE_COMPONENT
+SELECT js_riu(4294967296);
+--error ER_LANGUAGE_COMPONENT
+SELECT js_riu(-1);
+--error ER_LANGUAGE_COMPONENT,ER_WARN_DATA_OUT_OF_RANGE
+SELECT py_rtu(256);
+--error ER_LANGUAGE_COMPONENT,ER_WARN_DATA_OUT_OF_RANGE
+SELECT py_rtu(-1);
+--error ER_LANGUAGE_COMPONENT,ER_WARN_DATA_OUT_OF_RANGE
+SELECT py_rsu(65536);
+--error ER_LANGUAGE_COMPONENT,ER_WARN_DATA_OUT_OF_RANGE
+SELECT py_riu(4294967296);
+--error ER_LANGUAGE_COMPONENT,ER_WARN_DATA_OUT_OF_RANGE
+SELECT py_riu(-1);
+--error ER_LANGUAGE_COMPONENT,ER_WARN_DATA_OUT_OF_RANGE
+SELECT j_rtu(256);
+--error ER_LANGUAGE_COMPONENT,ER_WARN_DATA_OUT_OF_RANGE
+SELECT j_rtu(-1);
+--error ER_LANGUAGE_COMPONENT,ER_WARN_DATA_OUT_OF_RANGE
+SELECT j_rsu(65536);
+--error ER_LANGUAGE_COMPONENT,ER_WARN_DATA_OUT_OF_RANGE
+SELECT j_riu(4294967296);
+--error ER_LANGUAGE_COMPONENT,ER_WARN_DATA_OUT_OF_RANGE
+SELECT j_riu(-1);
+
+--echo #
+--echo # 6. Unsigned and TIMESTAMP OUT parameters. A TIMESTAMP goes back as an
+--echo #    instant: 08:00 UTC is 13:30 in the session's zone.
+--echo #
+CALL js_outs(@tu, @iu, @ts);
+SELECT 'js' AS lang, @tu, @iu, @ts;
+CALL py_outs(@tu, @iu, @ts);
+SELECT 'py' AS lang, @tu, @iu, @ts;
+CALL j_outs(@tu, @iu, @ts);
+SELECT 'java' AS lang, @tu, @iu, @ts;
+
+--echo #
+--echo # 7. JavaScript TIMESTAMP arguments and returns (Python's and Java's are in
+--echo #    types_and_zones): the argument is a Date of the instant; a Date
+--echo #    returned for TIMESTAMP goes back as an instant, shown in the session's
+--echo #    zone; the zero timestamp argument is an Invalid Date.
+--echo #
+SELECT js_ts_arg('2024-07-01 17:30:00.250') AS arg, js_ts_arg(NULL) AS null_arg,
+  js_ts_ret(1719835200123) AS ret, js_ts_plus('2024-07-01 17:30:00.250') AS plus_minute;
+SELECT js_ts_arg(ts) AS from_column FROM test.tr WHERE id = 1;
+SET SESSION sql_mode = '';
+SELECT js_ts_arg(ts) AS zero FROM test.tr WHERE id = 2;
+SET SESSION sql_mode = DEFAULT;
+--echo # The same instant into a TIMESTAMP column through SQL: the server's text.
+CALL js_ts_insert();
+SELECT ts FROM tr WHERE id = 4;
+
+--disconnect con1
+--connection default
+--source include/wait_until_count_sessions.inc
+DROP PROCEDURE js_cols;
+DROP PROCEDURE py_cols;
+DROP PROCEDURE j_cols;
+DROP FUNCTION js_uargs;
+DROP FUNCTION py_uargs;
+DROP FUNCTION j_uargs;
+DROP FUNCTION js_bits;
+DROP FUNCTION py_bits;
+DROP FUNCTION j_bits;
+DROP FUNCTION j_bit_back;
+DROP FUNCTION j_bit_minus1;
+DROP PROCEDURE j_bit_out;
+DROP FUNCTION js_usum;
+DROP FUNCTION py_usum;
+DROP FUNCTION j_usum;
+DROP FUNCTION js_rtu;
+DROP FUNCTION js_rsu;
+DROP FUNCTION js_riu;
+DROP FUNCTION py_rtu;
+DROP FUNCTION py_rsu;
+DROP FUNCTION py_riu;
+DROP FUNCTION j_rtu;
+DROP FUNCTION j_rsu;
+DROP FUNCTION j_riu;
+DROP PROCEDURE js_outs;
+DROP PROCEDURE py_outs;
+DROP PROCEDURE j_outs;
+DROP FUNCTION js_ts_arg;
+DROP FUNCTION js_ts_ret;
+DROP FUNCTION js_ts_plus;
+DROP PROCEDURE js_ts_insert;
+DROP TABLE tr;
+REVOKE CREATE_JAVASCRIPT_ROUTINE, CREATE_PYTHON_ROUTINE, CREATE_JAVA_ROUTINE ON *.* FROM root@localhost;
+UNINSTALL COMPONENT "file://component_mle";
