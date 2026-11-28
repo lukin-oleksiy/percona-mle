@@ -178,19 +178,13 @@ SET GLOBAL mle.sql_result_max = 256 * 1024 * 1024;
 CALL fill_big();
 CALL java_big('keep', @kept);
 CALL java_big('drop', @dropped);
-SELECT SLEEP(1);
-SLEEP(1)
-0
-CALL java_big('', @after);
+# (calls after idle seconds, until the committed heap has fallen by 30 MiB)
 SELECT @kept - @after >= 30 AS heap_given_back_while_idle;
 heap_given_back_while_idle
 1
 SET GLOBAL mle.vector_cache_idle_ms = 500;
 CALL java_big('keep', @kept);
-SELECT SLEEP(1.5);
-SLEEP(1.5)
-0
-CALL java_big('', @after);
+# (calls after idle seconds, until the committed heap has fallen by 30 MiB)
 SELECT @kept - @after >= 30 AS expired_while_idle_and_given_back;
 expired_while_idle_and_given_back
 1

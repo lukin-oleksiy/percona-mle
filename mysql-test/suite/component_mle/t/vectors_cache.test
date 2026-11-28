@@ -266,8 +266,27 @@ SET GLOBAL mle.sql_result_max = 256 * 1024 * 1024;
 CALL fill_big();
 CALL java_big('keep', @kept);
 CALL java_big('drop', @dropped);
-SELECT SLEEP(1);
-CALL java_big('', @after);
+--echo # (calls after idle seconds, until the committed heap has fallen by 30 MiB)
+--let $given = 0
+--let $tries = 0
+--disable_query_log
+--disable_result_log
+while (!$given)
+{
+  # SLEEP is not a call: the worker stays idle. A call before the give-back ran leaves it due.
+  SELECT SLEEP(1);
+  CALL java_big('', @after);
+  --let $given = `SELECT @kept - @after >= 30`
+  --inc $tries
+  if ($tries == 30)
+  {
+    --enable_result_log
+    SELECT @kept, @after;
+    --die the heap was not given back in 30 idle seconds
+  }
+}
+--enable_result_log
+--enable_query_log
 SELECT @kept - @after >= 30 AS heap_given_back_while_idle;
 --disconnect con2
 --connection default
@@ -276,8 +295,27 @@ SET GLOBAL mle.vector_cache_idle_ms = 500;
 --source ../include/wait_for_pool.inc
 --connect (con2, localhost, root,,test)
 CALL java_big('keep', @kept);
-SELECT SLEEP(1.5);
-CALL java_big('', @after);
+--echo # (calls after idle seconds, until the committed heap has fallen by 30 MiB)
+--let $given = 0
+--let $tries = 0
+--disable_query_log
+--disable_result_log
+while (!$given)
+{
+  # SLEEP is not a call: the worker stays idle. A call before the give-back ran leaves it due.
+  SELECT SLEEP(1);
+  CALL java_big('', @after);
+  --let $given = `SELECT @kept - @after >= 30`
+  --inc $tries
+  if ($tries == 30)
+  {
+    --enable_result_log
+    SELECT @kept, @after;
+    --die the heap was not given back in 30 idle seconds
+  }
+}
+--enable_result_log
+--enable_query_log
 SELECT @kept - @after >= 30 AS expired_while_idle_and_given_back;
 CALL info(@r);
 SELECT @r AS cache;

@@ -67,6 +67,15 @@ public final class SqlBridge {
   /** The values one SQL message may carry. */
   public static final int MAX_VALUES = Wire.MAX_VALUES;
 
+  /**
+   * Whether this thread may send SQL now (the routine's own thread, while its guest code runs): the
+   * vector cache lets only such a thread load a set, so that threads of the routine wait for it.
+   */
+  public static boolean maySendSql() {
+    Dispatcher d = dispatcher;
+    return d != null && d.maySendSql();
+  }
+
   /** The running routine's schema (the current database while it runs), or null. */
   public static String routineSchema() {
     Dispatcher d = dispatcher;

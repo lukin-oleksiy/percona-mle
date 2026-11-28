@@ -1,0 +1,218 @@
+#
+# component_mle: the vector cache (exp note 76) when things go wrong: the heap
+# exhausted while a set is kept, the worker killed, a load stopped by KILL
+# QUERY, a load whose rows are bad, parameters of every kind, the cache used
+# from the routine's own threads. The server and the session work on, the
+# cache never holds a half-loaded set, the next call loads again.
+#
+call mtr.add_suppression("Component mle reported: 'The worker of .* was (lost|retired)");
+INSTALL COMPONENT "file://component_mle";
+# A small heap, so that exhausting it is quick; the cache's default limit is a quarter of it.
+SET GLOBAL mle.heap_max = 256 * 1024 * 1024;
+GRANT CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* TO root@localhost;
+# The routines run in con0 (a session that used MLE must end before UNINSTALL).
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE big (id BIGINT PRIMARY KEY, v VECTOR(256));
+INSERT INTO big WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30000)
+SELECT i, STRING_TO_VECTOR(CONCAT('[', REPEAT('0.5,', 255), i % 97, ']')) FROM n;
+CREATE TABLE items (id BIGINT PRIMARY KEY, v VECTOR(4));
+INSERT INTO items VALUES (1, STRING_TO_VECTOR('[1,0,0,0]')), (2, STRING_TO_VECTOR('[0,1,0,0]')),
+(3, STRING_TO_VECTOR('[0,0,1,0]')), (4, STRING_TO_VECTOR('[0,0,0,1]'));
+CREATE TABLE odd (id BIGINT PRIMARY KEY, v VECTOR(4));
+INSERT INTO odd VALUES (1, STRING_TO_VECTOR('[1,0,0,0]')), (2, STRING_TO_VECTOR('[0,1,0]'));
+CREATE TABLE dated (id BIGINT PRIMARY KEY, v VECTOR(4), d DATE, t TIME);
+INSERT INTO dated VALUES (1, STRING_TO_VECTOR('[1,0,0,0]'), '2026-01-01', '08:00:00'),
+(2, STRING_TO_VECTOR('[0,1,0,0]'), '2026-01-02', '12:00:00'), (3, STRING_TO_VECTOR('[0,0,1,0]'), '2026-01-03', '18:00:00');
+CREATE TABLE nulls (id BIGINT PRIMARY KEY, v VECTOR(4));
+INSERT INTO nulls VALUES (1, STRING_TO_VECTOR('[1,0,0,0]')), (2, NULL);
+CREATE FUNCTION info() RETURNS TEXT LANGUAGE JAVA AS $$
+StringBuilder b = new StringBuilder();
+for (CacheEntry e : Vectors.cacheInfo())
+b.append(e.name()).append(" rows ").append(e.rows()).append(" uses ").append(e.uses()).append("; ");
+return b.length() == 0 ? "(empty)" : b.toString().trim();
+$$;
+CREATE PROCEDURE big_size(OUT r TEXT) LANGUAGE JAVA AS $$
+VectorSet s = Vectors.cached("big", "SELECT id, v FROM big");
+r[0] = s.size() + " rows, nearest " + s.nearest(s.vector(0), 1, "cosine").ids()[0];
+$$;
+CREATE FUNCTION hog() RETURNS INT LANGUAGE JAVA AS $$
+java.util.List<long[]> keep = new java.util.ArrayList<>();
+for (;;) keep.add(new long[1 << 20]);
+$$;
+CREATE PROCEDURE items_size(OUT r INT) LANGUAGE JAVA AS $$
+r[0] = Vectors.cached("items", "SELECT id, v FROM items").size();
+$$;
+CREATE PROCEDURE slow_load() LANGUAGE JAVA AS $$
+Mle.session().runSql("DO GET_LOCK('slow_load', 0)");
+Vectors.cached("slow", "SELECT id, v FROM items WHERE SLEEP(2) = 0");
+$$;
+CREATE PROCEDURE odd_load(OUT r INT) LANGUAGE JAVA AS $$
+r[0] = Vectors.cached("odd", "SELECT id, v FROM odd").size();
+$$;
+CREATE PROCEDURE nulls_load(OUT r TEXT) LANGUAGE JAVA AS $$
+VectorSet s = Vectors.cached("nulls", "SELECT id, v FROM nulls");
+r[0] = s.size() + " kept, " + s.skipped() + " skipped";
+$$;
+# The routine's own threads: 16 tasks look up the set the routine loaded, all at once;
+# a thread asking for a set nobody loaded gets an error (SQL runs only on the
+# routine's thread); one asking while the routine loads it waits for that load.
+CREATE PROCEDURE threads(OUT r TEXT) LANGUAGE JAVA AS $$
+VectorSet s = Vectors.cached("items", "SELECT id, v FROM items");
+java.util.Set<Object> seen = java.util.concurrent.ConcurrentHashMap.newKeySet();
+java.util.stream.IntStream.range(0, 16).parallel().forEach(i ->
+seen.add(Vectors.cached("items", "SELECT id, v FROM items")));
+java.util.concurrent.ExecutorService ex = java.util.concurrent.Executors.newFixedThreadPool(4);
+String other;
+try {
+other = ex.submit(() -> {
+try { return "loaded " + Vectors.cached("fresh", "SELECT id, v FROM items WHERE id < 3").size(); }
+catch (IllegalStateException e) { return e.getMessage(); }
+}).get();
+// Threads asking while this thread loads "slow" (SLEEP(0.5) a row) get the set it loads.
+java.util.List<java.util.concurrent.Future<Object>> waiters = new java.util.ArrayList<>();
+VectorSet[] mine = new VectorSet[1];
+for (int i = 0; i < 4; i++)
+waiters.add(ex.submit(() -> {
+while (true) {
+try { return Vectors.cached("slow", "SELECT id, v FROM items WHERE SLEEP(0.5) = 0"); }
+catch (IllegalStateException e) { Thread.sleep(5); }  // not loading yet: ask again
+}
+}));
+mine[0] = Vectors.cached("slow", "SELECT id, v FROM items WHERE SLEEP(0.5) = 0");
+boolean same = true;
+for (java.util.concurrent.Future<Object> f : waiters) same &= f.get() == mine[0];
+other += "; waiters got the routine's set: " + same;
+} catch (InterruptedException | java.util.concurrent.ExecutionException e) {
+throw new IllegalStateException(e);
+} finally {
+ex.shutdown();
+}
+r[0] = "one set: " + (seen.size() == 1 && seen.contains(s)) + "; another thread: " + other;
+$$;
+# Parameters: Java dates and times (compared by value); a JavaScript array as
+# a VECTOR, taken when the call is made (changing it afterwards changes neither
+# the kept query nor refresh).
+CREATE PROCEDURE java_params(OUT r TEXT) LANGUAGE JAVA AS $$
+String sql = "SELECT id, v FROM dated WHERE d >= ? AND t <= ?";
+VectorSet a = Vectors.cached("byd", sql, java.time.LocalDate.of(2026, 1, 2), java.time.Duration.ofHours(12));
+VectorSet b = Vectors.cached("byd", sql, java.time.LocalDate.of(2026, 1, 2), java.time.Duration.ofHours(12));
+String other;
+try { Vectors.cached("byd", sql, java.time.LocalDate.of(2026, 1, 1), java.time.Duration.ofHours(12)); other = "kept"; }
+catch (IllegalArgumentException e) { other = "another query"; }
+r[0] = a.size() + " rows, the same set: " + (a == b) + "; another date: " + other;
+$$;
+CREATE PROCEDURE js_params(OUT r TEXT) LANGUAGE JAVASCRIPT AS $$
+const V = Java.type('com.percona.mle.api.Vectors')
+const sql = 'SELECT id, v FROM dated WHERE VECTOR_DIM(?) = 4 AND id > ?'
+  const q = [1, 0, 0, 0]
+const a = V.cached('jsq', sql, q, 1)
+q.push(5)  // five floats now: not the kept query's parameter
+  const again = V.refresh('jsq')  // runs the kept query: four floats
+  let other
+  try { V.cached('jsq', sql, q, 1); other = 'kept' } catch (e) { other = 'another query' }
+  const same = V.cached('jsq', sql, [1, 0, 0, 0], 1)
+  r = `${a.size()} rows; refresh ${again.size()} rows; the changed array: ${other}; the old values: ${same === again}`
+$$;
+CALL java_params(@r);
+SELECT @r AS java_params;
+java_params
+1 rows, the same set: true; another date: another query
+CALL js_params(@r);
+SELECT @r AS js_params;
+js_params
+2 rows; refresh 2 rows; the changed array: another query; the old values: true
+DROP PROCEDURE java_params;
+DROP PROCEDURE js_params;
+#
+# 1. The heap exhausted while a set is kept: the call fails, the worker is
+#    retired (its cache with it); the next call loads the set again.
+SET GLOBAL mle.sql_result_max = 256 * 1024 * 1024;
+CALL big_size(@r);
+SELECT @r AS big;
+big
+30000 rows, nearest 1
+CALL big_size(@r);
+SELECT @r AS big;
+big
+30000 rows, nearest 1
+SELECT info();
+info()
+byd rows 1 uses 1; jsq rows 2 uses 2; big rows 30000 uses 1;
+SELECT hog();
+ERROR HY000: Java> <out of memory>
+SELECT info();
+info()
+(empty)
+CALL big_size(@r);
+SELECT @r AS big;
+big
+30000 rows, nearest 1
+SELECT info();
+info()
+big rows 30000 uses 0;
+include/assert.inc [A new worker after heap exhaustion]
+#
+# 2. The worker killed from outside: the next call fails with the reason,
+#    the one after loads again in a fresh worker.
+SELECT info();
+ERROR HY000: MLE> the worker died: <reason>
+SELECT info();
+info()
+(empty)
+CALL big_size(@r);
+SELECT @r AS big;
+big
+30000 rows, nearest 1
+SELECT info();
+info()
+big rows 30000 uses 0;
+SET GLOBAL mle.sql_result_max = DEFAULT;
+#
+# 3. KILL QUERY while the set loads: nothing kept, the next call loads.
+CALL slow_load();
+KILL QUERY CON;
+ERROR 70100: Query execution was interrupted
+DO RELEASE_ALL_LOCKS();
+SELECT info();
+info()
+(empty)
+CALL items_size(@r);
+SELECT @r AS items;
+items
+4
+SELECT info();
+info()
+items rows 4 uses 0;
+#
+# 4. A load whose rows are bad (vectors of 4 and 3 floats): the error, nothing kept.
+CALL odd_load(@r);
+ERROR HY000: Java> java.lang.IllegalArgumentException: the vector of row 1 (id 2) has 3 dimensions, the first has 4 (odd_load, line 2)
+SELECT info();
+info()
+big rows 30000 uses 0;
+# A NULL vector is skipped, as by Vectors.load (skipped() counts it).
+CALL nulls_load(@r);
+SELECT @r AS nulls;
+nulls
+1 kept, 1 skipped
+#
+# 5. The routine's threads.
+CALL threads(@r);
+SELECT @r AS threads;
+threads
+one set: true; another thread: 'fresh' is not kept and cannot be loaded on this thread (SQL runs only on the thread that runs the routine): ask for it there first; waiters got the routine's set: true
+SELECT info();
+info()
+big rows 30000 uses 0; nulls rows 1 uses 0; items rows 4 uses 16; slow rows 4 uses 4;
+DROP TABLE big, items, odd, nulls, dated;
+DROP FUNCTION info;
+DROP PROCEDURE big_size;
+DROP FUNCTION hog;
+DROP PROCEDURE items_size;
+DROP PROCEDURE slow_load;
+DROP PROCEDURE odd_load;
+DROP PROCEDURE nulls_load;
+DROP PROCEDURE threads;
+REVOKE CREATE_JAVA_ROUTINE, CREATE_JAVASCRIPT_ROUTINE ON *.* FROM root@localhost;
+SET GLOBAL mle.heap_max = DEFAULT;
+UNINSTALL COMPONENT "file://component_mle";

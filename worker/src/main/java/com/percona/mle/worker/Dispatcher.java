@@ -62,8 +62,11 @@ final class Dispatcher {
   private final Thread thread;
   /** The languages of READY: what PREPARE and PARSE_LIBRARY may name, and an Error's language. */
   private final List<String> languages;
-  /** The request being served at the innermost depth, or null between requests. */
-  private Request current;
+  /**
+   * The request being served at the innermost depth, or null between requests. Volatile: threads of
+   * a routine read its schema (the vector cache's names, routineSchema).
+   */
+  private volatile Request current;
   /** Numbers the requests of this worker, nested ones too, and the ranges of their statement ids. */
   private long serials;
   /** The call_seq of the last top-level request: the next one's is 1 more (§8.2). */
@@ -257,6 +260,12 @@ final class Dispatcher {
     return q;
   }
 
+  /** Whether serving(...) would let this thread send SQL now. */
+  boolean maySendSql() {
+    Request q = current;
+    return Thread.currentThread() == thread && q != null && q.activation && !decodingRows;
+  }
+
   /** The worker_class of READY: this kind of worker, whatever the host calls its class (§9.1). */
   private static final String WORKER_CLASS = "jvm";
 
@@ -318,7 +327,8 @@ final class Dispatcher {
     long now = System.nanoTime();
     long trimAt = trimWhenIdle && IDLE_TRIM_NS > 0 && polyglot.pythonStarted() ? now + IDLE_TRIM_NS : Long.MAX_VALUE;
     trimWhenIdle = false;
-    long giveBackAt = com.percona.mle.api.VectorCache.takeGiveBack() ? now + IDLE_GC_NS : Long.MAX_VALUE;
+    // A give-back stays due until it runs: an idle time shorter than IDLE_GC_NS leaves it for the next.
+    long giveBackAt = com.percona.mle.api.VectorCache.giveBackDue() ? now + IDLE_GC_NS : Long.MAX_VALUE;
     while (true) {
       long expiryAt = com.percona.mle.api.VectorCache.nextExpiry();
       long at = Math.min(trimAt, Math.min(giveBackAt, expiryAt));
@@ -328,22 +338,24 @@ final class Dispatcher {
       now = System.nanoTime();
       if (expiryAt <= now) {
         com.percona.mle.api.VectorCache.expire();
-        if (giveBackAt == Long.MAX_VALUE && com.percona.mle.api.VectorCache.takeGiveBack()) giveBackAt = now;
+        if (giveBackAt == Long.MAX_VALUE && com.percona.mle.api.VectorCache.giveBackDue()) giveBackAt = now;
       }
       if (trimAt <= now || giveBackAt <= now) {
-        boolean cache = giveBackAt <= now;
+        boolean cache = com.percona.mle.api.VectorCache.giveBackDue();
         trimAt = giveBackAt = Long.MAX_VALUE;  // once per idle period
         MemoryWatch.forcedGc();
         System.gc();
         // SerialGC shrinks the heap in steps over consecutive full GCs (ShrinkHeapInSteps: 0, 10,
         // 40, 100 %). After the cache let go of a large set the live data is small and a GC is
         // short: a few more, until the committed heap stops falling, give it back now.
-        if (cache)
+        if (cache) {
           for (int i = 0; i < 3; i++) {
             long committed = Runtime.getRuntime().totalMemory();
             System.gc();
             if (Runtime.getRuntime().totalMemory() >= committed) break;
           }
+          com.percona.mle.api.VectorCache.gaveBack();
+        }
         Native.mallocTrim();
         mb.stats(Wire.STATE_IDLE);
       }

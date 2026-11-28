@@ -35,10 +35,12 @@ import java.util.function.Supplier;
  * nanoseconds (the unit tests drive both).
  *
  * <p>Thread-safe: the table is guarded by this object's lock; a load runs outside the lock, and
- * threads that ask for a name while it is loaded wait for that load (one load per name). Bytes are
+ * threads that ask for a name while it is loaded wait for that load (one load per name). Only a
+ * thread that may load (the routine's own: SQL runs there only) starts a load; another thread
+ * waits for a load under way or gets an error. Bytes are
  * counted per base: a view, or a quantized set that rescores with a set's floats, shares that set's
  * vectors, which count once however many entries use them; removing an entry frees its base only
- * when no other entry uses it.
+ * when no other entry uses it; a value kept under two names counts once.
  */
 final class CacheTable {
   /** What an entry holds: a VectorSet or a QuantizedSet. */
@@ -117,9 +119,12 @@ final class CacheTable {
 
   /**
    * The set kept under key, or loaded with loader and kept. A name kept under another query, kind
-   * or by keep() is an error. With the cache off: loaded every time, not kept.
+   * or by keep() is an error. With the cache off: loaded every time, not kept. mayLoad: whether this
+   * thread may run the loader; if not, it waits for a load under way, or fails when there is none
+   * (rather than a load that fails or succeeds by which thread came first).
    */
-  Sized cached(Key key, String kind, String sql, List<Object> params, Object[] raw, Supplier<Sized> loader) {
+  Sized cached(Key key, String kind, String sql, List<Object> params, Object[] raw, Supplier<Sized> loader,
+      boolean mayLoad) {
     if (!enabled()) return loader.get();
     while (true) {
       CompletableFuture<Void> wait;
@@ -132,6 +137,10 @@ final class CacheTable {
           return e.value;
         }
         wait = loading.get(key);
+        if (wait == null && !mayLoad) {
+          throw new IllegalStateException("'" + key.name() + "' is not kept and cannot be loaded on this thread"
+              + " (SQL runs only on the thread that runs the routine): ask for it there first");
+        }
         if (wait == null) {
           loading.put(key, mine = new CompletableFuture<>());
           loaders.put(key, Thread.currentThread());
@@ -139,33 +148,34 @@ final class CacheTable {
           throw new IllegalStateException("'" + key.name() + "' is being loaded by this call: its query cannot use it");
         }
       }
-      if (mine == null) {  // another thread loads this name: wait, then look again
-        try {
-          wait.join();
-        } catch (RuntimeException failed) {
-          // its load failed and kept nothing: look again (this thread may load it)
-        }
+      if (mine == null) {  // another thread loads this name: wait, then look again (its load may have failed)
+        wait.join();
         continue;
       }
-      Sized value;
+      // The waiters are released whatever happens, an OutOfMemoryError in put() too: complete(null)
+      // allocates nothing, and a waiter looks again either way.
       try {
-        value = loader.get();
-      } catch (RuntimeException | Error t) {
+        Sized value = loader.get();
+        Entry n = new Entry(key, kind, sql, params, raw, value, clock.getAsLong(), defaultIdleNs);
         synchronized (this) {
           loading.remove(key);
           loaders.remove(key);
+          put(n, null);
         }
-        mine.completeExceptionally(t);
-        throw t;
+        return value;
+      } finally {
+        synchronized (this) {
+          loading.remove(key, mine);
+          loaders.remove(key);
+        }
+        mine.complete(null);
       }
-      synchronized (this) {
-        loading.remove(key);
-        loaders.remove(key);
-        put(new Entry(key, kind, sql, params, raw, value, clock.getAsLong(), defaultIdleNs), null);
-      }
-      mine.complete(null);
-      return value;
     }
+  }
+
+  /** cached(...) by a thread that may load. */
+  Sized cached(Key key, String kind, String sql, List<Object> params, Object[] raw, Supplier<Sized> loader) {
+    return cached(key, kind, sql, params, raw, loader, true);
   }
 
   private static void same(Entry e, String kind, String sql, List<Object> params) {
@@ -248,7 +258,11 @@ final class CacheTable {
     return true;
   }
 
-  /** Drops the entries idle for their idle time by now. */
+  /**
+   * Drops the entries idle for their idle time by now; then, if indexes built since the sets were
+   * kept (cosine norms, ids, labels) took the bytes over the limit, the least recently used until
+   * they fit (put() is the only other place that evicts).
+   */
   synchronized void expire() {
     long now = clock.getAsLong();
     long before = total();
@@ -260,31 +274,43 @@ final class CacheTable {
         any = true;
       }
     }
+    for (Iterator<Entry> it = entries.values().iterator(); it.hasNext() && entries.size() > 1 && total() > max; ) {
+      it.next();
+      it.remove();
+      any = true;
+    }
     if (any) freed(before);
   }
 
-  /** The clock's time of the next expiry, or Long.MAX_VALUE. */
+  /** Expiries further than this are looked at again then (no overflow of the clock's time). */
+  static final long FAR_NS = 86_400_000_000_000L;
+
+  /** The clock's time of the next expiry (at most FAR_NS away), or Long.MAX_VALUE. */
   synchronized long nextExpiry() {
-    long next = Long.MAX_VALUE;
+    long now = clock.getAsLong();
+    long next = Long.MAX_VALUE;  // nanoseconds from now
     for (Entry e : entries.values())
-      if (e.idleNs > 0) next = Math.min(next, e.lastUsedNs + e.idleNs);
-    return next;
+      if (e.idleNs > 0) next = Math.min(next, Math.max(0, e.idleNs - (now - e.lastUsedNs)));
+    return next == Long.MAX_VALUE ? next : now + Math.min(next, FAR_NS);
   }
 
-  /** Whether disposals freed enough since the last give-back to give memory back now; resets it. */
-  synchronized boolean takeGiveBack() {
-    boolean due = giveBackDue;
+  /** Whether disposals freed enough since the last give-back to give memory back. */
+  synchronized boolean giveBackDue() {
+    return giveBackDue;
+  }
+
+  /** The memory was given back (a GC ran): count anew. */
+  synchronized void gaveBack() {
     giveBackDue = false;
-    if (due) freed = 0;
-    return due;
+    freed = 0;
   }
 
-  /** The bytes kept: every entry's own bytes and every base once. */
+  /** The bytes kept: every value's own bytes once (a value may be kept under two names), every base once. */
   synchronized long total() {
     long t = 0;
-    IdentityHashMap<Object, Boolean> bases = new IdentityHashMap<>();
+    IdentityHashMap<Object, Boolean> values = new IdentityHashMap<>(), bases = new IdentityHashMap<>();
     for (Entry e : entries.values()) {
-      t += e.value.ownBytes();
+      if (values.put(e.value, Boolean.TRUE) == null) t += e.value.ownBytes();
       Object b = e.value.base();
       if (b != null && bases.put(b, Boolean.TRUE) == null) t += e.value.baseBytes();
     }
@@ -320,15 +346,15 @@ final class CacheTable {
    */
   private boolean put(Entry n, Entry old) {
     Entry previous = old != null ? old : entries.get(n.key);
-    // The bytes n adds: its own, and its base unless another entry (not the one it replaces) has it.
-    long adds = n.value.ownBytes();
+    // The bytes n adds: its own and its base, each unless another entry (not the one it replaces) has it.
     Object base = n.value.base();
-    if (base != null) {
-      boolean shared = false;
-      for (Entry e : entries.values())
-        if (e != previous && e.value.base() == base) shared = true;
-      if (!shared) adds += n.value.baseBytes();
+    boolean sameValue = false, sharedBase = false;
+    for (Entry e : entries.values()) {
+      if (e == previous) continue;
+      if (e.value == n.value) sameValue = true;
+      if (base != null && e.value.base() == base) sharedBase = true;
     }
+    long adds = (sameValue ? 0 : n.value.ownBytes()) + (base != null && !sharedBase ? n.value.baseBytes() : 0);
     if (adds > max) {
       refused = new Info(n.key, n.kind, n.value.rows(), n.value.dimensions(), adds, n.loadedAtMs, 0, -1, 0, n.sql,
           "not kept: " + mib(adds) + " is more than mle.vector_cache_max (" + mib(max) + ")");

@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /** The vector cache's table (exp note 76): eviction, shared bases, names, refresh, expiry, threads. */
@@ -53,6 +54,13 @@ class CacheTableTest {
 
   static Fake own(long bytes) {
     return new Fake(null, 0, bytes);
+  }
+
+  /** Whether a give-back is due; then it ran. */
+  static boolean take(CacheTable t) {
+    boolean due = t.giveBackDue();
+    if (due) t.gaveBack();
+    return due;
   }
 
   CacheTable.Sized load(CacheTable t, String name, CacheTable.Sized v) {
@@ -80,7 +88,7 @@ class CacheTableTest {
     assertEquals(6120, t.total());
     t.drop(k("view1"));
     assertEquals(6070, t.total());  // the base stays for view2
-    assertFalse(t.takeGiveBack());
+    assertFalse(take(t));
     t.keep(k("other"), "vectors", own(5000));  // needs the base's room: view2 (and its base) evicted
     assertNull(t.kept(k("view2")));
     assertEquals(5000, t.total());
@@ -195,16 +203,16 @@ class CacheTableTest {
     load(t, "big", own(100L << 20));
     load(t, "small", own(1 << 20));
     t.drop(k("small"));
-    assertFalse(t.takeGiveBack());  // 1 MiB: not worth a GC
+    assertFalse(take(t));  // 1 MiB: not worth a GC
     t.drop(k("big"));
-    assertTrue(t.takeGiveBack());  // 100 MiB, and the cache is empty
-    assertFalse(t.takeGiveBack());  // once
+    assertTrue(take(t));  // 100 MiB, and the cache is empty
+    assertFalse(take(t));  // once
     load(t, "x", own(10));
     t.dropAll();
-    assertTrue(t.takeGiveBack());  // the whole cache
+    assertTrue(take(t));  // the whole cache
     load(t, "y", own(10));
     t.clear();  // RESET: its own GC, no give-back
-    assertFalse(t.takeGiveBack());
+    assertFalse(take(t));
   }
 
   @Test
@@ -287,5 +295,132 @@ class CacheTableTest {
     for (Thread th : threads) th.join();
     assertEquals(0, failures.get());
     assertTrue(t.total() <= 5_000);
+  }
+
+  @Test
+  void aThreadThatMayNotLoadWaitsForALoadOrFails() throws Exception {
+    CacheTable t = table(1000, 0);
+    assertThrows(IllegalStateException.class,
+        () -> t.cached(k("a"), "vectors", "SELECT a", List.of(), new Object[0], () -> own(10), false));
+    assertNull(t.kept(k("a")));
+    CountDownLatch loading = new CountDownLatch(1), release = new CountDownLatch(1);
+    Fake v = own(10);
+    Thread loader = new Thread(() -> t.cached(k("a"), "vectors", "SELECT a", List.of(), new Object[0], () -> {
+      loading.countDown();
+      try {
+        release.await();
+      } catch (InterruptedException e) {
+        throw new IllegalStateException(e);
+      }
+      return v;
+    }));
+    loader.start();
+    loading.await();
+    AtomicReference<Object> got = new AtomicReference<>();
+    Thread waiter = new Thread(() -> got.set(
+        t.cached(k("a"), "vectors", "SELECT a", List.of(), new Object[0], () -> own(99), false)));
+    waiter.start();
+    Thread.sleep(50);
+    assertTrue(waiter.isAlive());  // waits for the load under way
+    release.countDown();
+    loader.join();
+    waiter.join();
+    assertSame(v, got.get());
+  }
+
+  @Test
+  void waitersAreReleasedWhenKeepingTheLoadedSetFails() throws Exception {
+    CacheTable t = table(1000, 0);
+    CountDownLatch loading = new CountDownLatch(1), release = new CountDownLatch(1);
+    // A value whose bytes cannot be counted (as an OutOfMemoryError in put() would).
+    CacheTable.Sized broken = new CacheTable.Sized() {
+      public Object base() { return null; }
+      public long baseBytes() { return 0; }
+      public long ownBytes() { throw new OutOfMemoryError("test"); }
+      public int rows() { return 1; }
+      public int dimensions() { return 1; }
+    };
+    Thread loader = new Thread(() -> {
+      try {
+        t.cached(k("a"), "vectors", "SELECT a", List.of(), new Object[0], () -> {
+          loading.countDown();
+          try {
+            release.await();
+          } catch (InterruptedException e) {
+            throw new IllegalStateException(e);
+          }
+          return broken;
+        });
+      } catch (OutOfMemoryError expected) {
+        // the loading call fails
+      }
+    });
+    loader.start();
+    loading.await();
+    AtomicReference<Object> got = new AtomicReference<>();
+    Thread waiter = new Thread(() -> got.set(load(t, "a", own(5))));
+    waiter.start();
+    Thread.sleep(50);
+    release.countDown();
+    waiter.join(5000);
+    assertFalse(waiter.isAlive(), "a waiter of a failed put() must not hang");
+    assertEquals(5, ((Fake) got.get()).ownBytes());  // it loaded the name itself
+  }
+
+  @Test
+  void aGiveBackStaysDueUntilItRuns() {
+    CacheTable t = table(1L << 40, 0);
+    load(t, "a", own(100L << 20));
+    t.drop(k("a"));
+    assertTrue(t.giveBackDue());
+    assertTrue(t.giveBackDue());  // looking does not take it
+    t.gaveBack();
+    assertFalse(t.giveBackDue());
+  }
+
+  @Test
+  void indexesBuiltAfterKeepingAreEvictedAtTheNextExpiry() {
+    CacheTable t = table(1000, 0);
+    AtomicLong grows = new AtomicLong(400);
+    CacheTable.Sized growing = new CacheTable.Sized() {
+      public Object base() { return null; }
+      public long baseBytes() { return 0; }
+      public long ownBytes() { return grows.get(); }
+      public int rows() { return 1; }
+      public int dimensions() { return 1; }
+    };
+    load(t, "a", growing);
+    load(t, "b", own(500));
+    grows.set(700);  // an index built after keep: 1200 > 1000
+    t.expire();
+    assertNull(t.kept(k("a")));
+    assertEquals(500, t.total());
+    t.expire();  // the last set stays even when its own index takes it over
+    grows.set(2000);
+    load(t, "a2", growing);  // refused (over the limit alone)
+    assertNull(t.kept(k("a2")));
+  }
+
+  @Test
+  void aFarExpiryDoesNotOverflow() {
+    CacheTable t = table(1000, 0);
+    load(t, "a", own(10));
+    load(t, "b", own(10));
+    t.expireAfter(k("a"), Long.MAX_VALUE / 1_000_000L);
+    t.expireAfter(k("b"), 5_000);
+    assertEquals(now.get() + 5 * S, t.nextExpiry());
+    t.drop(k("b"));
+    long next = t.nextExpiry();
+    assertTrue(next > now.get() && next <= now.get() + CacheTable.FAR_NS);
+  }
+
+  @Test
+  void aValueKeptUnderTwoNamesCountsOnce() {
+    CacheTable t = table(1000, 0);
+    Fake v = own(600);
+    t.keep(k("a"), "vectors", v);
+    assertTrue(t.keep(k("b"), "vectors", v));  // fits: the same 600 bytes
+    assertEquals(600, t.total());
+    assertSame(v, t.kept(k("a")));
   }
 }

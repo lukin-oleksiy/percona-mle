@@ -38,7 +38,10 @@ import org.graalvm.polyglot.Value;
 public final class VectorCache {
   private VectorCache() {}
 
-  /** The limit: mle.vector_cache_max (-Dmle.vectorCacheMax), -1 (the default) for a quarter of the heap. */
+  /**
+   * The limit: mle.vector_cache_max (-Dmle.vectorCacheMax), -1 (the default) for a quarter of the
+   * heap; at most the heap (a larger setting would never evict before the heap is exhausted).
+   */
   static final long MAX = limit(Long.getLong("mle.vectorCacheMax", -1));
   /** The default idle time: mle.vector_cache_idle_ms (-Dmle.vectorCacheIdleMs), 30 minutes; 0: never. */
   static final long IDLE_MS = Math.max(0, Long.getLong("mle.vectorCacheIdleMs", 1_800_000L));
@@ -46,7 +49,8 @@ public final class VectorCache {
   static final CacheTable TABLE = new CacheTable(MAX, IDLE_MS * 1_000_000L, System::nanoTime);
 
   static long limit(long setting) {
-    return setting < 0 ? Runtime.getRuntime().maxMemory() / 4 : setting;
+    long heap = Runtime.getRuntime().maxMemory();
+    return setting < 0 ? heap / 4 : Math.min(setting, heap);
   }
 
   // ------------------------------------------------------- for the library
@@ -64,14 +68,16 @@ public final class VectorCache {
   static VectorSet cached(String name, String sql, Object[] params) {
     if (sql == null) throw new IllegalArgumentException("the query must not be null");
     Object[] p = javaValues(params);
-    return (VectorSet) TABLE.cached(key(name), "vectors", sql, values(p), p, () -> VectorSet.load(sql, p));
+    return (VectorSet) TABLE.cached(key(name), "vectors", sql, values(p), p, () -> VectorSet.load(sql, p),
+        com.percona.mle.worker.SqlBridge.maySendSql());
   }
 
   static QuantizedSet cachedQuantized(String name, String type, String sql, Object[] params) {
     if (sql == null) throw new IllegalArgumentException("the query must not be null");
     String kind = QuantizedSet.binaryType(type) ? "binary" : "int8";
     Object[] p = javaValues(params);
-    return (QuantizedSet) TABLE.cached(key(name), kind, sql, values(p), p, () -> QuantizedSet.load(kind, sql, p));
+    return (QuantizedSet) TABLE.cached(key(name), kind, sql, values(p), p, () -> QuantizedSet.load(kind, sql, p),
+        com.percona.mle.worker.SqlBridge.maySendSql());
   }
 
   static Object refresh(String name) {
@@ -82,32 +88,52 @@ public final class VectorCache {
   }
 
   /**
-   * The parameters as Java values, taken once (a JavaScript array changed after the call does not
-   * change the kept query): a guest number as Long or Double, text as String, an array or numpy
-   * array as float[] (a VECTOR), a host object as itself.
+   * The parameters as Java values, taken once: a JavaScript array or object changed after the call
+   * does not change the kept query, and no guest object is held after the call. A guest number
+   * becomes Long or Double, text String, a guest date and time LocalDate, LocalTime, LocalDateTime
+   * or Instant, a duration Duration, an array or numpy array float[] (a VECTOR); a Java array is
+   * copied; other Java objects stay as they are. A guest value that is none of these stays as it is
+   * (the load then reports it as Vectors.load does).
    */
   static Object[] javaValues(Object[] params) {
     if (params == null) return new Object[0];
     Object[] out = new Object[params.length];
-    for (int i = 0; i < out.length; i++) {
-      Object p = params[i];
-      if (p instanceof Value v) {
-        if (v.isNull()) p = null;
-        else if (v.isHostObject()) p = v.asHostObject();
-        else if (v.isBoolean()) p = v.asBoolean();
-        else if (v.isNumber()) p = v.fitsInLong() ? (Object) v.asLong() : (Object) v.asDouble();
-        else if (v.isString()) p = v.asString();
-        else if (v.hasArrayElements() || v.hasMember("tobytes")) p = GuestVectors.vector(v, "parameter " + i);
-      }
-      out[i] = p;
-    }
+    for (int i = 0; i < out.length; i++) out[i] = javaValue(params[i], i);
     return out;
   }
 
+  private static Object javaValue(Object p, int i) {
+    if (p == null || p instanceof Number || p instanceof String || p instanceof Boolean || p instanceof MleJson
+        || p instanceof java.time.temporal.TemporalAccessor || p instanceof java.time.Duration) return p;
+    if (p instanceof float[] f) return f.clone();
+    if (p instanceof byte[] b) return b.clone();
+    if (p instanceof double[] d) return d.clone();
+    if (p.getClass().isArray()) return p;  // not a parameter SQL takes: the load says so
+    // A guest value: as a Value, or wrapped for Java (a JavaScript array arrives as a List, an object as a Map).
+    Value v = p instanceof Value pv ? pv : Value.asValue(p);
+    if (v.isHostObject()) {
+      Object h = v.asHostObject();
+      return h == p ? p : javaValue(h, i);
+    }
+    if (v.isNull()) return null;
+    if (v.isBoolean()) return v.asBoolean();
+    if (v.isNumber()) return v.fitsInLong() ? (Object) v.asLong() : (Object) v.asDouble();
+    if (v.isString()) return v.asString();
+    if (v.isInstant() && v.isTimeZone()) return v.asInstant();
+    if (v.isDate() && v.isTime()) return java.time.LocalDateTime.of(v.asDate(), v.asTime());
+    if (v.isDate()) return v.asDate();
+    if (v.isTime()) return v.asTime();
+    if (v.isDuration()) return v.asDuration();
+    if (v.hasArrayElements() || v.hasMember("tobytes")) return GuestVectors.vector(v, "parameter " + i);
+    return p;
+  }
+
   /**
-   * The parameters as the values they become in SQL, to compare by value: integers as Long (or
-   * BigInteger), other numbers as Double or a BigDecimal without trailing zeros, text as String, a
-   * VECTOR or bytes as a list of their elements; JavaScript and Python values the same way.
+   * The parameters (Java values, from javaValues) as the values they become in SQL, to compare by
+   * value: integers as Long (or BigInteger), other numbers as Double, or a BigDecimal without
+   * trailing zeros when no double is that number; text as String, a VECTOR or bytes as a list of
+   * their elements, JSON as its text, a date or time as itself; anything else as itself (equal only
+   * to itself, or by its equals).
    */
   static List<Object> values(Object[] params) {
     List<Object> out = new ArrayList<>(params.length);
@@ -120,34 +146,34 @@ public final class VectorCache {
 
   private static Object value(Object p) {
     if (p == null) return null;
-    if (p instanceof Value v) {
-      if (v.isNull()) return null;
-      if (v.isHostObject()) return value(v.asHostObject());
-      if (v.isBoolean()) return v.asBoolean() ? 1L : 0L;
-      if (v.isNumber()) return v.fitsInLong() ? (Object) v.asLong() : (Object) v.asDouble();
-      if (v.isString()) return v.asString();
-      if (v.hasArrayElements() || v.hasMember("tobytes")) return floats(GuestVectors.vector(v, "a parameter"));
-      return v.toString();
-    }
     if (p instanceof Long || p instanceof Integer || p instanceof Short || p instanceof Byte) return ((Number) p).longValue();
     if (p instanceof Boolean b) return b ? 1L : 0L;
-    if (p instanceof Double || p instanceof Float) {
-      double d = ((Number) p).doubleValue();
-      return d == Math.rint(d) && Math.abs(d) < 0x1p63 ? (Object) (long) d : (Object) d;
-    }
+    if (p instanceof Double || p instanceof Float) return number(((Number) p).doubleValue());
     if (p instanceof BigInteger b) return b.bitLength() < 64 ? (Object) b.longValue() : b;
     if (p instanceof BigDecimal b) {
       BigDecimal s = b.stripTrailingZeros();
-      return s.scale() <= 0 && s.precision() - s.scale() < 19 ? (Object) s.longValueExact() : s;
+      if (s.scale() <= 0 && s.precision() - s.scale() < 19) return s.longValueExact();
+      double d = s.doubleValue();
+      return Double.isFinite(d) && new BigDecimal(d).compareTo(s) == 0 ? (Object) d : s;
     }
     if (p instanceof float[] f) return floats(f);
+    if (p instanceof double[] d) {
+      float[] f = new float[d.length];
+      for (int i = 0; i < d.length; i++) f[i] = (float) d[i];
+      return floats(f);
+    }
     if (p instanceof byte[] b) {
       List<Byte> l = new ArrayList<>(b.length);
       for (byte x : b) l.add(x);
       return List.copyOf(l);
     }
     if (p instanceof CharSequence s) return s.toString();
-    return value(Value.asValue(p));
+    if (p instanceof MleJson j) return List.of("json", j.text());
+    return p;
+  }
+
+  private static Object number(double d) {
+    return d == Math.rint(d) && Math.abs(d) < 0x1p63 ? (Object) (long) d : (Object) d;
   }
 
   private static List<Float> floats(float[] f) {
@@ -173,8 +199,13 @@ public final class VectorCache {
     return TABLE.nextExpiry();
   }
 
-  /** Whether drops, expiry or eviction freed enough (64 MiB, or the whole cache) to give memory back; resets it. */
-  public static boolean takeGiveBack() {
-    return TABLE.takeGiveBack();
+  /** Whether drops, expiry or eviction freed enough (64 MiB, or the whole cache) to give memory back. */
+  public static boolean giveBackDue() {
+    return TABLE.giveBackDue();
+  }
+
+  /** The worker gave memory back (it ran a GC): what is freed from now on counts anew. */
+  public static void gaveBack() {
+    TABLE.gaveBack();
   }
 }
