@@ -35,7 +35,7 @@ import java.util.Map;
  * {@link #mean} and {@link #meanOf} (centroids, profiles), {@link #kmeans}, {@link #classify}
  * (k nearest neighbours' vote) and {@link #truncate} (Matryoshka embeddings).
  */
-public final class VectorSet implements CacheTable.Sized {
+public final class VectorSet {
   private final float[][] rows;
   private final long[] ids;
   private final String[] labels;
@@ -604,27 +604,21 @@ public final class VectorSet implements CacheTable.Sized {
 
   // ----------------------------------------------- bytes (exp note 76)
 
+  // For the cache's table (VectorCache.sized); not API (exp note 76 T6).
+
   /** The set whose vectors this one shares: a view's root, else this set. */
-  @Override
-  public Object base() {
+  Object cacheBase() {
     return root;
   }
 
   /** The bytes of the root set: its vectors, ids, labels and the indexes it has built. */
-  @Override
-  public long baseBytes() {
+  long cacheBaseBytes() {
     return root.storageBytes();
   }
 
   /** A view's own arrays (references, ids, its indexes); 0 for a set that is its own root. */
-  @Override
-  public long ownBytes() {
+  long cacheOwnBytes() {
     return root == this ? 0 : 3 * (16 + 8L * rows.length) + indexBytes();
-  }
-
-  @Override
-  public int rows() {
-    return rows.length;
   }
 
   private long storageBytes() {

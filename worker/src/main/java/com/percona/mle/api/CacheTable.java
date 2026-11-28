@@ -41,10 +41,21 @@ import java.util.function.Supplier;
  * counted per base: a view, or a quantized set that rescores with a set's floats, shares that set's
  * vectors, which count once however many entries use them; removing an entry frees its base only
  * when no other entry uses it; a value kept under two names counts once.
+ *
+ * <p>Entries hold their values through soft references (exp note 76 H1): the JVM clears them before
+ * it would throw an OutOfMemoryError, so a call that needs the heap gets it and the next {@code
+ * cached} loads the set again. A cleared entry is forgotten when the table next looks at it (the
+ * last one forgotten shows in info()). SerialGC also clears a soft reference unused for about a
+ * second per free MiB of heap, so an idle set can go before its idle time.
  */
 final class CacheTable {
   /** What an entry holds: a VectorSet or a QuantizedSet. */
   interface Sized {
+    /** What is kept (a VectorSet, a QuantizedSet): what the cache returns, and its identity. */
+    default Object set() {
+      return this;
+    }
+
     /** The vectors this value shares with others (a view's root set), or null. */
     Object base();
 
@@ -68,7 +79,8 @@ final class CacheTable {
     final String sql;  // null: kept by keep()
     final List<Object> params;  // as compared (by value)
     final Object[] raw;  // as passed to the query (Java values)
-    Sized value;
+    final java.lang.ref.SoftReference<Sized> ref;
+    final int rows, dimensions;  // for info() after the JVM cleared the value
     final long loadedAtMs;
     long lastUsedNs, uses, idleNs;
 
@@ -78,10 +90,17 @@ final class CacheTable {
       this.sql = sql;
       this.params = params;
       this.raw = raw;
-      this.value = value;
+      this.ref = new java.lang.ref.SoftReference<>(value);
+      this.rows = value.rows();
+      this.dimensions = value.dimensions();
       this.loadedAtMs = System.currentTimeMillis();
       this.lastUsedNs = now;
       this.idleNs = idleNs;
+    }
+
+    /** The value, or null once the JVM cleared it. */
+    Sized value() {
+      return ref.get();
     }
   }
 
@@ -90,6 +109,8 @@ final class CacheTable {
       long uses, String sql, String state) {}
 
   static final long GIVE_BACK = 64L << 20;
+  /** Emptying the cache gives memory back only if this much was freed since the last give-back (T3). */
+  static final long GIVE_BACK_EMPTIED = 8L << 20;
 
   private final long max;
   private final long defaultIdleNs;
@@ -99,6 +120,7 @@ final class CacheTable {
   private final Map<Key, CompletableFuture<Void>> loading = new java.util.HashMap<>();
   /** The thread loading each name: a load query that asks for its own name (a function in it) fails, not waits. */
   private final Map<Key, Thread> loaders = new java.util.HashMap<>();
+  /** The last set not kept (over the limit) or forgotten (cleared by the JVM), for info(). */
   private Info refused;
   private long freed;
   private boolean giveBackDue;
@@ -130,11 +152,15 @@ final class CacheTable {
       CompletableFuture<Void> wait;
       CompletableFuture<Void> mine = null;
       synchronized (this) {
-        Entry e = entries.get(key);
+        Entry e = live(key);
         if (e != null) {
-          same(e, kind, sql, params);
-          touch(e);
-          return e.value;
+          Sized v = e.value();
+          if (v != null) {
+            same(e, kind, sql, params);
+            touch(e);
+            return v;
+          }
+          forget(e);  // cleared since live() looked
         }
         wait = loading.get(key);
         if (wait == null && !mayLoad) {
@@ -197,10 +223,14 @@ final class CacheTable {
 
   /** The value kept under key, or null. */
   synchronized Sized kept(Key key) {
-    Entry e = entries.get(key);
-    if (e == null) return null;
+    Entry e = live(key);
+    Sized v = e == null ? null : e.value();
+    if (v == null) {
+      if (e != null) forget(e);
+      return null;
+    }
     touch(e);
-    return e.value;
+    return v;
   }
 
   /**
@@ -211,7 +241,7 @@ final class CacheTable {
   Sized refresh(Key key, java.util.function.Function<Entry, Sized> reloader) {
     Entry e;
     synchronized (this) {
-      e = entries.get(key);
+      e = live(key);
       if (e == null) return null;
       if (e.sql == null)
         throw new IllegalArgumentException("'" + key.name() + "' is kept by keep(), without a query to run again");
@@ -228,6 +258,7 @@ final class CacheTable {
   }
 
   synchronized boolean drop(Key key) {
+    purge();
     long before = total();
     boolean had = entries.remove(key) != null;
     if (had) freed(before);
@@ -235,6 +266,7 @@ final class CacheTable {
   }
 
   synchronized void dropAll() {
+    purge();
     if (entries.isEmpty()) return;
     long before = total();
     entries.clear();
@@ -252,7 +284,7 @@ final class CacheTable {
   /** Sets an entry's idle time (0: never expires); false if the name is not kept. */
   synchronized boolean expireAfter(Key key, long idleMs) {
     if (idleMs < 0) throw new IllegalArgumentException("idleMs must be at least 0 (0: never), not " + idleMs);
-    Entry e = entries.get(key);
+    Entry e = live(key);
     if (e == null) return false;
     e.idleNs = idleMs > Long.MAX_VALUE / 1_000_000L ? 0 : idleMs * 1_000_000L;
     return true;
@@ -264,6 +296,7 @@ final class CacheTable {
    * they fit (put() is the only other place that evicts).
    */
   synchronized void expire() {
+    purge();
     long now = clock.getAsLong();
     long before = total();
     boolean any = false;
@@ -310,9 +343,11 @@ final class CacheTable {
     long t = 0;
     IdentityHashMap<Object, Boolean> values = new IdentityHashMap<>(), bases = new IdentityHashMap<>();
     for (Entry e : entries.values()) {
-      if (values.put(e.value, Boolean.TRUE) == null) t += e.value.ownBytes();
-      Object b = e.value.base();
-      if (b != null && bases.put(b, Boolean.TRUE) == null) t += e.value.baseBytes();
+      Sized v = e.value();
+      if (v == null) continue;  // cleared by the JVM: its bytes are free already
+      if (values.put(v.set(), Boolean.TRUE) == null) t += v.ownBytes();
+      Object b = v.base();
+      if (b != null && bases.put(b, Boolean.TRUE) == null) t += v.baseBytes();
     }
     return t;
   }
@@ -323,12 +358,15 @@ final class CacheTable {
 
   /** The entries, least recently used first, then the last set that was not kept (if any). */
   synchronized List<Info> info() {
+    purge();
     long now = clock.getAsLong();
     List<Info> out = new ArrayList<>();
     for (Entry e : entries.values()) {
-      long bytes = e.value.ownBytes() + (e.value.base() != null ? e.value.baseBytes() : 0);
+      Sized v = e.value();
+      if (v == null) continue;
+      long bytes = v.ownBytes() + (v.base() != null ? v.baseBytes() : 0);
       long expires = e.idleNs == 0 ? -1 : Math.max(0, (e.lastUsedNs + e.idleNs - now) / 1_000_000L);
-      out.add(new Info(e.key, e.kind, e.value.rows(), e.value.dimensions(), bytes, e.loadedAtMs, e.idleNs / 1_000_000L,
+      out.add(new Info(e.key, e.kind, e.rows, e.dimensions, bytes, e.loadedAtMs, e.idleNs / 1_000_000L,
           expires, e.uses, e.sql, "kept"));
     }
     if (refused != null) out.add(refused);
@@ -345,18 +383,22 @@ final class CacheTable {
    * until the bytes fit. A value larger than the limit alone is not kept and evicts nothing.
    */
   private boolean put(Entry n, Entry old) {
+    purge();
+    Sized nv = n.value();
+    if (nv == null) return false;  // cleared already (the heap is that short)
     Entry previous = old != null ? old : entries.get(n.key);
     // The bytes n adds: its own and its base, each unless another entry (not the one it replaces) has it.
-    Object base = n.value.base();
+    Object base = nv.base();
     boolean sameValue = false, sharedBase = false;
     for (Entry e : entries.values()) {
-      if (e == previous) continue;
-      if (e.value == n.value) sameValue = true;
-      if (base != null && e.value.base() == base) sharedBase = true;
+      Sized v = e.value();
+      if (e == previous || v == null) continue;
+      if (v.set() == nv.set()) sameValue = true;
+      if (base != null && v.base() == base) sharedBase = true;
     }
-    long adds = (sameValue ? 0 : n.value.ownBytes()) + (base != null && !sharedBase ? n.value.baseBytes() : 0);
+    long adds = (sameValue ? 0 : nv.ownBytes()) + (base != null && !sharedBase ? nv.baseBytes() : 0);
     if (adds > max) {
-      refused = new Info(n.key, n.kind, n.value.rows(), n.value.dimensions(), adds, n.loadedAtMs, 0, -1, 0, n.sql,
+      refused = new Info(n.key, n.kind, n.rows, n.dimensions, adds, n.loadedAtMs, 0, -1, 0, n.sql,
           "not kept: " + mib(adds) + " is more than mle.vector_cache_max (" + mib(max) + ")");
       if (previous != null) {  // a replacement that does not fit: the old one goes too (it is stale)
         long before = total();
@@ -381,7 +423,45 @@ final class CacheTable {
     long f = before - total();
     if (f <= 0) return;
     freed += f;
-    if (freed >= GIVE_BACK || entries.isEmpty()) giveBackDue = true;
+    if (freed >= GIVE_BACK || (entries.isEmpty() && freed >= GIVE_BACK_EMPTIED)) giveBackDue = true;
+  }
+
+  /** The entry under key if its value is still there; a cleared one is forgotten. */
+  private Entry live(Key key) {
+    Entry e = entries.get(key);
+    if (e != null && e.value() == null) {
+      forget(e);
+      return null;
+    }
+    return e;
+  }
+
+  /** Forgets the entries the JVM cleared. */
+  private void purge() {
+    for (Iterator<Entry> it = entries.values().iterator(); it.hasNext(); ) {
+      Entry e = it.next();
+      if (e.value() == null) {
+        it.remove();
+        noteForgotten(e);
+      }
+    }
+  }
+
+  private void forget(Entry e) {
+    if (entries.get(e.key) == e) entries.remove(e.key);
+    noteForgotten(e);
+  }
+
+  /** No give-back for it: the GC that cleared it has the memory already. */
+  private void noteForgotten(Entry e) {
+    refused = new Info(e.key, e.kind, e.rows, e.dimensions, 0, e.loadedAtMs, 0, -1, e.uses, e.sql,
+        "forgotten: the Java heap ran short (mle.heap_max)");
+  }
+
+  /** Clears the value under key as the JVM does when the heap runs short (unit tests). */
+  synchronized void clearReference(Key key) {
+    Entry e = entries.get(key);
+    if (e != null) e.ref.clear();
   }
 
   static String mib(long bytes) {

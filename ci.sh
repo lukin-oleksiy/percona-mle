@@ -71,6 +71,20 @@ if [ $do_unit = 1 ]; then
   done
 fi
 
+if [ $do_unit = 1 ]; then
+  # The worker's Java unit tests (JUnit; the build skips them, exp note 76 T7), with the build's JDK.
+  java_home="$(sed -n 's/^MLE_JAVA_HOME:[A-Z]*=//p' "$build/CMakeCache.txt")"
+  if JAVA_HOME="$java_home" mvn -q -B -f "$(dirname "$0")/worker/pom.xml" -Dmle.build.dir="$build/worker/maven" \
+       test >"$log/worker-junit.log" 2>&1; then
+    echo "   pass  worker JUnit ($(cat "$build"/worker/maven/surefire-reports/*.txt | grep -o 'Tests run: [0-9]*' \
+      | awk '{s+=$3} END {print s}') tests)"
+  else
+    echo "   FAIL  worker JUnit ($log/worker-junit.log)"
+    grep -E 'FAIL|Tests run:.*Fail' "$log/worker-junit.log" | head -5 | sed 's/^/         /'
+    failed+=(worker-junit)
+  fi
+fi
+
 if [ $do_mtr = 1 ]; then
   echo "== MySQL tests (component_mle)"
   if scope "$build/mtr" --force --parallel="$parallel" --max-test-fail=0 --retry=0 "${tests[@]}" \

@@ -54,13 +54,14 @@ FILE(GLOB_RECURSE MLE_WORKER_JAVA_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/main/java/*.java
   ${CMAKE_CURRENT_SOURCE_DIR}/src/main/resources/*)
 SET(MLE_WORKER_JAR ${CMAKE_CURRENT_BINARY_DIR}/maven/mle-worker.jar)
-# deps/ is emptied first: copy-dependencies only adds, and the jars of a previous GraalVM version
+# The unit tests (worker/src/test) are not run here: ci.sh runs them, as the C++ unit tests (exp
+# note 76 T7). deps/ is emptied first: copy-dependencies only adds, and the jars of a previous GraalVM version
 # would stay and be installed with the new ones.
 ADD_CUSTOM_COMMAND(OUTPUT ${MLE_WORKER_JAR}
   COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_CURRENT_BINARY_DIR}/maven/deps
   COMMAND ${CMAKE_COMMAND} -E env JAVA_HOME=${MLE_JAVA_HOME}
     ${MLE_MAVEN} -q -B -f ${CMAKE_CURRENT_SOURCE_DIR}/pom.xml
-    -Dmle.build.dir=${CMAKE_CURRENT_BINARY_DIR}/maven package
+    -Dmle.build.dir=${CMAKE_CURRENT_BINARY_DIR}/maven -DskipTests package
   COMMAND ${CMAKE_COMMAND} -E touch ${MLE_WORKER_JAR}
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/pom.xml ${MLE_WORKER_JAVA_SOURCES}
   COMMENT "Building mle-worker.jar with Maven"

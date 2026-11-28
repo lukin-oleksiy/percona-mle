@@ -68,23 +68,47 @@ public final class VectorCache {
   static VectorSet cached(String name, String sql, Object[] params) {
     if (sql == null) throw new IllegalArgumentException("the query must not be null");
     Object[] p = javaValues(params);
-    return (VectorSet) TABLE.cached(key(name), "vectors", sql, values(p), p, () -> VectorSet.load(sql, p),
-        com.percona.mle.worker.SqlBridge.maySendSql());
+    return (VectorSet) TABLE.cached(key(name), "vectors", sql, values(p), p, () -> sized(VectorSet.load(sql, p)),
+        com.percona.mle.worker.SqlBridge.maySendSql()).set();
   }
 
   static QuantizedSet cachedQuantized(String name, String type, String sql, Object[] params) {
     if (sql == null) throw new IllegalArgumentException("the query must not be null");
     String kind = QuantizedSet.binaryType(type) ? "binary" : "int8";
     Object[] p = javaValues(params);
-    return (QuantizedSet) TABLE.cached(key(name), kind, sql, values(p), p, () -> QuantizedSet.load(kind, sql, p),
-        com.percona.mle.worker.SqlBridge.maySendSql());
+    return (QuantizedSet) TABLE.cached(key(name), kind, sql, values(p), p,
+        () -> sized(QuantizedSet.load(kind, sql, p)), com.percona.mle.worker.SqlBridge.maySendSql()).set();
   }
 
   static Object refresh(String name) {
-    return TABLE.refresh(key(name), e -> {
+    CacheTable.Sized v = TABLE.refresh(key(name), e -> {
       Object[] p = e.raw;
-      return e.kind.equals("vectors") ? VectorSet.load(e.sql, p) : QuantizedSet.load(e.kind, e.sql, p);
+      return e.kind.equals("vectors") ? sized(VectorSet.load(e.sql, p)) : sized(QuantizedSet.load(e.kind, e.sql, p));
     });
+    return v == null ? null : v.set();
+  }
+
+  /** What the table needs to know of a set (its bytes, what it shares), without making it API (T6). */
+  static CacheTable.Sized sized(VectorSet s) {
+    return new CacheTable.Sized() {
+      public Object set() { return s; }
+      public Object base() { return s.cacheBase(); }
+      public long baseBytes() { return s.cacheBaseBytes(); }
+      public long ownBytes() { return s.cacheOwnBytes(); }
+      public int rows() { return s.size(); }
+      public int dimensions() { return s.dimensions(); }
+    };
+  }
+
+  static CacheTable.Sized sized(QuantizedSet q) {
+    return new CacheTable.Sized() {
+      public Object set() { return q; }
+      public Object base() { return q.cacheBase(); }
+      public long baseBytes() { return q.cacheBaseBytes(); }
+      public long ownBytes() { return q.cacheOwnBytes(); }
+      public int rows() { return q.size(); }
+      public int dimensions() { return q.dimensions(); }
+    };
   }
 
   /**

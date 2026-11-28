@@ -155,6 +155,33 @@ SELECT info();
 SELECT info();
 CALL big_size(@r); SELECT @r AS big;
 SELECT info();
+--echo #
+--echo # 2b. The heap running short with a set kept (exp note 76 H1): the JVM clears
+--echo #     kept sets before an OutOfMemoryError, so a routine that fills the heap
+--echo #     (and catches the error) finds the set forgotten, the worker stays, and
+--echo #     cacheInfo says why; the next call loads the set again.
+CREATE PROCEDURE fill_heap(OUT r TEXT) LANGUAGE JAVA AS $$
+boolean before = Vectors.kept("big") != null;
+java.util.List<long[]> keep = new java.util.ArrayList<>();
+try {
+  for (;;) keep.add(new long[1 << 17]);
+} catch (OutOfMemoryError e) {
+  keep = null;
+  CacheEntry[] all = Vectors.cacheInfo();
+  r[0] = "kept before: " + before + "; after the heap ran out: " + (Vectors.kept("big") != null)
+      + "; " + all[all.length - 1].name() + " " + all[all.length - 1].state();
+}
+$$;
+CALL big_size(@r); SELECT @r AS big;
+--let $pid3 = `SELECT mle_debug_worker_pid()`
+CALL fill_heap(@r); SELECT @r AS fill_heap;
+CALL big_size(@r); SELECT @r AS big;
+SELECT info();
+--let $pid4 = `SELECT mle_debug_worker_pid()`
+--let $assert_text = The same worker: the call that needed the heap got it
+--let $assert_cond = $pid4 = $pid3
+--source include/assert.inc
+DROP PROCEDURE fill_heap;
 SET GLOBAL mle.sql_result_max = DEFAULT;
 
 --echo #

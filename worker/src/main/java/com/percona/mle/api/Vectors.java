@@ -483,21 +483,23 @@ public final class Vectors {
 
   /**
    * Keeps a set made any way (a view, a quantized set, a projection) under name, replacing what the
-   * name held; false when it was not kept (the cache off, or the set larger than the limit).
+   * name held; false when it was not kept (the cache off, or the set larger than the limit). The
+   * cache may forget it later (the limit, idle expiry, the heap running short, the session's end).
    */
   public static boolean keep(String name, VectorSet set) {
     if (set == null) throw new IllegalArgumentException("the set must not be null");
-    return VectorCache.TABLE.keep(VectorCache.key(name), "vectors", set);
+    return VectorCache.TABLE.keep(VectorCache.key(name), "vectors", VectorCache.sized(set));
   }
 
   public static boolean keep(String name, QuantizedSet set) {
     if (set == null) throw new IllegalArgumentException("the set must not be null");
-    return VectorCache.TABLE.keep(VectorCache.key(name), set.type(), set);
+    return VectorCache.TABLE.keep(VectorCache.key(name), set.type(), VectorCache.sized(set));
   }
 
   /** The set kept under name (a VectorSet or a QuantizedSet), or null. */
   public static Object kept(String name) {
-    return VectorCache.TABLE.kept(VectorCache.key(name));
+    CacheTable.Sized v = VectorCache.TABLE.kept(VectorCache.key(name));
+    return v == null ? null : v.set();
   }
 
   /**
@@ -523,7 +525,7 @@ public final class Vectors {
     return VectorCache.TABLE.expireAfter(VectorCache.key(name), idleMs);
   }
 
-  /** The kept sets, least recently used first, then the last set that was not kept, with why. */
+  /** The kept sets, least recently used first, then the last set that was not kept or was forgotten, with why. */
   public static CacheEntry[] cacheInfo() {
     return VectorCache.TABLE.info().stream().map(CacheEntry::new).toArray(CacheEntry[]::new);
   }

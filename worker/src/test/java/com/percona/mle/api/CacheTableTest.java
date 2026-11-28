@@ -198,7 +198,7 @@ class CacheTableTest {
   }
 
   @Test
-  void aLargeDisposalOrTheWholeCacheAsksForAGiveBack() {
+  void aLargeDisposalOrTheWholeCacheOf8MiBAsksForAGiveBack() {
     CacheTable t = table(1L << 32, 0);
     load(t, "big", own(100L << 20));
     load(t, "small", own(1 << 20));
@@ -209,7 +209,10 @@ class CacheTableTest {
     assertFalse(take(t));  // once
     load(t, "x", own(10));
     t.dropAll();
-    assertTrue(take(t));  // the whole cache
+    assertFalse(take(t));  // the whole cache, but 10 bytes: not worth a GC (T3)
+    load(t, "x", own(9L << 20));
+    t.dropAll();
+    assertTrue(take(t));  // the whole cache and 9 MiB freed since the last give-back
     load(t, "y", own(10));
     t.clear();  // RESET: its own GC, no give-back
     assertFalse(take(t));
@@ -422,5 +425,27 @@ class CacheTableTest {
     assertTrue(t.keep(k("b"), "vectors", v));  // fits: the same 600 bytes
     assertEquals(600, t.total());
     assertSame(v, t.kept(k("a")));
+  }
+
+  @Test
+  void aSetTheJvmClearedIsForgottenAndLoadedAgain() {
+    CacheTable t = table(1000, 0);
+    Fake first = own(300), second = own(300);
+    load(t, "a", first);
+    load(t, "b", own(200));
+    t.clearReference(k("a"));  // as the JVM before an OutOfMemoryError
+    assertEquals(200, t.total());  // its bytes no longer count
+    assertSame(second, load(t, "a", second));  // loaded again
+    assertSame(second, t.kept(k("a")));
+    t.clearReference(k("b"));
+    assertNull(t.kept(k("b")));
+    List<CacheTable.Info> info = t.info();
+    CacheTable.Info last = info.get(info.size() - 1);
+    assertEquals("b", last.key().name());
+    assertTrue(last.state().startsWith("forgotten"));
+    assertFalse(take(t));  // no give-back: the GC that cleared it has the memory
+    t.clearReference(k("a"));
+    assertFalse(t.drop(k("a")));  // already forgotten
+    assertEquals(0, t.size());
   }
 }

@@ -49,7 +49,7 @@ import jdk.incubator.vector.VectorSpecies;
  * <p>Threads: the scan is split over the vector pool like {@link VectorSet#nearest}; candidates
  * are ranked by score then position, so results do not depend on the number of threads.
  */
-public final class QuantizedSet implements CacheTable.Sized {
+public final class QuantizedSet {
   static final VectorSpecies<Float> SP = VectorEngine.SP;
   static final int L = VectorEngine.L;
   static final VectorSpecies<Byte> BS = VectorSpecies.of(byte.class, VectorShape.forBitSize(L * 8));
@@ -241,29 +241,23 @@ public final class QuantizedSet implements CacheTable.Sized {
 
   // ----------------------------------------------- bytes (exp note 76)
 
-  /** The VectorSet whose floats this set rescores with, or null. */
-  @Override
-  public Object base() {
-    return source instanceof VectorSet v ? v.base() : null;
+  // For the cache's table (VectorCache.sized); not API (exp note 76 T6).
+
+  /** The base of the VectorSet whose floats this set rescores with, or null. */
+  Object cacheBase() {
+    return source instanceof VectorSet v ? v.cacheBase() : null;
   }
 
-  @Override
-  public long baseBytes() {
-    return source instanceof VectorSet v ? v.baseBytes() : 0;
+  long cacheBaseBytes() {
+    return source instanceof VectorSet v ? v.cacheBaseBytes() : 0;
   }
 
   /** The codes, scales, norms, ids and labels (not the floats a rescoring set shares with its VectorSet). */
-  @Override
-  public long ownBytes() {
+  long cacheOwnBytes() {
     long n = size();
     long perVector = binary ? 16 + 8L * ((d + 63) / 64) : 16 + d + 4;
     return n * (perVector + 4 + 8) + 3 * 16 + (labels == null ? 0 : 16 + 48 * n) + (byId == null ? 0 : 48 * n)
         + (floats != null ? 16 + 8 * n : 0);
-  }
-
-  @Override
-  public int rows() {
-    return size();
   }
 
   QuantizedSet from(Object set) {
