@@ -54,6 +54,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -303,6 +304,12 @@ Worker *Launcher::spawn(size_t cls, std::string *error) {
   auto *h = static_cast<wire::RegionHeader *>(p);
   h->magic = wire::kMagic;
   h->version = wire::kVersion;
+#ifndef NDEBUG
+  // Debug builds only: the conformance suite's region of another version
+  // (LauncherConfig::test_region_version, exp note 66 K1).
+  if (const char *v = getenv("MLE_TEST_REGION_VERSION"))
+    h->version = static_cast<uint32_t>(strtoul(v, nullptr, 0));
+#endif
   h->region_size = region;
   h->arena_size = m_arena_size;
   munmap(p, wire::kHeaderSize);

@@ -194,12 +194,19 @@ bool LauncherChannel::start(const LauncherConfig &config, std::string *error) {
                                       POSIX_SPAWN_SETSID);
   std::string exe = config.launcher_exe;
   char *argv[] = {exe.data(), nullptr};
-  // Diagnostics: the only variable the launcher gets (its workers' sandbox
-  // allows writes in that directory; README, launcher/child.cc).
-  std::string debug_dir;
+  // Diagnostics: the only variables the launcher gets (its workers' sandbox
+  // allows writes in that directory; README, launcher/child.cc), and a
+  // test's region version (honoured by debug builds of the launcher only).
+  std::string debug_dir, region_version;
   if (!config.debug_write_dir.empty())
     debug_dir = "MLE_DEBUG_WRITE_DIR=" + config.debug_write_dir;
-  char *envp[] = {debug_dir.empty() ? nullptr : debug_dir.data(), nullptr};
+  if (config.test_region_version != 0)
+    region_version =
+        "MLE_TEST_REGION_VERSION=" + std::to_string(config.test_region_version);
+  char *envp[3] = {nullptr, nullptr, nullptr};
+  size_t nenv = 0;
+  if (!debug_dir.empty()) envp[nenv++] = debug_dir.data();
+  if (!region_version.empty()) envp[nenv++] = region_version.data();
   const int rc = posix_spawn(&m_pid, exe.c_str(), &fa, &attr, argv, envp);
   posix_spawn_file_actions_destroy(&fa);
   posix_spawnattr_destroy(&attr);

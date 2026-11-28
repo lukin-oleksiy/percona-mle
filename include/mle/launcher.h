@@ -58,6 +58,9 @@ struct LauncherConfig {
   std::string debug_write_dir;
   uint32_t arena_size = wire::kDefaultArenaSize;
   std::vector<ClassConfig> classes;
+  /** Tests only: the version the launcher writes into its workers' regions
+      instead of wire::kVersion (debug builds of the launcher; 0: none). */
+  uint32_t test_region_version = 0;
   /** How long start() and acquire() wait for the launcher. */
   int timeout_ms = 10000;
 };
