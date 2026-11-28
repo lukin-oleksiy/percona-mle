@@ -153,6 +153,10 @@ ClassConfig jvm_worker_class(const Layout &layout, const JvmClassOptions &o) {
   if (!layout.aot_cache.empty()) c.read_paths.push_back(layout.aot_cache);
   c.hidden_paths = o.hidden_paths;
   c.memory_max = o.memory_max;
+  // The kernel throttles a JVM worker at 90 % of its limit instead of killing
+  // it at 100 %: its GCs, which free GraalPy's numpy memory, catch up (exp note
+  // 42 item 1; MemoryWatch's last-resort GC is at 85 %).
+  c.memory_high = o.memory_max / 10 * 9;
   c.pids_max = o.pids_max;
   c.nofile = 4096;
   c.pool_size = o.pool_size;
@@ -170,6 +174,7 @@ static void bound_messages(ClassConfig &c, const JvmClassOptions &o) {
 
 ClassConfig cpython_worker_class(const Layout &layout, const JvmClassOptions &o) {
   ClassConfig c = jvm_worker_class(layout, o);  // limits, environment, hidden paths
+  c.memory_high = 0;  // CPython frees by reference counting: no GC to wait for
   c.executable = layout.cpython_exe;
   c.args = {"--class=" + o.name, "--code=" + layout.cpython_code};
   // The standard library is the system's (under /usr/lib or /usr/lib64: the
@@ -194,6 +199,7 @@ ClassConfig cpython_worker_class(const Layout &layout, const JvmClassOptions &o)
 
 ClassConfig v8_worker_class(const Layout &layout, const JvmClassOptions &o, uint64_t heap_max) {
   ClassConfig c = jvm_worker_class(layout, o);  // limits, environment, hidden paths
+  c.memory_high = 0;  // JVM workers only (exp note 42 item 1)
   c.executable = layout.v8_exe;
   c.args = {"--class=" + o.name, "--heap-mb=" + std::to_string(heap_max >> 20)};
   // libnode and its libraries are the system's (the launcher's system paths).

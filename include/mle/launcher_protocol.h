@@ -97,6 +97,11 @@ struct ClassConfig {
       the keyring components' configuration, its datadir). */
   std::vector<std::string> hidden_paths;
   uint64_t memory_max = 0;
+  /** cgroup memory.high (0: none): above it the kernel throttles the
+      worker's allocations instead of killing it, so that a garbage collector
+      catches up (JVM workers: GraalPy frees numpy memory at GCs; exp note 42
+      item 1). */
+  uint64_t memory_high = 0;
   uint32_t pids_max = 0;
   uint32_t nofile = 4096;
   bool core_dumps = false;

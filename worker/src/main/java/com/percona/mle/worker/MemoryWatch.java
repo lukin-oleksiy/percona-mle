@@ -44,7 +44,8 @@ import java.util.concurrent.locks.LockSupport;
  * and again; the P2-P4 benchmarks stay at about half of the limit and never get there. Freed
  * arrays reach the system at once because workers run with a fixed malloc mmap threshold
  * (mle.malloc_mmap_threshold), and the launcher sets the cgroup's memory.high to 90 % of
- * memory.max, so that the kernel throttles an allocating thread instead of killing the worker.
+ * memory.max (ClassConfig::memory_high, host/defaults.cc), so that the kernel throttles an
+ * allocating thread instead of killing the worker.
  * Idle workers are left alone: RESET and the pool already trim them. The count goes to the host
  * with the worker's statistics (mle_worker_memory_gcs) and restarts at RESET. A check allocates
  * nothing: /proc/self/status is re-read through a file kept open, into a reused buffer.

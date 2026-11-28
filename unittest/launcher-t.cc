@@ -801,6 +801,45 @@ TEST(MleLauncherCgroup, MemoryLimitEndsOnlyTheWorker) {
             "killed by the out-of-memory killer (cgroup memory limit)");
 }
 
+TEST(MleLauncherCgroup, MemoryHighIsWrittenWhenGiven) {
+  // exp note 42 item 1: memory.high (JVM workers: 90 % of memory.max) lets the kernel throttle
+  // instead of kill; 0 leaves the leaf's default ("max").
+  NEED_CGROUP(base);
+  ClassConfig high = test_class("high");
+  high.memory_max = 256ULL << 20;
+  high.memory_high = 230ULL << 20;
+  ClassConfig none = test_class("none");
+  none.memory_max = 256ULL << 20;
+  auto l = start(config({high, none}, base));
+  ASSERT_NE(l, nullptr);
+  ASSERT_TRUE(l->info().cgroup_enabled) << l->info().cgroup_info;
+  auto read_leaf = [&](const char *file) {
+    std::string out;
+    if (DIR *d = opendir(base.c_str())) {
+      while (dirent *e = readdir(d))
+        if (strncmp(e->d_name, "mle-", 4) == 0) {
+          std::ifstream f(base + "/" + e->d_name + "/" + file);
+          std::getline(f, out);
+        }
+      closedir(d);
+    }
+    return out;
+  };
+  std::string error;
+  {
+    auto w = l->acquire("high", &error);
+    ASSERT_NE(w, nullptr) << error;
+    EXPECT_EQ(read_leaf("memory.high"), std::to_string(230ULL << 20));
+    EXPECT_EQ(read_leaf("memory.max"), std::to_string(256ULL << 20));
+  }
+  const auto deadline = Clock::now() + std::chrono::seconds(3);
+  while (count_leaves(base) != 0 && Clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  auto w = l->acquire("none", &error);
+  ASSERT_NE(w, nullptr) << error;
+  EXPECT_EQ(read_leaf("memory.high"), "max");
+}
+
 TEST(MleLauncherCgroup, ProcessLimitAndLeftoverChildren) {
   NEED_CGROUP(base);
   ClassConfig c = test_class("t", {"fork", "20"});

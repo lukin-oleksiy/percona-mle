@@ -130,6 +130,8 @@ std::string cgroup_create_leaf(const std::string &base, uint64_t id,
   const bool ok =
       (c.memory_max == 0 ||
        write_file(leaf + "/memory.max", std::to_string(c.memory_max), error)) &&
+      (c.memory_high == 0 ||
+       write_file(leaf + "/memory.high", std::to_string(c.memory_high), error)) &&
       // Without swap accounting the file does not exist: nothing to limit.
       (access((leaf + "/memory.swap.max").c_str(), F_OK) != 0 ||
        write_file(leaf + "/memory.swap.max", "0", error)) &&
